@@ -1,0 +1,43 @@
+[package]
+name = "bilbycast-relay"
+version = "0.1.0"
+edition = "2024"
+description = "QUIC relay server for bilbycast IP tunneling between NAT'd edge nodes"
+
+[dependencies]
+# QUIC
+quinn = "0.11.9"
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2.0"
+rcgen = "0.14.7"
+
+# Async runtime
+tokio = { version = "1.50.0", features = ["full"] }
+
+# HTTP API
+axum = "0.8.8"
+tower-http = { version = "0.6.8", features = ["cors"] }
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# CLI
+clap = { version = "4.6.0", features = ["derive"] }
+
+# Logging
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Concurrency
+dashmap = "6.1.0"
+
+# Crypto
+hmac = "0.12.1"
+sha2 = "0.10.9"
+base64 = "0.22.1"
+
+# Utilities
+uuid = { version = "1.22.0", features = ["v4", "serde"] }
+anyhow = "1.0.102"
+bytes = "1.11.1"

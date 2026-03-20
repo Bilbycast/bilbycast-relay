@@ -1,0 +1,7 @@
+{
+  "quic_addr": "0.0.0.0:4433",
+  "api_addr": "0.0.0.0:4480",
+  "shared_secret": "CHANGE_ME_TO_A_LONG_RANDOM_SECRET",
+  "max_edges": 100,
+  "max_tunnels": 500
+}

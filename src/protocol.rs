@@ -1,0 +1,210 @@
+//! Control protocol messages exchanged on QUIC control streams.
+//!
+//! This module defines messages for two connection modes:
+//! - **Relay mode**: Edge ↔ Relay (EdgeMessage / RelayMessage)
+//! - **Direct mode**: Edge ↔ Edge peer-to-peer (PeerMessage)
+//!
+//! The data plane (StreamHeader, UDP datagrams) is identical in both modes.
+//! Messages are length-prefixed: 4-byte big-endian length + JSON payload.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// ── ALPN protocol identifiers ──
+
+/// ALPN protocol for edge-to-relay connections.
+pub const ALPN_RELAY: &[u8] = b"bilbycast-relay";
+
+/// ALPN protocol for direct edge-to-edge connections.
+/// Used by bilbycast-edge when two edges connect without a relay.
+#[allow(dead_code)]
+pub const ALPN_DIRECT: &[u8] = b"bilbycast-direct";
+
+/// Messages sent from edge to relay on the control stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum EdgeMessage {
+    /// Authenticate with a relay token.
+    #[serde(rename = "auth")]
+    Auth { token: String },
+
+    /// Bind a tunnel endpoint on this edge.
+    #[serde(rename = "tunnel_bind")]
+    TunnelBind {
+        tunnel_id: Uuid,
+        direction: TunnelDirection,
+        protocol: TunnelProtocol,
+    },
+
+    /// Unbind a tunnel.
+    #[serde(rename = "tunnel_unbind")]
+    TunnelUnbind { tunnel_id: Uuid },
+
+    /// Keepalive ping.
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+/// Messages sent from relay to edge on the control stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RelayMessage {
+    /// Authentication succeeded.
+    #[serde(rename = "auth_ok")]
+    AuthOk { edge_id: String },
+
+    /// Authentication failed.
+    #[serde(rename = "auth_error")]
+    AuthError { reason: String },
+
+    /// Tunnel is ready (both sides have bound).
+    #[serde(rename = "tunnel_ready")]
+    TunnelReady { tunnel_id: Uuid },
+
+    /// Tunnel is waiting for the peer to bind.
+    #[serde(rename = "tunnel_waiting")]
+    TunnelWaiting { tunnel_id: Uuid },
+
+    /// Tunnel went down (peer disconnected or unbound).
+    #[serde(rename = "tunnel_down")]
+    TunnelDown { tunnel_id: Uuid, reason: String },
+
+    /// Keepalive pong.
+    #[serde(rename = "pong")]
+    Pong,
+}
+
+/// Direction of this edge's role in the tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TunnelDirection {
+    /// Ingress: local device → this edge → relay → egress edge.
+    #[serde(rename = "ingress")]
+    Ingress,
+    /// Egress: relay → this edge → local device.
+    #[serde(rename = "egress")]
+    Egress,
+}
+
+/// Transport protocol for the tunneled data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TunnelProtocol {
+    #[serde(rename = "tcp")]
+    Tcp,
+    #[serde(rename = "udp")]
+    Udp,
+}
+
+// ── Direct mode (edge-to-edge) control messages ──
+
+/// Messages exchanged on the control stream of a direct edge-to-edge QUIC connection.
+///
+/// In direct mode, two edges connect without a relay. One edge acts as a QUIC
+/// server (DirectListen) and the other as a client (DirectConnect). Authentication
+/// uses the same HMAC-SHA256 scheme as relay auth, but keyed with a per-tunnel PSK:
+/// `token = generate_token(tunnel_id, psk)`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PeerMessage {
+    /// Authenticate with a pre-shared key.
+    /// The token is `base64(tunnel_id:hmac_sha256(tunnel_id, psk))`.
+    #[serde(rename = "peer_auth")]
+    PeerAuth { tunnel_id: Uuid, token: String },
+
+    /// Authentication succeeded, tunnel is ready for data.
+    #[serde(rename = "peer_auth_ok")]
+    PeerAuthOk { tunnel_id: Uuid },
+
+    /// Authentication failed.
+    #[serde(rename = "peer_auth_error")]
+    PeerAuthError { reason: String },
+
+    /// Keepalive ping.
+    #[serde(rename = "ping")]
+    Ping,
+
+    /// Keepalive pong.
+    #[serde(rename = "pong")]
+    Pong,
+}
+
+// ── Data plane (shared between relay and direct modes) ──
+
+/// Header sent at the start of each data QUIC stream (not the control stream).
+/// Used to identify which tunnel this stream belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamHeader {
+    pub tunnel_id: Uuid,
+    pub stream_type: StreamType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StreamType {
+    /// A proxied TCP connection.
+    #[serde(rename = "tcp")]
+    Tcp,
+}
+
+// ── Wire format helpers ──
+
+/// Read a length-prefixed JSON message from a QUIC stream.
+pub async fn read_message<T: serde::de::DeserializeOwned>(
+    recv: &mut quinn::RecvStream,
+) -> anyhow::Result<T> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 1_048_576 {
+        anyhow::bail!("message too large: {len} bytes");
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await?;
+    Ok(serde_json::from_slice(&buf)?)
+}
+
+/// Write a length-prefixed JSON message to a QUIC stream.
+pub async fn write_message<T: Serialize>(
+    send: &mut quinn::SendStream,
+    msg: &T,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_vec(msg)?;
+    let len = (json.len() as u32).to_be_bytes();
+    send.write_all(&len).await?;
+    send.write_all(&json).await?;
+    Ok(())
+}
+
+/// Read a stream header from a newly opened data stream.
+pub async fn read_stream_header(recv: &mut quinn::RecvStream) -> anyhow::Result<StreamHeader> {
+    read_message(recv).await
+}
+
+/// Write a stream header to a newly opened data stream.
+pub async fn write_stream_header(
+    send: &mut quinn::SendStream,
+    header: &StreamHeader,
+) -> anyhow::Result<()> {
+    write_message(send, header).await
+}
+
+/// UDP datagram prefix: 16-byte UUID (binary) prepended to each QUIC datagram.
+pub const UDP_DATAGRAM_PREFIX_LEN: usize = 16;
+
+/// Encode a UDP datagram with tunnel_id prefix.
+/// Used by edge clients to construct datagrams for sending to the relay.
+#[allow(dead_code)]
+pub fn encode_udp_datagram(tunnel_id: &Uuid, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(UDP_DATAGRAM_PREFIX_LEN + payload.len());
+    buf.extend_from_slice(tunnel_id.as_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Decode a UDP datagram: extract tunnel_id and payload.
+pub fn decode_udp_datagram(data: &[u8]) -> Option<(Uuid, &[u8])> {
+    if data.len() < UDP_DATAGRAM_PREFIX_LEN {
+        return None;
+    }
+    let id = Uuid::from_bytes(data[..16].try_into().ok()?);
+    Some((id, &data[16..]))
+}
