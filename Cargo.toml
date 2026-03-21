@@ -37,6 +37,11 @@ hmac = "0.12.1"
 sha2 = "0.10.9"
 base64 = "0.22.1"
 
+# WebSocket client (manager connection)
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+
 # Utilities
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 anyhow = "1.0.102"

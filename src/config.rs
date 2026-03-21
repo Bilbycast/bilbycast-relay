@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// Manager connection configuration (same pattern as bilbycast-edge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerConfig {
+    /// Whether manager connection is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// WebSocket URL of the manager (e.g., "ws://localhost:8443/ws/node").
+    pub url: String,
+
+    /// One-time registration token (used on first connect, cleared after).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_token: Option<String>,
+
+    /// Persistent node ID (assigned by manager during registration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+
+    /// Persistent node secret (assigned by manager during registration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_secret: Option<String>,
+}
+
 /// Relay server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -30,6 +53,10 @@ pub struct RelayConfig {
     /// Maximum concurrent tunnels (default: 500).
     #[serde(default = "default_max_tunnels")]
     pub max_tunnels: usize,
+
+    /// Optional manager connection for centralized monitoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<ManagerConfig>,
 }
 
 fn default_quic_addr() -> String {
@@ -58,6 +85,7 @@ impl Default for RelayConfig {
             tls_key_path: None,
             max_edges: default_max_edges(),
             max_tunnels: default_max_tunnels(),
+            manager: None,
         }
     }
 }

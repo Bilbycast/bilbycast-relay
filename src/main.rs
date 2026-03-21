@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod config;
+mod manager;
 mod protocol;
 mod server;
 mod session;
@@ -105,6 +106,27 @@ async fn main() -> Result<()> {
         axum::serve(listener, api_router).await.unwrap();
     });
 
+    // Start manager client if configured
+    let manager_handle = if let Some(ref mgr_config) = config.manager {
+        if mgr_config.enabled {
+            tracing::info!(
+                "Manager client enabled, connecting to {}",
+                mgr_config.url
+            );
+            Some(manager::client::start_manager_client(
+                mgr_config.clone(),
+                ctx.clone(),
+                relay_stats.clone(),
+                config.clone(),
+                std::path::PathBuf::from(&cli.config),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Start QUIC server (blocks until shutdown)
     let quic_handle = tokio::spawn({
         let config = config.clone();
@@ -116,10 +138,19 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for either to finish
+    // Wait for any to finish
     tokio::select! {
         _ = api_handle => tracing::info!("API server stopped"),
         _ = quic_handle => tracing::info!("QUIC server stopped"),
+        _ = async {
+            if let Some(h) = manager_handle {
+                let _ = h.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::info!("Manager client stopped");
+        }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down");
         }

@@ -1,0 +1,506 @@
+//! Manager WebSocket client for bilbycast-relay.
+//!
+//! Maintains a persistent outbound WebSocket connection to the manager,
+//! forwarding relay stats (tunnels, edges, bandwidth) and executing commands.
+//!
+//! Authentication uses the same protocol as bilbycast-edge: first WebSocket
+//! frame contains either registration_token or node_id + node_secret.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
+
+use crate::config::{ManagerConfig, RelayConfig};
+use crate::session::SessionContext;
+use crate::stats::RelayStats;
+
+/// Start the manager client background task.
+pub fn start_manager_client(
+    config: ManagerConfig,
+    ctx: Arc<SessionContext>,
+    relay_stats: Arc<RelayStats>,
+    relay_config: RelayConfig,
+    config_path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        manager_client_loop(config, ctx, relay_stats, relay_config, config_path).await;
+    })
+}
+
+async fn manager_client_loop(
+    mut config: ManagerConfig,
+    ctx: Arc<SessionContext>,
+    relay_stats: Arc<RelayStats>,
+    relay_config: RelayConfig,
+    config_path: PathBuf,
+) {
+    let mut backoff_secs = 1u64;
+    let max_backoff = 60u64;
+
+    loop {
+        tracing::info!("Connecting to manager at {}", config.url);
+
+        match try_connect(&config, &ctx, &relay_stats, &relay_config, &config_path).await {
+            Ok(ConnectResult::Closed) => {
+                tracing::info!("Manager connection closed normally");
+                backoff_secs = 1;
+            }
+            Ok(ConnectResult::Registered {
+                node_id,
+                node_secret,
+            }) => {
+                tracing::info!(
+                    "Registered with manager as node_id={node_id}, persisting credentials"
+                );
+                config.registration_token = None;
+                config.node_id = Some(node_id.clone());
+                config.node_secret = Some(node_secret.clone());
+                backoff_secs = 1;
+
+                persist_credentials(&relay_config, &config_path, &node_id, &node_secret);
+            }
+            Err(e) => {
+                tracing::warn!("Manager connection failed: {e}");
+            }
+        }
+
+        tracing::info!("Reconnecting to manager in {backoff_secs}s...");
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(max_backoff);
+    }
+}
+
+enum ConnectResult {
+    Closed,
+    Registered {
+        node_id: String,
+        node_secret: String,
+    },
+}
+
+async fn try_connect(
+    config: &ManagerConfig,
+    ctx: &Arc<SessionContext>,
+    relay_stats: &Arc<RelayStats>,
+    relay_config: &RelayConfig,
+    config_path: &PathBuf,
+) -> Result<ConnectResult, String> {
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(&config.url)
+        .await
+        .map_err(|e| format!("WebSocket connect failed: {e}"))?;
+
+    tracing::info!("WebSocket connected, sending auth...");
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    // Step 1: Send auth message
+    let auth_msg = build_auth_message(config);
+    if let Ok(json) = serde_json::to_string(&auth_msg) {
+        ws_write
+            .send(Message::Text(json.into()))
+            .await
+            .map_err(|e| format!("Failed to send auth: {e}"))?;
+    }
+
+    // Step 2: Wait for auth response (10s timeout)
+    let auth_timeout = tokio::time::timeout(Duration::from_secs(10), ws_read.next()).await;
+
+    let mut registered_creds: Option<(String, String)> = None;
+
+    match auth_timeout {
+        Ok(Some(Ok(Message::Text(text)))) => {
+            let response: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| format!("Invalid auth response: {e}"))?;
+
+            match response["type"].as_str().unwrap_or("") {
+                "auth_ok" => {
+                    tracing::info!("Authenticated with manager");
+                }
+                "register_ack" => {
+                    let payload = &response["payload"];
+                    let node_id = payload["node_id"].as_str().unwrap_or("").to_string();
+                    let node_secret = payload["node_secret"].as_str().unwrap_or("").to_string();
+                    tracing::info!("Registered with manager: node_id={node_id}");
+
+                    if !node_id.is_empty() && !node_secret.is_empty() {
+                        persist_credentials(relay_config, config_path, &node_id, &node_secret);
+                        registered_creds = Some((node_id, node_secret));
+                    }
+                }
+                "auth_error" => {
+                    let msg = response["message"].as_str().unwrap_or("Unknown auth error");
+                    return Err(format!("Auth rejected: {msg}"));
+                }
+                other => {
+                    return Err(format!("Unexpected auth response type: {other}"));
+                }
+            }
+        }
+        Ok(Some(Ok(_))) => return Err("Unexpected non-text auth response".into()),
+        Ok(Some(Err(e))) => return Err(format!("WebSocket error during auth: {e}")),
+        Ok(None) => return Err("Connection closed during auth".into()),
+        Err(_) => return Err("Auth response timeout (10s)".into()),
+    }
+
+    // Send initial health
+    let health = build_health_message(ctx, relay_stats, relay_config);
+    if let Ok(json) = serde_json::to_string(&health) {
+        let _ = ws_write.send(Message::Text(json.into())).await;
+    }
+
+    // Main loop: stats every 1s, health every 15s, handle incoming commands
+    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut health_interval = tokio::time::interval(Duration::from_secs(15));
+    health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = stats_interval.tick() => {
+                let envelope = serde_json::json!({
+                    "type": "stats",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": build_stats_payload(ctx, relay_stats)
+                });
+                if let Ok(json) = serde_json::to_string(&envelope) {
+                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            _ = health_interval.tick() => {
+                let envelope = build_health_message(ctx, relay_stats, relay_config);
+                if let Ok(json) = serde_json::to_string(&envelope) {
+                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            msg = ws_read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_manager_message(&text, ctx, relay_config, &mut ws_write).await;
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws_write.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        return Err(format!("WebSocket error: {e}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some((node_id, node_secret)) = registered_creds {
+        return Ok(ConnectResult::Registered {
+            node_id,
+            node_secret,
+        });
+    }
+
+    Ok(ConnectResult::Closed)
+}
+
+// ───────────────────────────────────────────────────────
+// Message builders
+// ───────────────────────────────────────────────────────
+
+fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
+    if let (Some(node_id), Some(node_secret)) = (&config.node_id, &config.node_secret) {
+        serde_json::json!({
+            "type": "auth",
+            "payload": {
+                "node_id": node_id,
+                "node_secret": node_secret
+            }
+        })
+    } else if let Some(token) = &config.registration_token {
+        serde_json::json!({
+            "type": "auth",
+            "payload": {
+                "registration_token": token
+            }
+        })
+    } else {
+        serde_json::json!({
+            "type": "auth",
+            "payload": {}
+        })
+    }
+}
+
+fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_json::Value {
+    let tunnel_infos = ctx.router.list_tunnels();
+    let (total_tunnels, active_tunnels) = ctx.router.counts();
+    let connected_edges = ctx.edge_connections.len();
+
+    let total_bytes_ingress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_ingress).sum();
+    let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
+
+    // Build edges list
+    let edges: Vec<serde_json::Value> = ctx
+        .edge_connections
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "edge_id": entry.key(),
+                "remote_addr": entry.value().remote_address().to_string()
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "tunnels": tunnel_infos,
+        "edges": edges,
+        "connected_edges": connected_edges,
+        "active_tunnels": active_tunnels,
+        "total_tunnels": total_tunnels,
+        "total_bytes_ingress": total_bytes_ingress,
+        "total_bytes_egress": total_bytes_egress,
+        "uptime_secs": relay_stats.uptime_secs()
+    })
+}
+
+fn build_health_message(
+    ctx: &SessionContext,
+    relay_stats: &RelayStats,
+    relay_config: &RelayConfig,
+) -> serde_json::Value {
+    let (total_tunnels, active_tunnels) = ctx.router.counts();
+    serde_json::json!({
+        "type": "health",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_secs": relay_stats.uptime_secs(),
+            "connected_edges": ctx.edge_connections.len(),
+            "active_tunnels": active_tunnels,
+            "total_tunnels": total_tunnels,
+            "api_addr": relay_config.api_addr,
+            "quic_addr": relay_config.quic_addr
+        }
+    })
+}
+
+// ───────────────────────────────────────────────────────
+// Command handling
+// ───────────────────────────────────────────────────────
+
+async fn handle_manager_message<S>(
+    text: &str,
+    ctx: &Arc<SessionContext>,
+    relay_config: &RelayConfig,
+    ws_write: &mut futures_util::stream::SplitSink<S, Message>,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+{
+    let envelope: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Invalid message from manager: {e}");
+            return;
+        }
+    };
+
+    let msg_type = envelope["type"].as_str().unwrap_or("");
+    let payload = &envelope["payload"];
+
+    match msg_type {
+        "ping" => {
+            let pong = serde_json::json!({
+                "type": "pong",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "payload": null
+            });
+            if let Ok(json) = serde_json::to_string(&pong) {
+                let _ = ws_write.send(Message::Text(json.into())).await;
+            }
+        }
+        "command" => {
+            let command_id = payload["command_id"].as_str().unwrap_or("unknown");
+            let action = &payload["action"];
+            let action_type = action["type"].as_str().unwrap_or("");
+
+            // get_config sends a config_response, not a command_ack
+            if action_type == "get_config" {
+                tracing::info!("Manager command: get_config");
+                let mut config_json = serde_json::to_value(relay_config).unwrap_or_default();
+                // Redact secrets
+                config_json["shared_secret"] = serde_json::json!("***REDACTED***");
+                if let Some(mgr) = config_json.get_mut("manager") {
+                    if let Some(obj) = mgr.as_object_mut() {
+                        if obj.contains_key("node_secret") {
+                            obj.insert(
+                                "node_secret".to_string(),
+                                serde_json::json!("***REDACTED***"),
+                            );
+                        }
+                    }
+                }
+                let response = serde_json::json!({
+                    "type": "config_response",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": config_json
+                });
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = ws_write.send(Message::Text(json.into())).await;
+                }
+                return;
+            }
+
+            let result = execute_command(action_type, action, ctx).await;
+
+            // For list commands, include data in the ack
+            let ack = match &result {
+                Ok(Some(data)) => serde_json::json!({
+                    "type": "command_ack",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": {
+                        "command_id": command_id,
+                        "success": true,
+                        "data": data
+                    }
+                }),
+                Ok(None) => serde_json::json!({
+                    "type": "command_ack",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": {
+                        "command_id": command_id,
+                        "success": true
+                    }
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "command_ack",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": {
+                        "command_id": command_id,
+                        "success": false,
+                        "error": e
+                    }
+                }),
+            };
+            if let Ok(json) = serde_json::to_string(&ack) {
+                let _ = ws_write.send(Message::Text(json.into())).await;
+            }
+        }
+        "register_ack" => {
+            tracing::debug!("Late register_ack received, ignoring");
+        }
+        _ => {
+            tracing::debug!("Unknown message type from manager: {msg_type}");
+        }
+    }
+}
+
+async fn execute_command(
+    action_type: &str,
+    action: &serde_json::Value,
+    ctx: &Arc<SessionContext>,
+) -> Result<Option<serde_json::Value>, String> {
+    match action_type {
+        "disconnect_edge" => {
+            let edge_id = action["edge_id"]
+                .as_str()
+                .ok_or("Missing edge_id")?;
+            tracing::info!("Manager command: disconnect_edge '{edge_id}'");
+
+            if let Some((_, conn)) = ctx.edge_connections.remove(edge_id) {
+                conn.close(0u32.into(), b"disconnected by manager");
+                // Session cleanup (tunnel teardown, peer notification) is handled
+                // by the session task detecting the connection closure.
+                Ok(None)
+            } else {
+                Err(format!("Edge '{edge_id}' is not connected"))
+            }
+        }
+        "close_tunnel" => {
+            let tunnel_id_str = action["tunnel_id"]
+                .as_str()
+                .ok_or("Missing tunnel_id")?;
+            let tunnel_id: Uuid = tunnel_id_str
+                .parse()
+                .map_err(|e| format!("Invalid UUID: {e}"))?;
+            tracing::info!("Manager command: close_tunnel '{tunnel_id}'");
+
+            // Find the tunnel and unbind both sides
+            let tunnel_info = ctx
+                .router
+                .list_tunnels()
+                .into_iter()
+                .find(|t| t.tunnel_id == tunnel_id);
+
+            if let Some(info) = tunnel_info {
+                if let Some(ref ingress_id) = info.ingress_edge_id {
+                    ctx.router.unbind(&tunnel_id, ingress_id);
+                }
+                if let Some(ref egress_id) = info.egress_edge_id {
+                    ctx.router.unbind(&tunnel_id, egress_id);
+                }
+                Ok(None)
+            } else {
+                Err(format!("Tunnel '{tunnel_id}' not found"))
+            }
+        }
+        "list_tunnels" => {
+            tracing::info!("Manager command: list_tunnels");
+            let tunnels = ctx.router.list_tunnels();
+            let data = serde_json::to_value(&tunnels).unwrap_or_default();
+            Ok(Some(data))
+        }
+        "list_edges" => {
+            tracing::info!("Manager command: list_edges");
+            let edges: Vec<serde_json::Value> = ctx
+                .edge_connections
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "edge_id": entry.key(),
+                        "remote_addr": entry.value().remote_address().to_string()
+                    })
+                })
+                .collect();
+            Ok(Some(serde_json::json!(edges)))
+        }
+        _ => Err(format!("Unknown relay command: {action_type}")),
+    }
+}
+
+// ───────────────────────────────────────────────────────
+// Credential persistence
+// ───────────────────────────────────────────────────────
+
+fn persist_credentials(
+    relay_config: &RelayConfig,
+    config_path: &PathBuf,
+    node_id: &str,
+    node_secret: &str,
+) {
+    let mut config = relay_config.clone();
+    if let Some(ref mut mgr) = config.manager {
+        mgr.registration_token = None;
+        mgr.node_id = Some(node_id.to_string());
+        mgr.node_secret = Some(node_secret.to_string());
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&config) {
+        if let Err(e) = std::fs::write(config_path, &json) {
+            tracing::warn!("Failed to persist manager credentials: {e}");
+        } else {
+            tracing::info!(
+                "Manager credentials saved to {}",
+                config_path.display()
+            );
+        }
+    }
+}
