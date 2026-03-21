@@ -35,8 +35,9 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
 |  |        server.rs                 |   |     api.rs (Axum)           |  |
 |  |                                  |   |                             |  |
 |  |  TLS 1.3 (rustls)               |   |  GET /health                |  |
-|  |  ALPN: bilbycast-relay           |   |  GET /api/v1/tunnels        |  |
-|  |  Self-signed or user-provided    |   |  GET /api/v1/edges          |  |
+|  |  ALPN: bilbycast-relay           |   |  GET /metrics (Prometheus)  |  |
+|  |  Self-signed or user-provided    |   |  GET /api/v1/tunnels        |  |
+|  |                                  |   |  GET /api/v1/edges          |  |
 |  |                                  |   |                             |  |
 |  |  For each connection:            |   +-----------------------------+  |
 |  |    tokio::spawn(session)         |                                    |

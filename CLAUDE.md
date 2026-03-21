@@ -30,7 +30,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full architectural diagram.
 
 The relay runs three concurrent tasks:
 - **QUIC server** (default `:4433`) — accepts edge node connections, handles auth, tunnel binding, and data forwarding
-- **REST API** (default `:4480`, Axum) — health/status endpoints (`/health`, `/api/v1/tunnels`, `/api/v1/edges`)
+- **REST API** (default `:4480`, Axum) — health/status endpoints (`/health`, `/api/v1/tunnels`, `/api/v1/edges`) and Prometheus metrics (`/metrics`)
 - **Manager client** (optional) — persistent outbound WebSocket to bilbycast-manager for centralized monitoring, stats streaming (1s interval), health (15s), and command handling
 
 Main uses `tokio::select!` to run all tasks concurrently and handle graceful shutdown via Ctrl+C.
@@ -52,7 +52,7 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 | **`tunnel_router.rs`** | `TunnelRouter` pairs ingress/egress endpoints by tunnel UUID using `DashMap`. Manages bind/unbind lifecycle and peer connection lookup |
 | **`auth.rs`** | Stateless HMAC-SHA256 token generation/verification. Token format: `base64(identity:hmac_hex)`. Used for both relay auth and direct P2P auth |
 | **`server.rs`** | QUIC endpoint setup with self-signed TLS fallback. Configures transport parameters (datagram buffers sized for SRT at 10 Mbps, keep-alive at 15s) |
-| **`api.rs`** | Axum REST routes: `/health`, `/api/v1/tunnels`, `/api/v1/edges` |
+| **`api.rs`** | Axum REST routes: `/health`, `/metrics` (Prometheus), `/api/v1/tunnels`, `/api/v1/edges` |
 | **`config.rs`** | `RelayConfig` + `ManagerConfig` (JSON, with serde defaults). Supports config file + CLI overrides + env vars |
 | **`stats.rs`** | Atomic (`AtomicU64`) per-tunnel and global stats — lock-free counters for bytes, streams, datagrams |
 | **`manager/client.rs`** | WebSocket client to bilbycast-manager: auth (registration token or node_id/secret), stats/health streaming, command handling (get_config, disconnect_edge, close_tunnel, list_tunnels, list_edges) |
@@ -68,7 +68,7 @@ If `manager` is configured in `RelayConfig`, the relay maintains a persistent ou
 5. Handles commands: `get_config` (returns config with secrets redacted), `disconnect_edge`, `close_tunnel`, `list_tunnels`, `list_edges`
 6. Reconnects with exponential backoff (1s → 60s) on disconnection
 
-`ManagerConfig` fields: `enabled`, `url`, `registration_token` (one-time), `node_id`, `node_secret` (persistent after registration).
+`ManagerConfig` fields: `enabled`, `url` (must be `wss://` — plaintext `ws://` is rejected), `accept_self_signed_cert` (default false — set true for dev/testing with self-signed manager certs), `registration_token` (one-time), `node_id`, `node_secret` (persistent after registration).
 
 ### Two Connection Modes (ALPN)
 

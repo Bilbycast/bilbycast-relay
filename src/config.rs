@@ -7,8 +7,13 @@ pub struct ManagerConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// WebSocket URL of the manager (e.g., "ws://localhost:8443/ws/node").
+    /// WebSocket URL of the manager (must be wss://).
     pub url: String,
+
+    /// Accept self-signed TLS certificates from the manager.
+    /// Only enable this for development/testing. Default: false.
+    #[serde(default)]
+    pub accept_self_signed_cert: bool,
 
     /// One-time registration token (used on first connect, cleared after).
     #[serde(default, skip_serializing_if = "Option::is_none")]
