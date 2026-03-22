@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
             "shared_secret is required. Set it in the config file or via RELAY_SHARED_SECRET env var."
         );
     }
+    config.validate()?;
 
     // Token generation mode
     if let Some(edge_id) = cli.generate_token {

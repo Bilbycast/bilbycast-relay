@@ -112,6 +112,18 @@ No `Mutex` or `RwLock` is used anywhere in the codebase.
 - Tokens are stateless (no server-side session storage)
 - HMAC prevents forgery — edge_id is embedded in token, preventing cross-edge reuse
 - Shared secret configurable via config file or `RELAY_SHARED_SECRET` env var
+- **Constant-time comparison** on HMAC signatures to prevent timing attacks (`auth.rs`)
+- Token length limited to 1KB to prevent memory exhaustion
+
+**Config validation** (`config.rs`): Validated at startup via `RelayConfig::validate()`:
+- `shared_secret` minimum 16 characters
+- `max_edges` bounded 1-10000, `max_tunnels` bounded 1-100000
+- Socket addresses validated as parseable
+- Manager URL must use `wss://` when enabled
+
+**Protocol message limits:**
+- QUIC control messages: max 1MB per message (length-prefixed)
+- WebSocket messages to/from manager: bounded by protocol envelope
 
 ### QoS & Backpressure
 

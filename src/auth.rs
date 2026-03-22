@@ -39,6 +39,10 @@ pub fn generate_token(edge_id: &str, shared_secret: &str) -> String {
 /// - Relay auth: `verify_token(token, shared_secret)` → `Some(edge_id)`
 /// - Direct auth: `verify_token(token, psk)` → `Some(tunnel_id)`
 pub fn verify_token(token: &str, shared_secret: &str) -> Option<String> {
+    // Reject oversized tokens (max ~1KB base64 = ~768 bytes decoded)
+    if token.len() > 1024 {
+        return None;
+    }
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(token)
         .ok()?;
@@ -47,8 +51,8 @@ pub fn verify_token(token: &str, shared_secret: &str) -> Option<String> {
 
     let expected_sig = compute_hmac(edge_id, shared_secret);
 
-    // Constant-time comparison via HMAC verify
-    if provided_sig == expected_sig {
+    // Constant-time comparison to prevent timing attacks
+    if constant_time_eq(provided_sig.as_bytes(), expected_sig.as_bytes()) {
         Some(edge_id.to_string())
     } else {
         None
@@ -61,6 +65,18 @@ fn compute_hmac(edge_id: &str, shared_secret: &str) -> String {
     mac.update(edge_id.as_bytes());
     let result = mac.finalize();
     hex::encode(&result.into_bytes())
+}
+
+/// Constant-time byte comparison to prevent timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Simple hex encoding (avoid pulling in the `hex` crate for just this).

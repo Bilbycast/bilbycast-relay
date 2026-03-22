@@ -80,6 +80,42 @@ fn default_max_tunnels() -> usize {
     500
 }
 
+impl RelayConfig {
+    /// Validate the relay configuration.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // Shared secret minimum length for security
+        if self.shared_secret.len() < 16 {
+            anyhow::bail!(
+                "shared_secret must be at least 16 characters for security (got {})",
+                self.shared_secret.len()
+            );
+        }
+
+        // Bounds on resource limits
+        if self.max_edges == 0 || self.max_edges > 10_000 {
+            anyhow::bail!("max_edges must be 1-10000, got {}", self.max_edges);
+        }
+        if self.max_tunnels == 0 || self.max_tunnels > 100_000 {
+            anyhow::bail!("max_tunnels must be 1-100000, got {}", self.max_tunnels);
+        }
+
+        // Validate socket addresses are parseable
+        self.quic_addr.parse::<std::net::SocketAddr>()
+            .map_err(|e| anyhow::anyhow!("invalid quic_addr '{}': {}", self.quic_addr, e))?;
+        self.api_addr.parse::<std::net::SocketAddr>()
+            .map_err(|e| anyhow::anyhow!("invalid api_addr '{}': {}", self.api_addr, e))?;
+
+        // Validate manager URL if enabled
+        if let Some(ref mgr) = self.manager {
+            if mgr.enabled && !mgr.url.starts_with("wss://") {
+                anyhow::bail!("Manager URL must use wss:// (TLS required)");
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {

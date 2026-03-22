@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-relay"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "QUIC relay server for bilbycast IP tunneling between NAT'd edge nodes"
 
