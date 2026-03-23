@@ -1,8 +1,9 @@
 [package]
 name = "bilbycast-relay"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "QUIC relay server for bilbycast IP tunneling between NAT'd edge nodes"
+license = "Elastic-2.0"
 
 [dependencies]
 # QUIC
