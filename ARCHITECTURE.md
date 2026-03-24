@@ -20,7 +20,9 @@
                            +--------------------+
 ```
 
-The relay connects to bilbycast-manager via an outbound WebSocket (same protocol as edge nodes). This enables centralized monitoring of tunnels, connected edges, bandwidth, and remote commands (disconnect_edge, close_tunnel).
+The relay is a stateless traffic forwarder. It requires no configuration to run — edges connect, bind tunnels, and data flows. Optionally connects to bilbycast-manager via an outbound WebSocket for centralized monitoring.
+
+Multiple relays can run behind a load balancer since they hold no auth state, ACL, or shared secrets.
 
 ## Internal Architecture
 
@@ -39,9 +41,9 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
 |  |  Self-signed or user-provided    |   |  GET /api/v1/tunnels        |  |
 |  |                                  |   |  GET /api/v1/edges          |  |
 |  |                                  |   |                             |  |
-|  |  For each connection:            |   +-----------------------------+  |
-|  |    tokio::spawn(session)         |                                    |
-|  +----------------------------------+                                    |
+|  |  For each connection:            |   |  All public, read-only.     |  |
+|  |    tokio::spawn(session)         |   |  No admin routes.           |  |
+|  +----------------------------------+   +-----------------------------+  |
 |                  |                                                        |
 |                  v                                                        |
 |  +===================================================================+   |
@@ -52,13 +54,13 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
 |  |  | Control Stream    | | Data Streams      | | Datagram Loop   |  |   |
 |  |  | Loop              | | Loop              | | (UDP)           |  |   |
 |  |  |                   | |                   | |                 |  |   |
-|  |  | Auth (mandatory)  | | accept_bi()       | | read_datagram() |  |   |
-|  |  | TunnelBind/Unbind | | per-stream task:  | | 16-byte UUID    |  |   |
-|  |  | Ping/Pong         | |   StreamHeader    | | lookup peer     |  |   |
-|  |  |                   | |   tokio::join!    | | send_datagram() |  |   |
-|  |  | JSON over bi-     | |   (bidir copy)   | | best-effort     |  |   |
-|  |  | stream (4B len    | |   64KB buffers    | | 2MB buffers     |  |   |
-|  |  | prefix)           | |                   | |                 |  |   |
+|  |  | TunnelBind/Unbind | | accept_bi()       | | read_datagram() |  |   |
+|  |  | Ping/Pong         | | per-stream task:  | | 16-byte UUID    |  |   |
+|  |  |                   | |   StreamHeader    | | lookup peer     |  |   |
+|  |  | No auth step.     | |   tokio::join!    | | send_datagram() |  |   |
+|  |  | Edge sends        | |   (bidir copy)   | | best-effort     |  |   |
+|  |  | TunnelBind        | |   64KB buffers    | | 2MB buffers     |  |   |
+|  |  | immediately.      | |                   | |                 |  |   |
 |  |  +-------------------+ +-------------------+ +-----------------+  |   |
 |  |                                                                   |   |
 |  +===================================================================+   |
@@ -68,14 +70,14 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
 |  |   TunnelRouter                |  |   SessionContext            |       |
 |  |   tunnel_router.rs            |  |   (shared across sessions) |       |
 |  |                               |  |                            |       |
-|  |   DashMap<Uuid, TunnelState>  |  |   shared_secret: String    |       |
-|  |   (lock-free)                 |  |   router: Arc<TunnelRouter>|       |
-|  |                               |  |   edge_connections:        |       |
-|  |   bind() -> Active|Waiting    |  |     DashMap<String, Conn>  |       |
-|  |   unbind() -> notify peer     |  |                            |       |
-|  |   get_peer_connection()       |  +----------------------------+       |
-|  |   remove_edge() -> cleanup    |                                       |
-|  +-------------------------------+                                       |
+|  |   DashMap<Uuid, TunnelState>  |  |   router: Arc<TunnelRouter>|       |
+|  |   (lock-free)                 |  |   edge_connections:        |       |
+|  |                               |  |     DashMap<String, Conn>  |       |
+|  |   bind() -> Active|Waiting    |  |                            |       |
+|  |   unbind() -> notify peer     |  |   No shared_secret.        |       |
+|  |   get_peer_connection()       |  |   No max_edges/tunnels.    |       |
+|  |   remove_edge() -> cleanup    |  |                            |       |
+|  +-------------------------------+  +----------------------------+       |
 |                  |                                                        |
 |                  v                                                        |
 |  +-------------------------------+                                       |
@@ -91,7 +93,7 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
 |  |   Manager Client (optional)   |                                       |
 |  |   manager/client.rs           |                                       |
 |  |                               |                                       |
-|  |   WebSocket → manager :8443   |                                       |
+|  |   WebSocket -> manager :8443  |                                       |
 |  |   Auth: reg_token / node creds|                                       |
 |  |   Stats every 1s (tunnels,    |                                       |
 |  |     edges, bandwidth)         |                                       |
@@ -103,7 +105,7 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
 +===========================================================================+
 ```
 
-## Connection & Authentication Flow
+## Connection Flow (No Authentication)
 
 ```
   Edge Node                          Relay
@@ -112,25 +114,18 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
   1. QUIC connect ------------------>
      (TLS 1.3 handshake)             Verify ALPN = "bilbycast-relay"
                                      Accept connection
+                                     Assign connection_id (remote addr + counter)
                                      tokio::spawn(session)
 
   2. Open bi-stream (control) ------>
-     Send Auth { token }             Verify HMAC-SHA256:
-                                       decode base64(edge_id:hmac_hex)
-                                       recompute HMAC(edge_id, secret)
-                                       compare signatures
-
-                          <--------- AuthOk { edge_id }
-                                     Register edge in DashMap
-
-  3. Send TunnelBind { id, dir } --->
+     Send TunnelBind { id, dir } --->
                                      router.bind(tunnel_id, direction)
                                        if peer already bound:
                           <---------     TunnelReady to both edges
                                        else:
                           <---------     TunnelWaiting
 
-  4a. TCP: Open bi-stream ---------->
+  3a. TCP: Open bi-stream ---------->
       Send StreamHeader              Read header, lookup peer
                                      Open bi-stream to peer
                                      Write StreamHeader to peer
@@ -139,16 +134,18 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
                                        egress -> ingress copy
                                      )
 
-  4b. UDP: Send datagram ----------->
+  3b. UDP: Send datagram ----------->
       [16B tunnel_id | payload]      Extract UUID, lookup peer
                                      send_datagram() to peer
                                      (best-effort, drop on overflow)
 
-  5. Disconnect -------------------->
+  4. Disconnect -------------------->
                                      remove_edge() from router
                                      Notify peers: TunnelDown
                                      Cleanup all tunnel bindings
 ```
+
+No Auth/AuthOk/AuthError exchange. Edges send TunnelBind immediately after opening the control stream.
 
 ## Tunnel State Machine
 
@@ -223,29 +220,30 @@ The relay connects to bilbycast-manager via an outbound WebSocket (same protocol
 
 ```
   +---------------------------------------------------------------+
-  | Layer 1: Transport Security (QUIC + TLS 1.3)                  |
-  |   - All traffic encrypted (rustls)                            |
-  |   - ALPN enforcement prevents protocol downgrade              |
-  |   - Optional user-provided certificates for production        |
+  | Layer 1: End-to-End Encryption (Edge Level)                    |
+  |   - ChaCha20-Poly1305 between edges                           |
+  |   - Relay sees only encrypted ciphertext                      |
+  |   - Relay cannot inspect or modify tunnel payloads             |
   +---------------------------------------------------------------+
-  | Layer 2: Authentication Gate                                   |
-  |   - HMAC-SHA256 token required before any data exchange        |
-  |   - Token = base64(edge_id : hmac_hex(edge_id, secret))       |
-  |   - Connection terminated immediately on auth failure          |
-  |   - No data streams accepted until authenticated               |
+  | Layer 2: Transport Security (QUIC + TLS 1.3)                  |
+  |   - All traffic encrypted in transit (rustls)                  |
+  |   - ALPN enforcement prevents protocol downgrade               |
+  |   - Optional user-provided certificates for production         |
   +---------------------------------------------------------------+
   | Layer 3: Tunnel Isolation                                      |
-  |   - Each tunnel identified by unique UUID                      |
-  |   - Data routed only to the bound peer (ingress <-> egress)   |
+  |   - Each tunnel identified by 128-bit random UUID              |
+  |   - Brute-force discovery infeasible (2^128 search space)      |
+  |   - Data routed only to the bound peer (ingress <-> egress)    |
   |   - No cross-tunnel data leakage possible via TunnelRouter     |
   +---------------------------------------------------------------+
   | Layer 4: Resource Protection                                   |
   |   - Max 1024 concurrent bi-streams per connection              |
   |   - Max 256 uni-streams per connection                         |
   |   - 15-second keep-alive detects and cleans dead connections   |
-  |   - Configurable max_edges and max_tunnels limits              |
   +---------------------------------------------------------------+
 ```
+
+No authentication layer. The relay is a stateless forwarder — security is provided by edge-to-edge encryption and transport-level TLS.
 
 ## Non-Blocking Concurrency Model
 

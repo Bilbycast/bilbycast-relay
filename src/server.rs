@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! QUIC server: accepts connections from edge nodes.
 
 use std::sync::Arc;
@@ -55,9 +52,8 @@ pub async fn run_quic_server(
 }
 
 /// Create the SessionContext shared state.
-pub fn create_session_context(config: &RelayConfig) -> Arc<SessionContext> {
+pub fn create_session_context() -> Arc<SessionContext> {
     Arc::new(SessionContext {
-        shared_secret: config.shared_secret.clone(),
         router: Arc::new(TunnelRouter::new()),
         edge_connections: dashmap::DashMap::new(),
     })

@@ -409,7 +409,6 @@ async fn handle_manager_message<S>(
                 tracing::info!("Manager command: get_config");
                 let mut config_json = serde_json::to_value(relay_config).unwrap_or_default();
                 // Redact secrets
-                config_json["shared_secret"] = serde_json::json!("***REDACTED***");
                 if let Some(mgr) = config_json.get_mut("manager") {
                     if let Some(obj) = mgr.as_object_mut() {
                         if obj.contains_key("node_secret") {

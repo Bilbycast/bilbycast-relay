@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! Integration tests: two quinn clients simulate ingress + egress edges,
 //! verify TCP and UDP data flows through the relay.
+//!
+//! The relay is stateless — no authentication required. Edges connect and
+//! immediately bind tunnels by UUID.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,17 +14,13 @@ use std::time::Duration;
 use quinn::{ClientConfig, Connection, Endpoint, TransportConfig};
 use uuid::Uuid;
 
-// We import the library types via the binary crate's modules.
-// Since bilbycast-relay is a binary crate, we replicate the wire protocol here.
 use serde::{Deserialize, Serialize};
 
-// ── Wire protocol (mirrors src/protocol.rs) ──
+// ── Wire protocol (mirrors src/protocol.rs — no auth messages) ──
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum EdgeMessage {
-    #[serde(rename = "auth")]
-    Auth { token: String },
     #[serde(rename = "tunnel_bind")]
     TunnelBind {
         tunnel_id: Uuid,
@@ -40,10 +36,6 @@ enum EdgeMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum RelayMessage {
-    #[serde(rename = "auth_ok")]
-    AuthOk { edge_id: String },
-    #[serde(rename = "auth_error")]
-    AuthError { reason: String },
     #[serde(rename = "tunnel_ready")]
     TunnelReady { tunnel_id: Uuid },
     #[serde(rename = "tunnel_waiting")]
@@ -104,27 +96,6 @@ async fn read_msg<T: serde::de::DeserializeOwned>(
 }
 
 // ── Test helpers ──
-
-const SHARED_SECRET: &str = "test_secret_for_integration";
-
-/// Generate an HMAC-SHA256 token (same logic as auth.rs).
-fn generate_token(edge_id: &str, shared_secret: &str) -> String {
-    use base64::Engine;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(shared_secret.as_bytes()).unwrap();
-    mac.update(edge_id.as_bytes());
-    let result = mac.finalize();
-    let sig = result
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let payload = format!("{edge_id}:{sig}");
-    base64::engine::general_purpose::STANDARD.encode(payload.as_bytes())
-}
 
 /// Build a quinn client endpoint that trusts any certificate (for testing with self-signed).
 fn make_client_endpoint() -> anyhow::Result<Endpoint> {
@@ -231,24 +202,28 @@ async fn start_relay() -> anyhow::Result<SocketAddr> {
     let endpoint = quinn::Endpoint::server(server_config, quic_addr)?;
     let actual_addr = endpoint.local_addr()?;
 
-    // Shared state (replicate what server::create_session_context does)
+    // Shared state — no auth needed
     let router = Arc::new(TestTunnelRouter::new());
     let edge_connections: Arc<dashmap::DashMap<String, Connection>> =
         Arc::new(dashmap::DashMap::new());
-    let shared_secret = SHARED_SECRET.to_string();
 
     // Accept loop
+    let conn_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let router = router.clone();
             let edge_connections = edge_connections.clone();
-            let shared_secret = shared_secret.clone();
+            let counter = conn_counter.clone();
 
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else {
                     return;
                 };
-                handle_test_edge(connection, &shared_secret, &router, &edge_connections).await;
+                let conn_id = format!(
+                    "conn-{}",
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                handle_test_edge(connection, &conn_id, &router, &edge_connections).await;
             });
         }
     });
@@ -256,7 +231,6 @@ async fn start_relay() -> anyhow::Result<SocketAddr> {
     // Start API server
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
-        // Simple health endpoint
         let app = axum::Router::new().route(
             "/health",
             axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
@@ -271,7 +245,6 @@ async fn start_relay() -> anyhow::Result<SocketAddr> {
 }
 
 // ── Minimal relay logic for integration tests ──
-// We replicate the session handling inline since we can't import from the binary crate.
 
 struct TestTunnelRouter {
     tunnels: dashmap::DashMap<Uuid, TestTunnelState>,
@@ -297,7 +270,7 @@ impl TestTunnelRouter {
 
 async fn handle_test_edge(
     connection: Connection,
-    shared_secret: &str,
+    conn_id: &str,
     router: &Arc<TestTunnelRouter>,
     edge_connections: &Arc<dashmap::DashMap<String, Connection>>,
 ) {
@@ -306,56 +279,8 @@ async fn handle_test_edge(
         return;
     };
 
-    // Authenticate
-    let Ok(msg) = read_msg::<EdgeMessage>(&mut recv).await else {
-        return;
-    };
-    let edge_id = match msg {
-        EdgeMessage::Auth { token } => {
-            let token_bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &token,
-            );
-            let Ok(decoded) = token_bytes else {
-                let _ = write_msg(
-                    &mut send,
-                    &RelayMessage::AuthError {
-                        reason: "invalid token".into(),
-                    },
-                )
-                .await;
-                return;
-            };
-            let Ok(payload) = String::from_utf8(decoded) else {
-                return;
-            };
-            let Some((eid, _sig)) = payload.split_once(':') else {
-                return;
-            };
-            // Verify by regenerating token
-            let expected = generate_token(eid, shared_secret);
-            if expected != token {
-                let _ = write_msg(
-                    &mut send,
-                    &RelayMessage::AuthError {
-                        reason: "invalid token".into(),
-                    },
-                )
-                .await;
-                return;
-            }
-            let _ = write_msg(
-                &mut send,
-                &RelayMessage::AuthOk {
-                    edge_id: eid.to_string(),
-                },
-            )
-            .await;
-            eid.to_string()
-        }
-        _ => return,
-    };
-
+    // No auth — connection is immediately ready
+    let edge_id = conn_id.to_string();
     edge_connections.insert(edge_id.clone(), connection.clone());
 
     // Handle control messages and data streams concurrently
@@ -526,29 +451,16 @@ async fn forward_test_tcp_stream(
     Ok(())
 }
 
-// ── Helper: connect a client edge ──
+// ── Helper: connect a client edge (no auth needed) ──
 
 async fn connect_edge(
     endpoint: &Endpoint,
     relay_addr: SocketAddr,
-    edge_id: &str,
 ) -> anyhow::Result<(Connection, quinn::SendStream, quinn::RecvStream)> {
     let connection = endpoint.connect(relay_addr, "localhost")?.await?;
 
-    // Open control stream
-    let (mut send, mut recv) = connection.open_bi().await?;
-
-    // Authenticate
-    let token = generate_token(edge_id, SHARED_SECRET);
-    write_msg(&mut send, &EdgeMessage::Auth { token }).await?;
-
-    let resp: RelayMessage = read_msg(&mut recv).await?;
-    match resp {
-        RelayMessage::AuthOk { edge_id: id } => {
-            assert_eq!(id, edge_id);
-        }
-        other => anyhow::bail!("expected AuthOk, got {:?}", other),
-    }
+    // Open control stream — no auth step
+    let (send, recv) = connection.open_bi().await?;
 
     Ok((connection, send, recv))
 }
@@ -556,38 +468,11 @@ async fn connect_edge(
 // ── Tests ──
 
 #[tokio::test]
-async fn test_auth_success() {
+async fn test_connect_no_auth() {
     let relay_addr = start_relay().await.unwrap();
     let client = make_client_endpoint().unwrap();
 
-    let (_conn, _send, _recv) = connect_edge(&client, relay_addr, "edge-test-1").await.unwrap();
-}
-
-#[tokio::test]
-async fn test_auth_failure() {
-    let relay_addr = start_relay().await.unwrap();
-    let client = make_client_endpoint().unwrap();
-
-    let connection = client.connect(relay_addr, "localhost").unwrap().await.unwrap();
-    let (mut send, mut recv) = connection.open_bi().await.unwrap();
-
-    // Send a bad token
-    write_msg(
-        &mut send,
-        &EdgeMessage::Auth {
-            token: "totally_bogus_token".into(),
-        },
-    )
-    .await
-    .unwrap();
-
-    // The server sends AuthError then closes the connection. We may get the
-    // response or the connection may close before we can read it — both are valid.
-    match read_msg::<RelayMessage>(&mut recv).await {
-        Ok(RelayMessage::AuthError { .. }) => {} // got the error message
-        Ok(other) => panic!("expected AuthError, got {:?}", other),
-        Err(_) => {} // connection closed before we could read — also valid
-    }
+    let (_conn, _send, _recv) = connect_edge(&client, relay_addr).await.unwrap();
 }
 
 #[tokio::test]
@@ -595,7 +480,7 @@ async fn test_ping_pong() {
     let relay_addr = start_relay().await.unwrap();
     let client = make_client_endpoint().unwrap();
 
-    let (_conn, mut send, mut recv) = connect_edge(&client, relay_addr, "edge-ping").await.unwrap();
+    let (_conn, mut send, mut recv) = connect_edge(&client, relay_addr).await.unwrap();
 
     write_msg(&mut send, &EdgeMessage::Ping).await.unwrap();
     let resp: RelayMessage = read_msg(&mut recv).await.unwrap();
@@ -614,7 +499,7 @@ async fn test_tunnel_bind_waiting_then_active() {
 
     // Ingress edge binds first → should get TunnelWaiting
     let (_conn1, mut send1, mut recv1) =
-        connect_edge(&client, relay_addr, "edge-ingress").await.unwrap();
+        connect_edge(&client, relay_addr).await.unwrap();
 
     write_msg(
         &mut send1,
@@ -635,7 +520,7 @@ async fn test_tunnel_bind_waiting_then_active() {
 
     // Egress edge binds → both should get TunnelReady
     let (_conn2, mut send2, mut recv2) =
-        connect_edge(&client, relay_addr, "edge-egress").await.unwrap();
+        connect_edge(&client, relay_addr).await.unwrap();
 
     write_msg(
         &mut send2,
@@ -656,7 +541,6 @@ async fn test_tunnel_bind_waiting_then_active() {
     }
 
     // Ingress gets TunnelReady via uni stream notification
-    // Ingress should receive TunnelReady on a uni stream notification
     if let Ok(Ok(mut uni)) =
         tokio::time::timeout(Duration::from_secs(2), _conn1.accept_uni()).await
     {
@@ -666,7 +550,6 @@ async fn test_tunnel_bind_waiting_then_active() {
             other => panic!("expected TunnelReady notification, got {:?}", other),
         }
     }
-    // If it times out, that's okay — the notification is best-effort for this test.
 }
 
 #[tokio::test]
@@ -676,15 +559,11 @@ async fn test_tcp_tunnel_bidirectional() {
 
     let tunnel_id = Uuid::new_v4();
 
-    // Connect both edges
+    // Connect both edges (no auth)
     let (conn_ingress, mut ctrl_send_i, mut ctrl_recv_i) =
-        connect_edge(&client, relay_addr, "edge-tcp-ingress")
-            .await
-            .unwrap();
+        connect_edge(&client, relay_addr).await.unwrap();
     let (conn_egress, mut ctrl_send_e, mut ctrl_recv_e) =
-        connect_edge(&client, relay_addr, "edge-tcp-egress")
-            .await
-            .unwrap();
+        connect_edge(&client, relay_addr).await.unwrap();
 
     // Bind ingress
     write_msg(
@@ -777,15 +656,11 @@ async fn test_udp_tunnel_datagram() {
 
     let tunnel_id = Uuid::new_v4();
 
-    // Connect both edges
+    // Connect both edges (no auth)
     let (conn_ingress, mut ctrl_send_i, mut ctrl_recv_i) =
-        connect_edge(&client, relay_addr, "edge-udp-ingress")
-            .await
-            .unwrap();
+        connect_edge(&client, relay_addr).await.unwrap();
     let (conn_egress, mut ctrl_send_e, mut ctrl_recv_e) =
-        connect_edge(&client, relay_addr, "edge-udp-egress")
-            .await
-            .unwrap();
+        connect_edge(&client, relay_addr).await.unwrap();
 
     // Bind both sides as UDP tunnel
     write_msg(

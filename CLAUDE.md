@@ -4,14 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-bilbycast-relay is a QUIC relay server written in Rust that enables IP tunneling between NAT'd edge nodes. It acts as an intermediary, pairing ingress and egress edge nodes by tunnel ID and forwarding TCP streams and UDP datagrams between them.
+bilbycast-relay is a stateless QUIC relay server written in Rust that enables IP tunneling between NAT'd edge nodes. It acts as a simple traffic forwarder, pairing ingress and egress edge nodes by tunnel ID and forwarding TCP streams and UDP datagrams between them. The relay has no authentication, no ACL, and no configuration requirements — it can run with zero config.
 
 ## Build & Development Commands
 
 ```bash
 cargo build                  # Build debug
 cargo build --release        # Build release
-cargo run -- -c relay-config.json   # Run with config file
+cargo run                    # Run with defaults (no config needed)
+cargo run -- -c relay.json   # Run with optional config file
+cargo run -- --quic-addr 0.0.0.0:4433 --api-addr 0.0.0.0:4480  # CLI overrides
 cargo test                   # Run all tests (unit + integration)
 cargo test --lib             # Unit tests only
 cargo test --test integration # Integration tests only
@@ -20,17 +22,15 @@ cargo test test_name         # Run a single test by name
 
 **Logging**: Controlled via `RUST_LOG` env var (default: `bilbycast_relay=info`).
 
-**Shared secret**: Required. Set via config file `shared_secret` field or `RELAY_SHARED_SECRET` env var.
-
-**Token generation**: `cargo run -- --generate-token <edge_id>` generates an auth token and exits.
+**No shared secret or tokens needed** — the relay is a stateless forwarder with no authentication layer.
 
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full architectural diagram.
 
 The relay runs three concurrent tasks:
-- **QUIC server** (default `:4433`) — accepts edge node connections, handles auth, tunnel binding, and data forwarding
-- **REST API** (default `:4480`, Axum) — health/status endpoints (`/health`, `/api/v1/tunnels`, `/api/v1/edges`) and Prometheus metrics (`/metrics`)
+- **QUIC server** (default `:4433`) — accepts edge node connections, handles tunnel binding, and forwards data
+- **REST API** (default `:4480`, Axum) — public read-only endpoints: `/health`, `/metrics` (Prometheus), `/api/v1/tunnels`, `/api/v1/edges`
 - **Manager client** (optional) — persistent outbound WebSocket to bilbycast-manager for centralized monitoring, stats streaming (1s interval), health (15s), and command handling
 
 Main uses `tokio::select!` to run all tasks concurrently and handle graceful shutdown via Ctrl+C.
@@ -38,24 +38,39 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 ### Connection Lifecycle
 
 1. Edge connects via QUIC and opens a bidirectional control stream
-2. Edge sends `Auth` message with HMAC-SHA256 token; relay verifies against shared secret (`session.rs:authenticate`)
-3. Edge sends `TunnelBind` with a tunnel UUID and direction (ingress/egress)
-4. When both sides of a tunnel bind, the relay notifies both edges with `TunnelReady`
-5. Data flows: TCP via bidirectional QUIC streams (with `StreamHeader`), UDP via QUIC datagrams (16-byte UUID prefix)
+2. Edge immediately sends `TunnelBind` with a tunnel UUID and direction (ingress/egress) — no authentication step
+3. When both sides of a tunnel bind, the relay notifies both edges with `TunnelReady`
+4. Data flows: TCP via bidirectional QUIC streams (with `StreamHeader`), UDP via QUIC datagrams (16-byte UUID prefix)
 
 ### Key Modules
 
 | Module | Responsibility |
 |--------|---------------|
 | **`protocol.rs`** | Wire format: 4-byte BE length-prefixed JSON messages, `EdgeMessage`/`RelayMessage`/`PeerMessage` enums, `StreamHeader`, UDP datagram encoding (16-byte UUID prefix + payload) |
-| **`session.rs`** | Per-connection handler: auth, control stream loop, TCP stream forwarding (`forward_tcp_stream`), UDP datagram forwarding. `SessionContext` holds shared state |
+| **`session.rs`** | Per-connection handler: control stream loop, TCP stream forwarding (`forward_tcp_stream`), UDP datagram forwarding. `SessionContext` holds shared state. Edges get a `connection_id` from remote addr + counter |
 | **`tunnel_router.rs`** | `TunnelRouter` pairs ingress/egress endpoints by tunnel UUID using `DashMap`. Manages bind/unbind lifecycle and peer connection lookup |
-| **`auth.rs`** | Stateless HMAC-SHA256 token generation/verification. Token format: `base64(identity:hmac_hex)`. Used for both relay auth and direct P2P auth |
 | **`server.rs`** | QUIC endpoint setup with self-signed TLS fallback. Configures transport parameters (datagram buffers sized for SRT at 10 Mbps, keep-alive at 15s) |
-| **`api.rs`** | Axum REST routes: `/health`, `/metrics` (Prometheus), `/api/v1/tunnels`, `/api/v1/edges` |
-| **`config.rs`** | `RelayConfig` + `ManagerConfig` (JSON, with serde defaults). Supports config file + CLI overrides + env vars |
+| **`api.rs`** | Axum REST routes: `/health`, `/metrics` (Prometheus), `/api/v1/tunnels`, `/api/v1/edges`. All public, read-only — no admin routes |
+| **`config.rs`** | `RelayConfig` + `ManagerConfig` (JSON, with serde defaults). Fields: `quic_addr`, `api_addr`, `tls_cert_path`, `tls_key_path`, `manager` (optional). No `shared_secret`, `max_edges`, or `max_tunnels` |
 | **`stats.rs`** | Atomic (`AtomicU64`) per-tunnel and global stats — lock-free counters for bytes, streams, datagrams |
 | **`manager/client.rs`** | WebSocket client to bilbycast-manager: auth (registration token or node_id/secret), stats/health streaming, command handling (get_config, disconnect_edge, close_tunnel, list_tunnels, list_edges) |
+
+**Removed modules**: `auth.rs` and `authorized_edges.rs` no longer exist. No HMAC, SHA2, or base64 dependencies in Cargo.toml.
+
+### Protocol Messages
+
+**EdgeMessage** (edge to relay):
+- `TunnelBind` — bind to a tunnel with UUID and direction
+- `TunnelUnbind` — unbind from a tunnel
+- `Ping` — keepalive
+
+**RelayMessage** (relay to edge):
+- `TunnelReady` — both sides bound, tunnel is active
+- `TunnelWaiting` — only one side bound, waiting for peer
+- `TunnelDown` — peer disconnected or unbound
+- `Pong` — keepalive response
+
+No `Auth`, `AuthOk`, or `AuthError` messages exist.
 
 ### Manager Connection (Optional)
 
@@ -65,8 +80,10 @@ If `manager` is configured in `RelayConfig`, the relay maintains a persistent ou
 2. On first connect: receives `register_ack` with credentials, persists to config file
 3. Sends stats every 1 second: tunnels array, connected edges, total bandwidth, uptime
 4. Sends health every 15 seconds: status, version, tunnel/edge counts, listen addresses
-5. Handles commands: `get_config` (returns config with secrets redacted), `disconnect_edge`, `close_tunnel`, `list_tunnels`, `list_edges`
-6. Reconnects with exponential backoff (1s → 60s) on disconnection
+5. Handles commands: `get_config`, `disconnect_edge`, `close_tunnel`, `list_tunnels`, `list_edges`
+6. Reconnects with exponential backoff (1s -> 60s) on disconnection
+
+**Removed manager commands**: `authorize_edge`, `revoke_edge`, `list_authorized_edges` no longer exist.
 
 `ManagerConfig` fields: `enabled`, `url` (must be `wss://` — plaintext `ws://` is rejected), `accept_self_signed_cert` (default false — set true for dev/testing with self-signed manager certs), `registration_token` (one-time), `node_id`, `node_secret` (persistent after registration).
 
@@ -100,26 +117,19 @@ No `Mutex` or `RwLock` is used anywhere in the codebase.
 
 ### Security Architecture
 
-| Layer | Mechanism | Implementation |
-|-------|-----------|----------------|
-| **Transport encryption** | TLS 1.3 via QUIC | `rustls` + `quinn` — all data encrypted in transit |
-| **Identity verification** | ALPN protocol negotiation | Server enforces `bilbycast-relay` ALPN — prevents protocol downgrade |
-| **Authentication** | HMAC-SHA256 stateless tokens | `auth.rs` — token = `base64(edge_id:hmac_sha256_hex(edge_id, secret))` |
-| **Auth-before-data** | Mandatory auth gate | `session.rs` — connection rejected immediately on auth failure, no data streams accepted |
-| **Tunnel isolation** | Per-tunnel UUID routing | Tunnel data is routed exclusively to the bound peer via `TunnelRouter` |
+| Layer | Mechanism | Detail |
+|-------|-----------|--------|
+| **Transport encryption** | TLS 1.3 via QUIC | `rustls` + `quinn` — all data encrypted in transit between edge and relay |
+| **End-to-end encryption** | ChaCha20-Poly1305 | Edge-to-edge encryption at the edge level. The relay sees only encrypted ciphertext — it cannot read tunnel payloads |
+| **ALPN enforcement** | Protocol negotiation | Server enforces `bilbycast-relay` ALPN — prevents protocol downgrade |
+| **Tunnel isolation** | Per-tunnel UUID routing | 128-bit random UUIDs. Data routed exclusively to the bound peer via `TunnelRouter`. No cross-tunnel leakage |
+| **Resource protection** | QUIC transport limits | Max 1024 bidi / 256 uni streams per connection, 15s keep-alive for dead connection detection |
 
-**Token security notes:**
-- Tokens are stateless (no server-side session storage)
-- HMAC prevents forgery — edge_id is embedded in token, preventing cross-edge reuse
-- Shared secret configurable via config file or `RELAY_SHARED_SECRET` env var
-- **Constant-time comparison** on HMAC signatures to prevent timing attacks (`auth.rs`)
-- Token length limited to 1KB to prevent memory exhaustion
+**Security model**: The relay is a dumb pipe. It forwards encrypted ciphertext between edges without the ability to inspect or modify payloads. Security is enforced at the edge level (ChaCha20-Poly1305 encryption) and transport level (QUIC/TLS 1.3). Tunnel IDs are 128-bit random UUIDs, making brute-force tunnel discovery infeasible.
 
-**Config validation** (`config.rs`): Validated at startup via `RelayConfig::validate()`:
-- `shared_secret` minimum 16 characters
-- `max_edges` bounded 1-10000, `max_tunnels` bounded 1-100000
-- Socket addresses validated as parseable
-- Manager URL must use `wss://` when enabled
+**Scalability**: Because the relay is stateless (no auth state, no ACL, no shared secrets), multiple relays can run behind a load balancer. Edges simply connect to any available relay instance.
+
+**Config validation** (`config.rs`): Socket addresses validated as parseable. Manager URL must use `wss://` when enabled.
 
 **Protocol message limits:**
 - QUIC control messages: max 1MB per message (length-prefixed)
@@ -146,6 +156,6 @@ No `Mutex` or `RwLock` is used anywhere in the codebase.
 
 ### Testing
 
-Integration tests (`tests/integration.rs`) spin up the full QUIC relay, connect two simulated edges, and verify TCP/UDP data forwarding. They duplicate the wire protocol types since this is a binary crate (not a library). Unit tests for auth are in `src/auth.rs`.
+Integration tests (`tests/integration.rs`) spin up the full QUIC relay, connect two simulated edges, and verify TCP/UDP data forwarding. They duplicate the wire protocol types since this is a binary crate (not a library).
 
-Test coverage: auth token generation/verification, tunnel state transitions (waiting/active), bidirectional TCP forwarding, UDP datagram forwarding, ping/pong keepalive.
+Test coverage: tunnel state transitions (waiting/active), bidirectional TCP forwarding, UDP datagram forwarding, ping/pong keepalive.

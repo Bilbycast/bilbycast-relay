@@ -1,15 +1,13 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! Per-edge-connection session handling.
 //!
-//! Each edge connects via QUIC. After authentication on the control stream,
-//! the session processes tunnel binds and forwards data streams/datagrams.
+//! Each edge connects via QUIC and immediately sends tunnel bind messages.
+//! The relay is stateless — no authentication required. It pairs edges by
+//! tunnel ID and forwards encrypted traffic between them.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -17,22 +15,28 @@ use dashmap::DashMap;
 use quinn::Connection;
 use uuid::Uuid;
 
-use crate::auth;
 use crate::protocol::*;
 use crate::tunnel_router::{BindResult, TunnelEndpoint, TunnelRouter};
 
+/// Counter for generating unique connection IDs.
+static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Shared state accessible to all sessions.
 pub struct SessionContext {
-    pub shared_secret: String,
     pub router: Arc<TunnelRouter>,
-    /// Map of edge_id -> Connection for sending notifications.
+    /// Map of connection_id -> Connection for sending notifications.
     pub edge_connections: DashMap<String, Connection>,
 }
 
 /// Handle a new QUIC connection from an edge node.
 pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connection) {
     let remote = connection.remote_address();
-    tracing::info!("New QUIC connection from {remote}");
+    let connection_id = format!(
+        "conn-{}-{}",
+        CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed),
+        remote
+    );
+    tracing::info!("New QUIC connection from {remote} (id: {connection_id})");
 
     // Open the control bi-stream (edge initiates it)
     let (mut send, mut recv) = match connection.accept_bi().await {
@@ -43,31 +47,22 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         }
     };
 
-    // 1. Authenticate
-    let edge_id = match authenticate(&mut send, &mut recv, &ctx.shared_secret).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!("Auth failed from {remote}: {e}");
-            return;
-        }
-    };
-
-    tracing::info!("Edge '{edge_id}' authenticated from {remote}");
+    // Register connection
     ctx.edge_connections
-        .insert(edge_id.clone(), connection.clone());
+        .insert(connection_id.clone(), connection.clone());
 
-    // 2. Process control messages + data streams + UDP datagrams concurrently
+    // Process control messages + data streams + UDP datagrams concurrently
     let ctrl_ctx = ctx.clone();
     let ctrl_conn = connection.clone();
-    let ctrl_edge = edge_id.clone();
+    let ctrl_edge = connection_id.clone();
 
     let data_ctx = ctx.clone();
     let data_conn = connection.clone();
-    let data_edge = edge_id.clone();
+    let data_edge = connection_id.clone();
 
     let dgram_ctx = ctx.clone();
     let dgram_conn = connection.clone();
-    let dgram_edge = edge_id.clone();
+    let dgram_edge = connection_id.clone();
 
     tokio::select! {
         // Control stream message loop
@@ -90,56 +85,18 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         }
         // Connection closed
         _ = connection.closed() => {
-            tracing::info!("Edge '{edge_id}' connection closed");
+            tracing::info!("Connection '{connection_id}' closed");
         }
     }
 
     // Cleanup: remove edge and notify peers
-    tracing::info!("Edge '{edge_id}' disconnected from {remote}");
-    ctx.edge_connections.remove(&edge_id);
+    tracing::info!("Connection '{connection_id}' disconnected from {remote}");
+    ctx.edge_connections.remove(&connection_id);
 
-    let affected = ctx.router.remove_edge(&edge_id);
+    let affected = ctx.router.remove_edge(&connection_id);
     for (tunnel_id, peer_edge_id) in affected {
         if let Some(peer_id) = peer_edge_id {
             notify_tunnel_down(&ctx, &peer_id, tunnel_id, "peer disconnected").await;
-        }
-    }
-}
-
-async fn authenticate(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
-    shared_secret: &str,
-) -> Result<String> {
-    let msg: EdgeMessage = read_message(recv)
-        .await
-        .context("failed to read auth message")?;
-
-    match msg {
-        EdgeMessage::Auth { token } => match auth::verify_token(&token, shared_secret) {
-            Some(edge_id) => {
-                write_message(
-                    send,
-                    &RelayMessage::AuthOk {
-                        edge_id: edge_id.clone(),
-                    },
-                )
-                .await?;
-                Ok(edge_id)
-            }
-            None => {
-                write_message(
-                    send,
-                    &RelayMessage::AuthError {
-                        reason: "invalid token".into(),
-                    },
-                )
-                .await?;
-                anyhow::bail!("invalid auth token");
-            }
-        },
-        _ => {
-            anyhow::bail!("expected Auth message, got {:?}", msg);
         }
     }
 }
@@ -161,7 +118,7 @@ async fn handle_control_stream(
                 protocol,
             } => {
                 tracing::info!(
-                    "Edge '{edge_id}' binding tunnel {tunnel_id} as {direction:?} ({protocol:?})"
+                    "Connection '{edge_id}' binding tunnel {tunnel_id} as {direction:?} ({protocol:?})"
                 );
 
                 let endpoint = TunnelEndpoint {
@@ -206,7 +163,7 @@ async fn handle_control_stream(
             }
 
             EdgeMessage::TunnelUnbind { tunnel_id } => {
-                tracing::info!("Edge '{edge_id}' unbinding tunnel {tunnel_id}");
+                tracing::info!("Connection '{edge_id}' unbinding tunnel {tunnel_id}");
                 if let Some(peer_id) = ctx.router.unbind(&tunnel_id, edge_id) {
                     notify_tunnel_down(ctx, &peer_id, tunnel_id, "peer unbound").await;
                 }
@@ -214,10 +171,6 @@ async fn handle_control_stream(
 
             EdgeMessage::Ping => {
                 write_message(send, &RelayMessage::Pong).await?;
-            }
-
-            EdgeMessage::Auth { .. } => {
-                tracing::warn!("Edge '{edge_id}' sent duplicate Auth, ignoring");
             }
         }
     }
@@ -254,7 +207,7 @@ async fn forward_tcp_stream(
     let header: StreamHeader = read_stream_header(from_recv).await?;
     let tunnel_id = header.tunnel_id;
 
-    tracing::debug!("TCP stream for tunnel {tunnel_id} from edge '{edge_id}'");
+    tracing::debug!("TCP stream for tunnel {tunnel_id} from connection '{edge_id}'");
 
     // Determine direction of this edge in the tunnel
     let from_direction = {

@@ -33,11 +33,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Concurrency
 dashmap = "6.1.0"
 
-# Crypto
-hmac = "0.12.1"
-sha2 = "0.10.9"
-base64 = "0.22.1"
-
 # WebSocket client (manager connection)
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.32"
@@ -47,3 +42,6 @@ chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 anyhow = "1.0.102"
 bytes = "1.11.1"
+
+[dev-dependencies]
+tempfile = "3"

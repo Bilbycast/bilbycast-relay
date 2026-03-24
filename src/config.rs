@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 use serde::{Deserialize, Serialize};
 
 /// Manager connection configuration (same pattern as bilbycast-edge).
@@ -35,6 +32,9 @@ pub struct ManagerConfig {
 }
 
 /// Relay server configuration.
+///
+/// The relay is stateless and requires no authentication configuration.
+/// It simply pairs edges by tunnel ID and forwards encrypted traffic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
     /// QUIC listen address (e.g., "0.0.0.0:4433").
@@ -45,10 +45,6 @@ pub struct RelayConfig {
     #[serde(default = "default_api_addr")]
     pub api_addr: String,
 
-    /// Shared secret for HMAC token verification.
-    /// Edge tokens are signed with this secret by the manager.
-    pub shared_secret: String,
-
     /// Optional path to TLS certificate (PEM). If absent, self-signed cert is generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_cert_path: Option<String>,
@@ -56,14 +52,6 @@ pub struct RelayConfig {
     /// Optional path to TLS private key (PEM). If absent, self-signed cert is generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key_path: Option<String>,
-
-    /// Maximum concurrent edge connections (default: 100).
-    #[serde(default = "default_max_edges")]
-    pub max_edges: usize,
-
-    /// Maximum concurrent tunnels (default: 500).
-    #[serde(default = "default_max_tunnels")]
-    pub max_tunnels: usize,
 
     /// Optional manager connection for centralized monitoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,33 +66,9 @@ fn default_api_addr() -> String {
     "0.0.0.0:4480".to_string()
 }
 
-fn default_max_edges() -> usize {
-    100
-}
-
-fn default_max_tunnels() -> usize {
-    500
-}
-
 impl RelayConfig {
     /// Validate the relay configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
-        // Shared secret minimum length for security
-        if self.shared_secret.len() < 16 {
-            anyhow::bail!(
-                "shared_secret must be at least 16 characters for security (got {})",
-                self.shared_secret.len()
-            );
-        }
-
-        // Bounds on resource limits
-        if self.max_edges == 0 || self.max_edges > 10_000 {
-            anyhow::bail!("max_edges must be 1-10000, got {}", self.max_edges);
-        }
-        if self.max_tunnels == 0 || self.max_tunnels > 100_000 {
-            anyhow::bail!("max_tunnels must be 1-100000, got {}", self.max_tunnels);
-        }
-
         // Validate socket addresses are parseable
         self.quic_addr.parse::<std::net::SocketAddr>()
             .map_err(|e| anyhow::anyhow!("invalid quic_addr '{}': {}", self.quic_addr, e))?;
@@ -127,11 +91,8 @@ impl Default for RelayConfig {
         Self {
             quic_addr: default_quic_addr(),
             api_addr: default_api_addr(),
-            shared_secret: String::new(),
             tls_cert_path: None,
             tls_key_path: None,
-            max_edges: default_max_edges(),
-            max_tunnels: default_max_tunnels(),
             manager: None,
         }
     }

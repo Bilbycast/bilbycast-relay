@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! REST API for relay health, status, and tunnel monitoring.
+//!
+//! All endpoints are public and read-only. The relay is stateless and has no
+//! authentication — it simply forwards encrypted traffic between edge nodes.
 
 use std::sync::Arc;
 
