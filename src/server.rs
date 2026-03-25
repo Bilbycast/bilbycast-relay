@@ -11,6 +11,7 @@ use quinn::ServerConfig;
 use crate::config::RelayConfig;
 use crate::protocol::ALPN_RELAY;
 use crate::session::{self, SessionContext};
+use crate::stats::RelayStats;
 use crate::tunnel_router::TunnelRouter;
 
 /// Build the QUIC server and start accepting connections.
@@ -52,10 +53,11 @@ pub async fn run_quic_server(
 }
 
 /// Create the SessionContext shared state.
-pub fn create_session_context() -> Arc<SessionContext> {
+pub fn create_session_context(relay_stats: Arc<RelayStats>) -> Arc<SessionContext> {
     Arc::new(SessionContext {
         router: Arc::new(TunnelRouter::new()),
         edge_connections: dashmap::DashMap::new(),
+        relay_stats,
     })
 }
 

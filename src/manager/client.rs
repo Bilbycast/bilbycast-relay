@@ -317,6 +317,16 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
 
     let total_bytes_ingress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_ingress).sum();
     let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
+    let total_bytes_forwarded = total_bytes_ingress + total_bytes_egress;
+    let total_tcp_streams: u64 = tunnel_infos.iter().map(|t| t.stats.tcp_streams_total).sum();
+    let active_tcp_streams: u64 = tunnel_infos.iter().map(|t| t.stats.tcp_streams_active).sum();
+    let total_udp_datagrams: u64 = tunnel_infos.iter().map(|t| t.stats.udp_datagrams_total).sum();
+
+    // Update peaks
+    relay_stats.update_peaks(active_tunnels as u64, connected_edges as u64);
+
+    // Compute current throughput
+    let total_bandwidth_bps = relay_stats.compute_bandwidth_bps(total_bytes_forwarded);
 
     // Build edges list
     let edges: Vec<serde_json::Value> = ctx
@@ -338,6 +348,14 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
         "total_tunnels": total_tunnels,
         "total_bytes_ingress": total_bytes_ingress,
         "total_bytes_egress": total_bytes_egress,
+        "total_bytes_forwarded": total_bytes_forwarded,
+        "total_bandwidth_bps": total_bandwidth_bps,
+        "total_tcp_streams": total_tcp_streams,
+        "active_tcp_streams": active_tcp_streams,
+        "total_udp_datagrams": total_udp_datagrams,
+        "peak_tunnels": relay_stats.peak_tunnels.load(std::sync::atomic::Ordering::Relaxed),
+        "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
+        "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
         "uptime_secs": relay_stats.uptime_secs()
     })
 }
@@ -348,6 +366,10 @@ fn build_health_message(
     relay_config: &RelayConfig,
 ) -> serde_json::Value {
     let (total_tunnels, active_tunnels) = ctx.router.counts();
+    let tunnel_infos = ctx.router.list_tunnels();
+    let total_bytes_ingress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_ingress).sum();
+    let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
+
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -358,6 +380,10 @@ fn build_health_message(
             "connected_edges": ctx.edge_connections.len(),
             "active_tunnels": active_tunnels,
             "total_tunnels": total_tunnels,
+            "total_bytes_forwarded": total_bytes_ingress + total_bytes_egress,
+            "peak_tunnels": relay_stats.peak_tunnels.load(std::sync::atomic::Ordering::Relaxed),
+            "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
+            "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
             "api_addr": relay_config.api_addr,
             "quic_addr": relay_config.quic_addr
         }
@@ -418,6 +444,9 @@ async fn handle_manager_message<S>(
                             );
                         }
                     }
+                }
+                if config_json.get("api_token").is_some() {
+                    config_json["api_token"] = serde_json::json!("***REDACTED***");
                 }
                 let response = serde_json::json!({
                     "type": "config_response",
@@ -542,6 +571,37 @@ async fn execute_command(
                 })
                 .collect();
             Ok(Some(serde_json::json!(edges)))
+        }
+        "authorize_tunnel" => {
+            let tunnel_id_str = action["tunnel_id"]
+                .as_str()
+                .ok_or("Missing tunnel_id")?;
+            let tunnel_id: Uuid = tunnel_id_str
+                .parse()
+                .map_err(|e| format!("Invalid UUID: {e}"))?;
+            let ingress_token = action["ingress_token"]
+                .as_str()
+                .ok_or("Missing ingress_token")?
+                .to_string();
+            let egress_token = action["egress_token"]
+                .as_str()
+                .ok_or("Missing egress_token")?
+                .to_string();
+            tracing::info!("Manager command: authorize_tunnel '{tunnel_id}'");
+            ctx.router
+                .authorize_tunnel(tunnel_id, ingress_token, egress_token);
+            Ok(None)
+        }
+        "revoke_tunnel" => {
+            let tunnel_id_str = action["tunnel_id"]
+                .as_str()
+                .ok_or("Missing tunnel_id")?;
+            let tunnel_id: Uuid = tunnel_id_str
+                .parse()
+                .map_err(|e| format!("Invalid UUID: {e}"))?;
+            tracing::info!("Manager command: revoke_tunnel '{tunnel_id}'");
+            ctx.router.revoke_tunnel(&tunnel_id);
+            Ok(None)
         }
         _ => Err(format!("Unknown relay command: {action_type}")),
     }

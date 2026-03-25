@@ -20,9 +20,9 @@
                            +--------------------+
 ```
 
-The relay is a stateless traffic forwarder. It requires no configuration to run — edges connect, bind tunnels, and data flows. Optionally connects to bilbycast-manager via an outbound WebSocket for centralized monitoring.
+The relay is a traffic forwarder that requires no configuration to run — edges connect, bind tunnels, and data flows. Optionally connects to bilbycast-manager via an outbound WebSocket for centralized monitoring. Supports optional security hardening: Bearer token auth for the REST API (`api_token`) and per-tunnel HMAC-SHA256 bind authentication (`authorize_tunnel`/`revoke_tunnel` commands from manager).
 
-Multiple relays can run behind a load balancer since they hold no auth state, ACL, or shared secrets.
+Multiple relays can run behind a load balancer. The only auth state is pre-authorized tunnel bind tokens (managed via WebSocket commands), stored in a lock-free DashMap.
 
 ## Internal Architecture
 
@@ -40,7 +40,7 @@ Multiple relays can run behind a load balancer since they hold no auth state, AC
 |  |  ALPN: bilbycast-relay           |   |  GET /metrics (Prometheus)  |  |
 |  |  Self-signed or user-provided    |   |  GET /api/v1/tunnels        |  |
 |  |                                  |   |  GET /api/v1/edges          |  |
-|  |                                  |   |                             |  |
+|  |                                  |   |  GET /api/v1/stats          |  |
 |  |  For each connection:            |   |  All public, read-only.     |  |
 |  |    tokio::spawn(session)         |   |  No admin routes.           |  |
 |  +----------------------------------+   +-----------------------------+  |
@@ -54,13 +54,13 @@ Multiple relays can run behind a load balancer since they hold no auth state, AC
 |  |  | Control Stream    | | Data Streams      | | Datagram Loop   |  |   |
 |  |  | Loop              | | Loop              | | (UDP)           |  |   |
 |  |  |                   | |                   | |                 |  |   |
-|  |  | TunnelBind/Unbind | | accept_bi()       | | read_datagram() |  |   |
-|  |  | Ping/Pong         | | per-stream task:  | | 16-byte UUID    |  |   |
-|  |  |                   | |   StreamHeader    | | lookup peer     |  |   |
-|  |  | No auth step.     | |   tokio::join!    | | send_datagram() |  |   |
-|  |  | Edge sends        | |   (bidir copy)   | | best-effort     |  |   |
-|  |  | TunnelBind        | |   64KB buffers    | | 2MB buffers     |  |   |
-|  |  | immediately.      | |                   | |                 |  |   |
+|  |  | Identify (opt)    | | accept_bi()       | | read_datagram() |  |   |
+|  |  | TunnelBind/Unbind | | per-stream task:  | | 16-byte UUID    |  |   |
+|  |  | Ping/Pong         | |   StreamHeader    | | lookup peer     |  |   |
+|  |  |                   | |   tokio::join!    | | send_datagram() |  |   |
+|  |  | No auth step.     | |   (bidir copy)   | | best-effort     |  |   |
+|  |  | Edge sends        | |   64KB buffers    | | 2MB buffers     |  |   |
+|  |  | Identify+Bind.    | |                   | |                 |  |   |
 |  |  +-------------------+ +-------------------+ +-----------------+  |   |
 |  |                                                                   |   |
 |  +===================================================================+   |
@@ -85,7 +85,7 @@ Multiple relays can run behind a load balancer since they hold no auth state, AC
 |  |   AtomicU64 counters          |                                       |
 |  |                               |                                       |
 |  |   bytes_ingress / egress      |                                       |
-|  |   tcp_streams_total           |                                       |
+|  |   tcp_streams_total / active  |                                       |
 |  |   udp_datagrams_total         |                                       |
 |  +-------------------------------+                                       |
 |                                                                          |
@@ -105,11 +105,14 @@ Multiple relays can run behind a load balancer since they hold no auth state, AC
 +===========================================================================+
 ```
 
-## Connection Flow (No Authentication)
+## Connection Flow (Optional Bind Authentication)
 
 ```
   Edge Node                          Relay
   =========                          =====
+
+  0. (Manager pre-authorizes) -----> authorize_tunnel { tunnel_id, ingress_token, egress_token }
+                                     Store in authorized_tokens DashMap
 
   1. QUIC connect ------------------>
      (TLS 1.3 handshake)             Verify ALPN = "bilbycast-relay"
@@ -118,7 +121,11 @@ Multiple relays can run behind a load balancer since they hold no auth state, AC
                                      tokio::spawn(session)
 
   2. Open bi-stream (control) ------>
-     Send TunnelBind { id, dir } --->
+     [Optional] Identify { edge_id } ->  Store identity for topology correlation
+     Send TunnelBind { id, dir,      Verify bind_token (if authorized):
+       bind_token } --------------->   - If no auth registered: allow (backwards compat)
+                                       - If auth registered: constant-time compare
+                                       - If invalid/missing: reject with TunnelDown
                                      router.bind(tunnel_id, direction)
                                        if peer already bound:
                           <---------     TunnelReady to both edges
@@ -145,7 +152,7 @@ Multiple relays can run behind a load balancer since they hold no auth state, AC
                                      Cleanup all tunnel bindings
 ```
 
-No Auth/AuthOk/AuthError exchange. Edges send TunnelBind immediately after opening the control stream.
+No Auth/AuthOk/AuthError exchange on the control stream. Tunnel bind authentication is inline via the `bind_token` field on `TunnelBind`. The manager pre-authorizes tunnels via WebSocket `authorize_tunnel` command before edges connect. If no authorization exists for a tunnel, unauthenticated bind is allowed (backwards compatible).
 
 ## Tunnel State Machine
 
@@ -230,20 +237,31 @@ No Auth/AuthOk/AuthError exchange. Edges send TunnelBind immediately after openi
   |   - ALPN enforcement prevents protocol downgrade               |
   |   - Optional user-provided certificates for production         |
   +---------------------------------------------------------------+
-  | Layer 3: Tunnel Isolation                                      |
-  |   - Each tunnel identified by 128-bit random UUID              |
-  |   - Brute-force discovery infeasible (2^128 search space)      |
+  | Layer 3: Tunnel Bind Authentication (Optional)                 |
+  |   - Manager pre-authorizes tunnels via authorize_tunnel cmd    |
+  |   - Edges include HMAC-SHA256 bind_token in TunnelBind         |
+  |   - Constant-time comparison prevents timing attacks           |
+  |   - Unauthenticated bind allowed if no auth registered         |
+  +---------------------------------------------------------------+
+  | Layer 4: REST API Authentication (Optional)                    |
+  |   - Bearer token auth via api_token config field               |
+  |   - /health always public; other endpoints require token       |
+  |   - Prevents unauthorized topology/tunnel enumeration          |
+  +---------------------------------------------------------------+
+  | Layer 5: Tunnel Isolation                                      |
+  |   - Tunnel IDs must be valid UUIDs (v4 random)                 |
+  |   - Brute-force discovery infeasible (2^122 search space)      |
   |   - Data routed only to the bound peer (ingress <-> egress)    |
   |   - No cross-tunnel data leakage possible via TunnelRouter     |
   +---------------------------------------------------------------+
-  | Layer 4: Resource Protection                                   |
+  | Layer 6: Resource Protection                                   |
   |   - Max 1024 concurrent bi-streams per connection              |
   |   - Max 256 uni-streams per connection                         |
   |   - 15-second keep-alive detects and cleans dead connections   |
   +---------------------------------------------------------------+
 ```
 
-No authentication layer. The relay is a stateless forwarder — security is provided by edge-to-edge encryption and transport-level TLS.
+Security is defense-in-depth: end-to-end encryption protects payload confidentiality, optional bind authentication prevents unauthorized tunnel hijacking, and optional API auth prevents topology enumeration.
 
 ## Non-Blocking Concurrency Model
 

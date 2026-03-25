@@ -53,6 +53,12 @@ pub struct RelayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key_path: Option<String>,
 
+    /// Optional Bearer token for REST API authentication.
+    /// If set, all API endpoints (except /health) require `Authorization: Bearer <token>`.
+    /// Must be 32-128 characters. If absent, the API is open (backwards compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
+
     /// Optional manager connection for centralized monitoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<ManagerConfig>,
@@ -75,6 +81,13 @@ impl RelayConfig {
         self.api_addr.parse::<std::net::SocketAddr>()
             .map_err(|e| anyhow::anyhow!("invalid api_addr '{}': {}", self.api_addr, e))?;
 
+        // Validate API token length if set
+        if let Some(ref token) = self.api_token {
+            if token.len() < 32 || token.len() > 128 {
+                anyhow::bail!("api_token must be 32-128 characters, got {}", token.len());
+            }
+        }
+
         // Validate manager URL if enabled
         if let Some(ref mgr) = self.manager {
             if mgr.enabled && !mgr.url.starts_with("wss://") {
@@ -93,6 +106,7 @@ impl Default for RelayConfig {
             api_addr: default_api_addr(),
             tls_cert_path: None,
             tls_key_path: None,
+            api_token: None,
             manager: None,
         }
     }

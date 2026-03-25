@@ -73,13 +73,17 @@ async fn main() -> Result<()> {
     tracing::info!("bilbycast-relay v{}", env!("CARGO_PKG_VERSION"));
 
     // Create shared state
-    let ctx = server::create_session_context();
     let relay_stats = Arc::new(RelayStats::new());
+    let ctx = server::create_session_context(relay_stats.clone());
 
     // Start REST API
+    if config.api_token.is_none() {
+        tracing::warn!("No api_token configured — REST API endpoints are open without authentication");
+    }
     let api_state = Arc::new(api::ApiState {
         ctx: ctx.clone(),
         relay_stats: relay_stats.clone(),
+        api_token: config.api_token.clone(),
     });
     let api_router = api::create_router(api_state);
     let api_addr: std::net::SocketAddr = config

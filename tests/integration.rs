@@ -29,6 +29,8 @@ enum EdgeMessage {
     },
     #[serde(rename = "tunnel_unbind")]
     TunnelUnbind { tunnel_id: Uuid },
+    #[serde(rename = "identify")]
+    Identify { edge_id: String },
     #[serde(rename = "ping")]
     Ping,
 }

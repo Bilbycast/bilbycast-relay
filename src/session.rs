@@ -8,7 +8,7 @@
 //! tunnel ID and forwards encrypted traffic between them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -16,6 +16,7 @@ use quinn::Connection;
 use uuid::Uuid;
 
 use crate::protocol::*;
+use crate::stats::RelayStats;
 use crate::tunnel_router::{BindResult, TunnelEndpoint, TunnelRouter};
 
 /// Counter for generating unique connection IDs.
@@ -26,6 +27,8 @@ pub struct SessionContext {
     pub router: Arc<TunnelRouter>,
     /// Map of connection_id -> Connection for sending notifications.
     pub edge_connections: DashMap<String, Connection>,
+    /// Global relay stats for peak tracking and connection counting.
+    pub relay_stats: Arc<RelayStats>,
 }
 
 /// Handle a new QUIC connection from an edge node.
@@ -37,6 +40,9 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         remote
     );
     tracing::info!("New QUIC connection from {remote} (id: {connection_id})");
+    ctx.relay_stats
+        .connections_total
+        .fetch_add(1, Ordering::Relaxed);
 
     // Open the control bi-stream (edge initiates it)
     let (mut send, mut recv) = match connection.accept_bi().await {
@@ -51,10 +57,15 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
     ctx.edge_connections
         .insert(connection_id.clone(), connection.clone());
 
+    // Identified edge_id (set via Identify message, used for reporting).
+    // Falls back to connection_id if not set.
+    let identified_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     // Process control messages + data streams + UDP datagrams concurrently
     let ctrl_ctx = ctx.clone();
     let ctrl_conn = connection.clone();
     let ctrl_edge = connection_id.clone();
+    let ctrl_identified = identified_id.clone();
 
     let data_ctx = ctx.clone();
     let data_conn = connection.clone();
@@ -66,7 +77,7 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
 
     tokio::select! {
         // Control stream message loop
-        r = handle_control_stream(&ctrl_ctx, &ctrl_conn, &ctrl_edge, &mut send, &mut recv) => {
+        r = handle_control_stream(&ctrl_ctx, &ctrl_conn, &ctrl_edge, &ctrl_identified, &mut send, &mut recv) => {
             if let Err(e) = r {
                 tracing::debug!("Control stream ended for '{ctrl_edge}': {e}");
             }
@@ -104,7 +115,8 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
 async fn handle_control_stream(
     ctx: &Arc<SessionContext>,
     connection: &Connection,
-    edge_id: &str,
+    connection_id: &str,
+    identified_id: &Arc<Mutex<Option<String>>>,
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> Result<()> {
@@ -112,17 +124,56 @@ async fn handle_control_stream(
         let msg: EdgeMessage = read_message(recv).await?;
 
         match msg {
+            EdgeMessage::Identify { edge_id: provided_id } => {
+                if provided_id.len() > 64 {
+                    tracing::warn!(
+                        "Connection '{connection_id}' sent Identify with edge_id too long ({} chars), ignoring",
+                        provided_id.len()
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    "Connection '{connection_id}' identified as '{provided_id}'"
+                );
+                *identified_id.lock().unwrap() = Some(provided_id);
+            }
+
             EdgeMessage::TunnelBind {
                 tunnel_id,
                 direction,
                 protocol,
+                bind_token,
             } => {
+                // Verify bind token before allowing the bind
+                if !ctx.router.verify_bind_token(&tunnel_id, direction, bind_token.as_deref()) {
+                    tracing::warn!(
+                        "Connection '{connection_id}' bind rejected for tunnel {tunnel_id} — invalid bind_token"
+                    );
+                    write_message(
+                        send,
+                        &RelayMessage::TunnelDown {
+                            tunnel_id,
+                            reason: "bind authentication failed".to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // Use identified edge_id for reporting, connection_id for internal lookups
+                let edge_id = identified_id
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| connection_id.to_string());
+
                 tracing::info!(
-                    "Connection '{edge_id}' binding tunnel {tunnel_id} as {direction:?} ({protocol:?})"
+                    "Connection '{connection_id}' (edge '{edge_id}') binding tunnel {tunnel_id} as {direction:?} ({protocol:?})"
                 );
 
                 let endpoint = TunnelEndpoint {
-                    edge_id: edge_id.to_string(),
+                    edge_id,
+                    connection_id: connection_id.to_string(),
                     direction,
                     connection: connection.clone(),
                 };
@@ -134,23 +185,22 @@ async fn handle_control_stream(
                         // Notify this edge
                         write_message(send, &RelayMessage::TunnelReady { tunnel_id }).await?;
 
-                        // Notify peer
+                        // Notify peer (use connection_id for DashMap lookup)
                         let peer_dir = match direction {
                             TunnelDirection::Ingress => TunnelDirection::Egress,
                             TunnelDirection::Egress => TunnelDirection::Ingress,
                         };
-                        // Find peer edge_id from the router
                         if let Some(entry) = ctx.router.tunnels_ref().get(&tunnel_id) {
-                            let peer_edge_id = match peer_dir {
+                            let peer_connection_id = match peer_dir {
                                 TunnelDirection::Egress => {
-                                    entry.egress.as_ref().map(|e| e.edge_id.clone())
+                                    entry.egress.as_ref().map(|e| e.connection_id.clone())
                                 }
                                 TunnelDirection::Ingress => {
-                                    entry.ingress.as_ref().map(|e| e.edge_id.clone())
+                                    entry.ingress.as_ref().map(|e| e.connection_id.clone())
                                 }
                             };
                             drop(entry);
-                            if let Some(peer_id) = peer_edge_id {
+                            if let Some(peer_id) = peer_connection_id {
                                 notify_tunnel_ready(ctx, &peer_id, tunnel_id).await;
                             }
                         }
@@ -163,8 +213,8 @@ async fn handle_control_stream(
             }
 
             EdgeMessage::TunnelUnbind { tunnel_id } => {
-                tracing::info!("Connection '{edge_id}' unbinding tunnel {tunnel_id}");
-                if let Some(peer_id) = ctx.router.unbind(&tunnel_id, edge_id) {
+                tracing::info!("Connection '{connection_id}' unbinding tunnel {tunnel_id}");
+                if let Some(peer_id) = ctx.router.unbind(&tunnel_id, connection_id) {
                     notify_tunnel_down(ctx, &peer_id, tunnel_id, "peer unbound").await;
                 }
             }
@@ -199,7 +249,7 @@ async fn handle_data_streams(
 /// Forward a single TCP stream from one edge to the peer through the relay.
 async fn forward_tcp_stream(
     ctx: &Arc<SessionContext>,
-    edge_id: &str,
+    connection_id: &str,
     mut from_send: quinn::SendStream,
     from_recv: &mut quinn::RecvStream,
 ) -> Result<()> {
@@ -207,7 +257,7 @@ async fn forward_tcp_stream(
     let header: StreamHeader = read_stream_header(from_recv).await?;
     let tunnel_id = header.tunnel_id;
 
-    tracing::debug!("TCP stream for tunnel {tunnel_id} from connection '{edge_id}'");
+    tracing::debug!("TCP stream for tunnel {tunnel_id} from connection '{connection_id}'");
 
     // Determine direction of this edge in the tunnel
     let from_direction = {
@@ -219,7 +269,7 @@ async fn forward_tcp_stream(
         if entry
             .ingress
             .as_ref()
-            .is_some_and(|e| e.edge_id == edge_id)
+            .is_some_and(|e| e.connection_id == connection_id)
         {
             TunnelDirection::Ingress
         } else {
@@ -240,6 +290,7 @@ async fn forward_tcp_stream(
     write_stream_header(&mut peer_send, &header).await?;
 
     stats.tcp_streams_total.fetch_add(1, Ordering::Relaxed);
+    stats.tcp_streams_active.fetch_add(1, Ordering::Relaxed);
 
     // Bidirectional copy
     let stats_a = stats.clone();
@@ -271,6 +322,7 @@ async fn forward_tcp_stream(
     // Run both directions concurrently
     let _ = tokio::join!(copy_a, copy_b);
 
+    stats.tcp_streams_active.fetch_sub(1, Ordering::Relaxed);
     tracing::debug!("TCP stream for tunnel {tunnel_id} finished");
     Ok(())
 }
@@ -280,26 +332,26 @@ async fn forward_tcp_stream(
 async fn handle_udp_datagrams(
     ctx: &Arc<SessionContext>,
     connection: &Connection,
-    edge_id: &str,
+    connection_id: &str,
 ) -> Result<()> {
     loop {
         let datagram = connection.read_datagram().await?;
 
         let Some((tunnel_id, payload)) = decode_udp_datagram(&datagram) else {
-            tracing::debug!("Malformed UDP datagram from '{edge_id}' (too short)");
+            tracing::debug!("Malformed UDP datagram from '{connection_id}' (too short)");
             continue;
         };
 
         // Determine this edge's direction in the tunnel
         let from_direction = {
             let Some(entry) = ctx.router.tunnels_ref().get(&tunnel_id) else {
-                tracing::debug!("UDP datagram for unknown tunnel {tunnel_id} from '{edge_id}'");
+                tracing::debug!("UDP datagram for unknown tunnel {tunnel_id} from '{connection_id}'");
                 continue;
             };
             if entry
                 .ingress
                 .as_ref()
-                .is_some_and(|e| e.edge_id == edge_id)
+                .is_some_and(|e| e.connection_id == connection_id)
             {
                 TunnelDirection::Ingress
             } else {

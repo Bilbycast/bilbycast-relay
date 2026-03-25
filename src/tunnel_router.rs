@@ -17,7 +17,10 @@ use crate::stats::{TunnelStats, TunnelStatsSnapshot};
 
 /// A registered tunnel endpoint (one side — ingress or egress).
 pub struct TunnelEndpoint {
+    /// Identity for reporting (manager node_id if identified, else connection_id).
     pub edge_id: String,
+    /// Internal key for edge_connections DashMap lookups (always connection_id).
+    pub connection_id: String,
     pub direction: TunnelDirection,
     pub connection: quinn::Connection,
 }
@@ -57,16 +60,72 @@ pub struct TunnelInfo {
     pub stats: TunnelStatsSnapshot,
 }
 
+/// Pre-authorized bind tokens for a tunnel (set by manager via authorize_tunnel command).
+pub struct AuthorizedTunnel {
+    pub ingress_token: String,
+    pub egress_token: String,
+}
+
 /// The tunnel router manages all active and pending tunnels.
 pub struct TunnelRouter {
     tunnels: DashMap<Uuid, TunnelState>,
+    /// Pre-authorized bind tokens keyed by tunnel UUID.
+    /// If a tunnel has an entry here, bind requests must include a valid bind_token.
+    authorized_tokens: DashMap<Uuid, AuthorizedTunnel>,
 }
 
 impl TunnelRouter {
     pub fn new() -> Self {
         Self {
             tunnels: DashMap::new(),
+            authorized_tokens: DashMap::new(),
         }
+    }
+
+    /// Register expected bind tokens for a tunnel (called by manager authorize_tunnel command).
+    pub fn authorize_tunnel(&self, tunnel_id: Uuid, ingress_token: String, egress_token: String) {
+        self.authorized_tokens.insert(
+            tunnel_id,
+            AuthorizedTunnel {
+                ingress_token,
+                egress_token,
+            },
+        );
+    }
+
+    /// Remove authorization for a tunnel.
+    pub fn revoke_tunnel(&self, tunnel_id: &Uuid) {
+        self.authorized_tokens.remove(tunnel_id);
+    }
+
+    /// Verify a bind token for a tunnel+direction.
+    ///
+    /// Returns `true` if:
+    /// - No authorization is registered for this tunnel (backwards compatible), OR
+    /// - The provided bind_token matches the expected token for the given direction.
+    pub fn verify_bind_token(
+        &self,
+        tunnel_id: &Uuid,
+        direction: TunnelDirection,
+        bind_token: Option<&str>,
+    ) -> bool {
+        let Some(auth) = self.authorized_tokens.get(tunnel_id) else {
+            // No authorization registered — allow (backwards compatible)
+            return true;
+        };
+
+        let expected = match direction {
+            TunnelDirection::Ingress => &auth.ingress_token,
+            TunnelDirection::Egress => &auth.egress_token,
+        };
+
+        let Some(provided) = bind_token else {
+            // Authorization exists but no token provided
+            return false;
+        };
+
+        // Constant-time comparison to prevent timing attacks
+        constant_time_eq(expected.as_bytes(), provided.as_bytes())
     }
 
     /// Bind a tunnel endpoint. Returns (was_newly_activated, peer_connection_if_active).
@@ -107,23 +166,25 @@ impl TunnelRouter {
     }
 
     /// Unbind a tunnel endpoint (edge disconnected or explicitly unbound).
-    /// Returns the peer's edge_id if there was a peer (for notification).
-    pub fn unbind(&self, tunnel_id: &Uuid, edge_id: &str) -> Option<String> {
-        let mut peer_edge_id = None;
+    /// Uses `connection_id` for matching. Returns the peer's `connection_id` for notification.
+    pub fn unbind(&self, tunnel_id: &Uuid, connection_id: &str) -> Option<String> {
+        let mut peer_connection_id = None;
 
         if let Some(mut entry) = self.tunnels.get_mut(tunnel_id) {
             let state = entry.value_mut();
 
             if let Some(ref ingress) = state.ingress {
-                if ingress.edge_id == edge_id {
+                if ingress.connection_id == connection_id {
                     state.ingress = None;
-                    peer_edge_id = state.egress.as_ref().map(|e| e.edge_id.clone());
+                    peer_connection_id =
+                        state.egress.as_ref().map(|e| e.connection_id.clone());
                 }
             }
             if let Some(ref egress) = state.egress {
-                if egress.edge_id == edge_id {
+                if egress.connection_id == connection_id {
                     state.egress = None;
-                    peer_edge_id = state.ingress.as_ref().map(|e| e.edge_id.clone());
+                    peer_connection_id =
+                        state.ingress.as_ref().map(|e| e.connection_id.clone());
                 }
             }
 
@@ -134,12 +195,12 @@ impl TunnelRouter {
             }
         }
 
-        peer_edge_id
+        peer_connection_id
     }
 
     /// Remove all tunnel endpoints for a given edge (edge disconnected).
-    /// Returns list of (tunnel_id, peer_edge_id) for notification.
-    pub fn remove_edge(&self, edge_id: &str) -> Vec<(Uuid, Option<String>)> {
+    /// Uses `connection_id` for matching. Returns list of (tunnel_id, peer_connection_id).
+    pub fn remove_edge(&self, connection_id: &str) -> Vec<(Uuid, Option<String>)> {
         let mut affected = Vec::new();
 
         // Collect tunnel IDs that this edge participates in
@@ -148,14 +209,18 @@ impl TunnelRouter {
             .iter()
             .filter(|entry| {
                 let s = entry.value();
-                s.ingress.as_ref().is_some_and(|e| e.edge_id == edge_id)
-                    || s.egress.as_ref().is_some_and(|e| e.edge_id == edge_id)
+                s.ingress
+                    .as_ref()
+                    .is_some_and(|e| e.connection_id == connection_id)
+                    || s.egress
+                        .as_ref()
+                        .is_some_and(|e| e.connection_id == connection_id)
             })
             .map(|entry| *entry.key())
             .collect();
 
         for tid in tunnel_ids {
-            let peer = self.unbind(&tid, edge_id);
+            let peer = self.unbind(&tid, connection_id);
             affected.push((tid, peer));
         }
 
@@ -219,4 +284,16 @@ pub enum BindResult {
     Active,
     /// Waiting for the peer to bind.
     Waiting,
+}
+
+/// Constant-time byte comparison to prevent timing attacks on token verification.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
