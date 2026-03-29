@@ -54,13 +54,13 @@ Multiple relays can run behind a load balancer. The only auth state is pre-autho
 |  |  | Control Stream    | | Data Streams      | | Datagram Loop   |  |   |
 |  |  | Loop              | | Loop              | | (UDP)           |  |   |
 |  |  |                   | |                   | |                 |  |   |
-|  |  | Identify (opt)    | | accept_bi()       | | read_datagram() |  |   |
-|  |  | TunnelBind/Unbind | | per-stream task:  | | 16-byte UUID    |  |   |
-|  |  | Ping/Pong         | |   StreamHeader    | | lookup peer     |  |   |
-|  |  |                   | |   tokio::join!    | | send_datagram() |  |   |
-|  |  | No auth step.     | |   (bidir copy)   | | best-effort     |  |   |
-|  |  | Edge sends        | |   64KB buffers    | | 2MB buffers     |  |   |
-|  |  | Identify+Bind.    | |                   | |                 |  |   |
+|  |  | Hello/HelloAck    | | accept_bi()       | | read_datagram() |  |   |
+|  |  | Identify (opt)    | | per-stream task:  | | 16-byte UUID    |  |   |
+|  |  | TunnelBind/Unbind | |   StreamHeader    | | lookup peer     |  |   |
+|  |  | Ping/Pong         | |   tokio::join!    | | send_datagram() |  |   |
+|  |  | Unknown->ignore   | |   (bidir copy)   | | best-effort     |  |   |
+|  |  | Edge sends Hello, | |   64KB buffers    | | 2MB buffers     |  |   |
+|  |  | Identify, Bind.   | |                   | |                 |  |   |
 |  |  +-------------------+ +-------------------+ +-----------------+  |   |
 |  |                                                                   |   |
 |  +===================================================================+   |
@@ -121,6 +121,11 @@ Multiple relays can run behind a load balancer. The only auth state is pre-autho
                                      tokio::spawn(session)
 
   2. Open bi-stream (control) ------>
+     Hello { protocol_version,       Respond with HelloAck { protocol_version,
+       software_version } ---------->   software_version }
+                          <---------   Log warning if versions differ
+                                       (Old edges skip Hello — relay proceeds normally)
+
      [Optional] Identify { edge_id } ->  Store identity for topology correlation
      Send TunnelBind { id, dir,      Verify bind_token (if authorized):
        bind_token } --------------->   - If no auth registered: allow (backwards compat)
@@ -152,7 +157,7 @@ Multiple relays can run behind a load balancer. The only auth state is pre-autho
                                      Cleanup all tunnel bindings
 ```
 
-No Auth/AuthOk/AuthError exchange on the control stream. Tunnel bind authentication is inline via the `bind_token` field on `TunnelBind`. The manager pre-authorizes tunnels via WebSocket `authorize_tunnel` command before edges connect. If no authorization exists for a tunnel, unauthenticated bind is allowed (backwards compatible).
+No Auth/AuthOk/AuthError exchange on the control stream. Tunnel bind authentication is inline via the `bind_token` field on `TunnelBind`. The manager pre-authorizes tunnels via WebSocket `authorize_tunnel` command before edges connect. If no authorization exists for a tunnel, unauthenticated bind is allowed (backwards compatible). The Hello/HelloAck exchange is optional — it provides version awareness but does not gate access. Unknown message types are gracefully ignored via `read_message_resilient()` (returns `ParsedMessage::Unknown` instead of a deserialization error).
 
 ## Tunnel State Machine
 

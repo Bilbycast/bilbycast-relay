@@ -121,7 +121,17 @@ async fn handle_control_stream(
     recv: &mut quinn::RecvStream,
 ) -> Result<()> {
     loop {
-        let msg: EdgeMessage = read_message(recv).await?;
+        let parsed = read_message_resilient::<EdgeMessage>(recv).await?;
+
+        let msg = match parsed {
+            ParsedMessage::Known(msg) => msg,
+            ParsedMessage::Unknown { msg_type } => {
+                tracing::debug!(
+                    "Unknown message type '{msg_type}' from '{connection_id}', ignoring"
+                );
+                continue;
+            }
+        };
 
         match msg {
             EdgeMessage::Identify { edge_id: provided_id } => {
@@ -221,6 +231,25 @@ async fn handle_control_stream(
 
             EdgeMessage::Ping => {
                 write_message(send, &RelayMessage::Pong).await?;
+            }
+
+            EdgeMessage::Hello { protocol_version, software_version } => {
+                tracing::info!(
+                    "Connection '{connection_id}' hello: protocol v{protocol_version}, software {software_version}"
+                );
+                if protocol_version != TUNNEL_PROTOCOL_VERSION {
+                    tracing::warn!(
+                        "Protocol version mismatch with '{connection_id}': edge={protocol_version}, relay={TUNNEL_PROTOCOL_VERSION}"
+                    );
+                }
+                write_message(
+                    send,
+                    &RelayMessage::HelloAck {
+                        protocol_version: TUNNEL_PROTOCOL_VERSION,
+                        software_version: env!("CARGO_PKG_VERSION").to_string(),
+                    },
+                )
+                .await?;
             }
         }
     }

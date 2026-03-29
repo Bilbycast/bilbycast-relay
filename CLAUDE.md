@@ -38,17 +38,18 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 ### Connection Lifecycle
 
 1. Edge connects via QUIC and opens a bidirectional control stream
-2. Edge optionally sends `Identify { edge_id }` with its manager node_id (enables topology correlation in the manager UI)
-3. Edge sends `TunnelBind` with a tunnel UUID, direction (ingress/egress), and optional `bind_token` (HMAC-SHA256). If the relay has pre-authorized tokens for this tunnel (via manager `authorize_tunnel` command), the bind_token is verified; otherwise unauthenticated bind is allowed (backwards compatible)
-4. When both sides of a tunnel bind, the relay notifies both edges with `TunnelReady`
-5. Data flows: TCP via bidirectional QUIC streams (with `StreamHeader`), UDP via QUIC datagrams (16-byte UUID prefix)
+2. Edge sends `Hello { protocol_version, software_version }` as the first message. Relay responds with `HelloAck`. Version mismatches are warned but don't reject the connection. Old edges that skip this step are handled gracefully
+3. Edge optionally sends `Identify { edge_id }` with its manager node_id (enables topology correlation in the manager UI)
+4. Edge sends `TunnelBind` with a tunnel UUID, direction (ingress/egress), and optional `bind_token` (HMAC-SHA256). If the relay has pre-authorized tokens for this tunnel (via manager `authorize_tunnel` command), the bind_token is verified; otherwise unauthenticated bind is allowed (backwards compatible)
+5. When both sides of a tunnel bind, the relay notifies both edges with `TunnelReady`
+6. Data flows: TCP via bidirectional QUIC streams (with `StreamHeader`), UDP via QUIC datagrams (16-byte UUID prefix)
 
 ### Key Modules
 
 | Module | Responsibility |
 |--------|---------------|
-| **`protocol.rs`** | Wire format: 4-byte BE length-prefixed JSON messages, `EdgeMessage`/`RelayMessage`/`PeerMessage` enums, `StreamHeader`, UDP datagram encoding (16-byte UUID prefix + payload) |
-| **`session.rs`** | Per-connection handler: control stream loop, TCP stream forwarding (`forward_tcp_stream`), UDP datagram forwarding. `SessionContext` holds shared state. Edges get a `connection_id` from remote addr + counter; optionally provide a stable identity via `Identify` message (used for topology correlation) |
+| **`protocol.rs`** | Wire format: 4-byte BE length-prefixed JSON messages, `EdgeMessage`/`RelayMessage`/`PeerMessage` enums, `StreamHeader`, UDP datagram encoding (16-byte UUID prefix + payload). `TUNNEL_PROTOCOL_VERSION` constant. `ParsedMessage<T>` enum + `read_message_resilient()` for graceful handling of unknown message types |
+| **`session.rs`** | Per-connection handler: control stream loop (uses resilient deserialization), TCP stream forwarding (`forward_tcp_stream`), UDP datagram forwarding. `SessionContext` holds shared state. Edges get a `connection_id` from remote addr + counter; optionally provide a stable identity via `Identify` message (used for topology correlation) |
 | **`tunnel_router.rs`** | `TunnelRouter` pairs ingress/egress endpoints by tunnel UUID using `DashMap`. Manages bind/unbind lifecycle, peer connection lookup, and per-tunnel bind token authorization (`authorized_tokens` DashMap, constant-time token comparison) |
 | **`server.rs`** | QUIC endpoint setup with self-signed TLS fallback. Configures transport parameters (datagram buffers sized for SRT at 10 Mbps, keep-alive at 15s) |
 | **`api.rs`** | Axum REST routes: `/health` (public), `/metrics`, `/api/v1/tunnels`, `/api/v1/edges`, `/api/v1/stats`. Optional Bearer token auth middleware if `api_token` is configured |
@@ -59,12 +60,14 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 ### Protocol Messages
 
 **EdgeMessage** (edge to relay):
+- `Hello` — protocol version handshake (sent first, relay responds with `HelloAck`). Contains `protocol_version` and `software_version`. Old relays ignore this gracefully via resilient deserialization
 - `Identify` — optional, sent before TunnelBind to provide a stable edge identity (manager node_id) for topology correlation
 - `TunnelBind` — bind to a tunnel with UUID, direction, and optional `bind_token` (HMAC-SHA256 hex for relay authentication)
 - `TunnelUnbind` — unbind from a tunnel
 - `Ping` — keepalive
 
 **RelayMessage** (relay to edge):
+- `HelloAck` — protocol version handshake response. Contains relay's `protocol_version` and `software_version`. Edge logs warning on mismatch. Old edges that don't send `Hello` never receive this
 - `TunnelReady` — both sides bound, tunnel is active
 - `TunnelWaiting` — only one side bound, waiting for peer
 - `TunnelDown` — peer disconnected or unbound
@@ -72,11 +75,13 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 
 No `Auth`, `AuthOk`, or `AuthError` messages exist on the control stream. Tunnel bind authentication is handled inline via the `bind_token` field on `TunnelBind`.
 
+**Backward compatibility**: The control stream uses `read_message_resilient()` which returns `ParsedMessage::Unknown` for unrecognized message types instead of a deserialization error. This allows newer nodes to send new message types without tearing down connections with older nodes.
+
 ### Manager Connection (Optional)
 
 If `manager` is configured in `RelayConfig`, the relay maintains a persistent outbound WebSocket connection to bilbycast-manager using the same protocol as bilbycast-edge:
 
-1. Connects to manager WebSocket URL, sends auth (registration_token or node_id + node_secret)
+1. Connects to manager WebSocket URL, sends auth (registration_token or node_id + node_secret, plus `software_version` and `protocol_version` for compatibility detection)
 2. On first connect: receives `register_ack` with credentials, persists to config file
 3. Sends stats every 1 second: tunnels array, connected edges, total bandwidth/throughput (bps), peak watermarks, active TCP streams, uptime
 4. Sends health every 15 seconds: status, version, tunnel/edge counts, total bytes forwarded, peaks, connections total, listen addresses

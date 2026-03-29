@@ -286,20 +286,27 @@ async fn try_connect(
 // Message builders
 // ───────────────────────────────────────────────────────
 
+/// WebSocket protocol version. Sent in auth payload so the manager can detect mismatches.
+const WS_PROTOCOL_VERSION: u32 = 1;
+
 fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
     if let (Some(node_id), Some(node_secret)) = (&config.node_id, &config.node_secret) {
         serde_json::json!({
             "type": "auth",
             "payload": {
                 "node_id": node_id,
-                "node_secret": node_secret
+                "node_secret": node_secret,
+                "software_version": env!("CARGO_PKG_VERSION"),
+                "protocol_version": WS_PROTOCOL_VERSION
             }
         })
     } else if let Some(token) = &config.registration_token {
         serde_json::json!({
             "type": "auth",
             "payload": {
-                "registration_token": token
+                "registration_token": token,
+                "software_version": env!("CARGO_PKG_VERSION"),
+                "protocol_version": WS_PROTOCOL_VERSION
             }
         })
     } else {
