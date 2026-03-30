@@ -15,8 +15,15 @@ pub struct ManagerConfig {
 
     /// Accept self-signed TLS certificates from the manager.
     /// Only enable this for development/testing. Default: false.
+    /// Requires `BILBYCAST_ALLOW_INSECURE=1` env var as a safety guard.
     #[serde(default)]
     pub accept_self_signed_cert: bool,
+
+    /// SHA-256 fingerprint of the manager's TLS certificate for certificate pinning.
+    /// Format: hex-encoded with colons, e.g. "ab:cd:ef:01:23:...".
+    /// When set, connections to servers with different certificates are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
 
     /// One-time registration token (used on first connect, cleared after).
     #[serde(default, skip_serializing_if = "Option::is_none")]

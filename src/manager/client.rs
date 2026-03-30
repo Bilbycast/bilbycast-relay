@@ -24,6 +24,16 @@ use crate::config::{ManagerConfig, RelayConfig};
 use crate::session::SessionContext;
 use crate::stats::RelayStats;
 
+/// Compute SHA-256 fingerprint of a DER-encoded certificate.
+fn compute_cert_fingerprint(cert_der: &[u8]) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(cert_der);
+    hash.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// Certificate verifier that accepts any certificate (for self-signed cert support).
 #[derive(Debug)]
 struct InsecureCertVerifier;
@@ -62,6 +72,60 @@ impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Certificate verifier with fingerprint pinning.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    expected_fingerprint: String,
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        let actual = compute_cert_fingerprint(end_entity.as_ref());
+        if actual != self.expected_fingerprint {
+            tracing::error!(
+                "Certificate fingerprint mismatch! Expected: {}, got: {}",
+                self.expected_fingerprint, actual
+            );
+            return Err(rustls::Error::General(format!(
+                "Certificate fingerprint mismatch: expected {}, got {}",
+                self.expected_fingerprint, actual
+            )));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -145,9 +209,50 @@ async fn try_connect(
     }
 
     let (ws_stream, _response) = if config.accept_self_signed_cert {
+        // SECURITY: Require explicit env var to allow insecure connections.
+        if std::env::var("BILBYCAST_ALLOW_INSECURE").as_deref() != Ok("1") {
+            return Err(
+                "accept_self_signed_cert is enabled but BILBYCAST_ALLOW_INSECURE=1 is not set. \
+                 This is a security safeguard — self-signed cert mode disables ALL certificate \
+                 validation, making the connection vulnerable to MITM attacks. Set \
+                 BILBYCAST_ALLOW_INSECURE=1 to confirm this is intentional (dev/testing only)."
+                    .into(),
+            );
+        }
+        tracing::warn!(
+            "SECURITY WARNING: accept_self_signed_cert is enabled — ALL TLS certificate \
+             validation is disabled. This makes the connection vulnerable to man-in-the-middle \
+             attacks. Do NOT use this in production."
+        );
         let tls_config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+        tokio_tungstenite::connect_async_tls_with_config(
+            &config.url,
+            None,
+            false,
+            Some(connector),
+        )
+        .await
+        .map_err(|e| format!("WebSocket connect failed: {e}"))?
+    } else if let Some(ref fingerprint) = config.cert_fingerprint {
+        // Certificate pinning: validate CA chain AND check fingerprint
+        tracing::info!("Certificate pinning enabled (fingerprint: {}...)", &fingerprint[..fingerprint.len().min(11)]);
+        let root_store = rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        );
+        let inner = rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(root_store))
+            .build()
+            .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
+        let verifier = PinnedCertVerifier {
+            expected_fingerprint: fingerprint.clone(),
+            inner,
+        };
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
         tokio_tungstenite::connect_async_tls_with_config(
@@ -257,7 +362,7 @@ async fn try_connect(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(&text, ctx, relay_config, &mut ws_write).await;
+                        handle_manager_message(&text, ctx, relay_config, config_path, &mut ws_write).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
@@ -405,6 +510,7 @@ async fn handle_manager_message<S>(
     text: &str,
     ctx: &Arc<SessionContext>,
     relay_config: &RelayConfig,
+    config_path: &PathBuf,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
 ) where
     S: futures_util::Sink<Message> + Unpin,
@@ -461,6 +567,45 @@ async fn handle_manager_message<S>(
                     "payload": config_json
                 });
                 if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = ws_write.send(Message::Text(json.into())).await;
+                }
+                return;
+            }
+
+            // rotate_secret is handled inline (needs config_path for persistence)
+            if action_type == "rotate_secret" {
+                let result = if let Some(new_secret) = action["new_secret"].as_str() {
+                    if new_secret.is_empty() {
+                        Err("Empty new_secret".to_string())
+                    } else {
+                        tracing::info!("Manager command: rotate_secret — updating node authentication secret");
+                        // Persist new secret to config file
+                        let mut updated = relay_config.clone();
+                        if let Some(ref mut mgr) = updated.manager {
+                            mgr.node_secret = Some(new_secret.to_string());
+                        }
+                        if let Ok(json) = serde_json::to_string_pretty(&updated) {
+                            if let Err(e) = std::fs::write(config_path, &json) {
+                                tracing::warn!("Failed to persist rotated secret: {e}");
+                            }
+                        }
+                        tracing::info!("Node secret rotated and persisted");
+                        Ok(())
+                    }
+                } else {
+                    Err("Missing new_secret".to_string())
+                };
+
+                let ack = serde_json::json!({
+                    "type": "command_ack",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": {
+                        "command_id": command_id,
+                        "success": result.is_ok(),
+                        "error": result.err()
+                    }
+                });
+                if let Ok(json) = serde_json::to_string(&ack) {
                     let _ = ws_write.send(Message::Text(json.into())).await;
                 }
                 return;

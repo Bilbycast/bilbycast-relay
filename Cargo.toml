@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-relay"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "QUIC relay server for bilbycast IP tunneling between NAT'd edge nodes"
 license = "Elastic-2.0"
@@ -42,6 +42,10 @@ chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 anyhow = "1.0.102"
 bytes = "1.11.1"
+
+# Certificate pinning (SHA-256 fingerprint)
+sha2 = "0.10.9"
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tempfile = "3"

@@ -90,7 +90,7 @@ If `manager` is configured in `RelayConfig`, the relay maintains a persistent ou
 
 **Tunnel bind authentication commands**: `authorize_tunnel` pre-registers expected HMAC-SHA256 bind tokens (ingress + egress) for a tunnel UUID. `revoke_tunnel` removes authorization. When authorized, edges must include a valid `bind_token` in their `TunnelBind` message. Old per-edge commands (`authorize_edge`, `revoke_edge`, `list_authorized_edges`) were removed in favor of this per-tunnel approach.
 
-`ManagerConfig` fields: `enabled`, `url` (must be `wss://` — plaintext `ws://` is rejected), `accept_self_signed_cert` (default false — set true for dev/testing with self-signed manager certs), `registration_token` (one-time), `node_id`, `node_secret` (persistent after registration).
+`ManagerConfig` fields: `enabled`, `url` (must be `wss://` — plaintext `ws://` is rejected), `accept_self_signed_cert` (default false — requires `BILBYCAST_ALLOW_INSECURE=1` env var as safety guard), `cert_fingerprint` (optional SHA-256 fingerprint for certificate pinning), `registration_token` (one-time), `node_id`, `node_secret` (persistent after registration). Supports `rotate_secret` command for periodic secret rotation.
 
 ### Two Connection Modes (ALPN)
 
