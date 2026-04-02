@@ -74,7 +74,8 @@ async fn main() -> Result<()> {
 
     // Create shared state
     let relay_stats = Arc::new(RelayStats::new());
-    let ctx = server::create_session_context(relay_stats.clone());
+    let (event_sender, event_rx) = manager::event_channel();
+    let ctx = server::create_session_context(relay_stats.clone(), event_sender.clone());
 
     // Start REST API
     if config.api_token.is_none() {
@@ -111,6 +112,8 @@ async fn main() -> Result<()> {
                 relay_stats.clone(),
                 config.clone(),
                 std::path::PathBuf::from(&config_path),
+                event_rx,
+                event_sender.clone(),
             ))
         } else {
             None

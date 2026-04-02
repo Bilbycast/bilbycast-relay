@@ -17,12 +17,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::config::{ManagerConfig, RelayConfig};
 use crate::session::SessionContext;
 use crate::stats::RelayStats;
+
+use super::events::{Event, build_event_envelope};
 
 /// Compute SHA-256 fingerprint of a DER-encoded certificate.
 fn compute_cert_fingerprint(cert_der: &[u8]) -> String {
@@ -136,9 +139,11 @@ pub fn start_manager_client(
     relay_stats: Arc<RelayStats>,
     relay_config: RelayConfig,
     config_path: PathBuf,
+    event_rx: mpsc::UnboundedReceiver<Event>,
+    event_sender: super::events::EventSender,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        manager_client_loop(config, ctx, relay_stats, relay_config, config_path).await;
+        manager_client_loop(config, ctx, relay_stats, relay_config, config_path, event_rx, event_sender).await;
     })
 }
 
@@ -148,6 +153,8 @@ async fn manager_client_loop(
     relay_stats: Arc<RelayStats>,
     relay_config: RelayConfig,
     config_path: PathBuf,
+    mut event_rx: mpsc::UnboundedReceiver<Event>,
+    event_sender: super::events::EventSender,
 ) {
     let mut backoff_secs = 1u64;
     let max_backoff = 60u64;
@@ -155,9 +162,10 @@ async fn manager_client_loop(
     loop {
         tracing::info!("Connecting to manager at {}", config.url);
 
-        match try_connect(&config, &ctx, &relay_stats, &relay_config, &config_path).await {
+        match try_connect(&config, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender).await {
             Ok(ConnectResult::Closed) => {
                 tracing::info!("Manager connection closed normally");
+                event_sender.emit(super::events::EventSeverity::Warning, "manager", "Manager connection lost, reconnecting");
                 backoff_secs = 1;
             }
             Ok(ConnectResult::Registered {
@@ -176,6 +184,7 @@ async fn manager_client_loop(
             }
             Err(e) => {
                 tracing::warn!("Manager connection failed: {e}");
+                event_sender.emit(super::events::EventSeverity::Warning, "manager", format!("Manager connection lost, reconnecting: {}", e));
             }
         }
 
@@ -199,6 +208,8 @@ async fn try_connect(
     relay_stats: &Arc<RelayStats>,
     relay_config: &RelayConfig,
     config_path: &PathBuf,
+    event_rx: &mut mpsc::UnboundedReceiver<Event>,
+    event_sender: &super::events::EventSender,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
     if !config.url.starts_with("wss://") {
@@ -295,12 +306,14 @@ async fn try_connect(
             match response["type"].as_str().unwrap_or("") {
                 "auth_ok" => {
                     tracing::info!("Authenticated with manager");
+                    event_sender.emit(super::events::EventSeverity::Info, "manager", "Connected to manager");
                 }
                 "register_ack" => {
                     let payload = &response["payload"];
                     let node_id = payload["node_id"].as_str().unwrap_or("").to_string();
                     let node_secret = payload["node_secret"].as_str().unwrap_or("").to_string();
                     tracing::info!("Registered with manager: node_id={node_id}");
+                    event_sender.emit(super::events::EventSeverity::Info, "manager", "Connected to manager");
 
                     if !node_id.is_empty() && !node_secret.is_empty() {
                         persist_credentials(relay_config, config_path, &node_id, &node_secret);
@@ -309,6 +322,7 @@ async fn try_connect(
                 }
                 "auth_error" => {
                     let msg = response["message"].as_str().unwrap_or("Unknown auth error");
+                    event_sender.emit(super::events::EventSeverity::Critical, "manager", format!("Manager authentication failed: {}", msg));
                     return Err(format!("Auth rejected: {msg}"));
                 }
                 other => {
@@ -372,6 +386,16 @@ async fn try_connect(
                         return Err(format!("WebSocket error: {e}"));
                     }
                     _ => {}
+                }
+            }
+
+            // Forward queued events to the manager
+            Some(event) = event_rx.recv() => {
+                let envelope = build_event_envelope(&event);
+                if let Ok(json) = serde_json::to_string(&envelope) {
+                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -587,9 +611,11 @@ async fn handle_manager_message<S>(
                         if let Ok(json) = serde_json::to_string_pretty(&updated) {
                             if let Err(e) = std::fs::write(config_path, &json) {
                                 tracing::warn!("Failed to persist rotated secret: {e}");
+                                ctx.event_sender.emit(super::events::EventSeverity::Warning, "manager", format!("Credential persistence failed: {}", e));
                             }
                         }
                         tracing::info!("Node secret rotated and persisted");
+                        ctx.event_sender.emit(super::events::EventSeverity::Info, "manager", "Secret rotated successfully");
                         Ok(())
                     }
                 } else {

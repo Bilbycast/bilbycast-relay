@@ -55,7 +55,8 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 | **`api.rs`** | Axum REST routes: `/health` (public), `/metrics`, `/api/v1/tunnels`, `/api/v1/edges`, `/api/v1/stats`. Optional Bearer token auth middleware if `api_token` is configured |
 | **`config.rs`** | `RelayConfig` + `ManagerConfig` (JSON, with serde defaults). Fields: `quic_addr`, `api_addr`, `tls_cert_path`, `tls_key_path`, `api_token` (optional, 32-128 chars), `manager` (optional) |
 | **`stats.rs`** | Atomic (`AtomicU64`) per-tunnel and global stats — lock-free counters for bytes, streams, datagrams, plus global `RelayStats` with peak watermarks (tunnels, edges), connection count, and bandwidth estimation |
-| **`manager/client.rs`** | WebSocket client to bilbycast-manager: auth (registration token or node_id/secret), stats/health streaming, command handling (get_config, disconnect_edge, close_tunnel, list_tunnels, list_edges, authorize_tunnel, revoke_tunnel) |
+| **`manager/client.rs`** | WebSocket client to bilbycast-manager: auth (registration token or node_id/secret), stats/health streaming, operational events, command handling (get_config, disconnect_edge, close_tunnel, list_tunnels, list_edges, authorize_tunnel, revoke_tunnel) |
+| **`manager/events.rs`** | `EventSender`/`EventSeverity`/`Event` types and the event channel for forwarding operational events to the manager. See `docs/events-and-alarms.md` for the full event reference |
 
 ### Protocol Messages
 

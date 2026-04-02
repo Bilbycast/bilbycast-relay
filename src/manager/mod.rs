@@ -5,3 +5,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 pub mod client;
+pub mod events;
+
+pub use events::{EventSender, EventSeverity, event_channel};
