@@ -19,7 +19,7 @@ use crate::config::RelayConfig;
 use crate::stats::RelayStats;
 
 #[derive(Parser)]
-#[command(name = "bilbycast-relay", about = "QUIC relay server for bilbycast IP tunneling")]
+#[command(name = "bilbycast-relay", about = "QUIC relay server for bilbycast IP tunneling", version)]
 struct Cli {
     /// Path to config file (JSON). Optional — relay can run with defaults.
     #[arg(short, long)]
