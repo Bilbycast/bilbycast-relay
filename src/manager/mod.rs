@@ -7,4 +7,4 @@
 pub mod client;
 pub mod events;
 
-pub use events::{EventSender, EventSeverity, event_channel};
+pub use events::{event_channel};
