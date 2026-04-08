@@ -1,5 +1,7 @@
 # bilbycast-relay
 
+> 🌐 Learn more at **[bilbycast.com](https://bilbycast.com)** — the official website for the Bilbycast broadcast media transport suite.
+
 Stateless QUIC relay server that enables IP tunneling between bilbycast-edge nodes behind NAT. The relay pairs ingress and egress edges by tunnel ID and forwards encrypted traffic between them — it cannot read tunnel payloads (end-to-end ChaCha20-Poly1305 encryption between edges).
 
 ## Quick Start
