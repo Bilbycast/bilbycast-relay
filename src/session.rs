@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use quinn::Connection;
 use uuid::Uuid;
 
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::protocol::*;
 use crate::stats::RelayStats;
 use crate::tunnel_router::{BindResult, TunnelEndpoint, TunnelRouter};
@@ -43,7 +43,7 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         remote
     );
     tracing::info!("New QUIC connection from {remote} (id: {connection_id})");
-    ctx.event_sender.emit(EventSeverity::Info, "edge", format!("Edge connected from {}", remote));
+    ctx.event_sender.emit_with_details(EventSeverity::Info, category::EDGE, format!("Edge connected from {}", remote), serde_json::json!({ "remote_addr": remote.to_string() }));
     ctx.relay_stats
         .connections_total
         .fetch_add(1, Ordering::Relaxed);
@@ -53,7 +53,7 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("Failed to accept control stream from {remote}: {e}");
-            ctx.event_sender.emit(EventSeverity::Warning, "edge", format!("Edge connection failed: control stream error from {}", remote));
+            ctx.event_sender.emit_with_details(EventSeverity::Warning, category::EDGE, format!("Edge connection failed: control stream error from {}", remote), serde_json::json!({ "remote_addr": remote.to_string() }));
             return;
         }
     };
@@ -107,13 +107,13 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
 
     // Cleanup: remove edge and notify peers
     tracing::info!("Connection '{connection_id}' disconnected from {remote}");
-    ctx.event_sender.emit(EventSeverity::Info, "edge", format!("Edge disconnected from {}", remote));
+    ctx.event_sender.emit_with_details(EventSeverity::Info, category::EDGE, format!("Edge disconnected from {}", remote), serde_json::json!({ "remote_addr": remote.to_string() }));
     ctx.edge_connections.remove(&connection_id);
 
     let affected = ctx.router.remove_edge(&connection_id);
     for (tunnel_id, peer_edge_id) in affected {
         let tunnel_id_str = tunnel_id.to_string();
-        ctx.event_sender.emit_with_id(EventSeverity::Warning, "tunnel", "Tunnel down: edge disconnected", &tunnel_id_str);
+        ctx.event_sender.emit_with_id(EventSeverity::Warning, category::TUNNEL, "Tunnel down: edge disconnected", &tunnel_id_str);
         if let Some(peer_id) = peer_edge_id {
             notify_tunnel_down(&ctx, &peer_id, tunnel_id, "peer disconnected").await;
         }
@@ -167,7 +167,7 @@ async fn handle_control_stream(
                     tracing::warn!(
                         "Connection '{connection_id}' bind rejected for tunnel {tunnel_id} — invalid bind_token"
                     );
-                    ctx.event_sender.emit_with_id(EventSeverity::Warning, "tunnel", "Tunnel bind rejected: invalid token", &tunnel_id.to_string());
+                    ctx.event_sender.emit_with_id_and_details(EventSeverity::Warning, category::TUNNEL, "Tunnel bind rejected: invalid token", &tunnel_id.to_string(), serde_json::json!({ "remote_addr": connection.remote_address().to_string() }));
                     write_message(
                         send,
                         &RelayMessage::TunnelDown {
@@ -200,7 +200,7 @@ async fn handle_control_stream(
                 match ctx.router.bind(tunnel_id, protocol, endpoint) {
                     BindResult::Active => {
                         tracing::info!("Tunnel {tunnel_id} is now active (both sides bound)");
-                        ctx.event_sender.emit_with_id(EventSeverity::Info, "tunnel", "Tunnel active (both sides bound)", &tunnel_id.to_string());
+                        ctx.event_sender.emit_with_id_and_details(EventSeverity::Info, category::TUNNEL, "Tunnel active (both sides bound)", &tunnel_id.to_string(), serde_json::json!({ "direction": format!("{:?}", direction) }));
 
                         // Notify this edge
                         write_message(send, &RelayMessage::TunnelReady { tunnel_id }).await?;
@@ -227,6 +227,7 @@ async fn handle_control_stream(
                     }
                     BindResult::Waiting => {
                         tracing::info!("Tunnel {tunnel_id} waiting for peer");
+                        ctx.event_sender.emit_with_id_and_details(EventSeverity::Info, category::TUNNEL, format!("Tunnel waiting: {:?} side bound", direction), &tunnel_id.to_string(), serde_json::json!({ "direction": format!("{:?}", direction) }));
                         write_message(send, &RelayMessage::TunnelWaiting { tunnel_id }).await?;
                     }
                 }
@@ -234,6 +235,7 @@ async fn handle_control_stream(
 
             EdgeMessage::TunnelUnbind { tunnel_id } => {
                 tracing::info!("Connection '{connection_id}' unbinding tunnel {tunnel_id}");
+                ctx.event_sender.emit_with_id(EventSeverity::Info, category::TUNNEL, "Tunnel unbound by edge", &tunnel_id.to_string());
                 if let Some(peer_id) = ctx.router.unbind(&tunnel_id, connection_id) {
                     notify_tunnel_down(ctx, &peer_id, tunnel_id, "peer unbound").await;
                 }
@@ -251,10 +253,10 @@ async fn handle_control_stream(
                     tracing::warn!(
                         "Protocol version mismatch with '{connection_id}': edge={protocol_version}, relay={TUNNEL_PROTOCOL_VERSION}"
                     );
-                    ctx.event_sender.emit(EventSeverity::Warning, "edge", format!(
+                    ctx.event_sender.emit_with_details(EventSeverity::Warning, category::EDGE, format!(
                         "Protocol version mismatch with '{}': edge={}, relay={}",
                         connection_id, protocol_version, TUNNEL_PROTOCOL_VERSION
-                    ));
+                    ), serde_json::json!({ "edge_version": protocol_version, "relay_version": TUNNEL_PROTOCOL_VERSION }));
                 }
                 write_message(
                     send,

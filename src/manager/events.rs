@@ -10,6 +10,13 @@
 
 use tokio::sync::mpsc;
 
+/// Well-known event category constants.
+pub mod category {
+    pub const EDGE: &str = "edge";
+    pub const TUNNEL: &str = "tunnel";
+    pub const MANAGER: &str = "manager";
+}
+
 /// Event severity levels matching the manager's `EventSeverity` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSeverity {
@@ -77,6 +84,41 @@ impl EventSender {
             category: category.to_string(),
             message: message.into(),
             details: None,
+            flow_id: Some(id.to_string()),
+        });
+    }
+
+    /// Convenience: send an event with structured details.
+    pub fn emit_with_details(
+        &self,
+        severity: EventSeverity,
+        category: &str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) {
+        self.send(Event {
+            severity,
+            category: category.to_string(),
+            message: message.into(),
+            details: Some(details),
+            flow_id: None,
+        });
+    }
+
+    /// Convenience: send an event with a tunnel/flow ID and structured details.
+    pub fn emit_with_id_and_details(
+        &self,
+        severity: EventSeverity,
+        category: &str,
+        message: impl Into<String>,
+        id: &str,
+        details: serde_json::Value,
+    ) {
+        self.send(Event {
+            severity,
+            category: category.to_string(),
+            message: message.into(),
+            details: Some(details),
             flow_id: Some(id.to_string()),
         });
     }

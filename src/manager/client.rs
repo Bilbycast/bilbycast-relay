@@ -25,7 +25,7 @@ use crate::config::{ManagerConfig, RelayConfig};
 use crate::session::SessionContext;
 use crate::stats::RelayStats;
 
-use super::events::{Event, build_event_envelope};
+use super::events::{Event, build_event_envelope, category};
 
 /// Compute SHA-256 fingerprint of a DER-encoded certificate.
 fn compute_cert_fingerprint(cert_der: &[u8]) -> String {
@@ -165,7 +165,7 @@ async fn manager_client_loop(
         match try_connect(&config, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender).await {
             Ok(ConnectResult::Closed) => {
                 tracing::info!("Manager connection closed normally");
-                event_sender.emit(super::events::EventSeverity::Warning, "manager", "Manager connection lost, reconnecting");
+                event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, "Manager connection lost, reconnecting");
                 backoff_secs = 1;
             }
             Ok(ConnectResult::Registered {
@@ -184,7 +184,7 @@ async fn manager_client_loop(
             }
             Err(e) => {
                 tracing::warn!("Manager connection failed: {e}");
-                event_sender.emit(super::events::EventSeverity::Warning, "manager", format!("Manager connection lost, reconnecting: {}", e));
+                event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Manager connection lost, reconnecting: {}", e));
             }
         }
 
@@ -306,14 +306,14 @@ async fn try_connect(
             match response["type"].as_str().unwrap_or("") {
                 "auth_ok" => {
                     tracing::info!("Authenticated with manager");
-                    event_sender.emit(super::events::EventSeverity::Info, "manager", "Connected to manager");
+                    event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Connected to manager");
                 }
                 "register_ack" => {
                     let payload = &response["payload"];
                     let node_id = payload["node_id"].as_str().unwrap_or("").to_string();
                     let node_secret = payload["node_secret"].as_str().unwrap_or("").to_string();
                     tracing::info!("Registered with manager: node_id={node_id}");
-                    event_sender.emit(super::events::EventSeverity::Info, "manager", "Connected to manager");
+                    event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Connected to manager");
 
                     if !node_id.is_empty() && !node_secret.is_empty() {
                         persist_credentials(relay_config, config_path, &node_id, &node_secret);
@@ -322,7 +322,7 @@ async fn try_connect(
                 }
                 "auth_error" => {
                     let msg = response["message"].as_str().unwrap_or("Unknown auth error");
-                    event_sender.emit(super::events::EventSeverity::Critical, "manager", format!("Manager authentication failed: {}", msg));
+                    event_sender.emit(super::events::EventSeverity::Critical, category::MANAGER, format!("Manager authentication failed: {}", msg));
                     return Err(format!("Auth rejected: {msg}"));
                 }
                 other => {
@@ -611,11 +611,11 @@ async fn handle_manager_message<S>(
                         if let Ok(json) = serde_json::to_string_pretty(&updated) {
                             if let Err(e) = std::fs::write(config_path, &json) {
                                 tracing::warn!("Failed to persist rotated secret: {e}");
-                                ctx.event_sender.emit(super::events::EventSeverity::Warning, "manager", format!("Credential persistence failed: {}", e));
+                                ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
                             }
                         }
                         tracing::info!("Node secret rotated and persisted");
-                        ctx.event_sender.emit(super::events::EventSeverity::Info, "manager", "Secret rotated successfully");
+                        ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
                         Ok(())
                     }
                 } else {

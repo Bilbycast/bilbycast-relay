@@ -47,24 +47,27 @@ Events are queued in an unbounded in-memory channel. When the relay is not conne
 
 ### Edge Connections (`edge`)
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | Edge connected from {addr} | New QUIC connection accepted from an edge node |
-| info | Edge disconnected from {addr} | Edge QUIC connection closed |
-| warning | Edge connection failed: control stream error from {addr} | Failed to accept bidirectional control stream |
-| warning | Protocol version mismatch (edge={v}, relay={v}) | Edge Hello message version differs from relay |
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | Edge connected from {addr} | New QUIC connection accepted from an edge node | `{ remote_addr }` |
+| info | Edge disconnected from {addr} | Edge QUIC connection closed | `{ remote_addr }` |
+| warning | Edge connection failed: control stream error from {addr} | Failed to accept bidirectional control stream | `{ remote_addr }` |
+| warning | Protocol version mismatch (edge={v}, relay={v}) | Edge Hello message version differs from relay | `{ edge_version, relay_version }` |
+| warning | QUIC connection accept failed: {error} | QUIC/TLS handshake failure at the server level | `{ error }` |
 
-**Source**: `src/session.rs`
+**Source**: `src/session.rs`, `src/server.rs`
 
 ---
 
 ### Tunnels (`tunnel`)
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | Tunnel active (both sides bound) | Both ingress and egress edges have bound |
-| warning | Tunnel bind rejected: invalid token | HMAC-SHA256 bind token verification failed |
-| warning | Tunnel down: edge disconnected | Edge QUIC connection lost, affecting bound tunnel |
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | Tunnel active (both sides bound) | Both ingress and egress edges have bound | `{ direction }` |
+| info | Tunnel waiting: {direction} side bound | Only one side has bound, waiting for peer | `{ direction }` |
+| info | Tunnel unbound by edge | Edge sent TunnelUnbind | |
+| warning | Tunnel bind rejected: invalid token | HMAC-SHA256 bind token verification failed | `{ remote_addr }` |
+| warning | Tunnel down: edge disconnected | Edge QUIC connection lost, affecting bound tunnel | |
 
 The `flow_id` field contains the tunnel UUID for all tunnel events.
 
@@ -114,15 +117,15 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| `edge` | 4 | Edge QUIC connection lifecycle |
-| `tunnel` | 3 | Tunnel state changes and authentication |
+| `edge` | 5 | Edge QUIC connection lifecycle (now with structured details) |
+| `tunnel` | 5 | Tunnel state changes, authentication, and lifecycle (waiting, unbound) |
 | `manager` | 6 | Manager connection and credential management |
-| **Total** | **13** | |
+| **Total** | **16** | |
 
 ### By Severity
 
 | Severity | Count | Description |
 |----------|-------|-------------|
 | critical | 1 | Manager authentication failure |
-| warning | 6 | Disconnects, bind rejections, protocol mismatches, persistence failures |
-| info | 6 | Connections, tunnel activation, secret rotation |
+| warning | 7 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures |
+| info | 8 | Connections, tunnel activation/waiting/unbound, secret rotation |

@@ -45,6 +45,12 @@ pub async fn run_quic_server(
                 }
                 Err(e) => {
                     tracing::warn!("Failed to accept QUIC connection: {e}");
+                    ctx.event_sender.emit_with_details(
+                        crate::manager::events::EventSeverity::Warning,
+                        crate::manager::events::category::EDGE,
+                        format!("QUIC connection accept failed: {e}"),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
                 }
             }
         });
