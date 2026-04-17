@@ -1,0 +1,32 @@
+bilbycast Commercial License
+============================
+
+The code in this repository is dual-licensed:
+
+1. The open-source licence — see LICENSE (GNU Affero General Public
+   License, version 3 or later). Free to use for review, private
+   deployment, and any use where you are comfortable with AGPL's
+   source-disclosure obligations (including § 13's network-copyleft
+   for operators of modified network services).
+
+2. A commercial licence from Softside Tech Pty Ltd — for OEMs,
+   hardware integrators, SaaS providers, and other commercial users
+   who need to embed, ship, or operate bilbycast without AGPL's
+   copyleft obligations. Typical use cases:
+
+   - Integrating bilbycast into a closed-source hardware product
+     (encoder / gateway / appliance)
+   - Operating bilbycast as part of a SaaS or managed service
+     without releasing the source of your modifications or
+     surrounding stack under AGPL
+   - Redistributing bilbycast as part of a commercial software
+     bundle under terms other than AGPL
+
+To obtain a commercial licence, or to discuss whether your use
+case needs one, please contact:
+
+    Softside Tech Pty Ltd
+    commercial@softsidetech.com
+
+If you're unsure which licence fits your use case, email us — we're
+happy to help you work it out before you invest engineering time.
