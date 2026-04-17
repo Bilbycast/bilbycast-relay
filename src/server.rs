@@ -118,7 +118,13 @@ fn build_server_config(config: &RelayConfig) -> Result<ServerConfig> {
     // 2 MB accommodates ~1500 max-size datagrams in-flight.
     transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
     transport.datagram_send_buffer_size(2 * 1024 * 1024);
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    // Failover tuning: 5 missed keep-alives before declaring dead (matches edge side).
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(25)
+            .try_into()
+            .context("max_idle_timeout conversion")?,
+    ));
 
     server_config.transport_config(Arc::new(transport));
 
