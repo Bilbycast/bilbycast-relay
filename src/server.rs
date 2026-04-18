@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
 //! QUIC server: accepts connections from edge nodes.
