@@ -103,8 +103,9 @@ async fn main() -> Result<()> {
     let manager_handle = if let Some(ref mgr_config) = config.manager {
         if mgr_config.enabled {
             tracing::info!(
-                "Manager client enabled, connecting to {}",
-                mgr_config.url
+                "Manager client enabled, connecting to {} URL(s): {}",
+                mgr_config.urls.len(),
+                mgr_config.urls.join(", ")
             );
             Some(manager::client::start_manager_client(
                 mgr_config.clone(),

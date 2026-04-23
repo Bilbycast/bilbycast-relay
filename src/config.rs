@@ -4,14 +4,20 @@
 use serde::{Deserialize, Serialize};
 
 /// Manager connection configuration (same pattern as bilbycast-edge).
+///
+/// Multi-URL client-side failover: the relay tries `urls[0]` first,
+/// rotates to `urls[1]` on WS close, and so on — 1-16 entries, each
+/// must start with `wss://`. 5 s backoff between attempts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagerConfig {
     /// Whether manager connection is enabled.
     #[serde(default)]
     pub enabled: bool,
 
-    /// WebSocket URL of the manager (must be wss://).
-    pub url: String,
+    /// Ordered list of manager WebSocket URLs (each `wss://`, 1-16
+    /// entries). The client tries them in order and rotates on WS
+    /// close with a fixed 5 s backoff.
+    pub urls: Vec<String>,
 
     /// Accept self-signed TLS certificates from the manager.
     /// Only enable this for development/testing. Default: false.
@@ -95,10 +101,39 @@ impl RelayConfig {
             }
         }
 
-        // Validate manager URL if enabled
+        // Validate manager URL list if enabled (1..16, each wss://,
+        // ≤2048 chars, unique — same rules as bilbycast-edge).
         if let Some(ref mgr) = self.manager {
-            if mgr.enabled && !mgr.url.starts_with("wss://") {
-                anyhow::bail!("Manager URL must use wss:// (TLS required)");
+            if mgr.enabled {
+                if mgr.urls.is_empty() {
+                    anyhow::bail!(
+                        "Manager urls[] cannot be empty when manager is enabled"
+                    );
+                }
+                if mgr.urls.len() > 16 {
+                    anyhow::bail!(
+                        "Manager urls[] may contain at most 16 entries (got {})",
+                        mgr.urls.len()
+                    );
+                }
+                let mut seen = std::collections::HashSet::new();
+                for (i, url) in mgr.urls.iter().enumerate() {
+                    if !url.starts_with("wss://") {
+                        anyhow::bail!(
+                            "Manager urls[{i}] = {url:?} must use wss:// (TLS required)"
+                        );
+                    }
+                    if url.len() > 2048 {
+                        anyhow::bail!(
+                            "Manager urls[{i}] must be at most 2048 characters"
+                        );
+                    }
+                    if !seen.insert(url.as_str()) {
+                        anyhow::bail!(
+                            "Manager urls[{i}] = {url:?} is a duplicate"
+                        );
+                    }
+                }
             }
         }
 
