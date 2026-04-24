@@ -22,7 +22,7 @@ cargo test test_name         # Run a single test by name
 
 **Logging**: Controlled via `RUST_LOG` env var (default: `bilbycast_relay=info`).
 
-**Optional security**: Set `api_token` in config to require Bearer token auth on REST API endpoints. Per-tunnel bind authentication is enabled automatically when the manager sends `authorize_tunnel` commands.
+**Optional security**: Set `api_token` in config to require Bearer token auth on REST API endpoints. Per-tunnel bind authentication is enabled automatically when the manager sends `authorize_tunnel` commands; set `require_bind_auth: true` to additionally reject binds for tunnels without a pre-registered authorization (fail-closed — recommended for production).
 
 ## Architecture
 
@@ -40,7 +40,7 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 1. Edge connects via QUIC and opens a bidirectional control stream
 2. Edge sends `Hello { protocol_version, software_version }` as the first message. Relay responds with `HelloAck`. Version mismatches are warned but don't reject the connection. Old edges that skip this step are handled gracefully
 3. Edge optionally sends `Identify { edge_id }` with its manager node_id (enables topology correlation in the manager UI)
-4. Edge sends `TunnelBind` with a tunnel UUID, direction (ingress/egress), and optional `bind_token` (HMAC-SHA256). If the relay has pre-authorized tokens for this tunnel (via manager `authorize_tunnel` command), the bind_token is verified; otherwise unauthenticated bind is allowed (backwards compatible)
+4. Edge sends `TunnelBind` with a tunnel UUID, direction (ingress/egress), and optional `bind_token` (HMAC-SHA256). If the relay has pre-authorized tokens for this tunnel (via manager `authorize_tunnel` command), the bind_token is verified. When no authorization is registered, behaviour is controlled by `RelayConfig::require_bind_auth`: `false` (default, backwards compatible) allows unauthenticated bind; `true` rejects with `TunnelDown { reason: "bind authentication failed" }`. Recommended value for production: `true`
 5. When both sides of a tunnel bind, the relay notifies both edges with `TunnelReady`
 6. Data flows: TCP via bidirectional QUIC streams (with `StreamHeader`), UDP via QUIC datagrams (16-byte UUID prefix)
 
@@ -53,7 +53,7 @@ Main uses `tokio::select!` to run all tasks concurrently and handle graceful shu
 | **`tunnel_router.rs`** | `TunnelRouter` pairs ingress/egress endpoints by tunnel UUID using `DashMap`. Manages bind/unbind lifecycle, peer connection lookup, and per-tunnel bind token authorization (`authorized_tokens` DashMap, constant-time token comparison) |
 | **`server.rs`** | QUIC endpoint setup with self-signed TLS fallback. Configures transport parameters (datagram buffers sized for SRT at 10 Mbps, keep-alive at 15s) |
 | **`api.rs`** | Axum REST routes: `/health` (public), `/metrics`, `/api/v1/tunnels`, `/api/v1/edges`, `/api/v1/stats`. Optional Bearer token auth middleware if `api_token` is configured |
-| **`config.rs`** | `RelayConfig` + `ManagerConfig` (JSON, with serde defaults). Fields: `quic_addr`, `api_addr`, `tls_cert_path`, `tls_key_path`, `api_token` (optional, 32-128 chars), `manager` (optional) |
+| **`config.rs`** | `RelayConfig` + `ManagerConfig` (JSON, with serde defaults). Fields: `quic_addr`, `api_addr`, `tls_cert_path`, `tls_key_path`, `api_token` (optional, 32-128 chars), `require_bind_auth` (bool, default `false`), `manager` (optional) |
 | **`stats.rs`** | Atomic (`AtomicU64`) per-tunnel and global stats — lock-free counters for bytes, streams, datagrams, plus global `RelayStats` with peak watermarks (tunnels, edges), connection count, and bandwidth estimation |
 | **`manager/client.rs`** | WebSocket client to bilbycast-manager: auth (registration token or node_id/secret), stats/health streaming, operational events, command handling (get_config, disconnect_edge, close_tunnel, list_tunnels, list_edges, authorize_tunnel, revoke_tunnel) |
 | **`manager/events.rs`** | `EventSender`/`EventSeverity`/`Event` types and the event channel for forwarding operational events to the manager. See `docs/events-and-alarms.md` for the full event reference |
@@ -128,7 +128,7 @@ No `Mutex` or `RwLock` is used anywhere in the codebase.
 | **Transport encryption** | TLS 1.3 via QUIC | `rustls` + `quinn` — all data encrypted in transit between edge and relay |
 | **End-to-end encryption** | ChaCha20-Poly1305 | Edge-to-edge encryption at the edge level. The relay sees only encrypted ciphertext — it cannot read tunnel payloads |
 | **REST API auth** | Bearer token (optional) | If `api_token` is configured, all endpoints except `/health` require `Authorization: Bearer <token>`. Prevents topology/tunnel enumeration |
-| **Tunnel bind auth** | HMAC-SHA256 (optional) | Manager pre-authorizes tunnels via `authorize_tunnel` command. Edges must include valid `bind_token` in `TunnelBind`. Constant-time comparison prevents timing attacks. Backwards compatible: unauthenticated bind allowed if no authorization registered |
+| **Tunnel bind auth** | HMAC-SHA256 (optional) | Manager pre-authorizes tunnels via `authorize_tunnel` command. Edges must include valid `bind_token` in `TunnelBind`. Constant-time comparison prevents timing attacks. Policy for tunnels without a pre-registered entry is controlled by `require_bind_auth`: default `false` = unauthenticated bind allowed (backwards compatible); `true` = fail-closed, recommended for production |
 | **ALPN enforcement** | Protocol negotiation | Server enforces `bilbycast-relay` ALPN — prevents protocol downgrade |
 | **Tunnel isolation** | Per-tunnel UUID routing | Tunnel IDs must be valid UUIDs (v4 random). Data routed exclusively to the bound peer via `TunnelRouter`. No cross-tunnel leakage |
 | **Resource protection** | QUIC transport limits | Max 1024 bidi / 256 uni streams per connection, 15s keep-alive for dead connection detection |

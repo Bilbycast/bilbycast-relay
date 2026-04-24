@@ -72,6 +72,21 @@ pub struct RelayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
 
+    /// Require a pre-registered bind authorization for every tunnel bind.
+    ///
+    /// When `false` (default, backwards compatible), tunnels without a
+    /// matching `authorize_tunnel` entry accept unauthenticated binds —
+    /// useful for deployments mixing relays with old managers that don't
+    /// send `authorize_tunnel`, or for standalone testing.
+    ///
+    /// When `true`, every bind must present a `bind_token` that matches
+    /// a token pre-registered by the manager; unauthorized binds are
+    /// rejected with `TunnelDown { reason: "bind authentication failed" }`.
+    /// Recommended for production deployments managed exclusively by a
+    /// modern bilbycast-manager.
+    #[serde(default)]
+    pub require_bind_auth: bool,
+
     /// Optional manager connection for centralized monitoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<ManagerConfig>,
@@ -149,6 +164,7 @@ impl Default for RelayConfig {
             tls_cert_path: None,
             tls_key_path: None,
             api_token: None,
+            require_bind_auth: false,
             manager: None,
         }
     }

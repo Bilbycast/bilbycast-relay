@@ -72,13 +72,21 @@ pub struct TunnelRouter {
     /// Pre-authorized bind tokens keyed by tunnel UUID.
     /// If a tunnel has an entry here, bind requests must include a valid bind_token.
     authorized_tokens: DashMap<Uuid, AuthorizedTunnel>,
+    /// When `true`, binds for tunnels without a pre-registered `authorize_tunnel`
+    /// entry are rejected (fail-closed). When `false`, they are allowed
+    /// (backwards-compatible permissive mode). Driven by
+    /// `RelayConfig::require_bind_auth`.
+    require_bind_auth: bool,
 }
 
 impl TunnelRouter {
-    pub fn new() -> Self {
+    /// Construct a router with an explicit auth policy.
+    /// `require_bind_auth = false` is the permissive backwards-compatible mode.
+    pub fn with_auth_policy(require_bind_auth: bool) -> Self {
         Self {
             tunnels: DashMap::new(),
             authorized_tokens: DashMap::new(),
+            require_bind_auth,
         }
     }
 
@@ -100,9 +108,10 @@ impl TunnelRouter {
 
     /// Verify a bind token for a tunnel+direction.
     ///
-    /// Returns `true` if:
-    /// - No authorization is registered for this tunnel (backwards compatible), OR
-    /// - The provided bind_token matches the expected token for the given direction.
+    /// Returns `true` if the provided bind_token matches the expected token
+    /// for the given direction. When no authorization is registered for this
+    /// tunnel: permissive mode (`require_bind_auth = false`, default) returns
+    /// `true` for backwards compatibility; strict mode returns `false`.
     pub fn verify_bind_token(
         &self,
         tunnel_id: &Uuid,
@@ -110,8 +119,9 @@ impl TunnelRouter {
         bind_token: Option<&str>,
     ) -> bool {
         let Some(auth) = self.authorized_tokens.get(tunnel_id) else {
-            // No authorization registered — allow (backwards compatible)
-            return true;
+            // No authorization registered: fail-closed in strict mode,
+            // fail-open in permissive (backwards-compatible) mode.
+            return !self.require_bind_auth;
         };
 
         let expected = match direction {
@@ -296,4 +306,60 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tid() -> Uuid {
+        Uuid::new_v4()
+    }
+
+    #[test]
+    fn permissive_mode_allows_unauthorized_tunnel() {
+        let router = TunnelRouter::with_auth_policy(false);
+        assert!(router.verify_bind_token(&tid(), TunnelDirection::Ingress, None));
+        assert!(router.verify_bind_token(&tid(), TunnelDirection::Egress, Some("anything")));
+    }
+
+    #[test]
+    fn strict_mode_rejects_unauthorized_tunnel() {
+        let router = TunnelRouter::with_auth_policy(true);
+        assert!(!router.verify_bind_token(&tid(), TunnelDirection::Ingress, None));
+        assert!(!router.verify_bind_token(&tid(), TunnelDirection::Egress, Some("anything")));
+    }
+
+    #[test]
+    fn authorized_tunnel_requires_matching_token_in_both_modes() {
+        for strict in [false, true] {
+            let router = TunnelRouter::with_auth_policy(strict);
+            let t = tid();
+            router.authorize_tunnel(t, "ingress-tok".into(), "egress-tok".into());
+
+            // Correct tokens accepted.
+            assert!(router.verify_bind_token(&t, TunnelDirection::Ingress, Some("ingress-tok")));
+            assert!(router.verify_bind_token(&t, TunnelDirection::Egress, Some("egress-tok")));
+
+            // Wrong direction, wrong value, and missing token all rejected.
+            assert!(!router.verify_bind_token(&t, TunnelDirection::Ingress, Some("egress-tok")));
+            assert!(!router.verify_bind_token(&t, TunnelDirection::Ingress, Some("nope")));
+            assert!(!router.verify_bind_token(&t, TunnelDirection::Ingress, None));
+        }
+    }
+
+    #[test]
+    fn revoke_restores_policy_default() {
+        let t = tid();
+
+        let strict = TunnelRouter::with_auth_policy(true);
+        strict.authorize_tunnel(t, "a".into(), "b".into());
+        strict.revoke_tunnel(&t);
+        assert!(!strict.verify_bind_token(&t, TunnelDirection::Ingress, Some("a")));
+
+        let permissive = TunnelRouter::with_auth_policy(false);
+        permissive.authorize_tunnel(t, "a".into(), "b".into());
+        permissive.revoke_tunnel(&t);
+        assert!(permissive.verify_bind_token(&t, TunnelDirection::Ingress, None));
+    }
 }

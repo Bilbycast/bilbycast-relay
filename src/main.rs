@@ -75,11 +75,22 @@ async fn main() -> Result<()> {
     // Create shared state
     let relay_stats = Arc::new(RelayStats::new());
     let (event_sender, event_rx) = manager::event_channel();
-    let ctx = server::create_session_context(relay_stats.clone(), event_sender.clone());
+    let ctx = server::create_session_context(
+        relay_stats.clone(),
+        event_sender.clone(),
+        config.require_bind_auth,
+    );
 
     // Start REST API
     if config.api_token.is_none() {
         tracing::warn!("No api_token configured — REST API endpoints are open without authentication");
+    }
+    if !config.require_bind_auth {
+        tracing::warn!(
+            "require_bind_auth=false — tunnels without a pre-registered authorize_tunnel \
+             entry accept unauthenticated binds (backwards-compatible mode). Set \
+             require_bind_auth=true for fail-closed bind authentication."
+        );
     }
     let api_state = Arc::new(api::ApiState {
         ctx: ctx.clone(),

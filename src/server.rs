@@ -60,9 +60,17 @@ pub async fn run_quic_server(
 }
 
 /// Create the SessionContext shared state.
-pub fn create_session_context(relay_stats: Arc<RelayStats>, event_sender: EventSender) -> Arc<SessionContext> {
+///
+/// `require_bind_auth` flips the router into fail-closed mode: binds for
+/// tunnels without a pre-registered `authorize_tunnel` entry are rejected.
+/// Pass `false` for the default backwards-compatible behaviour.
+pub fn create_session_context(
+    relay_stats: Arc<RelayStats>,
+    event_sender: EventSender,
+    require_bind_auth: bool,
+) -> Arc<SessionContext> {
     Arc::new(SessionContext {
-        router: Arc::new(TunnelRouter::new()),
+        router: Arc::new(TunnelRouter::with_auth_policy(require_bind_auth)),
         edge_connections: dashmap::DashMap::new(),
         relay_stats,
         event_sender,
