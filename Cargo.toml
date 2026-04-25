@@ -8,15 +8,15 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 # QUIC
 quinn = "0.11.9"
-rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.39", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
 
 # Async runtime
-tokio = { version = "1.51.0", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 
 # HTTP API
-axum = "0.8.8"
+axum = "0.8.9"
 tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Serialization
@@ -24,7 +24,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
 # CLI
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 # Logging
 tracing = "0.1.44"
@@ -39,13 +39,13 @@ futures-util = "0.3.32"
 chrono = { version = "0.4.44", features = ["serde"] }
 
 # Utilities
-uuid = { version = "1.23.0", features = ["v4", "serde"] }
+uuid = { version = "1.23.1", features = ["v4", "serde"] }
 anyhow = "1.0.102"
 bytes = "1.11.1"
 
 # Certificate pinning (SHA-256 fingerprint)
 sha2 = "0.11.0"
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"
