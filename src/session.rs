@@ -7,8 +7,9 @@
 //! The relay is stateless — no authentication required. It pairs edges by
 //! tunnel ID and forwards encrypted traffic between them.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -28,15 +29,66 @@ pub struct SessionContext {
     pub router: Arc<TunnelRouter>,
     /// Map of connection_id -> Connection for sending notifications.
     pub edge_connections: DashMap<String, Connection>,
+    /// Per-IP connection counter — bounds the total active QUIC
+    /// connections from any single source IP (DoS mitigation). Atomic
+    /// so the increment + check is race-free across the spawn-per-
+    /// connection model. Entries are removed when their counter drops
+    /// to zero on disconnect.
+    pub connections_by_ip: DashMap<IpAddr, Arc<AtomicU32>>,
     /// Global relay stats for peak tracking and connection counting.
     pub relay_stats: Arc<RelayStats>,
     /// Event sender for forwarding operational events to the manager.
     pub event_sender: EventSender,
+    /// Per-IP connection cap from `RelayConfig::max_connections_per_ip`.
+    pub max_connections_per_ip: u32,
+    /// Per-connection tunnel-bind cap from
+    /// `RelayConfig::max_tunnels_per_connection`.
+    pub max_tunnels_per_connection: u32,
 }
 
 /// Handle a new QUIC connection from an edge node.
 pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connection) {
     let remote = connection.remote_address();
+    let remote_ip = remote.ip();
+
+    // Per-IP connection cap — DoS mitigation. Increment first, then
+    // compare against the cap; if exceeded, decrement and reject.
+    // This is race-safe under spawn-per-connection because we never
+    // skip the decrement on rejection.
+    let ip_counter = ctx
+        .connections_by_ip
+        .entry(remote_ip)
+        .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+        .clone();
+    let active = ip_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if active > ctx.max_connections_per_ip {
+        ip_counter.fetch_sub(1, Ordering::Relaxed);
+        tracing::warn!(
+            "Rejecting QUIC connection from {remote}: per-IP cap of {} exceeded ({} active)",
+            ctx.max_connections_per_ip,
+            active
+        );
+        ctx.event_sender.emit_with_details(
+            EventSeverity::Warning,
+            category::EDGE,
+            format!(
+                "Connection rejected: per-IP cap exceeded ({} active from {})",
+                active, remote_ip
+            ),
+            serde_json::json!({
+                "error_code": "relay_dos_suspect",
+                "remote_addr": remote.to_string(),
+                "remote_ip": remote_ip.to_string(),
+                "active_connections": active,
+                "cap": ctx.max_connections_per_ip,
+            }),
+        );
+        // Closing the connection without finishing the handshake; quinn
+        // will tear it down. We deliberately don't open the control bi.
+        connection.close(0u32.into(), b"per-ip connection cap exceeded");
+        return;
+    }
+
     let connection_id = format!(
         "conn-{}-{}",
         CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -54,6 +106,8 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         Err(e) => {
             tracing::warn!("Failed to accept control stream from {remote}: {e}");
             ctx.event_sender.emit_with_details(EventSeverity::Warning, category::EDGE, format!("Edge connection failed: control stream error from {}", remote), serde_json::json!({ "remote_addr": remote.to_string() }));
+            // Decrement the per-IP counter on early exit.
+            decrement_ip_counter(&ctx, &remote_ip);
             return;
         }
     };
@@ -62,15 +116,12 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
     ctx.edge_connections
         .insert(connection_id.clone(), connection.clone());
 
-    // Identified edge_id (set via Identify message, used for reporting).
-    // Falls back to connection_id if not set.
-    let identified_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    // Process control messages + data streams + UDP datagrams concurrently
+    // Process control messages + data streams + UDP datagrams concurrently.
+    // The identified edge_id (set via Identify message, used for reporting)
+    // is owned by `handle_control_stream` since no other branch reads it.
     let ctrl_ctx = ctx.clone();
     let ctrl_conn = connection.clone();
     let ctrl_edge = connection_id.clone();
-    let ctrl_identified = identified_id.clone();
 
     let data_ctx = ctx.clone();
     let data_conn = connection.clone();
@@ -82,7 +133,7 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
 
     tokio::select! {
         // Control stream message loop
-        r = handle_control_stream(&ctrl_ctx, &ctrl_conn, &ctrl_edge, &ctrl_identified, &mut send, &mut recv) => {
+        r = handle_control_stream(&ctrl_ctx, &ctrl_conn, &ctrl_edge, &mut send, &mut recv) => {
             if let Err(e) = r {
                 tracing::debug!("Control stream ended for '{ctrl_edge}': {e}");
             }
@@ -109,6 +160,7 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
     tracing::info!("Connection '{connection_id}' disconnected from {remote}");
     ctx.event_sender.emit_with_details(EventSeverity::Info, category::EDGE, format!("Edge disconnected from {}", remote), serde_json::json!({ "remote_addr": remote.to_string() }));
     ctx.edge_connections.remove(&connection_id);
+    decrement_ip_counter(&ctx, &remote_ip);
 
     let affected = ctx.router.remove_edge(&connection_id);
     for (tunnel_id, peer_edge_id) in affected {
@@ -120,14 +172,40 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
     }
 }
 
+/// Decrement the per-IP connection counter, removing the map entry when
+/// it drops to zero. Safe to call exactly once per accepted-and-then-
+/// rejected or disconnected connection.
+fn decrement_ip_counter(ctx: &Arc<SessionContext>, ip: &IpAddr) {
+    if let Some(entry) = ctx.connections_by_ip.get(ip) {
+        let prev = entry.fetch_sub(1, Ordering::Relaxed);
+        // If we just dropped to zero, remove the entry. Use remove_if
+        // to avoid a TOCTOU between the load and remove.
+        if prev == 1 {
+            drop(entry);
+            ctx.connections_by_ip
+                .remove_if(ip, |_, counter| counter.load(Ordering::Relaxed) == 0);
+        }
+    }
+}
+
 async fn handle_control_stream(
     ctx: &Arc<SessionContext>,
     connection: &Connection,
     connection_id: &str,
-    identified_id: &Arc<Mutex<Option<String>>>,
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> Result<()> {
+    // Identified edge_id (set via Identify message, used for reporting).
+    // Falls back to connection_id if not set. Owned locally — no other
+    // task in this session needs to read it, so no Mutex is required.
+    let mut identified_id: Option<String> = None;
+
+    // Per-connection tunnel-bind counter for the DoS cap. Increments on
+    // every accepted bind, decrements on Unbind, and on edge disconnect
+    // the entire counter is dropped with this function. The cap comes
+    // from `RelayConfig::max_tunnels_per_connection`.
+    let mut active_binds_on_this_conn: u32 = 0;
+
     loop {
         let parsed = read_message_resilient::<EdgeMessage>(recv).await?;
 
@@ -153,7 +231,7 @@ async fn handle_control_stream(
                 tracing::info!(
                     "Connection '{connection_id}' identified as '{provided_id}'"
                 );
-                *identified_id.lock().unwrap() = Some(provided_id);
+                identified_id = Some(provided_id);
             }
 
             EdgeMessage::TunnelBind {
@@ -162,6 +240,38 @@ async fn handle_control_stream(
                 protocol,
                 bind_token,
             } => {
+                // Per-connection tunnel-bind cap — DoS mitigation.
+                // Checked BEFORE bind-token verification so a malicious
+                // connection spamming bogus tunnel IDs can't exhaust
+                // memory just by failing fast.
+                if active_binds_on_this_conn >= ctx.max_tunnels_per_connection {
+                    tracing::warn!(
+                        "Connection '{connection_id}' bind rejected for tunnel {tunnel_id} — per-connection tunnel cap of {} exceeded",
+                        ctx.max_tunnels_per_connection
+                    );
+                    ctx.event_sender.emit_with_id_and_details(
+                        EventSeverity::Warning,
+                        category::TUNNEL,
+                        "Tunnel bind rejected: per-connection cap exceeded",
+                        &tunnel_id.to_string(),
+                        serde_json::json!({
+                            "error_code": "relay_dos_suspect",
+                            "remote_addr": connection.remote_address().to_string(),
+                            "active_binds": active_binds_on_this_conn,
+                            "cap": ctx.max_tunnels_per_connection,
+                        }),
+                    );
+                    write_message(
+                        send,
+                        &RelayMessage::TunnelDown {
+                            tunnel_id,
+                            reason: "per-connection tunnel limit exceeded".to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
                 // Verify bind token before allowing the bind
                 if !ctx.router.verify_bind_token(&tunnel_id, direction, bind_token.as_deref()) {
                     tracing::warn!(
@@ -181,8 +291,6 @@ async fn handle_control_stream(
 
                 // Use identified edge_id for reporting, connection_id for internal lookups
                 let edge_id = identified_id
-                    .lock()
-                    .unwrap()
                     .clone()
                     .unwrap_or_else(|| connection_id.to_string());
 
@@ -196,6 +304,9 @@ async fn handle_control_stream(
                     direction,
                     connection: connection.clone(),
                 };
+
+                // Bind accepted — bump the per-connection counter.
+                active_binds_on_this_conn = active_binds_on_this_conn.saturating_add(1);
 
                 match ctx.router.bind(tunnel_id, protocol, endpoint) {
                     BindResult::Active => {
@@ -236,6 +347,11 @@ async fn handle_control_stream(
             EdgeMessage::TunnelUnbind { tunnel_id } => {
                 tracing::info!("Connection '{connection_id}' unbinding tunnel {tunnel_id}");
                 ctx.event_sender.emit_with_id(EventSeverity::Info, category::TUNNEL, "Tunnel unbound by edge", &tunnel_id.to_string());
+                // Decrement the per-connection counter (saturating at 0
+                // so an unmatched Unbind from a buggy edge can't take
+                // the counter negative — important if the cap is later
+                // checked against an underflowed u32).
+                active_binds_on_this_conn = active_binds_on_this_conn.saturating_sub(1);
                 if let Some(peer_id) = ctx.router.unbind(&tunnel_id, connection_id) {
                     notify_tunnel_down(ctx, &peer_id, tunnel_id, "peer unbound").await;
                 }

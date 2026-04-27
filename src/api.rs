@@ -49,7 +49,7 @@ async fn auth_middleware(
         .and_then(|h| h.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    if provided_token != expected_token.as_str() {
+    if !crate::util::constant_time_eq(provided_token.as_bytes(), expected_token.as_bytes()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Unauthorized — valid Bearer token required"})),

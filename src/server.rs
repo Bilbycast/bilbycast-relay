@@ -64,16 +64,25 @@ pub async fn run_quic_server(
 /// `require_bind_auth` flips the router into fail-closed mode: binds for
 /// tunnels without a pre-registered `authorize_tunnel` entry are rejected.
 /// Pass `false` for the default backwards-compatible behaviour.
+///
+/// `max_connections_per_ip` and `max_tunnels_per_connection` are the
+/// DoS-mitigation caps; pass the values from `RelayConfig`. Generous
+/// defaults (64 / 100) accommodate any realistic legitimate workload.
 pub fn create_session_context(
     relay_stats: Arc<RelayStats>,
     event_sender: EventSender,
     require_bind_auth: bool,
+    max_connections_per_ip: u32,
+    max_tunnels_per_connection: u32,
 ) -> Arc<SessionContext> {
     Arc::new(SessionContext {
         router: Arc::new(TunnelRouter::with_auth_policy(require_bind_auth)),
         edge_connections: dashmap::DashMap::new(),
+        connections_by_ip: dashmap::DashMap::new(),
         relay_stats,
         event_sender,
+        max_connections_per_ip,
+        max_tunnels_per_connection,
     })
 }
 

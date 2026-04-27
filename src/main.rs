@@ -9,6 +9,7 @@ mod server;
 mod session;
 mod stats;
 mod tunnel_router;
+mod util;
 
 use std::sync::Arc;
 
@@ -79,6 +80,8 @@ async fn main() -> Result<()> {
         relay_stats.clone(),
         event_sender.clone(),
         config.require_bind_auth,
+        config.max_connections_per_ip,
+        config.max_tunnels_per_connection,
     );
 
     // Start REST API

@@ -87,9 +87,35 @@ pub struct RelayConfig {
     #[serde(default)]
     pub require_bind_auth: bool,
 
+    /// Maximum simultaneous QUIC connections from a single source IP.
+    /// Defaults to 64 — well above any realistic legitimate workload
+    /// (a single edge typically holds ≤4 connections per relay) and
+    /// catches the connection-flood DoS pattern from a misbehaving
+    /// or compromised host. New connections from an IP at or above
+    /// this cap are dropped at handshake.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+
+    /// Maximum tunnel binds a single QUIC connection may establish.
+    /// Defaults to 100 — far above any realistic edge workload.
+    /// Excess `TunnelBind` messages on the same connection are
+    /// rejected with `TunnelDown { reason: "per-connection tunnel
+    /// limit exceeded" }` and surface as a `relay_dos_suspect`
+    /// event to the manager.
+    #[serde(default = "default_max_tunnels_per_connection")]
+    pub max_tunnels_per_connection: u32,
+
     /// Optional manager connection for centralized monitoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<ManagerConfig>,
+}
+
+fn default_max_connections_per_ip() -> u32 {
+    64
+}
+
+fn default_max_tunnels_per_connection() -> u32 {
+    100
 }
 
 fn default_quic_addr() -> String {
@@ -165,6 +191,8 @@ impl Default for RelayConfig {
             tls_key_path: None,
             api_token: None,
             require_bind_auth: false,
+            max_connections_per_ip: default_max_connections_per_ip(),
+            max_tunnels_per_connection: default_max_tunnels_per_connection(),
             manager: None,
         }
     }

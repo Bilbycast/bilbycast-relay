@@ -135,7 +135,7 @@ impl TunnelRouter {
         };
 
         // Constant-time comparison to prevent timing attacks
-        constant_time_eq(expected.as_bytes(), provided.as_bytes())
+        crate::util::constant_time_eq(expected.as_bytes(), provided.as_bytes())
     }
 
     /// Bind a tunnel endpoint. Returns (was_newly_activated, peer_connection_if_active).
@@ -294,18 +294,6 @@ pub enum BindResult {
     Active,
     /// Waiting for the peer to bind.
     Waiting,
-}
-
-/// Constant-time byte comparison to prevent timing attacks on token verification.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]
