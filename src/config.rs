@@ -108,6 +108,63 @@ pub struct RelayConfig {
     /// Optional manager connection for centralized monitoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<ManagerConfig>,
+
+    /// Optional structured-JSON log shipper for SIEM / NMS pickup
+    /// (Splunk, Skyline DataMiner, generic JSON-line ingesters). Mirrors
+    /// the same envelope shape the edge ships, so a single SIEM pipeline
+    /// can ingest events from edge + relay + manager unchanged. See
+    /// [`LoggingConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingConfig>,
+}
+
+/// Structured-JSON log shipper configuration. See the
+/// [`bilbycast-edge`] equivalent — the schema is identical so a single
+/// SIEM pickup config works across edge + relay + manager.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoggingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_target: Option<JsonLogTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JsonLogTarget {
+    Stdout {
+        #[serde(default)]
+        format: LogFormat,
+    },
+    File {
+        path: String,
+        #[serde(default)]
+        format: LogFormat,
+        #[serde(default = "default_max_size_mb")]
+        max_size_mb: u32,
+        #[serde(default = "default_max_backups")]
+        max_backups: u32,
+    },
+    Syslog {
+        addr: String,
+        #[serde(default)]
+        format: LogFormat,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Raw,
+    Splunk,
+    Dataminer,
+}
+
+fn default_max_size_mb() -> u32 {
+    64
+}
+
+fn default_max_backups() -> u32 {
+    5
 }
 
 fn default_max_connections_per_ip() -> u32 {
@@ -178,7 +235,57 @@ impl RelayConfig {
             }
         }
 
+        // Validate logging shipper if present
+        if let Some(ref logging) = self.logging {
+            validate_logging_config(logging)?;
+        }
+
         Ok(())
+    }
+}
+
+/// Validate the structured-JSON log shipper configuration. Mirrors the
+/// edge-side validator so a single SIEM pickup config works across the
+/// projects.
+pub fn validate_logging_config(logging: &LoggingConfig) -> anyhow::Result<()> {
+    let Some(ref target) = logging.json_target else {
+        return Ok(());
+    };
+    match target {
+        JsonLogTarget::Stdout { .. } => Ok(()),
+        JsonLogTarget::File {
+            path,
+            max_size_mb,
+            max_backups,
+            ..
+        } => {
+            if path.is_empty() {
+                anyhow::bail!("logging.json_target file: path cannot be empty");
+            }
+            if path.len() > 4096 {
+                anyhow::bail!("logging.json_target file: path too long (max 4096 chars)");
+            }
+            if path.contains('\0') {
+                anyhow::bail!("logging.json_target file: path must not contain NUL bytes");
+            }
+            if !(1..=4096).contains(max_size_mb) {
+                anyhow::bail!(
+                    "logging.json_target file: max_size_mb must be in 1..=4096 (got {})",
+                    max_size_mb
+                );
+            }
+            if *max_backups > 100 {
+                anyhow::bail!(
+                    "logging.json_target file: max_backups must be ≤ 100 (got {})",
+                    max_backups
+                );
+            }
+            Ok(())
+        }
+        JsonLogTarget::Syslog { addr, .. } => addr
+            .parse::<std::net::SocketAddr>()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("logging.json_target syslog addr '{}': {}", addr, e)),
     }
 }
 
@@ -194,6 +301,7 @@ impl Default for RelayConfig {
             max_connections_per_ip: default_max_connections_per_ip(),
             max_tunnels_per_connection: default_max_tunnels_per_connection(),
             manager: None,
+            logging: None,
         }
     }
 }

@@ -4,6 +4,7 @@
 mod api;
 mod config;
 mod manager;
+mod observability;
 mod protocol;
 mod server;
 mod session;
@@ -75,7 +76,32 @@ async fn main() -> Result<()> {
 
     // Create shared state
     let relay_stats = Arc::new(RelayStats::new());
-    let (event_sender, event_rx) = manager::event_channel();
+    let (mut event_sender, event_rx) = manager::event_channel();
+
+    // Optional structured-JSON log shipper. Mirrors the edge: installed
+    // before any clone, all clones inherit the value.
+    if let Some(ref logging_cfg) = config.logging {
+        let relay_id = config
+            .manager
+            .as_ref()
+            .and_then(|m| m.node_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        match observability::JsonLogShipper::from_config(
+            logging_cfg,
+            relay_id,
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            Ok(Some(shipper)) => {
+                tracing::info!("structured-JSON log shipper enabled");
+                event_sender.set_log_shipper(shipper);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("failed to start structured-JSON log shipper: {e:#}");
+            }
+        }
+    }
+
     let ctx = server::create_session_context(
         relay_stats.clone(),
         event_sender.clone(),

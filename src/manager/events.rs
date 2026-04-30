@@ -49,14 +49,30 @@ pub struct Event {
 ///
 /// Sending never blocks or fails — if the receiver is dropped (manager client
 /// not running), events are silently discarded.
+///
+/// When the structured-JSON `log_shipper` is configured, every event also
+/// fans out to it so SIEM / NMS pickup is independent of manager
+/// connectivity. The shipper is set once at startup before the first
+/// clone; clones inherit the same `Option<JsonLogShipper>` value (the
+/// shipper is cheaply clonable internally).
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: mpsc::UnboundedSender<Event>,
+    log_shipper: Option<crate::observability::JsonLogShipper>,
 }
 
 impl EventSender {
+    /// Install the structured-JSON log shipper. Must be called once at
+    /// startup *before* any clone of the original sender is handed out.
+    pub fn set_log_shipper(&mut self, shipper: crate::observability::JsonLogShipper) {
+        self.log_shipper = Some(shipper);
+    }
+
     /// Send an event to the manager.
     pub fn send(&self, event: Event) {
+        if let Some(ref shipper) = self.log_shipper {
+            shipper.ship_event(&event);
+        }
         let _ = self.tx.send(event);
     }
 
@@ -127,7 +143,13 @@ impl EventSender {
 /// Create an event sender/receiver pair.
 pub fn event_channel() -> (EventSender, mpsc::UnboundedReceiver<Event>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (EventSender { tx }, rx)
+    (
+        EventSender {
+            tx,
+            log_shipper: None,
+        },
+        rx,
+    )
 }
 
 /// Build a WebSocket event envelope from an `Event`.
