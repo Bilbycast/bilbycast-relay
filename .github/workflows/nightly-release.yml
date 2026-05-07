@@ -1,13 +1,35 @@
-name: Nightly Release
+name: Release
 
+# Three triggers, all converging on the same build + sign + publish job:
+#   - Nightly cron (default — catches version bumps that were committed
+#     but not released by hand)
+#   - `workflow_dispatch` (manual button in the GitHub Actions UI)
+#   - `push.tags: v*` (used by the monorepo-root `release-all.sh`
+#     orchestrator)
+#
+# The `check-version` job's `gh release view "${TAG}"` short-circuits
+# the nightly cron when the version hasn't bumped.
+#
+# Filename `nightly-release.yml` is preserved on disk because it is
+# hard-coded into the cosign `--certificate-identity-regexp` below —
+# renaming would invalidate every published manifest.sig.bundle.
 on:
   schedule:
-    # 3:00 AM AEST (UTC+10) = 17:00 UTC previous day
+    # 3:30 AM AEST (UTC+10) = 17:30 UTC previous day.
+    # Staggered between edge (17:00) and appear-x (18:00) crons.
     - cron: "30 17 * * *"
   workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
+  # Sigstore Fulcio OIDC token. Manager + relay don't have an
+  # auto-upgrade pipeline today, but signing the manifest is cheap
+  # parity with edge + appear-x and gives operators a verifiable
+  # supply-chain attestation on manual install.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -87,13 +109,37 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Prepare artifact
+      - name: Prepare bare-binary artefact (preserves existing install URL)
         run: |
           BINARY="target/${{ matrix.target }}/release/bilbycast-relay"
           ARTIFACT="bilbycast-relay-${{ matrix.artifact_suffix }}"
           cp "${BINARY}" "${ARTIFACT}"
           chmod +x "${ARTIFACT}"
           sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
+
+      # The signed `manifest.json` references *.tar.gz artefacts
+      # (build-manifest.sh's discovery pattern), so we ship both: the
+      # historical bare binary at `bilbycast-relay-<arch>-linux` (preserves
+      # the website's curl install URL) AND a tarball alongside that the
+      # manifest can sign over. Operators picking the tarball get the
+      # binary + LICENSE + README + sha256 sidecar in one bundle.
+      - name: Package release tarball (for manifest signing)
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          STAGE="bilbycast-relay-${VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "${STAGE}"
+          cp "target/${{ matrix.target }}/release/bilbycast-relay" "${STAGE}/bilbycast-relay"
+          chmod +x "${STAGE}/bilbycast-relay"
+          cp LICENSE              "${STAGE}/LICENSE"
+          cp LICENSE.commercial   "${STAGE}/LICENSE.commercial"
+          cp README.md            "${STAGE}/README.md"
+          if [ -f relay-config.example.json ]; then
+            cp relay-config.example.json "${STAGE}/relay-config.example.json"
+          fi
+          TARBALL="bilbycast-relay-${{ matrix.artifact_suffix }}.tar.gz"
+          tar czf "${TARBALL}" "${STAGE}"
+          sha256sum "${TARBALL}" > "${TARBALL}.sha256"
+          echo "Packaged ${TARBALL} ($(du -h ${TARBALL} | cut -f1))"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -102,6 +148,8 @@ jobs:
           path: |
             bilbycast-relay-${{ matrix.artifact_suffix }}
             bilbycast-relay-${{ matrix.artifact_suffix }}.sha256
+            bilbycast-relay-${{ matrix.artifact_suffix }}.tar.gz
+            bilbycast-relay-${{ matrix.artifact_suffix }}.tar.gz.sha256
           retention-days: 1
 
   release:
@@ -112,11 +160,64 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      # Shared canonical-manifest builder lives in the SDK repo.
+      - name: Checkout bilbycast-gateway-sdk (manifest script)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-gateway-sdk
+          path: bilbycast-gateway-sdk
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      # ── Build canonical manifest.json ──
+      # Discovers the *.tar.gz.sha256 sidecars and emits a single
+      # canonical JSON. Includes only the tarballs (the bare binaries
+      # are an additional convenience on the same release; the
+      # signed manifest tracks the tarball SHA-256s).
+      - name: Build manifest.json
+        env:
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          SEQUENCE="${{ github.run_number }}"
+          chmod +x bilbycast-gateway-sdk/scripts/build-manifest.sh
+          bilbycast-gateway-sdk/scripts/build-manifest.sh \
+              "${VERSION}" "stable" "${SEQUENCE}" "artifacts" \
+              "relay" "bilbycast-relay" \
+              > artifacts/manifest.json
+          echo "── manifest.json ──"
+          cat artifacts/manifest.json
+          echo
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.1"
+
+      - name: Sign manifest (Sigstore keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cd artifacts
+          cosign sign-blob --yes \
+              --bundle manifest.sig.bundle \
+              manifest.json
+          echo "── manifest.sig.bundle (head) ──"
+          head -c 512 manifest.sig.bundle
+          echo
+
+      - name: Verify cosign signature locally (paranoid check)
+        run: |
+          cd artifacts
+          cosign verify-blob \
+              --bundle manifest.sig.bundle \
+              --certificate-identity-regexp 'https://github\.com/Bilbycast/bilbycast-relay/\.github/workflows/nightly-release\.yml@refs/tags/v.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              manifest.json
 
       - name: Create tag and GitHub release
         env:
@@ -125,26 +226,63 @@ jobs:
           TAG="${{ needs.check-version.outputs.tag }}"
           VERSION="${{ needs.check-version.outputs.version }}"
 
-          git tag "${TAG}"
-          git push origin "${TAG}"
+          # Skip tag creation when the workflow was triggered by a tag
+          # push (the tag already exists in that case).
+          if ! git rev-parse "${TAG}" > /dev/null 2>&1; then
+              git tag "${TAG}"
+              git push origin "${TAG}"
+          fi
 
           gh release create "${TAG}" \
             --title "bilbycast-relay v${VERSION}" \
             --notes "Release of bilbycast-relay version ${VERSION}.
 
           ## Binaries (static musl — no runtime dependencies)
+
+          Two formats per architecture:
+
+          ### Bare binary (the canonical manual-install URL)
           - \`bilbycast-relay-x86_64-linux\` — Linux x86_64 (amd64)
           - \`bilbycast-relay-aarch64-linux\` — Linux ARM64 (aarch64)
 
-          Verify checksums:
+          \`\`\`
+          curl -fsSL -o bilbycast-relay \\\\
+              \"https://github.com/Bilbycast/bilbycast-relay/releases/latest/download/bilbycast-relay-\$(uname -m)-linux\"
+          chmod +x bilbycast-relay
+          ./bilbycast-relay
+          \`\`\`
+
+          ### Tarball (covered by the signed manifest)
+          - \`bilbycast-relay-x86_64-linux.tar.gz\` — binary + LICENSE + README + sha256
+          - \`bilbycast-relay-aarch64-linux.tar.gz\`
+
+          ## Verify checksums
           \`\`\`
           sha256sum -c bilbycast-relay-x86_64-linux.sha256
           sha256sum -c bilbycast-relay-aarch64-linux.sha256
-          \`\`\`" \
+          \`\`\`
+
+          ## Verify Sigstore signature (optional)
+
+          Every release ships \`manifest.json\` + \`manifest.sig.bundle\`. Operators who want stronger supply-chain guarantees than \`sha256sum\` alone can verify the signed manifest:
+          \`\`\`
+          cosign verify-blob \\\\
+              --bundle manifest.sig.bundle \\\\
+              --certificate-identity-regexp 'https://github.com/Bilbycast/bilbycast-relay/.github/workflows/nightly-release.yml@refs/tags/v.*' \\\\
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\\
+              manifest.json
+          \`\`\`
+          The manifest then carries the SHA-256 of each tarball — operators can cross-check against the bare-binary downloads as well." \
             artifacts/bilbycast-relay-x86_64-linux \
             artifacts/bilbycast-relay-x86_64-linux.sha256 \
+            artifacts/bilbycast-relay-x86_64-linux.tar.gz \
+            artifacts/bilbycast-relay-x86_64-linux.tar.gz.sha256 \
             artifacts/bilbycast-relay-aarch64-linux \
-            artifacts/bilbycast-relay-aarch64-linux.sha256
+            artifacts/bilbycast-relay-aarch64-linux.sha256 \
+            artifacts/bilbycast-relay-aarch64-linux.tar.gz \
+            artifacts/bilbycast-relay-aarch64-linux.tar.gz.sha256 \
+            artifacts/manifest.json \
+            artifacts/manifest.sig.bundle
 
       - name: Prune old releases (keep latest 3)
         env:
