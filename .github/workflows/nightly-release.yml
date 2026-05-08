@@ -1,23 +1,21 @@
 name: Release
 
-# Three triggers, all converging on the same build + sign + publish job:
-#   - Nightly cron (default — catches version bumps that were committed
-#     but not released by hand)
+# Two triggers, both converging on the same build + sign + publish job:
 #   - `workflow_dispatch` (manual button in the GitHub Actions UI)
 #   - `push.tags: v*` (used by the monorepo-root `release-all.sh`
-#     orchestrator)
+#     orchestrator — this is the canonical release path)
 #
-# The `check-version` job's `gh release view "${TAG}"` short-circuits
-# the nightly cron when the version hasn't bumped.
+# The schedule trigger was removed: cosign-keyless signing requires the
+# Fulcio cert subject to match `refs/tags/v*` (enforced by the
+# `--certificate-identity-regexp` below), and a `schedule` run from
+# `main` produces a `refs/heads/main` cert that fails verification.
+# `release-all.sh` pushes the tag and lets the `push.tags` trigger fire
+# the workflow under the correct ref.
 #
 # Filename `nightly-release.yml` is preserved on disk because it is
 # hard-coded into the cosign `--certificate-identity-regexp` below —
 # renaming would invalidate every published manifest.sig.bundle.
 on:
-  schedule:
-    # 3:30 AM AEST (UTC+10) = 17:30 UTC previous day.
-    # Staggered between edge (17:00) and appear-x (18:00) crons.
-    - cron: "30 17 * * *"
   workflow_dispatch:
   push:
     tags:
