@@ -260,6 +260,17 @@ jobs:
           sha256sum -c bilbycast-relay-aarch64-linux.sha256
           \`\`\`
 
+          ## Upgrading an existing install
+
+          Run the bundled upgrade script on the relay host. It downloads the latest signed \`manifest.json\` + \`manifest.sig.bundle\`, verifies the Sigstore signature against this workflow's identity, pulls the matching arch-specific tarball, verifies SHA-256, atomically swaps the binary with a \`.previous\` backup, restarts the systemd unit, polls \`/health\`, and **auto-rolls back** to the previous binary on a failed health probe.
+
+          \`\`\`
+          curl -fsSL https://github.com/Bilbycast/bilbycast-relay/releases/latest/download/upgrade-relay.sh \\\\
+              | sudo bash
+          \`\`\`
+
+          The relay is stateless — a restart drops connected edges, which all reconnect automatically. For zero-disruption upgrades, run multiple relay instances behind a load balancer and roll through them one at a time. Pass \`--help\` for every flag — including \`--target-version\`, \`--dry-run\`, \`--no-rollback\`, and \`--no-verify-cosign\` (for air-gapped boxes that can't install cosign).
+
           ## Verify Sigstore signature (optional)
 
           Every release ships \`manifest.json\` + \`manifest.sig.bundle\`. Operators who want stronger supply-chain guarantees than \`sha256sum\` alone can verify the signed manifest:
@@ -280,7 +291,8 @@ jobs:
             artifacts/bilbycast-relay-aarch64-linux.tar.gz \
             artifacts/bilbycast-relay-aarch64-linux.tar.gz.sha256 \
             artifacts/manifest.json \
-            artifacts/manifest.sig.bundle
+            artifacts/manifest.sig.bundle \
+            packaging/upgrade-relay.sh
 
       - name: Prune old releases (keep latest 3)
         env:

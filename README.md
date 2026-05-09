@@ -88,6 +88,18 @@ Options:
   -V, --version             Print version
 ```
 
+## Upgrading
+
+Run `packaging/upgrade-relay.sh` on the relay host. It downloads the latest signed `manifest.json` + `manifest.sig.bundle`, verifies the Sigstore signature against the publishing workflow's identity (auto-installing cosign with checksum verification if missing), pulls the matching arch-specific tarball (x86_64 / aarch64), verifies SHA-256, atomically swaps the binary with a `.previous` backup, restarts the systemd unit, polls `/health`, and **auto-rolls back** to the previous binary on health-check failure.
+
+```bash
+sudo ./packaging/upgrade-relay.sh                       # latest stable, default service name
+sudo ./packaging/upgrade-relay.sh --dry-run             # download + verify only; print plan
+sudo ./packaging/upgrade-relay.sh --target-version 0.10.2
+```
+
+The relay is stateless — a restart drops connected edges, which all reconnect automatically. For zero-disruption upgrades, run multiple relay instances behind a load balancer and roll them through one at a time. Pass `--help` for every flag.
+
 ## REST API
 
 | Endpoint | Auth | Description |
