@@ -15,24 +15,62 @@ use crate::session::{self, SessionContext};
 use crate::stats::RelayStats;
 use crate::tunnel_router::TunnelRouter;
 
-/// Build the QUIC server and start accepting connections.
+/// Build the QUIC server and start accepting connections. Binds one
+/// `quinn::Endpoint` per address in [`RelayConfig::effective_quic_addrs`]
+/// — defaults to dual-stack on a fresh install. v6 entries are bound
+/// with `IPV6_V6ONLY=1` so they coexist with v4 listeners on the same
+/// port. All endpoints share one `ServerConfig` and one `SessionContext`.
 pub async fn run_quic_server(
     config: &RelayConfig,
     ctx: Arc<SessionContext>,
 ) -> Result<()> {
     let server_config = build_server_config(config)?;
-    let endpoint = quinn::Endpoint::server(
-        server_config,
-        config.quic_addr.parse().context("invalid quic_addr")?,
-    )?;
+    let bind_entries = config.effective_quic_addrs();
+    if bind_entries.is_empty() {
+        anyhow::bail!("quic listener address list resolved to empty");
+    }
 
-    tracing::info!("QUIC server listening on {}", config.quic_addr);
+    let mut endpoint_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    for raw in &bind_entries {
+        let addr: std::net::SocketAddr = raw
+            .parse()
+            .with_context(|| format!("invalid QUIC bind address '{raw}'"))?;
+        let udp_socket = build_udp_socket(addr)
+            .with_context(|| format!("failed to bind QUIC socket on {addr}"))?;
+        let runtime = quinn::default_runtime()
+            .context("no compatible async runtime found for quinn")?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config.clone()),
+            udp_socket,
+            runtime,
+        )
+        .with_context(|| format!("failed to start QUIC endpoint on {addr}"))?;
 
+        tracing::info!("QUIC server listening on {addr}");
+
+        let ctx_clone = ctx.clone();
+        endpoint_set.spawn(async move {
+            run_quic_endpoint(endpoint, ctx_clone, addr).await;
+        });
+    }
+
+    // First endpoint to exit (e.g. a fatal accept error) brings the
+    // whole serve down; dropping the JoinSet aborts the others.
+    let _ = endpoint_set.join_next().await;
+    Ok(())
+}
+
+async fn run_quic_endpoint(
+    endpoint: quinn::Endpoint,
+    ctx: Arc<SessionContext>,
+    bind_addr: std::net::SocketAddr,
+) {
     loop {
         let incoming = match endpoint.accept().await {
             Some(inc) => inc,
             None => {
-                tracing::info!("QUIC endpoint closed");
+                tracing::info!("QUIC endpoint on {bind_addr} closed");
                 break;
             }
         };
@@ -44,19 +82,37 @@ pub async fn run_quic_server(
                     session::handle_edge_connection(ctx, connection).await;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to accept QUIC connection: {e}");
+                    tracing::warn!("Failed to accept QUIC connection on {bind_addr}: {e}");
                     ctx.event_sender.emit_with_details(
                         crate::manager::events::EventSeverity::Warning,
                         crate::manager::events::category::EDGE,
                         format!("QUIC connection accept failed: {e}"),
-                        serde_json::json!({ "error": e.to_string() }),
+                        serde_json::json!({ "error": e.to_string(), "bind_addr": bind_addr.to_string() }),
                     );
                 }
             }
         });
     }
+}
 
-    Ok(())
+/// Build a `std::net::UdpSocket` with the dual-stack contract applied:
+/// v6 sockets get `IPV6_V6ONLY=1` so they don't claim the v4 address
+/// space, both families get `SO_REUSEADDR`, and the socket is set to
+/// non-blocking for quinn.
+fn build_udp_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = match addr.ip() {
+        std::net::IpAddr::V4(_) => Domain::IPV4,
+        std::net::IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if matches!(addr.ip(), std::net::IpAddr::V6(_)) {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 /// Create the SessionContext shared state.

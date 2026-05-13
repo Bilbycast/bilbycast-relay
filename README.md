@@ -6,7 +6,35 @@ Stateless QUIC relay server that enables IP tunneling between bilbycast-edge nod
 
 ## Quick Start
 
-### Zero-config (simplest)
+### Install as a service (recommended for production)
+
+`packaging/install-relay.sh` creates the `bilbycast-relay` system user, drops the binary into `/opt/bilbycast/relay/`, writes `/etc/bilbycast/relay.json`, installs the systemd unit, and starts the service. Sigstore-verified Sigstore-keyless trust chain — same trust path the `upgrade-relay.sh` script uses.
+
+```bash
+# Standalone (no manager connection):
+curl -fsSL https://github.com/Bilbycast/bilbycast-relay/releases/latest/download/install-relay.sh \
+  | sudo bash
+
+# With manager connection:
+curl -fsSL https://github.com/Bilbycast/bilbycast-relay/releases/latest/download/install-relay.sh \
+  | sudo bash -s -- \
+      --manager wss://manager.example.com:8443/ws/node \
+      --registration-token <token-from-manager-ui> \
+      [--api-token <32-128-char-secret>] \
+      [--require-bind-auth]
+```
+
+Service controls after install:
+
+```bash
+sudo systemctl status bilbycast-relay
+sudo journalctl -u bilbycast-relay -f
+curl http://127.0.0.1:4480/health
+```
+
+Uninstall with `sudo packaging/uninstall-relay.sh` (preserves config + persisted node credentials) or `--purge` (wipes everything including the service user).
+
+### From source (development / standalone testing)
 
 ```bash
 cargo build --release
@@ -15,7 +43,7 @@ cargo build --release
 
 Starts with defaults: QUIC on `0.0.0.0:4433`, REST API on `0.0.0.0:4480`, self-signed TLS certificate. No config file needed.
 
-### With manager connection
+### With manager connection (manual config)
 
 1. In the manager UI, create a new node with device type **relay** and copy the registration token.
 
@@ -27,7 +55,7 @@ Starts with defaults: QUIC on `0.0.0.0:4433`, REST API on `0.0.0.0:4480`, self-s
      "api_addr": "0.0.0.0:4480",
      "manager": {
        "enabled": true,
-       "url": "wss://manager-host:8443/ws/node",
+       "urls": ["wss://manager-host:8443/ws/node"],
        "registration_token": "<token-from-manager>"
      }
    }
@@ -52,9 +80,10 @@ All fields are optional. Defaults are used for any omitted field.
   "tls_cert_path": "/path/to/cert.pem",
   "tls_key_path": "/path/to/key.pem",
   "api_token": "a-random-token-32-to-128-chars",
+  "require_bind_auth": false,
   "manager": {
     "enabled": true,
-    "url": "wss://manager-host:8443/ws/node",
+    "urls": ["wss://manager-host:8443/ws/node"],
     "accept_self_signed_cert": false,
     "cert_fingerprint": "ab:cd:ef:01:23:...",
     "registration_token": "<one-time-token>"
@@ -69,8 +98,9 @@ All fields are optional. Defaults are used for any omitted field.
 | `tls_cert_path` | (auto-generated) | Path to TLS certificate PEM. Self-signed cert generated if absent |
 | `tls_key_path` | (auto-generated) | Path to TLS private key PEM |
 | `api_token` | (none — API open) | Bearer token for REST API auth (32-128 chars). If set, all endpoints except `/health` require `Authorization: Bearer <token>` |
+| `require_bind_auth` | `false` | Reject `TunnelBind` from edges without a manager-registered HMAC token. Recommended `true` for production |
 | `manager.enabled` | `false` | Enable outbound WebSocket connection to bilbycast-manager |
-| `manager.url` | — | Manager WebSocket URL (must use `wss://`) |
+| `manager.urls` | — | Ordered list of manager WebSocket URLs (1-16, each `wss://`). Rotates on every WS close |
 | `manager.accept_self_signed_cert` | `false` | Accept self-signed TLS from manager (requires `BILBYCAST_ALLOW_INSECURE=1` env var) |
 | `manager.cert_fingerprint` | (none) | SHA-256 certificate pin for the manager (hex with colons) |
 | `manager.registration_token` | (none) | One-time registration token from manager |

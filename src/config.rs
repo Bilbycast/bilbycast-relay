@@ -50,13 +50,47 @@ pub struct ManagerConfig {
 /// It simply pairs edges by tunnel ID and forwards encrypted traffic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
-    /// QUIC listen address (e.g., "0.0.0.0:4433").
+    /// QUIC listen address (e.g., "0.0.0.0:4433"). Legacy single-address
+    /// field. Ignored on bind when [`quic_addrs`] is set; kept for
+    /// backward compat with pre-dual-stack configs.
     #[serde(default = "default_quic_addr")]
     pub quic_addr: String,
 
-    /// REST API listen address (e.g., "0.0.0.0:4480").
+    /// QUIC dual-stack listener addresses (e.g.
+    /// `["0.0.0.0:4433", "[::]:4433"]`). When set, the relay binds one
+    /// UDP socket per entry — v6 entries get `IPV6_V6ONLY=1` so they
+    /// coexist with v4 listeners on the same port. Unset = fall back to
+    /// `[quic_addr]`. Defaults are dual-stack on a fresh install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_addrs: Option<Vec<String>>,
+
+    /// Publicly-reachable QUIC address that remote edges should dial.
+    /// Distinct from the bind list above: a relay typically binds on
+    /// `0.0.0.0` / `[::]` (any-interface) but lives behind a NAT,
+    /// load-balancer, or cloud-instance public-IP mapping — the
+    /// listen address is not what edges connect to. When set, this
+    /// value is advertised in the relay's health payload and surfaces
+    /// in the manager's tunnel-creation dropdown.
+    ///
+    /// Format: `host:port` where host is an IPv4 / IPv6 literal or a
+    /// DNS name (e.g. `54.1.2.3:4433` or `relay.example.com:4433`).
+    /// Unspecified addresses (`0.0.0.0`, `[::]`) are rejected — those
+    /// are listen-only and meaningless to a remote dialer.
+    ///
+    /// When unset, the relay falls back to advertising `quic_addr`,
+    /// which is fine only when relay + edges share a host / LAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_quic_addr: Option<String>,
+
+    /// REST API listen address (e.g., "0.0.0.0:4480"). Legacy single-
+    /// address field. Ignored on bind when [`api_addrs`] is set.
     #[serde(default = "default_api_addr")]
     pub api_addr: String,
+
+    /// REST API dual-stack listener addresses. Same semantics as
+    /// [`quic_addrs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_addrs: Option<Vec<String>>,
 
     /// Optional path to TLS certificate (PEM). If absent, self-signed cert is generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,11 +220,29 @@ fn default_api_addr() -> String {
 impl RelayConfig {
     /// Validate the relay configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
-        // Validate socket addresses are parseable
+        // Validate socket addresses are parseable (legacy single-addr fields).
         self.quic_addr.parse::<std::net::SocketAddr>()
             .map_err(|e| anyhow::anyhow!("invalid quic_addr '{}': {}", self.quic_addr, e))?;
         self.api_addr.parse::<std::net::SocketAddr>()
             .map_err(|e| anyhow::anyhow!("invalid api_addr '{}': {}", self.api_addr, e))?;
+
+        // Validate dual-stack address lists when present. Each entry must
+        // parse as a SocketAddr; the list must be non-empty and entries
+        // must be unique.
+        if let Some(ref addrs) = self.quic_addrs {
+            validate_addr_list(addrs, "quic_addrs")?;
+        }
+        if let Some(ref addrs) = self.api_addrs {
+            validate_addr_list(addrs, "api_addrs")?;
+        }
+
+        // Validate the advertised public QUIC address if set. Must be
+        // a parseable `host:port` and must not be an unspecified /
+        // listen-only address — those would be useless to a remote
+        // dialer and almost certainly an operator mistake.
+        if let Some(ref addr) = self.public_quic_addr {
+            validate_public_addr(addr, "public_quic_addr")?;
+        }
 
         // Validate API token length if set
         if let Some(ref token) = self.api_token {
@@ -244,6 +296,95 @@ impl RelayConfig {
     }
 }
 
+/// Validate a dual-stack listener address list: non-empty, every entry
+/// parses as a `SocketAddr`, no duplicates. Empty/whitespace entries
+/// are silently skipped.
+fn validate_addr_list(entries: &[String], field: &str) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashSet<std::net::SocketAddr> =
+        std::collections::HashSet::new();
+    for raw in entries {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let addr: std::net::SocketAddr = trimmed.parse().map_err(|e| {
+            anyhow::anyhow!("{field}: invalid socket address '{trimmed}': {e}")
+        })?;
+        if !seen.insert(addr) {
+            anyhow::bail!("{field}: duplicate bind address '{trimmed}'");
+        }
+    }
+    if seen.is_empty() {
+        anyhow::bail!("{field}: bind address list must not be empty");
+    }
+    Ok(())
+}
+
+/// Validate the public-facing QUIC address advertised to remote edges.
+///
+/// Rules:
+/// - Non-empty, ≤ 256 chars.
+/// - Splits into `host:port` (rsplit on `:`, accounting for `[v6]:port`).
+/// - Port parses as u16 and is non-zero.
+/// - Host parses as IPv4 / IPv6 literal **or** is a syntactically valid
+///   DNS name (1–253 chars, label rules — letters, digits, hyphens
+///   inside labels). DNS resolution is not performed here; that happens
+///   on the edge at connect time.
+/// - IP literals must not be unspecified (`0.0.0.0`, `[::]`) — those are
+///   listen-only.
+fn validate_public_addr(raw: &str, field: &str) -> anyhow::Result<()> {
+    let s = raw.trim();
+    if s.is_empty() {
+        anyhow::bail!("{field}: must not be empty");
+    }
+    if s.len() > 256 {
+        anyhow::bail!("{field}: too long (max 256 chars)");
+    }
+
+    // Try the strict SocketAddr path first (covers IPv4 and bracketed IPv6).
+    if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        if sa.ip().is_unspecified() {
+            anyhow::bail!(
+                "{field}: '{s}' is an unspecified (listen-only) address; \
+                 set this to the address remote edges should dial"
+            );
+        }
+        if sa.port() == 0 {
+            anyhow::bail!("{field}: port must be non-zero");
+        }
+        return Ok(());
+    }
+
+    // Otherwise expect host:port where host is a DNS name.
+    let (host, port_str) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("{field}: '{s}' must be host:port"))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{field}: invalid port '{port_str}'"))?;
+    if port == 0 {
+        anyhow::bail!("{field}: port must be non-zero");
+    }
+    if host.is_empty() || host.len() > 253 {
+        anyhow::bail!("{field}: host '{host}' length must be 1..=253");
+    }
+    let label_ok = |label: &str| -> bool {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    if !host.split('.').all(label_ok) {
+        anyhow::bail!(
+            "{field}: host '{host}' is not a valid IPv4/IPv6 literal or DNS name"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the structured-JSON log shipper configuration. Mirrors the
 /// edge-side validator so a single SIEM pickup config works across the
 /// projects.
@@ -293,7 +434,18 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             quic_addr: default_quic_addr(),
+            // Dual-stack by default for new installs. Existing configs
+            // without this field keep `quic_addr`-only behaviour.
+            quic_addrs: Some(vec![
+                "0.0.0.0:4433".to_string(),
+                "[::]:4433".to_string(),
+            ]),
             api_addr: default_api_addr(),
+            api_addrs: Some(vec![
+                "0.0.0.0:4480".to_string(),
+                "[::]:4480".to_string(),
+            ]),
+            public_quic_addr: None,
             tls_cert_path: None,
             tls_key_path: None,
             api_token: None,
@@ -303,5 +455,67 @@ impl Default for RelayConfig {
             manager: None,
             logging: None,
         }
+    }
+}
+
+impl RelayConfig {
+    /// Resolve the effective list of QUIC bind addresses. Falls back to
+    /// `[quic_addr]` when [`quic_addrs`] is unset or empty.
+    pub fn effective_quic_addrs(&self) -> Vec<String> {
+        match &self.quic_addrs {
+            Some(addrs) if !addrs.is_empty() => addrs.clone(),
+            _ => vec![self.quic_addr.clone()],
+        }
+    }
+
+    /// Resolve the effective list of REST API bind addresses. Falls
+    /// back to `[api_addr]` when [`api_addrs`] is unset or empty.
+    pub fn effective_api_addrs(&self) -> Vec<String> {
+        match &self.api_addrs {
+            Some(addrs) if !addrs.is_empty() => addrs.clone(),
+            _ => vec![self.api_addr.clone()],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_addr_accepts_ipv4_and_ipv6_literals_and_dns_names() {
+        assert!(validate_public_addr("54.1.2.3:4433", "f").is_ok());
+        assert!(validate_public_addr("[2001:db8::1]:4433", "f").is_ok());
+        assert!(validate_public_addr("relay.example.com:4433", "f").is_ok());
+        assert!(validate_public_addr("relay1:4433", "f").is_ok());
+    }
+
+    #[test]
+    fn public_addr_rejects_unspecified_listen_only_values() {
+        let err = validate_public_addr("0.0.0.0:4433", "f").unwrap_err().to_string();
+        assert!(err.contains("unspecified"), "got {err}");
+        let err = validate_public_addr("[::]:4433", "f").unwrap_err().to_string();
+        assert!(err.contains("unspecified"), "got {err}");
+    }
+
+    #[test]
+    fn public_addr_rejects_malformed_input() {
+        assert!(validate_public_addr("", "f").is_err());
+        assert!(validate_public_addr("no-port", "f").is_err());
+        assert!(validate_public_addr("host:0", "f").is_err());
+        assert!(validate_public_addr("host:notaport", "f").is_err());
+        assert!(validate_public_addr("-bad.example.com:4433", "f").is_err());
+        assert!(validate_public_addr("bad-.example.com:4433", "f").is_err());
+    }
+
+    #[test]
+    fn relay_config_validate_picks_up_bad_public_addr() {
+        let mut c = RelayConfig::default();
+        c.public_quic_addr = Some("0.0.0.0:4433".to_string());
+        assert!(c.validate().is_err());
+        c.public_quic_addr = Some("54.1.2.3:4433".to_string());
+        assert!(c.validate().is_ok());
+        c.public_quic_addr = None;
+        assert!(c.validate().is_ok());
     }
 }

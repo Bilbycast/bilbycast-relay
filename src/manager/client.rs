@@ -535,7 +535,11 @@ fn build_health_message(
             "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
             "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
             "api_addr": relay_config.api_addr,
-            "quic_addr": relay_config.quic_addr
+            "quic_addr": relay_config.quic_addr,
+            // Advertised address remote edges should dial (distinct
+            // from the bind list). Omitted when unset — manager UI
+            // falls back to `quic_addr` for legacy single-host setups.
+            "public_quic_addr": relay_config.public_quic_addr
         }
     })
 }

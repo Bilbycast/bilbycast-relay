@@ -134,6 +134,11 @@ jobs:
           if [ -f relay-config.example.json ]; then
             cp relay-config.example.json "${STAGE}/relay-config.example.json"
           fi
+          # Stage the packaging files so install-relay.sh can prefer
+          # the tarball's unit over a separate curl from the release.
+          mkdir -p "${STAGE}/packaging"
+          cp packaging/bilbycast-relay.service  "${STAGE}/packaging/"
+          cp packaging/bilbycast-relay.sysusers "${STAGE}/packaging/"
           TARBALL="bilbycast-relay-${{ matrix.artifact_suffix }}.tar.gz"
           tar czf "${TARBALL}" "${STAGE}"
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"
@@ -292,7 +297,11 @@ jobs:
             artifacts/bilbycast-relay-aarch64-linux.tar.gz.sha256 \
             artifacts/manifest.json \
             artifacts/manifest.sig.bundle \
-            packaging/upgrade-relay.sh
+            packaging/install-relay.sh \
+            packaging/uninstall-relay.sh \
+            packaging/upgrade-relay.sh \
+            packaging/bilbycast-relay.service \
+            packaging/bilbycast-relay.sysusers
 
       - name: Prune old releases (keep latest 3)
         env:

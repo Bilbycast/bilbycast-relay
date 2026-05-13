@@ -1,0 +1,7 @@
+# systemd-sysusers config for the bilbycast-relay service account.
+# Drop into /etc/sysusers.d/ during install.
+#
+# Distinct from the edge's `bilbycast` user and the appear-x gateway's
+# `bilbycast-gateway` user so all three services can coexist on the
+# same host with separate filesystem permissions.
+u bilbycast-relay - "bilbycast-relay service account" /var/lib/bilbycast/relay /usr/sbin/nologin

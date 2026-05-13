@@ -1,0 +1,76 @@
+[Unit]
+Description=bilbycast-relay stateless QUIC relay
+Documentation=https://bilbycast.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bilbycast-relay
+Group=bilbycast-relay
+WorkingDirectory=/var/lib/bilbycast/relay
+
+# Single-binary install. `upgrade-relay.sh` discovers this path via
+# `systemctl cat`, stages `<path>.new`, atomically `mv -Tf`s it onto
+# the live binary, and keeps a `<path>.previous` for rollback.
+ExecStart=/opt/bilbycast/relay/bilbycast-relay --config /etc/bilbycast/relay.json
+
+Restart=always
+RestartSec=3
+# Crash-loop ceiling — pairs with the upgrade script's health probe so
+# a bad upgrade gets caught and rolled back instead of respawning forever.
+StartLimitInterval=300
+StartLimitBurst=10
+
+# SIGTERM lets in-flight QUIC sessions close cleanly. The relay is
+# stateless — edges reconnect on their own — so the drain window is
+# kept short.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# ── Hardening ──
+# The relay is a pure network forwarder: no GPU, no audio, no
+# real-time scheduling. The hardening profile is more aggressive
+# than the edge's because there's nothing on the box to whitelist
+# back in.
+ProtectSystem=strict
+# `/etc/bilbycast` is read-write so the relay can persist node_id +
+# node_secret to `relay.json` after first manager registration.
+# Everything else stays read-only.
+ReadWritePaths=/etc/bilbycast /var/lib/bilbycast/relay
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+NoNewPrivileges=true
+# Relay binds 4433/udp + 4480/tcp by default — both > 1024, no caps
+# needed. Operators wanting a < 1024 port should front the relay with
+# a load balancer rather than granting CAP_NET_BIND_SERVICE.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false  # ring / rustls JIT — leave default
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Many concurrent QUIC connections — keep the file-descriptor ceiling
+# high. Default 1024 trips well below the relay's design capacity.
+LimitNOFILE=65536
+
+# Operator-tunable runtime env (RUST_LOG etc). Created blank by
+# install-relay.sh.
+EnvironmentFile=-/etc/bilbycast/relay.env
+
+[Install]
+WantedBy=multi-user.target
