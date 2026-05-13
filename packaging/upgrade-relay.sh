@@ -172,13 +172,14 @@ ensure_cosign() {
         x86_64-linux)  cosign_arch="amd64";;
         aarch64-linux) cosign_arch="arm64";;
     esac
-    local url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${cosign_arch}"
-    local checksum_url="${url}.sha256"
+    local asset="cosign-linux-${cosign_arch}"
+    local url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${asset}"
+    local checksum_url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign_checksums.txt"
     curl -fsSL -o /tmp/cosign "${url}"
     local expected
-    expected="$(curl -fsSL "${checksum_url}" | awk '{ print $1 }')"
+    expected="$(curl -fsSL "${checksum_url}" | awk -v a="${asset}" '$2 == a {print $1}')"
     if [[ -z "${expected}" ]]; then
-        echo "Could not fetch cosign checksum from ${checksum_url}" >&2
+        echo "Could not fetch cosign checksum for ${asset} from ${checksum_url}" >&2
         exit 1
     fi
     local got
