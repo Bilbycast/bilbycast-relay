@@ -125,7 +125,7 @@ Run `packaging/upgrade-relay.sh` on the relay host. It downloads the latest sign
 ```bash
 sudo ./packaging/upgrade-relay.sh                       # latest stable, default service name
 sudo ./packaging/upgrade-relay.sh --dry-run             # download + verify only; print plan
-sudo ./packaging/upgrade-relay.sh --target-version 0.10.2
+sudo ./packaging/upgrade-relay.sh --target-version 0.8.0   # pin to a specific release tag
 ```
 
 The relay is stateless — a restart drops connected edges, which all reconnect automatically. For zero-disruption upgrades, run multiple relay instances behind a load balancer and roll them through one at a time. Pass `--help` for every flag.
