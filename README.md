@@ -76,11 +76,19 @@ All fields are optional. Defaults are used for any omitted field.
 ```json
 {
   "quic_addr": "0.0.0.0:4433",
+  "quic_addrs": ["0.0.0.0:4433", "[::]:4433"],
   "api_addr": "0.0.0.0:4480",
+  "api_addrs": ["0.0.0.0:4480", "[::]:4480"],
+  "public_quic_addr": "relay.example.com:4433",
   "tls_cert_path": "/path/to/cert.pem",
   "tls_key_path": "/path/to/key.pem",
   "api_token": "a-random-token-32-to-128-chars",
   "require_bind_auth": false,
+  "max_connections_per_ip": 64,
+  "max_tunnels_per_connection": 100,
+  "logging": {
+    "json_target": { "kind": "stdout", "format": "raw" }
+  },
   "manager": {
     "enabled": true,
     "urls": ["wss://manager-host:8443/ws/node"],
@@ -93,12 +101,18 @@ All fields are optional. Defaults are used for any omitted field.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `quic_addr` | `0.0.0.0:4433` | QUIC listen address for edge connections |
-| `api_addr` | `0.0.0.0:4480` | REST API listen address |
+| `quic_addr` | `0.0.0.0:4433` | QUIC listen address for edge connections (legacy single-address; ignored when `quic_addrs` is set) |
+| `quic_addrs` | `["0.0.0.0:4433", "[::]:4433"]` | Dual-stack QUIC listener addresses. v6 entries get `IPV6_V6ONLY=1` so they coexist with v4 on the same port |
+| `api_addr` | `0.0.0.0:4480` | REST API listen address (legacy single-address; ignored when `api_addrs` is set) |
+| `api_addrs` | `["0.0.0.0:4480", "[::]:4480"]` | Dual-stack REST API listener addresses (same semantics as `quic_addrs`) |
+| `public_quic_addr` | (none — falls back to `quic_addr`) | Publicly-reachable QUIC address remote edges dial (IP literal or DNS `host:port`). Advertised to the manager and surfaced in the tunnel-creation dropdown. Unspecified addresses (`0.0.0.0`/`[::]`) are rejected |
 | `tls_cert_path` | (auto-generated) | Path to TLS certificate PEM. Self-signed cert generated if absent |
 | `tls_key_path` | (auto-generated) | Path to TLS private key PEM |
 | `api_token` | (none — API open) | Bearer token for REST API auth (32-128 chars). If set, all endpoints except `/health` require `Authorization: Bearer <token>` |
 | `require_bind_auth` | `false` | Reject `TunnelBind` from edges without a manager-registered HMAC token. Recommended `true` for production |
+| `max_connections_per_ip` | `64` | DoS mitigation: max simultaneous QUIC connections per source IP. Excess connections are dropped at handshake |
+| `max_tunnels_per_connection` | `100` | DoS mitigation: max tunnel binds per connection. Excess `TunnelBind` messages are rejected |
+| `logging` | (none) | Optional structured-JSON log shipper for SIEM/NMS pickup. `json_target.kind`: `stdout` / `file` / `syslog`; `format`: `raw` / `splunk` / `dataminer`. Mirrors the edge's shape |
 | `manager.enabled` | `false` | Enable outbound WebSocket connection to bilbycast-manager |
 | `manager.urls` | — | Ordered list of manager WebSocket URLs (1-16, each `wss://`). Rotates on every WS close |
 | `manager.accept_self_signed_cert` | `false` | Accept self-signed TLS from manager (requires `BILBYCAST_ALLOW_INSECURE=1` env var) |
@@ -111,11 +125,17 @@ All fields are optional. Defaults are used for any omitted field.
 bilbycast-relay [OPTIONS]
 
 Options:
-  -c, --config <PATH>       Path to config file (JSON)
-      --quic-addr <ADDR>    Override QUIC listen address
-      --api-addr <ADDR>     Override API listen address
-  -h, --help                Print help
-  -V, --version             Print version
+  -c, --config <PATH>            Path to config file (JSON)
+      --quic-addr <ADDR>         Override QUIC listen address (legacy single-address)
+      --api-addr <ADDR>          Override API listen address (legacy single-address)
+      --quic-addrs <ADDRS>       Override QUIC dual-stack listeners (comma-separated,
+                                 e.g. 0.0.0.0:4433,[::]:4433). Takes precedence over --quic-addr
+      --api-addrs <ADDRS>        Override API dual-stack listeners (comma-separated).
+                                 Takes precedence over --api-addr
+      --public-quic-addr <ADDR>  Override the publicly-reachable QUIC address advertised
+                                 to remote edges (e.g. relay.example.com:4433)
+  -h, --help                     Print help
+  -V, --version                  Print version
 ```
 
 ## Upgrading

@@ -75,8 +75,8 @@ Multiple relays can run behind a load balancer. The only auth state is pre-autho
 |  |                               |  |     DashMap<String, Conn>  |       |
 |  |   bind() -> Active|Waiting    |  |                            |       |
 |  |   unbind() -> notify peer     |  |   No shared_secret.        |       |
-|  |   get_peer_connection()       |  |   No max_edges/tunnels.    |       |
-|  |   remove_edge() -> cleanup    |  |                            |       |
+|  |   get_peer_connection()       |  |   Per-IP conn cap (64),    |       |
+|  |   remove_edge() -> cleanup    |  |   per-conn tunnel cap (100)|       |
 |  +-------------------------------+  +----------------------------+       |
 |                  |                                                        |
 |                  v                                                        |
@@ -262,7 +262,7 @@ No Auth/AuthOk/AuthError exchange on the control stream. Tunnel bind authenticat
   | Layer 6: Resource Protection                                   |
   |   - Max 1024 concurrent bi-streams per connection              |
   |   - Max 256 uni-streams per connection                         |
-  |   - 15-second keep-alive detects and cleans dead connections   |
+  |   - 5-second keep-alive detects and cleans dead connections    |
   +---------------------------------------------------------------+
 ```
 

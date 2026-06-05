@@ -52,6 +52,7 @@ Events are queued in an unbounded in-memory channel. When the relay is not conne
 | info | Edge connected from {addr} | New QUIC connection accepted from an edge node | `{ remote_addr }` |
 | info | Edge disconnected from {addr} | Edge QUIC connection closed | `{ remote_addr }` |
 | warning | Edge connection failed: control stream error from {addr} | Failed to accept bidirectional control stream | `{ remote_addr }` |
+| warning | Connection rejected: per-IP cap exceeded ({n} active from {ip}) | New QUIC connection dropped at handshake — per-IP connection cap (`max_connections_per_ip`, default 64) reached. DoS mitigation | `{ error_code: "relay_dos_suspect", remote_addr, remote_ip, active_connections, cap }` |
 | warning | Protocol version mismatch (edge={v}, relay={v}) | Edge Hello message version differs from relay | `{ edge_version, relay_version }` |
 | warning | QUIC connection accept failed: {error} | QUIC/TLS handshake failure at the server level | `{ error }` |
 
@@ -67,6 +68,7 @@ Events are queued in an unbounded in-memory channel. When the relay is not conne
 | info | Tunnel waiting: {direction} side bound | Only one side has bound, waiting for peer | `{ direction }` |
 | info | Tunnel unbound by edge | Edge sent TunnelUnbind | |
 | warning | Tunnel bind rejected: invalid token | HMAC-SHA256 bind token verification failed | `{ remote_addr }` |
+| warning | Tunnel bind rejected: per-connection cap exceeded | `TunnelBind` rejected — per-connection tunnel-bind cap (`max_tunnels_per_connection`, default 100) reached on this connection. DoS mitigation; relay replies `TunnelDown { reason: "per-connection tunnel limit exceeded" }` | `{ error_code: "relay_dos_suspect", remote_addr, active_binds, cap }` |
 | warning | Tunnel down: edge disconnected | Edge QUIC connection lost, affecting bound tunnel | |
 
 The `flow_id` field contains the tunnel UUID for all tunnel events.
@@ -117,15 +119,15 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| `edge` | 5 | Edge QUIC connection lifecycle (now with structured details) |
-| `tunnel` | 5 | Tunnel state changes, authentication, and lifecycle (waiting, unbound) |
+| `edge` | 6 | Edge QUIC connection lifecycle (now with structured details), incl. per-IP DoS cap |
+| `tunnel` | 6 | Tunnel state changes, authentication, lifecycle (waiting, unbound), and per-connection DoS cap |
 | `manager` | 6 | Manager connection and credential management |
-| **Total** | **16** | |
+| **Total** | **18** | |
 
 ### By Severity
 
 | Severity | Count | Description |
 |----------|-------|-------------|
 | critical | 1 | Manager authentication failure |
-| warning | 7 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures |
+| warning | 9 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection) |
 | info | 8 | Connections, tunnel activation/waiting/unbound, secret rotation |
