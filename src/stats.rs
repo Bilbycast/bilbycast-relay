@@ -4,7 +4,7 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -71,6 +71,44 @@ pub struct RelayStats {
     pub connections_total: AtomicU64,
     /// Previous bandwidth sample for throughput calculation.
     prev_sample: Mutex<BandwidthSample>,
+    /// Manager-link state, surfaced on the relay's OWN local REST API
+    /// (/health, /api/v1/stats, /metrics). This is purely local
+    /// observability — it does NOT change the WS protocol or anything the
+    /// relay reports to the manager. Set by the manager-client loop in
+    /// `manager/client.rs`: `true` on successful auth, `false` on
+    /// disconnect/reconnect. Lock-free.
+    ///
+    /// When `manager` is not configured at all, `manager_configured` is
+    /// false and the surfaced object is omitted.
+    pub manager_configured: AtomicBool,
+    /// Whether the manager WS link is currently up (authenticated).
+    pub manager_connected: AtomicBool,
+    /// Epoch-millis of the last successful manager auth (0 if never).
+    pub manager_last_connect_ms: AtomicU64,
+    /// Epoch-millis of the last manager disconnect (0 if never disconnected
+    /// since the last connect). Used to compute `disconnected_secs`.
+    pub manager_last_disconnect_ms: AtomicU64,
+}
+
+/// Current wall-clock epoch in milliseconds (saturating to 0 before 1970).
+pub fn now_epoch_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Snapshot of the manager-link state for local surfaces.
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagerLinkStatus {
+    /// Whether the manager WS link is currently authenticated/up.
+    pub connected: bool,
+    /// Seconds since the link went down (0 while connected or never down).
+    pub disconnected_secs: u64,
+    /// True when the link is down but the relay is actively retrying
+    /// (the reconnect loop runs whenever a manager is configured).
+    pub reconnecting: bool,
 }
 
 impl RelayStats {
@@ -85,11 +123,61 @@ impl RelayStats {
                 total_bytes: 0,
                 timestamp: now,
             }),
+            manager_configured: AtomicBool::new(false),
+            manager_connected: AtomicBool::new(false),
+            manager_last_connect_ms: AtomicU64::new(0),
+            manager_last_disconnect_ms: AtomicU64::new(0),
         }
     }
 
     pub fn uptime_secs(&self) -> u64 {
         self.start_time.elapsed().as_secs()
+    }
+
+    /// Record a successful manager authentication.
+    pub fn mark_manager_connected(&self) {
+        self.manager_connected.store(true, Ordering::Relaxed);
+        self.manager_last_connect_ms
+            .store(now_epoch_ms(), Ordering::Relaxed);
+        self.manager_last_disconnect_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a manager-link disconnect. Idempotent — only stamps the
+    /// disconnect time on the first transition from connected → down so
+    /// `disconnected_secs` measures from the actual drop, not each retry.
+    pub fn mark_manager_disconnected(&self) {
+        let was_connected = self.manager_connected.swap(false, Ordering::Relaxed);
+        if was_connected || self.manager_last_disconnect_ms.load(Ordering::Relaxed) == 0 {
+            self.manager_last_disconnect_ms
+                .store(now_epoch_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot the manager-link state for local REST/metrics surfaces.
+    /// Returns `None` when no manager is configured (the link object is
+    /// then omitted from the response).
+    pub fn manager_link_status(&self) -> Option<ManagerLinkStatus> {
+        if !self.manager_configured.load(Ordering::Relaxed) {
+            return None;
+        }
+        let connected = self.manager_connected.load(Ordering::Relaxed);
+        let disconnected_secs = if connected {
+            0
+        } else {
+            let last = self.manager_last_disconnect_ms.load(Ordering::Relaxed);
+            if last == 0 {
+                0
+            } else {
+                now_epoch_ms().saturating_sub(last) / 1000
+            }
+        };
+        Some(ManagerLinkStatus {
+            connected,
+            disconnected_secs,
+            // A configured manager always has the reconnect loop running,
+            // so any not-connected state is an active retry.
+            reconnecting: !connected,
+        })
     }
 
     /// Update peak watermarks given current counts.
@@ -119,5 +207,57 @@ impl RelayStats {
         prev.timestamp = now;
 
         bps
+    }
+}
+
+#[cfg(test)]
+mod manager_link_tests {
+    use super::*;
+
+    #[test]
+    fn unconfigured_manager_omits_link_status() {
+        let stats = RelayStats::new();
+        assert!(stats.manager_link_status().is_none());
+    }
+
+    #[test]
+    fn connect_then_disconnect_transitions() {
+        let stats = RelayStats::new();
+        stats.manager_configured.store(true, Ordering::Relaxed);
+
+        // Initially configured but not yet connected → reconnecting.
+        let s = stats.manager_link_status().unwrap();
+        assert!(!s.connected);
+        assert!(s.reconnecting);
+        assert_eq!(s.disconnected_secs, 0); // never disconnected yet
+
+        // Authenticated.
+        stats.mark_manager_connected();
+        let s = stats.manager_link_status().unwrap();
+        assert!(s.connected);
+        assert!(!s.reconnecting);
+        assert_eq!(s.disconnected_secs, 0);
+
+        // Dropped.
+        stats.mark_manager_disconnected();
+        let s = stats.manager_link_status().unwrap();
+        assert!(!s.connected);
+        assert!(s.reconnecting);
+        // disconnected_secs computed from a just-stamped timestamp → 0.
+        assert_eq!(s.disconnected_secs, 0);
+        assert_ne!(stats.manager_last_disconnect_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn repeated_disconnect_does_not_reset_drop_time() {
+        let stats = RelayStats::new();
+        stats.manager_configured.store(true, Ordering::Relaxed);
+        stats.mark_manager_connected();
+        stats.mark_manager_disconnected();
+        let first = stats.manager_last_disconnect_ms.load(Ordering::Relaxed);
+        // A retry that fails again must NOT re-stamp the drop time.
+        stats.mark_manager_disconnected();
+        let second = stats.manager_last_disconnect_ms.load(Ordering::Relaxed);
+        assert_eq!(first, second);
     }
 }

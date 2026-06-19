@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::session::SessionContext;
-use crate::stats::RelayStats;
+use crate::stats::{ManagerLinkStatus, RelayStats};
 use crate::tunnel_router::TunnelInfo;
 
 pub struct ApiState {
@@ -85,6 +85,9 @@ struct HealthResponse {
     connected_edges: usize,
     total_tunnels: usize,
     active_tunnels: usize,
+    /// Manager-link state. Omitted when no manager is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manager: Option<ManagerLinkStatus>,
 }
 
 async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
@@ -96,6 +99,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
         connected_edges: state.ctx.edge_connections.len(),
         total_tunnels: total,
         active_tunnels: active,
+        manager: state.relay_stats.manager_link_status(),
     })
 }
 
@@ -117,6 +121,9 @@ struct RelayStatsResponse {
     peak_tunnels: u64,
     peak_edges: u64,
     connections_total: u64,
+    /// Manager-link state. Omitted when no manager is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manager: Option<ManagerLinkStatus>,
 }
 
 async fn relay_stats(State(state): State<Arc<ApiState>>) -> Json<RelayStatsResponse> {
@@ -149,6 +156,7 @@ async fn relay_stats(State(state): State<Arc<ApiState>>) -> Json<RelayStatsRespo
         peak_tunnels: state.relay_stats.peak_tunnels.load(Ordering::Relaxed),
         peak_edges: state.relay_stats.peak_edges.load(Ordering::Relaxed),
         connections_total: state.relay_stats.connections_total.load(Ordering::Relaxed),
+        manager: state.relay_stats.manager_link_status(),
     })
 }
 
@@ -282,6 +290,20 @@ async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> impl IntoResp
     let _ = writeln!(out, "# TYPE bilbycast_relay_peak_edges gauge");
     let _ = writeln!(out, "bilbycast_relay_peak_edges {}", state.relay_stats.peak_edges.load(Ordering::Relaxed));
     let _ = writeln!(out);
+
+    // Manager-link state (local observability only). Emitted when a
+    // manager is configured: 1 = WS link up, 0 = down/reconnecting.
+    if let Some(link) = state.relay_stats.manager_link_status() {
+        let _ = writeln!(out, "# HELP bilbycast_relay_manager_connected Whether the manager WebSocket link is currently up (1) or down (0).");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_manager_connected gauge");
+        let _ = writeln!(out, "bilbycast_relay_manager_connected {}", if link.connected { 1 } else { 0 });
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "# HELP bilbycast_relay_manager_disconnected_seconds Seconds since the manager link went down (0 while connected).");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_manager_disconnected_seconds gauge");
+        let _ = writeln!(out, "bilbycast_relay_manager_disconnected_seconds {}", link.disconnected_secs);
+        let _ = writeln!(out);
+    }
 
     // ── Per-tunnel metrics ──
 

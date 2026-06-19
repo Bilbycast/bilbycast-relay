@@ -87,7 +87,7 @@ If `manager` is configured in `RelayConfig`, the relay maintains a persistent ou
 3. Sends stats every 1 second: tunnels array, connected edges, total bandwidth/throughput (bps), peak watermarks, active TCP streams, uptime
 4. Sends health every 15 seconds: status, version, tunnel/edge counts, total bytes forwarded, peaks, connections total, `api_addr`, `quic_addr` (bind), and `public_quic_addr` (advertised dial address; manager UI prefers this when set, falls back to `quic_addr` only when it isn't listen-only)
 5. Handles commands: `get_config`, `disconnect_edge`, `close_tunnel`, `list_tunnels`, `list_edges`, `authorize_tunnel`, `revoke_tunnel`
-6. Reconnects with exponential backoff (1s -> 60s) on disconnection
+6. Reconnects with a **fixed 5 s backoff** (not exponential) on disconnection, rotating to the next configured URL on each failure. The backoff constant is `Duration::from_secs(5)` (`let fixed_backoff = Duration::from_secs(5);` in `manager/client.rs`); `cursor` advances by one (`cursor.wrapping_add(1)`) after every connection close/error so successive attempts cycle through `urls[]`. The backoff is *not* reset on success — there is simply no delay while connected; the 5 s sleep only runs between attempts.
 
 **Tunnel bind authentication commands**: `authorize_tunnel` pre-registers expected HMAC-SHA256 bind tokens (ingress + egress) for a tunnel UUID. `revoke_tunnel` removes authorization. When authorized, edges must include a valid `bind_token` in their `TunnelBind` message. Old per-edge commands (`authorize_edge`, `revoke_edge`, `list_authorized_edges`) were removed in favor of this per-tunnel approach.
 

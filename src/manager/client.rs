@@ -156,10 +156,19 @@ async fn manager_client_loop(
     mut event_rx: mpsc::UnboundedReceiver<Event>,
     event_sender: super::events::EventSender,
 ) {
-    // Multi-URL failover: rotate on close, fixed 5 s backoff that
-    // resets on successful auth. 1-16 URLs in config.urls.
+    // Multi-URL failover: rotate to the next manager URL on each close/error;
+    // constant 5 s backoff between attempts (no delay while connected; never
+    // accumulates). 1-16 URLs in config.urls.
     let fixed_backoff = Duration::from_secs(5);
     let mut cursor: usize = 0;
+
+    // Surface manager-link state on the relay's OWN local REST/metrics
+    // (purely local observability — no WS-protocol change). A configured
+    // manager means the reconnect loop is running, so the local surface
+    // reports `reconnecting` whenever the link is down.
+    relay_stats
+        .manager_configured
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     loop {
         if config.urls.is_empty() {
@@ -197,6 +206,10 @@ async fn manager_client_loop(
                 event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Manager connection lost, rotating to next URL: {}", e));
             }
         }
+
+        // The link is down again (try_connect only returns on close/error).
+        // Stamp the disconnect for the local manager-link surface.
+        relay_stats.mark_manager_disconnected();
 
         cursor = cursor.wrapping_add(1);
         tracing::info!(
@@ -320,6 +333,7 @@ async fn try_connect(
             match response["type"].as_str().unwrap_or("") {
                 "auth_ok" => {
                     tracing::info!("Authenticated with manager");
+                    relay_stats.mark_manager_connected();
                     event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Connected to manager");
                 }
                 "register_ack" => {
@@ -327,6 +341,7 @@ async fn try_connect(
                     let node_id = payload["node_id"].as_str().unwrap_or("").to_string();
                     let node_secret = payload["node_secret"].as_str().unwrap_or("").to_string();
                     tracing::info!("Registered with manager: node_id={node_id}");
+                    relay_stats.mark_manager_connected();
                     event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Connected to manager");
 
                     if !node_id.is_empty() && !node_secret.is_empty() {
