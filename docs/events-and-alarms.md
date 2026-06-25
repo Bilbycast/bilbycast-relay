@@ -82,8 +82,8 @@ The `flow_id` field contains the tunnel UUID for all tunnel events.
 | Severity | Message | Trigger |
 |----------|---------|---------|
 | info | Connected to manager | WebSocket auth succeeded (auth_ok or register_ack) |
-| warning | Manager connection lost, reconnecting | WebSocket closed normally |
-| warning | Manager connection lost, reconnecting: {error} | WebSocket errored |
+| warning | Manager connection lost, rotating to next URL | WebSocket closed normally |
+| warning | Manager connection lost, rotating to next URL: {error} | WebSocket errored |
 | critical | Manager authentication failed: {reason} | Auth rejected by manager |
 
 **Source**: `src/manager/client.rs`
