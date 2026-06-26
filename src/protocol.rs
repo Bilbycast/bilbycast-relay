@@ -99,12 +99,25 @@ pub enum RelayMessage {
 }
 
 /// Direction of this edge's role in the tunnel.
+///
+/// This is the *edge/relay-internal* perspective, which is the OPPOSITE of the
+/// bilbycast-manager UI's "ingress/egress" naming. At the manager level an
+/// "ingress node" is the media *source*; that source edge binds here as
+/// [`TunnelDirection::Egress`] (it captures local traffic and sends INTO the
+/// tunnel). See `bilbycast-manager .../api/tunnels.rs::build_edge_configs` and
+/// `bilbycast-edge/src/tunnel/udp_forwarder.rs` (`run_egress` = sender,
+/// `run_ingress` = receiver). The relay itself is direction-agnostic — it just
+/// forwards between the two bound endpoints — so these labels are purely the
+/// slot names used for pairing and reporting (`ingress_edge_id` is the
+/// receiver edge, `egress_edge_id` is the source edge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunnelDirection {
-    /// Ingress: local device → this edge → relay → egress edge.
+    /// Ingress (destination side): relay → this edge → local device. This edge
+    /// RECEIVES tunnel traffic and forwards it to a local consumer.
     #[serde(rename = "ingress")]
     Ingress,
-    /// Egress: relay → this edge → local device.
+    /// Egress (source side): local device → this edge → relay. This edge
+    /// captures local traffic on its listen port and SENDS it INTO the tunnel.
     #[serde(rename = "egress")]
     Egress,
 }
