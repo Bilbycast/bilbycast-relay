@@ -9,13 +9,14 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::session::SessionContext;
 use crate::stats::{ManagerLinkStatus, RelayStats};
@@ -68,6 +69,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
     let authenticated = Router::new()
         .route("/metrics", get(prometheus_metrics))
         .route("/api/v1/tunnels", get(list_tunnels))
+        .route("/api/v1/tunnels/{id}", delete(delete_tunnel))
         .route("/api/v1/edges", get(list_edges))
         .route("/api/v1/stats", get(relay_stats))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -171,6 +173,86 @@ async fn list_tunnels(State(state): State<Arc<ApiState>>) -> Json<TunnelsRespons
     Json(TunnelsResponse {
         tunnels: state.ctx.router.list_tunnels(),
     })
+}
+
+// ── DELETE /api/v1/tunnels/{id} ──
+
+/// `DELETE /api/v1/tunnels/{id}` — administrative escape hatch to tear down a
+/// tunnel directly on the relay, for when the manager (the normal cleanup path
+/// over the WS control channel) is unavailable.
+///
+/// **Fail-closed:** this destructive route only works when `api_token` is
+/// configured. With no token the relay's read-only API is open-by-default
+/// (`auth_middleware` lets everything through), and an open DELETE would let
+/// anyone reachable on the API port tear down tunnels — so it returns `403`
+/// when no token is set. When a token *is* set the middleware has already
+/// verified the Bearer token before this handler runs.
+///
+/// Semantics match a user-initiated delete: **revoke** the bind authorization
+/// (so a reconnecting edge can't immediately re-bind) **and** force-remove the
+/// live tunnel entry (so it stops showing in `waiting_ingress` / forwarding).
+/// Reuses the same `revoke_tunnel` + `force_remove_tunnel` primitives as the WS
+/// `close_tunnel`/`revoke_tunnel` commands so behaviour is identical.
+async fn delete_tunnel(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Refuse destructive mutation on an unauthenticated API.
+    if state.api_token.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "tunnel deletion requires api_token to be configured"
+            })),
+        )
+            .into_response();
+    }
+
+    // Tunnel IDs must be valid UUIDs (per the relay's tunnel-isolation rule).
+    let tunnel_id: Uuid = match id.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid tunnel id (must be a UUID): {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Block re-bind first, then drop the live entry.
+    state.ctx.router.revoke_tunnel(&tunnel_id);
+    match state.ctx.router.force_remove_tunnel(&tunnel_id) {
+        Some(affected) => {
+            let peers_notified = affected.len();
+            for connection_id in affected {
+                crate::session::notify_tunnel_down(
+                    &state.ctx,
+                    &connection_id,
+                    tunnel_id,
+                    "tunnel deleted via relay REST API",
+                )
+                .await;
+            }
+            tracing::info!("REST: deleted tunnel '{tunnel_id}' ({peers_notified} peer(s) notified)");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "deleted": true,
+                    "tunnel_id": tunnel_id.to_string(),
+                    "peers_notified": peers_notified,
+                })),
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("tunnel '{tunnel_id}' not found") })),
+        )
+            .into_response(),
+    }
 }
 
 // ── /api/v1/edges ──

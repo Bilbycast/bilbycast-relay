@@ -39,10 +39,10 @@ Multiple relays can run behind a load balancer. The only auth state is pre-autho
 |  |  TLS 1.3 (rustls)               |   |  GET /health                |  |
 |  |  ALPN: bilbycast-relay           |   |  GET /metrics (Prometheus)  |  |
 |  |  Self-signed or user-provided    |   |  GET /api/v1/tunnels        |  |
-|  |                                  |   |  GET /api/v1/edges          |  |
-|  |                                  |   |  GET /api/v1/stats          |  |
-|  |  For each connection:            |   |  All public, read-only.     |  |
-|  |    tokio::spawn(session)         |   |  No admin routes.           |  |
+|  |                                  |   |  DELETE .../tunnels/{id}    |  |
+|  |                                  |   |  GET /api/v1/edges, /stats  |  |
+|  |  For each connection:            |   |  GETs open; DELETE needs   |  |
+|  |    tokio::spawn(session)         |   |  api_token (tunnels/{id}).  |  |
 |  +----------------------------------+   +-----------------------------+  |
 |                  |                                                        |
 |                  v                                                        |

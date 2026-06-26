@@ -744,23 +744,25 @@ async fn execute_command(
                 .map_err(|e| format!("Invalid UUID: {e}"))?;
             tracing::info!("Manager command: close_tunnel '{tunnel_id}'");
 
-            // Find the tunnel and unbind both sides
-            let tunnel_info = ctx
-                .router
-                .list_tunnels()
-                .into_iter()
-                .find(|t| t.tunnel_id == tunnel_id);
-
-            if let Some(info) = tunnel_info {
-                if let Some(ref ingress_id) = info.ingress_edge_id {
-                    ctx.router.unbind(&tunnel_id, ingress_id);
+            // Authoritatively drop the tunnel by id. force_remove_tunnel works
+            // even for identified edges (edge_id != connection_id), where the
+            // old unbind-by-edge_id path silently no-opped and left the entry
+            // lingering in `waiting_ingress`. Notify any still-bound peer so it
+            // learns the tunnel is gone (matches connection-loss cleanup).
+            match ctx.router.force_remove_tunnel(&tunnel_id) {
+                Some(affected) => {
+                    for connection_id in affected {
+                        crate::session::notify_tunnel_down(
+                            ctx,
+                            &connection_id,
+                            tunnel_id,
+                            "tunnel closed by manager",
+                        )
+                        .await;
+                    }
+                    Ok(None)
                 }
-                if let Some(ref egress_id) = info.egress_edge_id {
-                    ctx.router.unbind(&tunnel_id, egress_id);
-                }
-                Ok(None)
-            } else {
-                Err(format!("Tunnel '{tunnel_id}' not found"))
+                None => Err(format!("Tunnel '{tunnel_id}' not found")),
             }
         }
         "list_tunnels" => {

@@ -564,7 +564,11 @@ async fn notify_tunnel_ready(ctx: &Arc<SessionContext>, edge_id: &str, tunnel_id
 }
 
 /// Send a TunnelDown notification to an edge.
-async fn notify_tunnel_down(
+///
+/// `edge_id` here is the `edge_connections` key, i.e. the endpoint's
+/// `connection_id` (the value returned by `TunnelRouter::force_remove_tunnel`
+/// and `remove_edge`). Best-effort: a missing/closed connection is ignored.
+pub(crate) async fn notify_tunnel_down(
     ctx: &Arc<SessionContext>,
     edge_id: &str,
     tunnel_id: Uuid,

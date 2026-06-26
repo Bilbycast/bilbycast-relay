@@ -208,6 +208,35 @@ impl TunnelRouter {
         peer_connection_id
     }
 
+    /// Forcibly and authoritatively remove a tunnel by its tunnel id.
+    ///
+    /// Unlike [`Self::unbind`], which removes a *single* endpoint matched by
+    /// `connection_id`, this drops the entire tunnel entry in one shot
+    /// regardless of how many sides are currently bound. Returns `None` if no
+    /// such tunnel exists, or `Some(connection_ids)` listing every endpoint
+    /// that was still bound when it was removed — so the caller can notify those
+    /// peers with `TunnelDown` (matching connection-loss cleanup semantics).
+    ///
+    /// This is the teardown primitive shared by the manager WS `close_tunnel`
+    /// command and the REST `DELETE /api/v1/tunnels/{id}` escape hatch. It
+    /// exists because the previous `close_tunnel` path called [`Self::unbind`]
+    /// with the *edge_id* (the manager node_id for an identified edge), which
+    /// never matches the `connection_id` that `unbind` compares against — so
+    /// teardown silently no-opped for any edge that had sent an `Identify`
+    /// message.
+    pub fn force_remove_tunnel(&self, tunnel_id: &Uuid) -> Option<Vec<String>> {
+        self.tunnels.remove(tunnel_id).map(|(_, state)| {
+            let mut affected = Vec::new();
+            if let Some(ingress) = state.ingress {
+                affected.push(ingress.connection_id);
+            }
+            if let Some(egress) = state.egress {
+                affected.push(egress.connection_id);
+            }
+            affected
+        })
+    }
+
     /// Remove all tunnel endpoints for a given edge (edge disconnected).
     /// Uses `connection_id` for matching. Returns list of (tunnel_id, peer_connection_id).
     pub fn remove_edge(&self, connection_id: &str) -> Vec<(Uuid, Option<String>)> {
