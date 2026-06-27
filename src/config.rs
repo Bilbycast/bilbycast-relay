@@ -166,12 +166,6 @@ pub struct RelayConfig {
     #[serde(default = "default_max_tunnels_per_connection")]
     pub max_tunnels_per_connection: u32,
 
-    /// Static relay-hosted bond bridges (bonding-via-relay) started at boot.
-    /// Usually the manager pushes these at runtime via `create_bond_bridge`;
-    /// this is for standalone / pinned deployments + testing. Default empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub bond_bridges: Vec<crate::bond_bridge::BondBridgeConfig>,
-
     /// Optional manager connection for centralized monitoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<ManagerConfig>,
@@ -505,7 +499,6 @@ impl Default for RelayConfig {
             require_bind_auth: false,
             max_connections_per_ip: default_max_connections_per_ip(),
             max_tunnels_per_connection: default_max_tunnels_per_connection(),
-            bond_bridges: Vec::new(),
             manager: None,
             logging: None,
         }

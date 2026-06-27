@@ -536,12 +536,11 @@ fn build_health_message(
     let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
 
     // Capability bits the manager UI gates on. "udp-relay" => native SRT/RIST
-    // (no-QUIC) tunnels; "bond-bridge" => bonding-via-relay.
+    // (no-QUIC) tunnels.
     let mut capabilities: Vec<&str> = Vec::new();
     if relay_config.udp_relay_enabled {
         capabilities.push("udp-relay");
     }
-    capabilities.push("bond-bridge");
 
     serde_json::json!({
         "type": "health",
@@ -568,9 +567,6 @@ fn build_health_message(
             "public_udp_addr": relay_config.public_udp_addr,
             "udp_sessions_total": ctx.udp_sessions.count(),
             "udp_sessions_active": ctx.udp_sessions.active_count(),
-            // Relay-hosted bond bridges (bonding-via-relay).
-            "bond_bridges_total": ctx.bond_bridges.count(),
-            "bond_bridges": ctx.bond_bridges.list(),
             "capabilities": capabilities
         }
     })
@@ -822,32 +818,6 @@ async fn execute_command(
             } else {
                 Err(format!("Native-UDP session '{tunnel_id}' not found"))
             }
-        }
-        "create_bond_bridge" => {
-            // Relay-hosted bonding-via-relay bridge. Body: { "bridge": {...} }.
-            let bridge_val = action.get("bridge").ok_or("Missing bridge")?;
-            let cfg: crate::bond_bridge::BondBridgeConfig =
-                serde_json::from_value(bridge_val.clone())
-                    .map_err(|e| format!("Invalid bond bridge config: {e}"))?;
-            tracing::info!("Manager command: create_bond_bridge '{}'", cfg.id);
-            ctx.bond_bridges
-                .start(cfg)
-                .await
-                .map_err(|e| format!("bond bridge start failed: {e}"))?;
-            Ok(None)
-        }
-        "delete_bond_bridge" => {
-            let id = action["id"].as_str().ok_or("Missing id")?;
-            tracing::info!("Manager command: delete_bond_bridge '{id}'");
-            if ctx.bond_bridges.stop(id) {
-                Ok(None)
-            } else {
-                Err(format!("bond bridge '{id}' not found"))
-            }
-        }
-        "list_bond_bridges" => {
-            tracing::info!("Manager command: list_bond_bridges");
-            Ok(Some(serde_json::to_value(ctx.bond_bridges.list()).unwrap_or_default()))
         }
         "authorize_tunnel" => {
             let tunnel_id_str = action["tunnel_id"]

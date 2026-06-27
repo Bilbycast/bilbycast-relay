@@ -72,8 +72,6 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/tunnels/{id}", delete(delete_tunnel))
         .route("/api/v1/udp-sessions", get(list_udp_sessions))
         .route("/api/v1/udp-sessions/{id}", delete(delete_udp_session))
-        .route("/api/v1/bond-bridges", get(list_bond_bridges))
-        .route("/api/v1/bond-bridges/{id}", delete(delete_bond_bridge))
         .route("/api/v1/edges", get(list_edges))
         .route("/api/v1/stats", get(relay_stats))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -315,46 +313,6 @@ async fn delete_udp_session(
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("session '{tunnel_id}' not found") })),
-        )
-            .into_response()
-    }
-}
-
-// ── /api/v1/bond-bridges (bonding-via-relay) ──
-
-#[derive(Serialize)]
-struct BondBridgesResponse {
-    bridges: Vec<crate::bond_bridge::BondBridgeInfo>,
-}
-
-async fn list_bond_bridges(State(state): State<Arc<ApiState>>) -> Json<BondBridgesResponse> {
-    Json(BondBridgesResponse {
-        bridges: state.ctx.bond_bridges.list(),
-    })
-}
-
-/// `DELETE /api/v1/bond-bridges/{id}` — tear down a relay-hosted bond bridge.
-/// Fail-closed (requires `api_token`), mirroring `delete_tunnel`.
-async fn delete_bond_bridge(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    if state.api_token.is_none() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "bond bridge deletion requires api_token to be configured"
-            })),
-        )
-            .into_response();
-    }
-    if state.ctx.bond_bridges.stop(&id) {
-        tracing::info!("REST: deleted bond bridge '{id}'");
-        (StatusCode::OK, Json(serde_json::json!({ "deleted": true, "id": id }))).into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("bond bridge '{id}' not found") })),
         )
             .into_response()
     }

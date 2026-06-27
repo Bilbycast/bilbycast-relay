@@ -31,9 +31,6 @@ pub struct SessionContext {
     /// `router` bind-token registry for auth; carries its own source-address
     /// rendezvous pairing. Populated by [`crate::udp_relay::run_udp_relay`].
     pub udp_sessions: Arc<crate::udp_relay::UdpSessionRouter>,
-    /// Relay-hosted bond bridges (bonding-via-relay). Created at boot from
-    /// config + at runtime via the manager `create_bond_bridge` command.
-    pub bond_bridges: Arc<crate::bond_bridge::BondBridgeRegistry>,
     /// Map of connection_id -> Connection for sending notifications.
     pub edge_connections: DashMap<String, Connection>,
     /// Per-IP connection counter — bounds the total active QUIC

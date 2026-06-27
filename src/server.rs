@@ -137,7 +137,6 @@ pub fn create_session_context(
         udp_sessions: Arc::new(crate::udp_relay::UdpSessionRouter::new(
             max_connections_per_ip,
         )),
-        bond_bridges: Arc::new(crate::bond_bridge::BondBridgeRegistry::new()),
         edge_connections: dashmap::DashMap::new(),
         connections_by_ip: dashmap::DashMap::new(),
         relay_stats,

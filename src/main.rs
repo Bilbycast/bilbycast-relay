@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 mod api;
-mod bond_bridge;
 mod config;
 mod manager;
 mod observability;
@@ -278,14 +277,6 @@ async fn main() -> Result<()> {
             }
         }
     });
-
-    // Start any static bond bridges from config (bonding-via-relay). Runtime
-    // bridges arrive via the manager `create_bond_bridge` command.
-    for bridge in &config.bond_bridges {
-        if let Err(e) = ctx.bond_bridges.start(bridge.clone()).await {
-            tracing::error!("failed to start configured bond bridge '{}': {e:#}", bridge.id);
-        }
-    }
 
     // Start the plain-UDP relay data plane (native SRT/RIST, no QUIC) unless
     // disabled. Bind failures inside are non-fatal (logged); if it can't bind
