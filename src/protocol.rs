@@ -19,7 +19,10 @@ use uuid::Uuid;
 // ── Protocol version ──
 
 /// Current tunnel protocol version. Bump when adding new message types or changing semantics.
-pub const TUNNEL_PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 (2026-06): adds the plain-UDP relay data plane (native SRT/RIST over relay
+/// without QUIC) — see [`UdpRelayControl`] and [`encode_udp_control`].
+pub const TUNNEL_PROTOCOL_VERSION: u32 = 2;
 
 // ── ALPN protocol identifiers ──
 
@@ -287,4 +290,63 @@ pub fn decode_udp_datagram(data: &[u8]) -> Option<(Uuid, &[u8])> {
     }
     let id = Uuid::from_bytes(data[..16].try_into().ok()?);
     Some((id, &data[16..]))
+}
+
+// ── Plain-UDP relay data plane (native SRT/RIST over relay, no QUIC) ──
+//
+// The native path reuses the exact `[16-byte tunnel_id][AEAD payload]` data framing
+// above. It rides plain UDP datagrams to the relay's UDP listener instead of QUIC
+// datagrams; the relay forwards the datagram verbatim to the paired peer (the edge
+// forwarders add/strip the prefix + AEAD — the relay stays opaque).
+//
+// A small control plane is multiplexed onto the SAME UDP socket using the **all-zero
+// (nil) UUID** as a reserved sentinel prefix: a datagram whose 16-byte prefix is nil
+// carries a JSON [`UdpRelayControl`] message rather than media. Real tunnel IDs are
+// random v4 UUIDs (validation rejects nil), so there is no collision.
+//
+// This must match `bilbycast-edge/src/tunnel/protocol.rs`.
+
+/// Control messages for the plain-UDP relay data plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum UdpRelayControl {
+    /// edge → relay: register/keepalive this endpoint's `(tunnel_id, direction)` and
+    /// prove authorization. Re-sent periodically so the relay learns and maintains this
+    /// edge's post-NAT source address (rendezvous) and the edge can detect a dead relay
+    /// (no [`UdpRelayControl::Ack`] → failover).
+    #[serde(rename = "register")]
+    Register {
+        tunnel_id: Uuid,
+        direction: TunnelDirection,
+        /// HMAC-SHA256 bind token (verified against the manager-pushed expected token).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind_token: Option<String>,
+        #[serde(default)]
+        protocol_version: u32,
+    },
+
+    /// relay → edge: acknowledge a [`UdpRelayControl::Register`] and report whether both
+    /// sides of the tunnel are now registered (media may flow).
+    #[serde(rename = "ack")]
+    Ack { tunnel_id: Uuid, ready: bool },
+}
+
+/// Encode a [`UdpRelayControl`] message as a control datagram: nil-UUID prefix + JSON.
+pub fn encode_udp_control(msg: &UdpRelayControl) -> anyhow::Result<Vec<u8>> {
+    let json = serde_json::to_vec(msg)?;
+    let mut buf = Vec::with_capacity(UDP_DATAGRAM_PREFIX_LEN + json.len());
+    buf.extend_from_slice(Uuid::nil().as_bytes());
+    buf.extend_from_slice(&json);
+    Ok(buf)
+}
+
+/// If `data` is a control datagram (nil-UUID prefix), decode the [`UdpRelayControl`].
+///
+/// Returns `None` for media datagrams (real tunnel UUID prefix) or malformed input.
+pub fn try_decode_udp_control(data: &[u8]) -> Option<UdpRelayControl> {
+    let (id, payload) = decode_udp_datagram(data)?;
+    if !id.is_nil() {
+        return None;
+    }
+    serde_json::from_slice::<UdpRelayControl>(payload).ok()
 }

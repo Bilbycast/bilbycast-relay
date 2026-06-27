@@ -77,6 +77,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -191,6 +200,7 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "axum",
+ "bonding-transport",
  "bytes",
  "chrono",
  "clap",
@@ -245,6 +255,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "bonding-protocol"
+version = "0.3.1"
+dependencies = [
+ "bytes",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bonding-transport"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "bonding-protocol",
+ "bytes",
+ "libc",
+ "log",
+ "quinn",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1744,6 +1784,19 @@ dependencies = [
  "tokio-rustls",
  "tungstenite",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

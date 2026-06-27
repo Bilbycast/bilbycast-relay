@@ -46,6 +46,13 @@ uuid = { version = "1.23.1", features = ["v4", "serde"] }
 anyhow = "1.0.102"
 bytes = "1.11.1"
 
+# Relay-hosted bond bridge (bonding-via-relay). UDP + QUIC aggregation legs
+# (the field edge's 5G / Starlink uplinks can bond over either carrier into the
+# relay). RIST is excluded by design (unidirectional at the bond layer). quinn /
+# rustls are already pulled in for the relay's own QUIC server, so path-quic adds
+# no new C deps — binary-purity-clean.
+bonding-transport = { path = "../bilbycast-bonding/bonding-transport", default-features = false, features = ["path-udp", "path-quic"] }
+
 # Certificate pinning (SHA-256 fingerprint)
 sha2 = "0.11.0"
 webpki-roots = "1.0.7"

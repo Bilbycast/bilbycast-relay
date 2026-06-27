@@ -27,6 +27,13 @@ static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Shared state accessible to all sessions.
 pub struct SessionContext {
     pub router: Arc<TunnelRouter>,
+    /// Native plain-UDP relay sessions (no QUIC). Shares the QUIC path's
+    /// `router` bind-token registry for auth; carries its own source-address
+    /// rendezvous pairing. Populated by [`crate::udp_relay::run_udp_relay`].
+    pub udp_sessions: Arc<crate::udp_relay::UdpSessionRouter>,
+    /// Relay-hosted bond bridges (bonding-via-relay). Created at boot from
+    /// config + at runtime via the manager `create_bond_bridge` command.
+    pub bond_bridges: Arc<crate::bond_bridge::BondBridgeRegistry>,
     /// Map of connection_id -> Connection for sending notifications.
     pub edge_connections: DashMap<String, Connection>,
     /// Per-IP connection counter — bounds the total active QUIC

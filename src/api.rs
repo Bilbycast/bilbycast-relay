@@ -70,6 +70,10 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/metrics", get(prometheus_metrics))
         .route("/api/v1/tunnels", get(list_tunnels))
         .route("/api/v1/tunnels/{id}", delete(delete_tunnel))
+        .route("/api/v1/udp-sessions", get(list_udp_sessions))
+        .route("/api/v1/udp-sessions/{id}", delete(delete_udp_session))
+        .route("/api/v1/bond-bridges", get(list_bond_bridges))
+        .route("/api/v1/bond-bridges/{id}", delete(delete_bond_bridge))
         .route("/api/v1/edges", get(list_edges))
         .route("/api/v1/stats", get(relay_stats))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -87,6 +91,9 @@ struct HealthResponse {
     connected_edges: usize,
     total_tunnels: usize,
     active_tunnels: usize,
+    /// Native plain-UDP relay sessions (SRT/RIST without QUIC).
+    udp_sessions_total: usize,
+    udp_sessions_active: usize,
     /// Manager-link state. Omitted when no manager is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     manager: Option<ManagerLinkStatus>,
@@ -101,6 +108,8 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
         connected_edges: state.ctx.edge_connections.len(),
         total_tunnels: total,
         active_tunnels: active,
+        udp_sessions_total: state.ctx.udp_sessions.count(),
+        udp_sessions_active: state.ctx.udp_sessions.active_count(),
         manager: state.relay_stats.manager_link_status(),
     })
 }
@@ -255,6 +264,102 @@ async fn delete_tunnel(
     }
 }
 
+// ── /api/v1/udp-sessions (native SRT/RIST over relay, no QUIC) ──
+
+#[derive(Serialize)]
+struct UdpSessionsResponse {
+    sessions: Vec<crate::udp_relay::UdpSessionInfo>,
+}
+
+async fn list_udp_sessions(State(state): State<Arc<ApiState>>) -> Json<UdpSessionsResponse> {
+    Json(UdpSessionsResponse {
+        sessions: state.ctx.udp_sessions.list(),
+    })
+}
+
+/// `DELETE /api/v1/udp-sessions/{id}` — administrative teardown of a native-UDP
+/// relay session. Fail-closed (requires `api_token`), mirroring `delete_tunnel`.
+async fn delete_udp_session(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.api_token.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "session deletion requires api_token to be configured"
+            })),
+        )
+            .into_response();
+    }
+    let tunnel_id: Uuid = match id.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid session id (must be a UUID): {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    if state.ctx.udp_sessions.remove(&tunnel_id) {
+        tracing::info!("REST: deleted native-UDP session '{tunnel_id}'");
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": true, "tunnel_id": tunnel_id.to_string() })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("session '{tunnel_id}' not found") })),
+        )
+            .into_response()
+    }
+}
+
+// ── /api/v1/bond-bridges (bonding-via-relay) ──
+
+#[derive(Serialize)]
+struct BondBridgesResponse {
+    bridges: Vec<crate::bond_bridge::BondBridgeInfo>,
+}
+
+async fn list_bond_bridges(State(state): State<Arc<ApiState>>) -> Json<BondBridgesResponse> {
+    Json(BondBridgesResponse {
+        bridges: state.ctx.bond_bridges.list(),
+    })
+}
+
+/// `DELETE /api/v1/bond-bridges/{id}` — tear down a relay-hosted bond bridge.
+/// Fail-closed (requires `api_token`), mirroring `delete_tunnel`.
+async fn delete_bond_bridge(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.api_token.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "bond bridge deletion requires api_token to be configured"
+            })),
+        )
+            .into_response();
+    }
+    if state.ctx.bond_bridges.stop(&id) {
+        tracing::info!("REST: deleted bond bridge '{id}'");
+        (StatusCode::OK, Json(serde_json::json!({ "deleted": true, "id": id }))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("bond bridge '{id}' not found") })),
+        )
+            .into_response()
+    }
+}
+
 // ── /api/v1/edges ──
 
 #[derive(Serialize)]
@@ -371,6 +476,28 @@ async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> impl IntoResp
     let _ = writeln!(out, "# HELP bilbycast_relay_peak_edges Peak number of simultaneous connected edges.");
     let _ = writeln!(out, "# TYPE bilbycast_relay_peak_edges gauge");
     let _ = writeln!(out, "bilbycast_relay_peak_edges {}", state.relay_stats.peak_edges.load(Ordering::Relaxed));
+    let _ = writeln!(out);
+
+    // ── Native plain-UDP relay (SRT/RIST without QUIC) ──
+    let udp_sessions = state.ctx.udp_sessions.list();
+    let udp_active = udp_sessions.iter().filter(|s| s.status == "active").count();
+    let udp_bytes: u64 = udp_sessions.iter().map(|s| s.bytes_ingress + s.bytes_egress).sum();
+    let udp_datagrams: u64 = udp_sessions.iter().map(|s| s.datagrams).sum();
+    let _ = writeln!(out, "# HELP bilbycast_relay_udp_sessions_total Native plain-UDP relay sessions (active + waiting).");
+    let _ = writeln!(out, "# TYPE bilbycast_relay_udp_sessions_total gauge");
+    let _ = writeln!(out, "bilbycast_relay_udp_sessions_total {}", udp_sessions.len());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "# HELP bilbycast_relay_udp_sessions_active Native plain-UDP relay sessions with both sides latched.");
+    let _ = writeln!(out, "# TYPE bilbycast_relay_udp_sessions_active gauge");
+    let _ = writeln!(out, "bilbycast_relay_udp_sessions_active {udp_active}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "# HELP bilbycast_relay_udp_bytes_forwarded_total Total bytes forwarded over the native plain-UDP relay.");
+    let _ = writeln!(out, "# TYPE bilbycast_relay_udp_bytes_forwarded_total counter");
+    let _ = writeln!(out, "bilbycast_relay_udp_bytes_forwarded_total {udp_bytes}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "# HELP bilbycast_relay_udp_datagrams_forwarded_total Total datagrams forwarded over the native plain-UDP relay.");
+    let _ = writeln!(out, "# TYPE bilbycast_relay_udp_datagrams_forwarded_total counter");
+    let _ = writeln!(out, "bilbycast_relay_udp_datagrams_forwarded_total {udp_datagrams}");
     let _ = writeln!(out);
 
     // Manager-link state (local observability only). Emitted when a

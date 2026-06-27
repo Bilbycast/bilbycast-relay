@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 mod api;
+mod bond_bridge;
 mod config;
 mod manager;
 mod observability;
@@ -10,6 +11,7 @@ mod server;
 mod session;
 mod stats;
 mod tunnel_router;
+mod udp_relay;
 mod util;
 
 use std::sync::Arc;
@@ -57,6 +59,21 @@ struct Cli {
     /// are rejected.
     #[arg(long)]
     public_quic_addr: Option<String>,
+
+    /// Override the plain-UDP relay (native SRT/RIST, no QUIC) listener
+    /// addresses (comma-separated, e.g. `0.0.0.0:4434,[::]:4434`).
+    #[arg(long)]
+    udp_relay_addrs: Option<String>,
+
+    /// Override the publicly-reachable plain-UDP relay address advertised to
+    /// remote edges for the native SRT/RIST path (e.g. `54.1.2.3:4434`).
+    #[arg(long)]
+    public_udp_addr: Option<String>,
+
+    /// Disable the plain-UDP relay data plane (native SRT/RIST over relay).
+    /// The relay then carries QUIC tunnels only.
+    #[arg(long)]
+    no_udp_relay: bool,
 }
 
 #[tokio::main]
@@ -110,6 +127,20 @@ async fn main() -> Result<()> {
     }
     if let Some(addr) = cli.public_quic_addr {
         config.public_quic_addr = Some(addr);
+    }
+    if let Some(raw) = cli.udp_relay_addrs {
+        let entries: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        config.udp_relay_addrs = Some(entries);
+    }
+    if let Some(addr) = cli.public_udp_addr {
+        config.public_udp_addr = Some(addr);
+    }
+    if cli.no_udp_relay {
+        config.udp_relay_enabled = false;
     }
 
     config.validate()?;
@@ -248,10 +279,43 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start any static bond bridges from config (bonding-via-relay). Runtime
+    // bridges arrive via the manager `create_bond_bridge` command.
+    for bridge in &config.bond_bridges {
+        if let Err(e) = ctx.bond_bridges.start(bridge.clone()).await {
+            tracing::error!("failed to start configured bond bridge '{}': {e:#}", bridge.id);
+        }
+    }
+
+    // Start the plain-UDP relay data plane (native SRT/RIST, no QUIC) unless
+    // disabled. Bind failures inside are non-fatal (logged); if it can't bind
+    // any listener the task exits and the relay continues QUIC-only.
+    let udp_relay_handle = if config.udp_relay_enabled {
+        let config = config.clone();
+        let ctx = ctx.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = udp_relay::run_udp_relay(&config, ctx).await {
+                tracing::warn!("native-UDP relay not started: {e:#}");
+            }
+        }))
+    } else {
+        tracing::info!("native-UDP relay disabled by config");
+        None
+    };
+
     // Wait for any to finish
     tokio::select! {
         _ = api_handle => tracing::info!("API server stopped"),
         _ = quic_handle => tracing::info!("QUIC server stopped"),
+        _ = async {
+            if let Some(h) = udp_relay_handle {
+                let _ = h.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::info!("native-UDP relay stopped");
+        }
         _ = async {
             if let Some(h) = manager_handle {
                 let _ = h.await;

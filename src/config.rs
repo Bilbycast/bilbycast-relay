@@ -82,6 +82,33 @@ pub struct RelayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_quic_addr: Option<String>,
 
+    /// Enable the plain-UDP relay data plane (native SRT/RIST over relay,
+    /// no QUIC). On by default — it only binds a UDP port and pairs edges
+    /// by session UUID, exactly like the QUIC path but without QUIC's
+    /// per-packet overhead or its congestion control fighting SRT/RIST ARQ.
+    /// Set `false` to opt out (e.g. on a relay that should only carry QUIC
+    /// tunnels). Bind failures are non-fatal: the relay logs and continues
+    /// without the native plane (and stops advertising the `udp-relay`
+    /// capability), so an upgrade never bricks a relay over a busy port.
+    #[serde(default = "default_true")]
+    pub udp_relay_enabled: bool,
+
+    /// Plain-UDP relay dual-stack listener addresses (e.g.
+    /// `["0.0.0.0:4434", "[::]:4434"]`). Same semantics as [`quic_addrs`]
+    /// (one socket per entry, v6 entries get `IPV6_V6ONLY=1`). Unset =
+    /// the dual-stack `:4434` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_relay_addrs: Option<Vec<String>>,
+
+    /// Publicly-reachable plain-UDP relay address remote edges dial for the
+    /// native SRT/RIST path. Same role + rules as [`public_quic_addr`] but
+    /// for the UDP plane; advertised in health and surfaced in the manager's
+    /// native-relay tunnel-creation dropdown. Unspecified addresses are
+    /// rejected (listen-only). When unset, the manager falls back to
+    /// `public_quic_addr`'s host with the UDP port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_udp_addr: Option<String>,
+
     /// REST API listen address (e.g., "0.0.0.0:4480"). Legacy single-
     /// address field. Ignored on bind when [`api_addrs`] is set.
     #[serde(default = "default_api_addr")]
@@ -138,6 +165,12 @@ pub struct RelayConfig {
     /// event to the manager.
     #[serde(default = "default_max_tunnels_per_connection")]
     pub max_tunnels_per_connection: u32,
+
+    /// Static relay-hosted bond bridges (bonding-via-relay) started at boot.
+    /// Usually the manager pushes these at runtime via `create_bond_bridge`;
+    /// this is for standalone / pinned deployments + testing. Default empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bond_bridges: Vec<crate::bond_bridge::BondBridgeConfig>,
 
     /// Optional manager connection for centralized monitoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +234,14 @@ fn default_max_backups() -> u32 {
     5
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_udp_relay_addrs() -> Vec<String> {
+    vec!["0.0.0.0:4434".to_string(), "[::]:4434".to_string()]
+}
+
 fn default_max_connections_per_ip() -> u32 {
     64
 }
@@ -242,6 +283,15 @@ impl RelayConfig {
         // dialer and almost certainly an operator mistake.
         if let Some(ref addr) = self.public_quic_addr {
             validate_public_addr(addr, "public_quic_addr")?;
+        }
+
+        // Validate the plain-UDP relay listener addresses + advertised
+        // public UDP address (same rules as the QUIC equivalents).
+        if let Some(ref addrs) = self.udp_relay_addrs {
+            validate_addr_list(addrs, "udp_relay_addrs")?;
+        }
+        if let Some(ref addr) = self.public_udp_addr {
+            validate_public_addr(addr, "public_udp_addr")?;
         }
 
         // Validate API token length if set
@@ -446,12 +496,16 @@ impl Default for RelayConfig {
                 "[::]:4480".to_string(),
             ]),
             public_quic_addr: None,
+            udp_relay_enabled: true,
+            udp_relay_addrs: Some(default_udp_relay_addrs()),
+            public_udp_addr: None,
             tls_cert_path: None,
             tls_key_path: None,
             api_token: None,
             require_bind_auth: false,
             max_connections_per_ip: default_max_connections_per_ip(),
             max_tunnels_per_connection: default_max_tunnels_per_connection(),
+            bond_bridges: Vec::new(),
             manager: None,
             logging: None,
         }
@@ -474,6 +528,16 @@ impl RelayConfig {
         match &self.api_addrs {
             Some(addrs) if !addrs.is_empty() => addrs.clone(),
             _ => vec![self.api_addr.clone()],
+        }
+    }
+
+    /// Resolve the effective plain-UDP relay bind addresses. Falls back to
+    /// the dual-stack `:4434` default when [`udp_relay_addrs`] is unset or
+    /// empty. Only meaningful when [`udp_relay_enabled`] is true.
+    pub fn effective_udp_relay_addrs(&self) -> Vec<String> {
+        match &self.udp_relay_addrs {
+            Some(addrs) if !addrs.is_empty() => addrs.clone(),
+            _ => default_udp_relay_addrs(),
         }
     }
 }
