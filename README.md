@@ -2,7 +2,13 @@
 
 > 🌐 Learn more at **[bilbycast.com](https://bilbycast.com)** — the official website for the Bilbycast broadcast media transport suite.
 
-Stateless QUIC relay server that enables IP tunneling between bilbycast-edge nodes behind NAT. The relay pairs ingress and egress edges by tunnel ID and forwards encrypted traffic between them — it cannot read tunnel payloads (end-to-end ChaCha20-Poly1305 encryption between edges).
+Stateless relay server that provides NAT traversal for bilbycast-edge nodes. It is a generic, **opaque per-path forwarder**: it pairs the two ends of each path by tunnel ID and forwards encrypted traffic between them, with no ability to read the payload (end-to-end ChaCha20-Poly1305 encryption lives on the edges — the relay sees only `[16-byte tunnel_id][AEAD ciphertext]`). It carries every path type the same way:
+
+- **QUIC tunnels** — TCP streams + UDP datagrams over QUIC/TLS 1.3 (`:4433`).
+- **Native SRT/RIST over relay** — plain UDP, no QUIC (`:4434`), so SRT/RIST run their own ARQ + congestion control without QUIC's per-packet overhead or a second congestion controller fighting theirs.
+- **Individual bond legs** — a relayed bond leg is just a native plain-UDP tunnel as far as the relay is concerned. The relay forwards each leg's packets opaquely; bond aggregation, cross-leg ARQ, FEC, and reordering all run end-to-end edge↔edge. **The relay never terminates or combines a bond** — there is no "bond bridge".
+
+Each path can go direct or over any relay, in any combination (and a path may use a primary + backup relay), and both ends can be behind NAT — both edges dial out.
 
 ## Quick Start
 
@@ -41,7 +47,7 @@ cargo build --release
 ./target/release/bilbycast-relay
 ```
 
-Starts with defaults: QUIC on `0.0.0.0:4433`, REST API on `0.0.0.0:4480`, self-signed TLS certificate. No config file needed.
+Starts with defaults: QUIC on `0.0.0.0:4433`, native SRT/RIST plain-UDP on `0.0.0.0:4434`, REST API on `0.0.0.0:4480`, self-signed TLS certificate. No config file needed.
 
 ### With manager connection (manual config)
 
@@ -80,6 +86,9 @@ All fields are optional. Defaults are used for any omitted field.
   "api_addr": "0.0.0.0:4480",
   "api_addrs": ["0.0.0.0:4480", "[::]:4480"],
   "public_quic_addr": "relay.example.com:4433",
+  "udp_relay_enabled": true,
+  "udp_relay_addrs": ["0.0.0.0:4434", "[::]:4434"],
+  "public_udp_addr": "relay.example.com:4434",
   "tls_cert_path": "/path/to/cert.pem",
   "tls_key_path": "/path/to/key.pem",
   "api_token": "a-random-token-32-to-128-chars",
@@ -106,6 +115,9 @@ All fields are optional. Defaults are used for any omitted field.
 | `api_addr` | `0.0.0.0:4480` | REST API listen address (legacy single-address; ignored when `api_addrs` is set) |
 | `api_addrs` | `["0.0.0.0:4480", "[::]:4480"]` | Dual-stack REST API listener addresses (same semantics as `quic_addrs`) |
 | `public_quic_addr` | (none — falls back to `quic_addr`) | Publicly-reachable QUIC address remote edges dial (IP literal or DNS `host:port`). Advertised to the manager and surfaced in the tunnel-creation dropdown. Unspecified addresses (`0.0.0.0`/`[::]`) are rejected |
+| `udp_relay_enabled` | `true` | Enable the native SRT/RIST plain-UDP data plane (no QUIC). Set `false` for a QUIC-only relay. Bind failures are non-fatal: the relay logs, drops the `udp-relay` capability, and continues |
+| `udp_relay_addrs` | `["0.0.0.0:4434", "[::]:4434"]` | Dual-stack listener addresses for the native SRT/RIST path (same semantics as `quic_addrs`) |
+| `public_udp_addr` | (none — manager falls back to `public_quic_addr`'s host + the UDP port) | Publicly-reachable address remote edges dial for the native SRT/RIST path. Advertised to the manager. Unspecified addresses are rejected |
 | `tls_cert_path` | (auto-generated) | Path to TLS certificate PEM. Self-signed cert generated if absent |
 | `tls_key_path` | (auto-generated) | Path to TLS private key PEM |
 | `api_token` | (none — API open) | Bearer token for REST API auth (32-128 chars). If set, all endpoints except `/health` require `Authorization: Bearer <token>` |
@@ -134,6 +146,11 @@ Options:
                                  Takes precedence over --api-addr
       --public-quic-addr <ADDR>  Override the publicly-reachable QUIC address advertised
                                  to remote edges (e.g. relay.example.com:4433)
+      --udp-relay-addrs <ADDRS>  Override native SRT/RIST plain-UDP listeners
+                                 (comma-separated, e.g. 0.0.0.0:4434,[::]:4434)
+      --public-udp-addr <ADDR>   Override the publicly-reachable native SRT/RIST address
+                                 advertised to remote edges (e.g. relay.example.com:4434)
+      --no-udp-relay             Disable the native SRT/RIST data plane (QUIC tunnels only)
   -h, --help                     Print help
   -V, --version                  Print version
 ```
@@ -154,13 +171,16 @@ The relay is stateless — a restart drops connected edges, which all reconnect 
 
 | Endpoint | Auth | Description |
 |----------|------|-------------|
-| `GET /health` | Public | Health check (always unauthenticated) |
+| `GET /health` | Public | Health check (always unauthenticated). Includes `udp_sessions_total` / `udp_sessions_active` for the native SRT/RIST plane |
 | `GET /metrics` | Token | Prometheus metrics |
-| `GET /api/v1/tunnels` | Token | List active tunnels |
+| `GET /api/v1/tunnels` | Token | List active QUIC tunnels |
+| `DELETE /api/v1/tunnels/{id}` | Token (required) | Administrative teardown of a QUIC tunnel when the manager is unavailable. **Fail-closed**: returns `403` unless `api_token` is set |
+| `GET /api/v1/udp-sessions` | Token | List native SRT/RIST plain-UDP relay sessions |
+| `DELETE /api/v1/udp-sessions/{id}` | Token (required) | Administrative teardown of a native-UDP session. **Fail-closed** (same as the tunnel DELETE) |
 | `GET /api/v1/edges` | Token | List connected edges |
 | `GET /api/v1/stats` | Token | Bandwidth, throughput, peaks, uptime |
 
-"Token" auth means `Authorization: Bearer <api_token>` is required when `api_token` is configured. If no `api_token` is set, all endpoints are open.
+"Token" auth means `Authorization: Bearer <api_token>` is required when `api_token` is configured. If no `api_token` is set, the read-only GETs are open, but the destructive `DELETE` routes refuse to run (return `403`) — a destructive route must never be reachable unauthenticated.
 
 ## Security
 

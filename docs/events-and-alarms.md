@@ -70,10 +70,12 @@ Events are queued in an unbounded in-memory channel. When the relay is not conne
 | warning | Tunnel bind rejected: invalid token | HMAC-SHA256 bind token verification failed | `{ remote_addr }` |
 | warning | Tunnel bind rejected: per-connection cap exceeded | `TunnelBind` rejected — per-connection tunnel-bind cap (`max_tunnels_per_connection`, default 100) reached on this connection. DoS mitigation; relay replies `TunnelDown { reason: "per-connection tunnel limit exceeded" }` | `{ error_code: "relay_dos_suspect", remote_addr, active_binds, cap }` |
 | warning | Tunnel down: edge disconnected | Edge QUIC connection lost, affecting bound tunnel | |
+| warning | Native-UDP register rejected: invalid token | `Register` on the native plain-UDP plane (`:4434`) failed bind-token verification | `{ remote_addr, transport: "udp" }` |
+| warning | Native-UDP register rejected: per-IP session cap exceeded | `Register` on the native plain-UDP plane dropped — per-IP session cap reached. DoS mitigation | `{ error_code: "relay_dos_suspect", remote_addr, remote_ip, transport: "udp" }` |
 
 The `flow_id` field contains the tunnel UUID for all tunnel events.
 
-**Source**: `src/session.rs`
+**Source**: `src/session.rs`, `src/udp_relay.rs`
 
 ---
 
@@ -120,14 +122,14 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | Category | Count | Description |
 |----------|-------|-------------|
 | `edge` | 6 | Edge QUIC connection lifecycle (now with structured details), incl. per-IP DoS cap |
-| `tunnel` | 6 | Tunnel state changes, authentication, lifecycle (waiting, unbound), and per-connection DoS cap |
+| `tunnel` | 8 | Tunnel state changes, authentication, lifecycle (waiting, unbound), per-connection DoS cap, and native plain-UDP register rejections (invalid token + per-IP session cap) |
 | `manager` | 6 | Manager connection and credential management |
-| **Total** | **18** | |
+| **Total** | **20** | |
 
 ### By Severity
 
 | Severity | Count | Description |
 |----------|-------|-------------|
 | critical | 1 | Manager authentication failure |
-| warning | 9 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection) |
+| warning | 11 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection + native-UDP session cap), native-UDP token rejections |
 | info | 8 | Connections, tunnel activation/waiting/unbound, secret rotation |
