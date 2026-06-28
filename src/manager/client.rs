@@ -477,6 +477,13 @@ fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
 
 fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_json::Value {
     let tunnel_infos = ctx.router.list_tunnels();
+    // Native plain-UDP plane (native SRT/RIST over relay + individual bonded
+    // legs). Streamed alongside the QUIC tunnels — previously only the aggregate
+    // count crossed the wire (in the 15s health), so a relay forwarding bond
+    // legs showed no per-leg rows. The relay stays opaque: each session carries
+    // only the tunnel UUID + post-NAT addrs (no edge identity, no bond grouping)
+    // — the manager joins the UUID to its tunnel table for a friendly name.
+    let udp_sessions = ctx.udp_sessions.list();
     let (total_tunnels, active_tunnels) = ctx.router.counts();
     let connected_edges = ctx.edge_connections.len();
 
@@ -507,6 +514,9 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
 
     serde_json::json!({
         "tunnels": tunnel_infos,
+        "udp_sessions": udp_sessions,
+        "udp_sessions_total": ctx.udp_sessions.count(),
+        "udp_sessions_active": ctx.udp_sessions.active_count(),
         "edges": edges,
         "connected_edges": connected_edges,
         "active_tunnels": active_tunnels,
