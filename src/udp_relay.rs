@@ -21,7 +21,7 @@
 //! The existing QUIC tunnel path is untouched; this runs as a parallel task.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -133,6 +133,13 @@ pub struct UdpSession {
     ingress: AtomicAddr,
     /// Manager "ingress node" / source side (sends INTO the tunnel).
     egress: AtomicAddr,
+    /// Index (into the relay's bound-socket set) that each side last
+    /// registered / sent on. The reply to a side MUST egress from the SAME
+    /// relay socket it dialed, or its NAT/conntrack (and any per-port firewall
+    /// forward) drops the unexpected source — the multi-listen-port bug that
+    /// pinned all forwarding onto `sockets[0]`. `usize::MAX` = unset.
+    ingress_sock: AtomicUsize,
+    egress_sock: AtomicUsize,
     /// Source IP that created the session (for per-IP DoS accounting).
     creator_ip: IpAddr,
     pub stats: Arc<TunnelStats>,
@@ -146,6 +153,8 @@ impl UdpSession {
             tunnel_id,
             ingress: AtomicAddr::new(),
             egress: AtomicAddr::new(),
+            ingress_sock: AtomicUsize::new(usize::MAX),
+            egress_sock: AtomicUsize::new(usize::MAX),
             creator_ip,
             stats: Arc::new(TunnelStats::new()),
             last_seen_ms: AtomicU64::new(now_ms()),
@@ -216,7 +225,13 @@ impl UdpSessionRouter {
     /// the DashMap shard entry lock, so they're counted exactly once per session
     /// (and freed once in [`Self::remove`]). Lock order is always
     /// `sessions` → `sessions_by_ip`, matching [`Self::remove`] — no deadlock.
-    pub fn latch(&self, tunnel_id: Uuid, direction: TunnelDirection, src: SocketAddr) -> LatchResult {
+    pub fn latch(
+        &self,
+        tunnel_id: Uuid,
+        direction: TunnelDirection,
+        src: SocketAddr,
+        sock_idx: usize,
+    ) -> LatchResult {
         use dashmap::mapref::entry::Entry;
         let ip = src.ip();
         let session = match self.sessions.entry(tunnel_id) {
@@ -236,38 +251,50 @@ impl UdpSessionRouter {
             }
         };
         match direction {
-            TunnelDirection::Ingress => session.ingress.store(src),
-            TunnelDirection::Egress => session.egress.store(src),
+            TunnelDirection::Ingress => {
+                session.ingress.store(src);
+                session.ingress_sock.store(sock_idx, Ordering::Relaxed);
+            }
+            TunnelDirection::Egress => {
+                session.egress.store(src);
+                session.egress_sock.store(sock_idx, Ordering::Relaxed);
+            }
         }
         session.last_seen_ms.store(now_ms(), Ordering::Relaxed);
         LatchResult::Ok(session.both_latched())
     }
 
     /// Resolve the forwarding target for a media datagram arriving from `src`
-    /// on tunnel `tunnel_id`: the *opposite* latched slot. Also accounts bytes.
-    /// Returns `None` if the session/peer isn't known (dropped).
-    pub fn forward_target(&self, tunnel_id: Uuid, src: SocketAddr, bytes: u64) -> Option<SocketAddr> {
+    /// on tunnel `tunnel_id`: the *opposite* latched slot, plus the index of
+    /// the relay socket that target dialed (so the reply egresses from the SAME
+    /// port the peer expects — required when the relay binds multiple UDP ports,
+    /// e.g. one per uplink). Also accounts bytes. `None` if the session/peer
+    /// isn't known (dropped).
+    pub fn forward_target(
+        &self,
+        tunnel_id: Uuid,
+        src: SocketAddr,
+        bytes: u64,
+    ) -> Option<(SocketAddr, usize)> {
         let session = self.sessions.get(&tunnel_id)?;
         let ingress = session.ingress.load();
         let egress = session.egress.load();
-        let target = if Some(src) == ingress {
+        let (target, target_sock) = if Some(src) == ingress {
             // From the destination side → forward to the source side.
             session.stats.bytes_ingress.fetch_add(bytes, Ordering::Relaxed);
-            egress
+            (egress?, session.egress_sock.load(Ordering::Relaxed))
         } else if Some(src) == egress {
             // From the source side → forward to the destination side.
             session.stats.bytes_egress.fetch_add(bytes, Ordering::Relaxed);
-            ingress
+            (ingress?, session.ingress_sock.load(Ordering::Relaxed))
         } else {
             // Source addr matches neither latched slot (unregistered or a NAT
             // rebind not yet re-latched by a keepalive). Drop.
             return None;
         };
-        if target.is_some() {
-            session.stats.udp_datagrams_total.fetch_add(1, Ordering::Relaxed);
-            session.last_seen_ms.store(now_ms(), Ordering::Relaxed);
-        }
-        target
+        session.stats.udp_datagrams_total.fetch_add(1, Ordering::Relaxed);
+        session.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+        Some((target, target_sock))
     }
 
     /// Remove sessions idle longer than [`SESSION_IDLE_TIMEOUT`]. Returns the
@@ -415,12 +442,14 @@ pub async fn run_udp_relay(config: &RelayConfig, ctx: Arc<SessionContext>) -> Re
     }
 
     // One recv loop per bound socket; all share the session router + socket set.
+    // Each loop carries its own index so a session records which port each side
+    // dialed and the reply egresses from that same socket.
     let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    for sock in sockets.iter().cloned() {
+    for (idx, sock) in sockets.iter().cloned().enumerate() {
         let ctx = ctx.clone();
         let sockets = sockets.clone();
         set.spawn(async move {
-            recv_loop(sock, sockets, ctx).await;
+            recv_loop(idx, sock, sockets, ctx).await;
         });
     }
     // First loop to exit collapses the task; dropping the JoinSet aborts the rest.
@@ -428,7 +457,12 @@ pub async fn run_udp_relay(config: &RelayConfig, ctx: Arc<SessionContext>) -> Re
     Ok(())
 }
 
-async fn recv_loop(sock: Arc<UdpSocket>, sockets: Arc<Vec<Arc<UdpSocket>>>, ctx: Arc<SessionContext>) {
+async fn recv_loop(
+    idx: usize,
+    sock: Arc<UdpSocket>,
+    sockets: Arc<Vec<Arc<UdpSocket>>>,
+    ctx: Arc<SessionContext>,
+) {
     let mut buf = vec![0u8; RECV_BUF];
     loop {
         let (n, src) = match sock.recv_from(&mut buf).await {
@@ -442,16 +476,18 @@ async fn recv_loop(sock: Arc<UdpSocket>, sockets: Arc<Vec<Arc<UdpSocket>>>, ctx:
 
         // Control plane (nil-UUID prefix) → registration/keepalive.
         if let Some(ctrl) = try_decode_udp_control(data) {
-            handle_control(&ctx, &sock, src, ctrl).await;
+            handle_control(&ctx, &sock, idx, src, ctrl).await;
             continue;
         }
 
-        // Data plane → forward verbatim to the paired slot.
+        // Data plane → forward verbatim to the paired slot, egressing from the
+        // socket the target dialed (falls back to family-match for a target
+        // whose dialed socket is somehow unknown / out of range).
         let Some((tunnel_id, _payload)) = decode_udp_datagram(data) else {
             continue; // too short
         };
-        if let Some(dest) = ctx.udp_sessions.forward_target(tunnel_id, src, n as u64) {
-            let out = socket_for(&sockets, dest);
+        if let Some((dest, dest_sock)) = ctx.udp_sessions.forward_target(tunnel_id, src, n as u64) {
+            let out = sockets.get(dest_sock).unwrap_or_else(|| socket_for(&sockets, dest));
             if let Err(e) = out.send_to(data, dest).await {
                 tracing::trace!("native-UDP relay forward to {dest} failed: {e}");
             }
@@ -462,6 +498,7 @@ async fn recv_loop(sock: Arc<UdpSocket>, sockets: Arc<Vec<Arc<UdpSocket>>>, ctx:
 async fn handle_control(
     ctx: &Arc<SessionContext>,
     sock: &Arc<UdpSocket>,
+    sock_idx: usize,
     src: SocketAddr,
     ctrl: UdpRelayControl,
 ) {
@@ -496,7 +533,7 @@ async fn handle_control(
                 return;
             }
 
-            match ctx.udp_sessions.latch(tunnel_id, direction, src) {
+            match ctx.udp_sessions.latch(tunnel_id, direction, src, sock_idx) {
                 LatchResult::Ok(ready) => {
                     // Ack so the edge confirms the relay is alive (failover) and
                     // learns when both sides are present.
@@ -548,19 +585,37 @@ mod tests {
         let src = v4(5000); // egress / source side
         let dst = v4(6000); // ingress / destination side
 
-        // Only one side latched → not ready, no forwarding target.
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, src), LatchResult::Ok(false)));
+        // Only one side latched → not ready, no forwarding target. Egress
+        // dialed relay socket 0, ingress dialed socket 1 (multi-port relay).
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, src, 0), LatchResult::Ok(false)));
         assert!(r.forward_target(t, src, 100).is_none());
 
         // Both latched → ready.
-        assert!(matches!(r.latch(t, TunnelDirection::Ingress, dst), LatchResult::Ok(true)));
+        assert!(matches!(r.latch(t, TunnelDirection::Ingress, dst, 1), LatchResult::Ok(true)));
 
-        // Source-side datagram forwards to the destination side, and vice versa.
-        assert_eq!(r.forward_target(t, src, 100), Some(dst));
-        assert_eq!(r.forward_target(t, dst, 100), Some(src));
+        // Source-side datagram forwards to the destination side via the socket
+        // the destination dialed (1), and vice versa via socket 0.
+        assert_eq!(r.forward_target(t, src, 100), Some((dst, 1)));
+        assert_eq!(r.forward_target(t, dst, 100), Some((src, 0)));
 
         // Unknown source addr is dropped.
         assert!(r.forward_target(t, v4(9999), 100).is_none());
+    }
+
+    #[test]
+    fn forwards_egress_from_the_socket_the_target_dialed() {
+        // Regression for the multi-listen-port bug: replies must leave the SAME
+        // relay socket the peer dialed, not always sockets[0].
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let src = v4(5000); // source/egress side, dialed relay socket 2
+        let dst = v4(6000); // destination/ingress side, dialed relay socket 0
+        r.latch(t, TunnelDirection::Egress, src, 2);
+        r.latch(t, TunnelDirection::Ingress, dst, 0);
+        // src→dst egresses from the socket dst dialed (0)…
+        assert_eq!(r.forward_target(t, src, 1), Some((dst, 0)));
+        // …and dst→src egresses from the socket src dialed (2).
+        assert_eq!(r.forward_target(t, dst, 1), Some((src, 2)));
     }
 
     #[test]
@@ -574,13 +629,13 @@ mod tests {
         let r = UdpSessionRouter::new(64);
         let t = Uuid::new_v4();
         let dst = v4(6000);
-        r.latch(t, TunnelDirection::Ingress, dst);
-        r.latch(t, TunnelDirection::Egress, v4(5000));
-        assert_eq!(r.forward_target(t, v4(5000), 1), Some(dst));
+        r.latch(t, TunnelDirection::Ingress, dst, 0);
+        r.latch(t, TunnelDirection::Egress, v4(5000), 0);
+        assert_eq!(r.forward_target(t, v4(5000), 1), Some((dst, 0)));
         // Egress edge's NAT rebinds to a new port; re-register relatches it.
-        r.latch(t, TunnelDirection::Egress, v4(5001));
+        r.latch(t, TunnelDirection::Egress, v4(5001), 0);
         assert!(r.forward_target(t, v4(5000), 1).is_none());
-        assert_eq!(r.forward_target(t, v4(5001), 1), Some(dst));
+        assert_eq!(r.forward_target(t, v4(5001), 1), Some((dst, 0)));
     }
 
     #[test]
@@ -589,15 +644,15 @@ mod tests {
         let ip = Ipv4Addr::new(10, 0, 0, 9);
         // Three distinct tunnels from the same IP: third is rejected.
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 1)),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0),
             LatchResult::Ok(_)
         ));
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2)),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0),
             LatchResult::Ok(_)
         ));
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 3)),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 3), 0),
             LatchResult::RejectedDosCap
         ));
     }
@@ -607,7 +662,7 @@ mod tests {
         let r = UdpSessionRouter::new(1);
         let t = Uuid::new_v4();
         let ip = Ipv4Addr::new(10, 0, 0, 1);
-        r.latch(t, TunnelDirection::Egress, SocketAddr::new(ip.into(), 1));
+        r.latch(t, TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0);
         // Force it stale.
         r.sessions
             .get(&t)
@@ -618,7 +673,7 @@ mod tests {
         assert_eq!(r.count(), 0);
         // IP quota was freed → a new session from the same IP succeeds.
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2)),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0),
             LatchResult::Ok(_)
         ));
     }
