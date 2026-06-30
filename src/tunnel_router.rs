@@ -57,6 +57,13 @@ pub struct TunnelInfo {
     pub status: String,
     pub ingress_edge_id: Option<String>,
     pub egress_edge_id: Option<String>,
+    /// Post-NAT remote address of each QUIC endpoint's connection (the public
+    /// `host:port` each edge dialed in from, as seen by the relay). Distinct
+    /// field names from the native-UDP plane's `ingress_addr`/`egress_addr`
+    /// so the manager UI's native-UDP-vs-QUIC detection (which keys on the
+    /// presence of `ingress_addr`) is unaffected. `None` until that side binds.
+    pub ingress_remote_addr: Option<String>,
+    pub egress_remote_addr: Option<String>,
     pub stats: TunnelStatsSnapshot,
 }
 
@@ -294,6 +301,14 @@ impl TunnelRouter {
                     status: s.status_str().to_string(),
                     ingress_edge_id: s.ingress.as_ref().map(|e| e.edge_id.clone()),
                     egress_edge_id: s.egress.as_ref().map(|e| e.edge_id.clone()),
+                    ingress_remote_addr: s
+                        .ingress
+                        .as_ref()
+                        .map(|e| e.connection.remote_address().to_string()),
+                    egress_remote_addr: s
+                        .egress
+                        .as_ref()
+                        .map(|e| e.connection.remote_address().to_string()),
                     stats: s.stats.snapshot(),
                 }
             })
