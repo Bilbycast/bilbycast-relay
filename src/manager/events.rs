@@ -15,6 +15,8 @@ pub mod category {
     pub const EDGE: &str = "edge";
     pub const TUNNEL: &str = "tunnel";
     pub const MANAGER: &str = "manager";
+    /// Viewer-distribution subsystem (WHEP SFU + LL-HLS origin).
+    pub const DISTRIBUTION: &str = "distribution";
 }
 
 /// Event severity levels matching the manager's `EventSeverity` enum.

@@ -177,6 +177,182 @@ pub struct RelayConfig {
     /// [`LoggingConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingConfig>,
+
+    /// Optional viewer-distribution subsystem (WHEP SFU + LL-HLS origin).
+    /// Only takes effect when the binary is built with the
+    /// `viewer-distribution` Cargo feature; a config block present on a
+    /// plain (opaque-forwarder-only) build parses fine and is logged as
+    /// ignored at startup. See [`DistributionConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<DistributionConfig>,
+}
+
+/// Viewer-distribution subsystem configuration.
+///
+/// This turns a relay into a public "distribution" node that terminates
+/// browser WHEP sessions (sub-second WebRTC) and/or serves an LL-HLS origin
+/// (CDN-scalable) from media an edge ships over the distribution ingest.
+/// It is a deliberately stateful, media-terminating role, isolated behind
+/// the `viewer-distribution` feature so pure-forwarder relays never carry
+/// any of it. Default-off even when compiled in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DistributionConfig {
+    /// Master switch. When false the subsystem does not start.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Browser-facing HTTP signaling + LL-HLS origin listener addresses
+    /// (dual-stack, same shape as `quic_addrs`). Default `:4485`.
+    ///
+    /// This is **plain HTTP** — browsers require a secure context, so front
+    /// it with a TLS-terminating reverse proxy / load balancer (the
+    /// `behind_proxy` pattern) that presents a CA cert on `public_base_url`'s
+    /// hostname. Native in-relay TLS is a follow-up (the DTLS/SRTP media
+    /// path is independently encrypted regardless).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_addrs: Option<Vec<String>>,
+
+    /// The relay's publicly-reachable IP, advertised as the ICE host
+    /// candidate in every WHEP SDP answer so browsers can reach the media
+    /// socket. Required for viewers outside the relay's own host/LAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
+
+    /// Public base URL (e.g. `https://relay.example.com`) the manager uses to
+    /// build shareable viewer links (`{base}/watch/{stream}`). Informational
+    /// on the relay; surfaced to the manager via health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+
+    /// Distribution ingest (edge → relay) QUIC listener addresses. The edge
+    /// ships browser-ready H.264+Opus elementary frames here. Default
+    /// `:4486`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_addrs: Option<Vec<String>>,
+
+    /// Shared HMAC-SHA256 secret (64 hex chars) the manager also gives the
+    /// edge + viewers, used to validate short-lived ingest / viewer tokens.
+    /// When unset, token checks are disabled (P0 / dev).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_secret: Option<String>,
+
+    /// Require a valid signed viewer token on every WHEP request. Default
+    /// false (public streams). Set true for token-gated distribution.
+    #[serde(default)]
+    pub require_viewer_token: bool,
+
+    /// Require a valid signed ingest token on every edge → relay ingest
+    /// connection. Default true — the ingest is a write surface.
+    #[serde(default = "default_true")]
+    pub require_ingest_token: bool,
+
+    /// Per-source-IP concurrent WHEP viewer cap (DoS mitigation on the
+    /// public endpoint). Default 256.
+    #[serde(default = "default_max_viewers_per_ip")]
+    pub max_viewers_per_ip: u32,
+
+    /// LL-HLS origin retention: how many recent media segments (+ their
+    /// parts) to keep per stream in the in-memory sliding window. Default 8.
+    #[serde(default = "default_origin_window_segments")]
+    pub origin_window_segments: usize,
+}
+
+impl Default for DistributionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_addrs: None,
+            public_ip: None,
+            public_base_url: None,
+            ingest_addrs: None,
+            token_secret: None,
+            require_viewer_token: false,
+            require_ingest_token: true,
+            max_viewers_per_ip: default_max_viewers_per_ip(),
+            origin_window_segments: default_origin_window_segments(),
+        }
+    }
+}
+
+fn default_max_viewers_per_ip() -> u32 {
+    256
+}
+
+fn default_origin_window_segments() -> usize {
+    8
+}
+
+fn default_distribution_http_addrs() -> Vec<String> {
+    vec!["0.0.0.0:4485".to_string(), "[::]:4485".to_string()]
+}
+
+fn default_distribution_ingest_addrs() -> Vec<String> {
+    vec!["0.0.0.0:4486".to_string(), "[::]:4486".to_string()]
+}
+
+impl DistributionConfig {
+    /// Effective HTTP signaling / origin bind addresses.
+    pub fn effective_http_addrs(&self) -> Vec<String> {
+        match &self.http_addrs {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => default_distribution_http_addrs(),
+        }
+    }
+
+    /// Effective distribution ingest bind addresses.
+    pub fn effective_ingest_addrs(&self) -> Vec<String> {
+        match &self.ingest_addrs {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => default_distribution_ingest_addrs(),
+        }
+    }
+
+    /// Parse the configured public IP (for ICE candidates), if any.
+    pub fn public_ip_parsed(&self) -> Option<std::net::IpAddr> {
+        self.public_ip.as_ref().and_then(|s| s.parse().ok())
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(ref addrs) = self.http_addrs {
+            validate_addr_list(addrs, "distribution.http_addrs")?;
+        }
+        if let Some(ref addrs) = self.ingest_addrs {
+            validate_addr_list(addrs, "distribution.ingest_addrs")?;
+        }
+        if let Some(ref ip) = self.public_ip {
+            ip.parse::<std::net::IpAddr>().map_err(|e| {
+                anyhow::anyhow!("distribution.public_ip '{ip}' is not a valid IP: {e}")
+            })?;
+        }
+        if let Some(ref url) = self.public_base_url {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                anyhow::bail!("distribution.public_base_url must start with http:// or https://");
+            }
+            if url.len() > 2048 {
+                anyhow::bail!("distribution.public_base_url too long (max 2048 chars)");
+            }
+        }
+        if let Some(ref secret) = self.token_secret {
+            if secret.len() != 64 || !secret.chars().all(|c| c.is_ascii_hexdigit()) {
+                anyhow::bail!("distribution.token_secret must be exactly 64 hex chars (32 bytes)");
+            }
+        }
+        if self.require_viewer_token && self.token_secret.is_none() {
+            anyhow::bail!(
+                "distribution.require_viewer_token=true requires distribution.token_secret to be set"
+            );
+        }
+        if self.enabled && self.require_ingest_token && self.token_secret.is_none() {
+            anyhow::bail!(
+                "distribution.require_ingest_token=true requires distribution.token_secret to be set \
+                 (set token_secret, or set require_ingest_token=false for an open dev ingest)"
+            );
+        }
+        if self.origin_window_segments == 0 || self.origin_window_segments > 64 {
+            anyhow::bail!("distribution.origin_window_segments must be in 1..=64");
+        }
+        Ok(())
+    }
 }
 
 /// Structured-JSON log shipper configuration. See the
@@ -334,6 +510,11 @@ impl RelayConfig {
         // Validate logging shipper if present
         if let Some(ref logging) = self.logging {
             validate_logging_config(logging)?;
+        }
+
+        // Validate the viewer-distribution subsystem block if present.
+        if let Some(ref dist) = self.distribution {
+            dist.validate()?;
         }
 
         Ok(())
@@ -501,6 +682,7 @@ impl Default for RelayConfig {
             max_tunnels_per_connection: default_max_tunnels_per_connection(),
             manager: None,
             logging: None,
+            distribution: None,
         }
     }
 }

@@ -1,25 +1,17 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-mod api;
-mod config;
-mod manager;
-mod observability;
-mod protocol;
-mod server;
-mod session;
-mod stats;
-mod tunnel_router;
-mod udp_relay;
-mod util;
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::config::RelayConfig;
-use crate::stats::RelayStats;
+use bilbycast_relay::build_tcp_listener;
+use bilbycast_relay::config::RelayConfig;
+use bilbycast_relay::stats::RelayStats;
+use bilbycast_relay::{api, manager, observability, server, udp_relay};
+#[cfg(feature = "viewer-distribution")]
+use bilbycast_relay::distribution;
 
 #[derive(Parser)]
 #[command(name = "bilbycast-relay", about = "QUIC relay server for bilbycast IP tunneling", version)]
@@ -294,10 +286,54 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Start the viewer-distribution subsystem (WHEP SFU + LL-HLS origin) when
+    // compiled in AND enabled in config. Isolated behind the feature so a
+    // plain opaque-forwarder build carries none of it.
+    #[cfg(feature = "viewer-distribution")]
+    let distribution_handle = if let Some(dist_cfg) =
+        config.distribution.clone().filter(|d| d.enabled)
+    {
+        let hub = Arc::new(distribution::hub::DistributionHub::new());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let events = event_sender.clone();
+        let dist_stats = relay_stats.clone();
+        tracing::info!("viewer-distribution subsystem enabled");
+        Some(tokio::spawn(async move {
+            if let Err(e) =
+                distribution::run_distribution(dist_cfg, hub, cancel, events, dist_stats).await
+            {
+                tracing::error!("viewer-distribution subsystem stopped: {e:#}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "viewer-distribution"))]
+    if config.distribution.as_ref().map(|d| d.enabled).unwrap_or(false) {
+        tracing::warn!(
+            "config has distribution.enabled=true but this binary was built WITHOUT the \
+             `viewer-distribution` feature — the subsystem will NOT start. Rebuild with \
+             `--features viewer-distribution` to enable it."
+        );
+    }
+
     // Wait for any to finish
     tokio::select! {
         _ = api_handle => tracing::info!("API server stopped"),
         _ = quic_handle => tracing::info!("QUIC server stopped"),
+        _ = async {
+            #[cfg(feature = "viewer-distribution")]
+            if let Some(h) = distribution_handle {
+                let _ = h.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+            #[cfg(not(feature = "viewer-distribution"))]
+            std::future::pending::<()>().await;
+        } => {
+            tracing::info!("viewer-distribution subsystem stopped");
+        }
         _ = async {
             if let Some(h) = udp_relay_handle {
                 let _ = h.await;
@@ -322,25 +358,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Build a tokio `TcpListener` for the REST API with the dual-stack
-/// contract: `IPV6_V6ONLY=1` on v6 sockets, `SO_REUSEADDR` on both
-/// families, non-blocking for tokio.
-fn build_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let domain = match addr.ip() {
-        std::net::IpAddr::V4(_) => Domain::IPV4,
-        std::net::IpAddr::V6(_) => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    if matches!(addr.ip(), std::net::IpAddr::V6(_)) {
-        socket.set_only_v6(true)?;
-    }
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    tokio::net::TcpListener::from_std(std_listener)
 }

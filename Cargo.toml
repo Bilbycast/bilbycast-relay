@@ -48,7 +48,53 @@ bytes = "1.11.1"
 
 # Certificate pinning (SHA-256 fingerprint)
 sha2 = "0.11.0"
+hmac = "0.13.0-rc.4"
 webpki-roots = "1.0.7"
+
+# ── Viewer distribution subsystem (feature: viewer-distribution, default OFF) ──
+# A stateful, media-terminating WHEP SFU + LL-HLS origin co-located in the relay
+# binary but hard-isolated from the stateless opaque forwarder. Only pulled in
+# when the operator opts a relay into the "distribution" role. The WebRTC stack
+# is str0m (same as bilbycast-edge) with the OpenSSL DTLS backend — the pure-Rust
+# dimpl DTLS stalls on localhost active↔passive handshakes (see edge Cargo.toml).
+[dependencies.str0m]
+version = "0.19.0"
+optional = true
+default-features = false
+features = ["openssl"]
+
+[dependencies.tokio-util]
+version = "0.7.18"
+optional = true
+features = ["rt"]
+
+# Lock-free single-writer/many-reader cell for the per-stream keyframe cache —
+# keeps the subsystem faithful to the relay's zero-Mutex-on-shared-state ethos.
+[dependencies.arc-swap]
+version = "1.7.1"
+optional = true
+
+# Only pulled in by `viewer-distribution-vendored` (the release variant) to
+# statically vendor OpenSSL — feature unification makes str0m's openssl-sys
+# vendored too, so the static-musl release binary carries no runtime libssl
+# dependency. Local dev uses plain `viewer-distribution` (system OpenSSL, fast).
+[dependencies.openssl]
+version = "0.10"
+optional = true
+
+[features]
+# OFF by default: a plain `cargo build` produces the pure opaque forwarder with
+# zero media-termination surface and no OpenSSL/str0m build dependency.
+default = []
+viewer-distribution = ["dep:str0m", "dep:tokio-util", "dep:arc-swap"]
+# Release variant: viewer-distribution + statically-vendored OpenSSL, for the
+# static-musl release build (no system libssl at build or run time).
+viewer-distribution-vendored = ["viewer-distribution", "dep:openssl", "openssl/vendored"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio-util = { version = "0.7.18", features = ["rt"] }
+
+[[test]]
+name = "distribution"
+required-features = ["viewer-distribution"]

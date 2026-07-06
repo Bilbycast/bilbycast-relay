@@ -512,7 +512,7 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
         })
         .collect();
 
-    serde_json::json!({
+    let mut stats = serde_json::json!({
         "tunnels": tunnel_infos,
         "udp_sessions": udp_sessions,
         "udp_sessions_total": ctx.udp_sessions.count(),
@@ -532,7 +532,20 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
         "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
         "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
         "uptime_secs": relay_stats.uptime_secs()
-    })
+    });
+
+    // Viewer-distribution telemetry (present only when the subsystem runs) —
+    // lets the manager dashboard show live viewer counts per relay.
+    if let Some(d) = relay_stats.distribution_snapshot() {
+        stats["distribution"] = serde_json::json!({
+            "streams": d.streams,
+            "viewers": d.viewers,
+            "bytes_out": d.bytes_out,
+            "origin_bytes": d.origin_bytes,
+        });
+    }
+
+    stats
 }
 
 fn build_health_message(
@@ -546,39 +559,62 @@ fn build_health_message(
     let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
 
     // Capability bits the manager UI gates on. "udp-relay" => native SRT/RIST
-    // (no-QUIC) tunnels.
+    // (no-QUIC) tunnels. "viewer-distribution" => WHEP SFU + LL-HLS origin.
     let mut capabilities: Vec<&str> = Vec::new();
     if relay_config.udp_relay_enabled {
         capabilities.push("udp-relay");
+    }
+    let dist_snapshot = relay_stats.distribution_snapshot();
+    if dist_snapshot.is_some() {
+        capabilities.push("viewer-distribution");
+    }
+
+    let mut payload = serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": relay_stats.uptime_secs(),
+        "connected_edges": ctx.edge_connections.len(),
+        "active_tunnels": active_tunnels,
+        "total_tunnels": total_tunnels,
+        "total_bytes_forwarded": total_bytes_ingress + total_bytes_egress,
+        "peak_tunnels": relay_stats.peak_tunnels.load(std::sync::atomic::Ordering::Relaxed),
+        "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
+        "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
+        "api_addr": relay_config.api_addr,
+        "quic_addr": relay_config.quic_addr,
+        // Advertised address remote edges should dial (distinct
+        // from the bind list). Omitted when unset — manager UI
+        // falls back to `quic_addr` for legacy single-host setups.
+        "public_quic_addr": relay_config.public_quic_addr,
+        // Native plain-UDP relay (SRT/RIST without QUIC). Advertised so the
+        // manager can offer the native-relay endpoint + gate the UI on it.
+        "public_udp_addr": relay_config.public_udp_addr,
+        "udp_sessions_total": ctx.udp_sessions.count(),
+        "udp_sessions_active": ctx.udp_sessions.active_count(),
+        "capabilities": capabilities
+    });
+
+    // Distribution telemetry + advertised viewer base URL, when the subsystem
+    // is running. Lets the manager render live viewer counts and build
+    // shareable viewer links.
+    if let Some(d) = dist_snapshot {
+        payload["distribution"] = serde_json::json!({
+            "streams": d.streams,
+            "viewers": d.viewers,
+            "bytes_out": d.bytes_out,
+            "origin_bytes": d.origin_bytes,
+        });
+    }
+    if let Some(dist_cfg) = relay_config.distribution.as_ref() {
+        if let Some(base) = dist_cfg.public_base_url.as_ref() {
+            payload["distribution_base_url"] = serde_json::json!(base);
+        }
     }
 
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": {
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-            "uptime_secs": relay_stats.uptime_secs(),
-            "connected_edges": ctx.edge_connections.len(),
-            "active_tunnels": active_tunnels,
-            "total_tunnels": total_tunnels,
-            "total_bytes_forwarded": total_bytes_ingress + total_bytes_egress,
-            "peak_tunnels": relay_stats.peak_tunnels.load(std::sync::atomic::Ordering::Relaxed),
-            "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
-            "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
-            "api_addr": relay_config.api_addr,
-            "quic_addr": relay_config.quic_addr,
-            // Advertised address remote edges should dial (distinct
-            // from the bind list). Omitted when unset — manager UI
-            // falls back to `quic_addr` for legacy single-host setups.
-            "public_quic_addr": relay_config.public_quic_addr,
-            // Native plain-UDP relay (SRT/RIST without QUIC). Advertised so the
-            // manager can offer the native-relay endpoint + gate the UI on it.
-            "public_udp_addr": relay_config.public_udp_addr,
-            "udp_sessions_total": ctx.udp_sessions.count(),
-            "udp_sessions_active": ctx.udp_sessions.active_count(),
-            "capabilities": capabilities
-        }
+        "payload": payload
     })
 }
 

@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bilbycast · __STREAM_ID__</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0d10; color: #e6e9ef;
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px; border-bottom: 1px solid #1c2128;
+  }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: #f2545b; }
+  header .dot.live { background: #3fb950; box-shadow: 0 0 8px #3fb95088; }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  header .id { color: #8b949e; font-weight: 400; }
+  main { flex: 1; display: grid; place-items: center; padding: 16px; }
+  .stage { width: min(100%, 1280px); }
+  video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 10px; display: block; }
+  .bar { display: flex; align-items: center; gap: 12px; margin-top: 10px; color: #8b949e; }
+  button {
+    background: #238636; color: #fff; border: 0; border-radius: 7px;
+    padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: #30363d; color: #8b949e; cursor: default; }
+  .status { font-variant-numeric: tabular-nums; }
+  .err { color: #f2545b; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>bilbycast viewer <span class="id">· __STREAM_ID__</span></h1>
+</header>
+<main>
+  <div class="stage">
+    <video id="v" autoplay playsinline muted controls></video>
+    <div class="bar">
+      <button id="play">Watch</button>
+      <span class="status" id="status">idle</span>
+    </div>
+  </div>
+</main>
+<script>
+(function () {
+  const STREAM = "__STREAM_ID__";
+  const params = new URLSearchParams(location.search);
+  const token = params.get("token");
+  const v = document.getElementById("v");
+  const dot = document.getElementById("dot");
+  const statusEl = document.getElementById("status");
+  const playBtn = document.getElementById("play");
+  let pc = null, resourceUrl = null;
+
+  function setStatus(s, err) {
+    statusEl.textContent = s;
+    statusEl.className = "status" + (err ? " err" : "");
+  }
+
+  async function start() {
+    playBtn.disabled = true;
+    setStatus("connecting…");
+    pc = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    const stream = new MediaStream();
+    pc.ontrack = (e) => { stream.addTrack(e.track); v.srcObject = stream; };
+    pc.oniceconnectionstatechange = () => {
+      const st = pc.iceConnectionState;
+      setStatus(st, st === "failed" || st === "disconnected");
+      const live = st === "connected" || st === "completed";
+      dot.classList.toggle("live", live);
+      if (live) { v.muted = false; }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    const headers = { "Content-Type": "application/sdp" };
+    if (token) headers["Authorization"] = "Bearer " + token;
+
+    let resp;
+    try {
+      resp = await fetch("/whep/" + encodeURIComponent(STREAM), {
+        method: "POST", headers, body: offer.sdp,
+      });
+    } catch (e) { setStatus("network error", true); playBtn.disabled = false; return; }
+
+    if (!resp.ok) {
+      setStatus("WHEP " + resp.status + ": " + (await resp.text()), true);
+      playBtn.disabled = false;
+      return;
+    }
+    resourceUrl = resp.headers.get("Location");
+    const answer = await resp.text();
+    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    setStatus("negotiated");
+  }
+
+  async function stop() {
+    if (resourceUrl) { try { await fetch(resourceUrl, { method: "DELETE" }); } catch (_) {} }
+    if (pc) { pc.close(); pc = null; }
+    resourceUrl = null;
+    dot.classList.remove("live");
+    setStatus("stopped");
+    playBtn.disabled = false;
+    playBtn.textContent = "Watch";
+  }
+
+  playBtn.addEventListener("click", () => {
+    if (pc) { stop(); } else { playBtn.textContent = "Stop"; start(); }
+  });
+  window.addEventListener("beforeunload", () => { if (resourceUrl) navigator.sendBeacon?.(resourceUrl); });
+})();
+</script>
+</body>
+</html>

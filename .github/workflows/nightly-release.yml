@@ -70,14 +70,33 @@ jobs:
     needs: check-version
     if: needs.check-version.outputs.should_release == 'true'
     strategy:
+      # Independent variants: a distribution-variant build failure (e.g. the
+      # vendored-OpenSSL musl build) must NOT cancel the lean forwarder release.
+      fail-fast: false
       matrix:
         include:
+          # Lean opaque forwarder (default — no media-termination surface, no
+          # OpenSSL). Preserves the historical artefact names + install URLs.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             artifact_suffix: x86_64-linux
+            features: ""
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact_suffix: aarch64-linux
+            features: ""
+          # Distribution variant: WHEP SFU + LL-HLS origin (str0m + vendored
+          # OpenSSL, statically linked). Runtime opt-in via config
+          # (`distribution.enabled`); the binary carries the capability but
+          # stays a pure forwarder unless configured.
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact_suffix: x86_64-linux-distribution
+            features: "viewer-distribution-vendored"
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact_suffix: aarch64-linux-distribution
+            features: "viewer-distribution-vendored"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout repository
@@ -105,7 +124,13 @@ jobs:
             ${{ matrix.target }}-cargo-relay-
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            echo "Building distribution variant with features: ${{ matrix.features }}"
+            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Prepare bare-binary artefact (preserves existing install URL)
         run: |
@@ -272,6 +297,15 @@ jobs:
           ### Tarball (covered by the signed manifest)
           - \`bilbycast-relay-x86_64-linux.tar.gz\` — binary + LICENSE + README + sha256
           - \`bilbycast-relay-aarch64-linux.tar.gz\`
+
+          ### Viewer-distribution variant (WHEP SFU + LL-HLS origin)
+          Adds the optional \`viewer-distribution\` capability (reach browser
+          viewers natively — see \`docs/distribution.md\`). str0m + statically
+          vendored OpenSSL; still a single static binary. The capability is
+          **runtime opt-in** via the config \`distribution\` block, so this
+          binary behaves as a pure forwarder unless configured.
+          - \`bilbycast-relay-x86_64-linux-distribution\` (+ \`.tar.gz\`)
+          - \`bilbycast-relay-aarch64-linux-distribution\` (+ \`.tar.gz\`)
 
           ## Verify checksums
           \`\`\`

@@ -88,6 +88,33 @@ pub struct RelayStats {
     /// Epoch-millis of the last manager disconnect (0 if never disconnected
     /// since the last connect). Used to compute `disconnected_secs`.
     pub manager_last_disconnect_ms: AtomicU64,
+
+    // ── Viewer-distribution subsystem telemetry ───────────────────────────
+    // Updated periodically by the distribution subsystem's telemetry task
+    // (when the `viewer-distribution` feature is on AND enabled). Read by the
+    // manager-client health builder + the local REST/metrics surfaces. Always
+    // present in the struct so the base build compiles unchanged; stays zero /
+    // false on a plain forwarder.
+    /// Whether the distribution subsystem is running.
+    pub distribution_enabled: AtomicBool,
+    /// Live distributed streams.
+    pub distribution_streams: AtomicU64,
+    /// Total concurrent viewers across all streams.
+    pub distribution_viewers: AtomicU64,
+    /// Total bytes fanned out to viewers (pre-SRTP ES accounting).
+    pub distribution_bytes_out: AtomicU64,
+    /// Bytes currently held in the LL-HLS origin cache.
+    pub distribution_origin_bytes: AtomicU64,
+}
+
+/// Snapshot of the distribution subsystem telemetry.
+#[derive(Debug, Clone, Serialize)]
+pub struct DistributionStatsSnapshot {
+    pub enabled: bool,
+    pub streams: u64,
+    pub viewers: u64,
+    pub bytes_out: u64,
+    pub origin_bytes: u64,
 }
 
 /// Current wall-clock epoch in milliseconds (saturating to 0 before 1970).
@@ -127,7 +154,36 @@ impl RelayStats {
             manager_connected: AtomicBool::new(false),
             manager_last_connect_ms: AtomicU64::new(0),
             manager_last_disconnect_ms: AtomicU64::new(0),
+            distribution_enabled: AtomicBool::new(false),
+            distribution_streams: AtomicU64::new(0),
+            distribution_viewers: AtomicU64::new(0),
+            distribution_bytes_out: AtomicU64::new(0),
+            distribution_origin_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Publish a distribution telemetry sample (called by the subsystem).
+    pub fn set_distribution(&self, streams: u64, viewers: u64, bytes_out: u64, origin_bytes: u64) {
+        self.distribution_enabled.store(true, Ordering::Relaxed);
+        self.distribution_streams.store(streams, Ordering::Relaxed);
+        self.distribution_viewers.store(viewers, Ordering::Relaxed);
+        self.distribution_bytes_out.store(bytes_out, Ordering::Relaxed);
+        self.distribution_origin_bytes.store(origin_bytes, Ordering::Relaxed);
+    }
+
+    /// Snapshot the distribution telemetry. Returns `None` when the subsystem
+    /// is not running (so the field is omitted from health/REST payloads).
+    pub fn distribution_snapshot(&self) -> Option<DistributionStatsSnapshot> {
+        if !self.distribution_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(DistributionStatsSnapshot {
+            enabled: true,
+            streams: self.distribution_streams.load(Ordering::Relaxed),
+            viewers: self.distribution_viewers.load(Ordering::Relaxed),
+            bytes_out: self.distribution_bytes_out.load(Ordering::Relaxed),
+            origin_bytes: self.distribution_origin_bytes.load(Ordering::Relaxed),
+        })
     }
 
     pub fn uptime_secs(&self) -> u64 {

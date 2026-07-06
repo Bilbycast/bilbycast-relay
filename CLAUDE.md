@@ -188,8 +188,54 @@ No `Mutex` or `RwLock` is used anywhere in the codebase.
 - Connection-level errors trigger full cleanup: edge unregistered, all tunnels unbound, peers notified with `TunnelDown`
 - UDP datagram send failures are non-fatal (best-effort, continue processing)
 
+### Viewer Distribution (feature `viewer-distribution`, default OFF)
+
+An optional, **default-off** subsystem that turns a relay into a public
+distribution node reaching browser viewers directly — a **WHEP SFU**
+(sub-second WebRTC) + an **LL-HLS/CMAF HTTP origin** (CDN-scalable). It is a
+deliberately **stateful, media-terminating** role, hard-isolated behind the
+`viewer-distribution` Cargo feature so a plain `cargo build` produces the pure
+opaque forwarder with zero media-termination surface and no OpenSSL/str0m build
+dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
+
+- **Crate shape**: modules now live in `src/lib.rs` (a library target) so
+  integration tests exercise the real code; `main.rs` is a thin binary shell.
+- **Ingest** (edge → relay): **WHIP-in** (`POST /whip/{stream}`) is the
+  zero-edge-code path — point the edge's shipped, quality-gated WHIP-client
+  output at the relay; the relay terminates DTLS/SRTP, depacketizes to H.264
+  access units + Opus frames, and feeds the hub. A **QUIC ES ingest** (ALPN
+  `bilbycast-distribution`, `:4486`) is the future lower-overhead path.
+- **Hub** (`src/distribution/hub.rs`): one `tokio::broadcast` fan-out per stream
+  + a lock-free (`arc-swap`) keyframe cache for instant late-join.
+- **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
+  packetize (RFC 6184) → SRTP → browser. Vendored str0m session + H.264
+  packetizer under `src/distribution/webrtc/` (kept in sync with bilbycast-edge).
+- **Origin** (`PUT/GET /origin/{stream}/{file}`): in-memory sliding-window cache
+  of the edge's CMAF PUTs; front with a CDN for scale.
+- **Player**: built-in `GET /watch/{stream}` (`player.html`).
+- **Tokens** (`src/distribution/token.rs`): short-lived HMAC-SHA256
+  `"{exp}.{hmac}"` over `"{scope}:{stream}:{exp}"` with a shared 64-hex
+  `token_secret` — same stateless-validation model as `authorize_tunnel`, plus
+  expiry. `require_ingest_token` (default true) gates writes; `require_viewer_token`
+  gates WHEP.
+- **DoS**: per-source-IP concurrent-viewer cap (`max_viewers_per_ip`) with a
+  lifecycle reaper.
+- **Config**: a `distribution` block on `RelayConfig` (parses on any build; a
+  plain build logs it as ignored). Example:
+  `../testbed/configs/relay-distribution.json`.
+- **Telemetry**: the subsystem publishes `{streams, viewers, bytes_out,
+  origin_bytes}` onto `RelayStats`; the manager health payload advertises the
+  `viewer-distribution` capability + a `distribution` object + `distribution_base_url`.
+- **Browser HTTPS**: the signaling/origin listener is plain HTTP — front with a
+  TLS-terminating LB (`behind_proxy`) for the browser secure context; DTLS/SRTP
+  media is independently encrypted. Native in-relay TLS is a follow-up.
+
+Build a distribution-capable relay: `cargo build --release --features viewer-distribution`.
+
 ### Testing
 
 Integration tests (`tests/integration.rs`) spin up the full QUIC relay, connect two simulated edges, and verify TCP/UDP data forwarding. They duplicate the wire protocol types since this is a binary crate (not a library).
+
+`tests/distribution.rs` (requires `--features viewer-distribution`) exercises the **real** `bilbycast_relay::distribution` code via the library target, including **real-network** end-to-end coverage: QUIC ES ingest → hub → subscriber; a WHEP viewer completing ICE + DTLS + SRTP and receiving decrypted media; and a WHIP client pushing H.264 over DTLS/SRTP that the relay depacketizes + reassembles into access units. Browser interop, cellular-hardware e2e, and multi-relay cascade at scale remain to be verified on real infrastructure.
 
 Test coverage: tunnel state transitions (waiting/active), bidirectional TCP forwarding, UDP datagram forwarding, ping/pong keepalive.
