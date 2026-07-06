@@ -255,6 +255,27 @@ pub struct DistributionConfig {
     /// parts) to keep per stream in the in-memory sliding window. Default 8.
     #[serde(default = "default_origin_window_segments")]
     pub origin_window_segments: usize,
+
+    /// Cascade sources: streams this (downstream/regional) relay pulls from an
+    /// upstream relay's WHEP and re-fans-out locally. Empty by default. See
+    /// [`CascadeSource`]. This is how WHEP scales past one relay's ceiling —
+    /// an origin relay feeds N regional relays, each serving nearby viewers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cascade_sources: Vec<CascadeSource>,
+}
+
+/// A single cascade pull: this relay acts as a WHEP client of an upstream
+/// relay and republishes the stream to its own hub under `local_stream`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CascadeSource {
+    /// Upstream WHEP URL, e.g. `http://origin-relay:4485/whep/big-game`.
+    /// Plain `http://` (relay-to-relay on a trusted network) in v1.
+    pub upstream_whep_url: String,
+    /// Local stream name to republish under (what downstream viewers watch).
+    pub local_stream: String,
+    /// Optional viewer token for the upstream (when the upstream is gated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 impl Default for DistributionConfig {
@@ -270,6 +291,7 @@ impl Default for DistributionConfig {
             require_ingest_token: true,
             max_viewers_per_ip: default_max_viewers_per_ip(),
             origin_window_segments: default_origin_window_segments(),
+            cascade_sources: Vec::new(),
         }
     }
 }
@@ -350,6 +372,30 @@ impl DistributionConfig {
         }
         if self.origin_window_segments == 0 || self.origin_window_segments > 64 {
             anyhow::bail!("distribution.origin_window_segments must be in 1..=64");
+        }
+        if self.cascade_sources.len() > 64 {
+            anyhow::bail!("distribution.cascade_sources: at most 64 entries");
+        }
+        for (i, src) in self.cascade_sources.iter().enumerate() {
+            if !(src.upstream_whep_url.starts_with("http://")
+                || src.upstream_whep_url.starts_with("https://"))
+            {
+                anyhow::bail!(
+                    "distribution.cascade_sources[{i}].upstream_whep_url must start with http:// or https://"
+                );
+            }
+            if src.upstream_whep_url.len() > 2048 {
+                anyhow::bail!("distribution.cascade_sources[{i}].upstream_whep_url too long");
+            }
+            let s = src.local_stream.trim();
+            if s.is_empty()
+                || s.len() > 128
+                || !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                anyhow::bail!(
+                    "distribution.cascade_sources[{i}].local_stream must be 1..=128 chars of [A-Za-z0-9._-]"
+                );
+            }
         }
         Ok(())
     }

@@ -95,13 +95,23 @@ impl WebrtcSession {
         // the depayloader silently discards every RTP packet.
         //
         // Workaround: register additional H.264 entries with level 5.1
-        // (0x33) so the level check passes for any 1080p/4K source. The
-        // PTs we choose must NOT collide with str0m's built-in defaults
-        // (which already occupy 35, 36, 45, 46, 96–103, 107–109, 114–115,
-        // 119–125, 127). Available dynamic PTs: 110–113, 116–118, 122,
-        // 126. We pick 110/111, 112/113, 116/117, 118/122 — duplicate
-        // PTs in the m-line produce SDP that even str0m's own parser
-        // rejects (Scenario L: edge → edge WHIP failed at SDP parse).
+        // (0x33) so the level check passes for any 1080p/4K source.
+        //
+        // Payload types here must avoid str0m 0.19's defaults AND generate
+        // valid SDP. str0m 0.19 assigns **Opus payload type 111** (see
+        // `PT_OPUS` in `format::codec_config`), and its default H.264 set uses
+        // the RTX slots 121/107/109/120/119/36/115. The original block reused
+        // **111 as the RTX slot for payload 110** — colliding with Opus. That
+        // panics str0m ("Pt locked multiple times: 111") the instant a session
+        // negotiates both this H.264 and Opus (a WHEP client offering audio,
+        // OR a server answering a default-codec offer). str0m is also fussy
+        // about *which* value an RTX PT may take (an arbitrary free PT such as
+        // 100/119 breaks SDP generation), so rather than hunt for another
+        // acceptable RTX PT we simply give payload 110 **no RTX** — the
+        // other three profiles keep their (proven-valid) RTX slots, and the
+        // default H.264 profiles carry RTX for the common case. This makes the
+        // workaround safe on BOTH the server (accept_offer) and client
+        // (create_offer, e.g. the cascade WHEP-client) roles.
         //
         // Whenever str0m bumps its built-in H.264 levels (or adds an
         // ergonomic API to set them), retire this block.
@@ -109,7 +119,7 @@ impl WebrtcSession {
         let codec_config = rtc_builder.codec_config();
         codec_config.add_h264(
             Pt::new_with_value(110),
-            Some(Pt::new_with_value(111)),
+            None,        // no RTX — 111 would collide with Opus (see above)
             true,        // packetization-mode=1
             0x42_00_33,  // Baseline profile, level 5.1
         );

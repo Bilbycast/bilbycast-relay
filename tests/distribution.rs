@@ -228,6 +228,26 @@ async fn ingest_rejects_missing_token_when_required() {
     drop(conn);
 }
 
+/// PT-111 regression: a client (ice_lite=false) building an offer WITH audio
+/// must not panic. Before the fix, the vendored session applied the level-5.1
+/// H.264 workaround unconditionally, reusing PT 111 as an RTX slot that
+/// collides with Opus (also PT 111) — str0m panicked "Pt locked multiple
+/// times: 111". The workaround is now server-role-only. This unblocks the
+/// cascade WHEP-client (which pulls video+audio from an upstream relay).
+#[tokio::test]
+async fn client_offer_with_audio_does_not_panic() {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+    let cfg = SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: false,
+    };
+    let mut s = WebrtcSession::new(&cfg).await.unwrap();
+    let (offer, _pending) = s.create_offer(true, true, false).unwrap();
+    assert!(offer.contains("m=video"), "offer must carry video");
+    assert!(offer.contains("m=audio"), "offer must carry audio");
+}
+
 /// The crown-jewel test: a full WHEP handshake (ICE + DTLS + SRTP over real
 /// loopback UDP) between a str0m client (the "browser viewer") and the relay
 /// SFU, verifying that media published to the hub is packetized, encrypted,
@@ -270,16 +290,13 @@ async fn whep_viewer_receives_encrypted_media_end_to_end() {
         }
     });
 
-    // The "browser": a str0m client in recvonly mode. Video-only on the
-    // client to sidestep a str0m client-role codec-config quirk (the vendored
-    // add_h264 workaround reuses PT 111 as an RTX slot, which str0m's local
-    // offer-generation collides with Opus's 111 — a client concern; the relay
-    // SERVER uses accept_offer, which the shipping edge proves works with real
-    // browsers offering Opus). Video-only exercises the identical SFU media
-    // path: packetize → SRTP encrypt → loopback → SRTP decrypt → depacketize.
+    // The "browser": a str0m client in recvonly mode, negotiating BOTH video
+    // and audio (the PT-111 RTX/Opus collision is fixed, so a client offer with
+    // audio no longer panics). Exercises the full SFU media path end to end:
+    // packetize → SRTP encrypt → loopback → SRTP decrypt → depacketize.
     let client_cfg = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: Some(lo), ice_lite: false };
     let mut client = WebrtcSession::new(&client_cfg).await.unwrap();
-    let (offer_sdp, pending) = client.create_offer(true, false, false).unwrap();
+    let (offer_sdp, pending) = client.create_offer(true, true, false).unwrap();
 
     // The relay SFU accepts the offer, answers, and starts fanning out.
     let handle = whep::create_and_spawn_viewer(
@@ -394,6 +411,100 @@ async fn whip_ingest_depacketizes_h264_into_hub() {
 
     cancel.cancel();
     assert!(matches!(got, Ok(true)), "WHIP ingest must deliver a reassembled keyframe AU, got {got:?}");
+}
+
+/// Cascade end-to-end: an UPSTREAM relay serves a stream over WHEP; a
+/// DOWNSTREAM relay pulls it as a WHEP client (real HTTP signalling + real
+/// ICE/DTLS/SRTP) and republishes it into its own hub for its own viewers.
+/// Proves the relay-to-relay scale path.
+#[tokio::test]
+async fn cascade_pulls_upstream_whep_and_republishes() {
+    use std::net::SocketAddr;
+
+    use bilbycast_relay::config::{CascadeSource, DistributionConfig};
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{build_router, cascade, DistributionState};
+    use bilbycast_relay::manager::events::event_channel;
+
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let cancel = CancellationToken::new();
+
+    // ── Upstream relay: a hub + a real WHEP HTTP server ──
+    let up_hub = Arc::new(Hub::new());
+    let (up_events, _up_rx) = event_channel();
+    let up_cfg = DistributionConfig {
+        require_viewer_token: false,
+        require_ingest_token: false,
+        ..Default::default()
+    };
+    let up_state = DistributionState::new(
+        up_hub.clone(),
+        Arc::new(OriginStore::new(8)),
+        up_cfg,
+        Some(lo),
+        cancel.clone(),
+        up_events,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = listener.local_addr().unwrap();
+    let router = build_router(up_state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+
+    // Publisher feeding the upstream hub.
+    let pub_hub = up_hub.clone();
+    let pub_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut pts: u64 = 0;
+        pub_hub.publish("big-game", EsFrame::video(pts, idr_au(), true));
+        let mut tick = tokio::time::interval(Duration::from_millis(30));
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    pts += 2700;
+                    if pts % 27_000 == 0 {
+                        pub_hub.publish("big-game", EsFrame::video(pts, idr_au(), true));
+                    } else {
+                        pub_hub.publish("big-game", EsFrame::video(pts, Bytes::from_static(&[0,0,0,1,0x41,0x9a]), false));
+                    }
+                    pub_hub.publish("big-game", EsFrame::audio(pts, Bytes::from_static(&[0xfc,0x22])));
+                }
+            }
+        }
+    });
+
+    // ── Downstream relay: cascade pull into a local hub ──
+    let down_hub = Arc::new(Hub::new());
+    let mut sub = down_hub.subscribe("regional-copy");
+    let source = CascadeSource {
+        upstream_whep_url: format!("http://{up_addr}/whep/big-game"),
+        local_stream: "regional-copy".to_string(),
+        token: None,
+    };
+    let casc_hub = down_hub.clone();
+    let casc_cancel = cancel.clone();
+    tokio::spawn(async move { cascade::run_cascade(casc_hub, source, Some(lo), casc_cancel).await; });
+
+    // A keyframe access unit must reach the DOWNSTREAM hub, having traversed:
+    // publisher -> upstream hub -> upstream WHEP viewer (SRTP) -> cascade client
+    // -> downstream hub.
+    let got = tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            match sub.rx.recv().await {
+                Ok(f) if f.keyframe => return true,
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+
+    cancel.cancel();
+    assert!(matches!(got, Ok(true)), "cascade must republish a keyframe downstream, got {got:?}");
 }
 
 async fn recv_timeout(

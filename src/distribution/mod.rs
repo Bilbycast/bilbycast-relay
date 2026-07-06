@@ -17,6 +17,7 @@
 //! - The same ingest also feeds a **LL-HLS origin** ([`origin`]) for
 //!   CDN-scalable, non-WebRTC browser reach.
 
+pub mod cascade;
 pub mod es;
 pub mod hub;
 pub mod ingest;
@@ -70,6 +71,31 @@ pub struct ViewerSession {
     pub ip: IpAddr,
 }
 
+impl DistributionState {
+    /// Construct subsystem state with empty session/ingest registries. Shared
+    /// by `run_distribution` and integration tests.
+    pub fn new(
+        hub: Arc<DistributionHub>,
+        origin: Arc<OriginStore>,
+        config: DistributionConfig,
+        public_ip: Option<std::net::IpAddr>,
+        cancel: CancellationToken,
+        events: EventSender,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            hub,
+            origin,
+            config,
+            public_ip,
+            cancel,
+            sessions: DashMap::new(),
+            ingests: DashMap::new(),
+            viewers_by_ip: DashMap::new(),
+            events,
+        })
+    }
+}
+
 /// Run the whole viewer-distribution subsystem: the ingest listener + the
 /// browser-facing HTTP signaling / origin listeners. Returns when the
 /// subsystem's cancel token fires or every listener dies.
@@ -111,17 +137,23 @@ pub async fn run_distribution(
         });
     }
 
-    let state = Arc::new(DistributionState {
-        hub: hub.clone(),
-        origin: origin.clone(),
-        config: config.clone(),
+    let state = DistributionState::new(
+        hub.clone(),
+        origin.clone(),
+        config.clone(),
         public_ip,
-        cancel: cancel.clone(),
-        sessions: DashMap::new(),
-        ingests: DashMap::new(),
-        viewers_by_ip: DashMap::new(),
-        events: events.clone(),
-    });
+        cancel.clone(),
+        events.clone(),
+    );
+
+    // Start cascade pulls (this relay as a WHEP client of an upstream relay).
+    for src in config.cascade_sources.clone() {
+        let hub = hub.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            cascade::run_cascade(hub, src, public_ip, cancel).await;
+        });
+    }
 
     // Start the edge→relay ingest listener (browser-ready ES over QUIC).
     let ingest_cancel = cancel.clone();
@@ -175,8 +207,9 @@ pub async fn run_distribution(
     Ok(())
 }
 
-/// Build the axum router for the distribution HTTP surface.
-fn build_router(state: Arc<DistributionState>) -> Router {
+/// Build the axum router for the distribution HTTP surface. `pub` so
+/// integration tests can serve an upstream distribution node.
+pub fn build_router(state: Arc<DistributionState>) -> Router {
     Router::new()
         .route("/distribution/health", get(health))
         // WHEP: viewer POSTs an SDP offer, gets an SDP answer + a resource URL.

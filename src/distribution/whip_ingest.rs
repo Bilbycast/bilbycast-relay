@@ -136,19 +136,38 @@ async fn ingest_loop(
             _ => continue,
         }
     }
+
+    republish_from_session(session, &hub, stream_id, &cancel).await;
+
+    hub.remove(stream_id);
+    tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
+}
+
+/// Drive a **connected** WebRTC session, depacketizing its inbound media into
+/// the hub: H.264 NALs are regrouped into access units (by PTS) and published
+/// as video frames; Opus frames pass straight through. Returns when the
+/// session disconnects or `cancel` fires. Shared by WHIP ingest (server role)
+/// and the cascade WHEP-client (client role) — both receive WebRTC media and
+/// republish it identically.
+pub(crate) async fn republish_from_session(
+    mut session: WebrtcSession,
+    hub: &DistributionHub,
+    stream_id: &str,
+    cancel: &CancellationToken,
+) {
     session.drain_pending_events();
 
     let mut asm = AuAssembler::new(stream_id.to_string());
 
     loop {
-        match session.poll_event(&cancel).await {
+        match session.poll_event(cancel).await {
             SessionEvent::MediaData { mid, data, rtp_time, .. } => {
                 let is_video = session.video_mid == Some(mid);
                 let is_audio = session.audio_mid == Some(mid);
                 if is_video {
                     // str0m video MediaTime is already the 90 kHz clock.
                     let pts_90k = rtp_time.numer() as u64;
-                    asm.push(&hub, pts_90k, &data);
+                    asm.push(hub, pts_90k, &data);
                 } else if is_audio {
                     // Opus 48 kHz clock → 90 kHz.
                     let numer = rtp_time.numer() as u128;
@@ -166,9 +185,7 @@ async fn ingest_loop(
         }
     }
 
-    asm.flush(&hub);
-    hub.remove(stream_id);
-    tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
+    asm.flush(hub);
 }
 
 #[cfg(test)]

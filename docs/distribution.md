@@ -103,28 +103,41 @@ viewers per ~3 Mbps stream before NIC bandwidth or per-viewer SRTP CPU saturates
 There is **no** "no extra infrastructure at scale" free lunch — high viewer
 counts need either a relay cascade (WHEP) or a CDN (LL-HLS).
 
-### Cascade (roadmap)
+### Cascade
 
-A WHEP cascade adds regional edge-relays that **pull** a stream from an upstream
-origin-relay and re-fan-out locally. The design reuses what's already here:
+A WHEP cascade adds regional relays that **pull** a stream from an upstream
+origin-relay and re-fan-out locally — an origin feeds N regionals, each serving
+nearby viewers. **Implemented** (`src/distribution/cascade.rs`):
 
 - A downstream relay runs a **WHEP client** (the vendored `WebrtcSession` in the
-  `false`/non-ICE-Lite role) that connects to the upstream relay's
-  `/whep/{stream}`, receives media, and republishes it to its own
-  [`hub::DistributionHub`] — i.e. the downstream relay is "just another viewer"
-  of the upstream, then an SFU to its own viewers.
-- The manager assigns viewers to the **nearest** relay, reusing the ordered
-  primary/backup relay topology (`tunnels` relay list) and the relay registry /
-  health advertising already used for tunnel relay selection.
+  non-ICE-Lite role) that POSTs an SDP offer to the upstream relay's
+  `/whep/{stream}`, completes ICE/DTLS/SRTP, receives media, and republishes it
+  to its own [`hub::DistributionHub`] under a local stream name — the downstream
+  relay is "just another viewer" of the upstream, then an SFU to its own viewers.
+  Its own viewers, LL-HLS origin, and keyframe cache all work unchanged. It
+  reconnects automatically if the upstream stream isn't live yet.
+- Configure per source in the `distribution.cascade_sources` list:
 
-**Blocker to clear first**: the vendored `webrtc/session.rs` `add_h264`
-workaround reuses payload type **111** as an H.264 RTX slot, which collides with
-Opus (PT 111) when a *client* builds an offer **with audio** (str0m panics "Pt
-locked multiple times: 111"). The server role (`accept_offer`, used by WHEP +
-WHIP-in) is unaffected. Before shipping cascade, add a client-only session
-constructor that either passes `None` for the RTX PT or picks RTX PTs outside
-str0m 0.19's default map. (Same latent issue exists in bilbycast-edge's WHEP
-*input*, which is video-first today.)
+  ```json
+  "cascade_sources": [
+    { "upstream_whep_url": "http://origin-relay:4485/whep/big-game",
+      "local_stream": "big-game",
+      "token": "<upstream viewer token, if the origin is gated>" }
+  ]
+  ```
+
+  Relay-to-relay signalling uses plain `http://` on a trusted network in v1.
+
+**Nearest-relay assignment** (which regional relay a given viewer connects to)
+is manager orchestration — today the operator points viewers at the nearest
+relay's `/watch/{stream}` (reusing the same relay-selection the manager already
+does for tunnels). Automatic geo/latency-based viewer assignment is a follow-up
+(it needs real multi-region relays + latency data to tune).
+
+*(Historical note: the cascade WHEP-client offering audio previously tripped a
+str0m PT-collision — the `add_h264` workaround reused PT 111, which is Opus's
+default. Fixed in `webrtc/session.rs` by dropping the RTX slot on that one
+H.264 profile; the workaround is now safe on both the server and client roles.)*
 
 ### Late-join & keyframes
 
@@ -183,6 +196,7 @@ as ignored at startup.
 | `es.rs` | Elementary-frame types + Annex-B NAL splitter |
 | `whep.rs` | Per-viewer WHEP session + send loop (packetize → SRTP) |
 | `whip_ingest.rs` | WHIP-in: terminate DTLS/SRTP, depacketize → access units → hub |
+| `cascade.rs` | Relay-to-relay: WHEP-client pull from an upstream relay → local hub |
 | `ingest.rs` | QUIC ES ingest (future lower-overhead edge path) |
 | `origin.rs` | LL-HLS/CMAF HTTP origin + sliding-window cache |
 | `token.rs` | Short-lived HMAC token mint/verify (viewer + ingest scopes) |
@@ -200,7 +214,12 @@ as ignored at startup.
 - **WHIP-in → hub**: a str0m WHIP client pushing H.264 over DTLS/SRTP, the relay
   depacketizing + reassembling access units
   (`whip_ingest_depacketizes_h264_into_hub`).
+- **Cascade**: an upstream relay serving WHEP + a downstream relay pulling it
+  (real HTTP signalling + real ICE/DTLS/SRTP) and republishing to its own hub
+  (`cascade_pulls_upstream_whep_and_republishes`).
+- WHEP client offering **audio** no longer panics (PT-111 regression guard).
 - Token scope/expiry, origin sliding window, per-IP cap, ingest gating.
 
-Browser interop, cellular-hardware end-to-end, and multi-relay cascade at scale
-remain to be verified on real infrastructure.
+Browser interop, cellular-hardware end-to-end, and multi-relay cascade **at
+scale** (plus automatic nearest-relay viewer assignment) remain to be verified
+on real infrastructure.
