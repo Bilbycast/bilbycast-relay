@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::config::{ManagerConfig, RelayConfig};
+use crate::distribution_control::DistributionControl;
 use crate::session::SessionContext;
 use crate::stats::RelayStats;
 
@@ -133,6 +134,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
 }
 
 /// Start the manager client background task.
+#[allow(clippy::too_many_arguments)]
 pub fn start_manager_client(
     config: ManagerConfig,
     ctx: Arc<SessionContext>,
@@ -141,12 +143,24 @@ pub fn start_manager_client(
     config_path: PathBuf,
     event_rx: mpsc::UnboundedReceiver<Event>,
     event_sender: super::events::EventSender,
+    distribution_control: Option<Arc<DistributionControl>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        manager_client_loop(config, ctx, relay_stats, relay_config, config_path, event_rx, event_sender).await;
+        manager_client_loop(
+            config,
+            ctx,
+            relay_stats,
+            relay_config,
+            config_path,
+            event_rx,
+            event_sender,
+            distribution_control,
+        )
+        .await;
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn manager_client_loop(
     mut config: ManagerConfig,
     ctx: Arc<SessionContext>,
@@ -155,6 +169,7 @@ async fn manager_client_loop(
     config_path: PathBuf,
     mut event_rx: mpsc::UnboundedReceiver<Event>,
     event_sender: super::events::EventSender,
+    distribution_control: Option<Arc<DistributionControl>>,
 ) {
     // Multi-URL failover: rotate to the next manager URL on each close/error;
     // constant 5 s backoff between attempts (no delay while connected; never
@@ -183,7 +198,7 @@ async fn manager_client_loop(
             config.urls.len(),
         );
 
-        match try_connect(&current_url, &config, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender).await {
+        match try_connect(&current_url, &config, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender, distribution_control.as_ref()).await {
             Ok(ConnectResult::Closed) => {
                 tracing::info!("Manager connection to {current_url} closed normally");
                 event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, "Manager connection lost, rotating to next URL");
@@ -228,6 +243,7 @@ enum ConnectResult {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_connect(
     current_url: &str,
     config: &ManagerConfig,
@@ -237,6 +253,7 @@ async fn try_connect(
     config_path: &PathBuf,
     event_rx: &mut mpsc::UnboundedReceiver<Event>,
     event_sender: &super::events::EventSender,
+    distribution_control: Option<&Arc<DistributionControl>>,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
     if !current_url.starts_with("wss://") {
@@ -366,7 +383,7 @@ async fn try_connect(
     }
 
     // Send initial health
-    let health = build_health_message(ctx, relay_stats, relay_config);
+    let health = build_health_message(ctx, relay_stats, relay_config, distribution_control);
     if let Ok(json) = serde_json::to_string(&health) {
         let _ = ws_write.send(Message::Text(json.into())).await;
     }
@@ -394,7 +411,7 @@ async fn try_connect(
             }
 
             _ = health_interval.tick() => {
-                let envelope = build_health_message(ctx, relay_stats, relay_config);
+                let envelope = build_health_message(ctx, relay_stats, relay_config, distribution_control);
                 if let Ok(json) = serde_json::to_string(&envelope) {
                     if ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
@@ -405,7 +422,7 @@ async fn try_connect(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(&text, ctx, relay_config, config_path, &mut ws_write).await;
+                        handle_manager_message(&text, ctx, relay_config, config_path, &mut ws_write, distribution_control).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
@@ -548,10 +565,101 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
     stats
 }
 
+/// Apply a manager `configure_distribution` command onto the runtime control
+/// cell (secret / gates / public IP+URL / cascade sources). Partial: only the
+/// fields present in the action are changed.
+fn apply_configure_distribution(
+    control: Option<&Arc<DistributionControl>>,
+    action: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(control) = control else {
+        return Err(
+            "this relay is not a viewer-distribution node (built without the feature, or role disabled)"
+                .to_string(),
+        );
+    };
+    use crate::distribution_control::DistUpdate;
+    let mut update = DistUpdate::default();
+    if let Some(s) = action.get("token_secret").and_then(|v| v.as_str()) {
+        if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("token_secret must be exactly 64 hex chars".to_string());
+        }
+        update.token_secret = Some(s.to_string());
+    }
+    if let Some(b) = action.get("require_viewer_token").and_then(|v| v.as_bool()) {
+        update.require_viewer_token = Some(b);
+    }
+    if let Some(b) = action.get("require_ingest_token").and_then(|v| v.as_bool()) {
+        update.require_ingest_token = Some(b);
+    }
+    if let Some(s) = action.get("public_ip").and_then(|v| v.as_str()) {
+        match s.parse() {
+            Ok(ip) => update.public_ip = Some(ip),
+            Err(_) => return Err(format!("invalid public_ip '{s}'")),
+        }
+    }
+    if let Some(s) = action.get("public_base_url").and_then(|v| v.as_str()) {
+        if !(s.starts_with("http://") || s.starts_with("https://")) {
+            return Err("public_base_url must start with http:// or https://".to_string());
+        }
+        update.public_base_url = Some(s.to_string());
+    }
+    control.apply(update);
+
+    if let Some(arr) = action.get("cascade_sources").and_then(|v| v.as_array()) {
+        let mut sources = Vec::with_capacity(arr.len());
+        for v in arr {
+            let src: crate::config::CascadeSource = serde_json::from_value(v.clone())
+                .map_err(|e| format!("invalid cascade source: {e}"))?;
+            sources.push(src);
+        }
+        control.set_cascade(sources);
+    }
+
+    tracing::info!("configure_distribution applied from manager");
+    Ok(())
+}
+
+/// Persist the current runtime distribution config into the relay's config.json
+/// so it survives a restart without the manager having to re-push. Best-effort:
+/// a write failure is logged, not fatal (the manager re-pushes on reconnect).
+fn persist_distribution_config(
+    control: Option<&Arc<DistributionControl>>,
+    relay_config: &RelayConfig,
+    config_path: &PathBuf,
+) {
+    let Some(control) = control else { return };
+    if config_path.as_os_str().is_empty() {
+        return; // running without a config file — nothing to persist to
+    }
+    let rt = control.load();
+    let mut updated = relay_config.clone();
+    let dcfg = updated
+        .distribution
+        .get_or_insert_with(crate::config::DistributionConfig::default);
+    dcfg.enabled = true;
+    dcfg.token_secret = rt.token_secret.clone();
+    dcfg.require_viewer_token = rt.require_viewer_token;
+    dcfg.require_ingest_token = rt.require_ingest_token;
+    dcfg.public_ip = rt.public_ip.map(|ip| ip.to_string());
+    dcfg.public_base_url = rt.public_base_url.clone();
+    dcfg.cascade_sources = control.cascade_now();
+
+    match serde_json::to_string_pretty(&updated) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(config_path, &json) {
+                tracing::warn!("failed to persist distribution config to {config_path:?}: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize config for persistence: {e}"),
+    }
+}
+
 fn build_health_message(
     ctx: &SessionContext,
     relay_stats: &RelayStats,
     relay_config: &RelayConfig,
+    distribution_control: Option<&Arc<DistributionControl>>,
 ) -> serde_json::Value {
     let (total_tunnels, active_tunnels) = ctx.router.counts();
     let tunnel_infos = ctx.router.list_tunnels();
@@ -605,10 +713,14 @@ fn build_health_message(
             "origin_bytes": d.origin_bytes,
         });
     }
-    if let Some(dist_cfg) = relay_config.distribution.as_ref() {
-        if let Some(base) = dist_cfg.public_base_url.as_ref() {
-            payload["distribution_base_url"] = serde_json::json!(base);
-        }
+    // Advertised viewer base URL — the runtime (manager-pushed) value wins over
+    // the config bootstrap so the manager's relay card + viewer links track the
+    // live setting.
+    let base_url = distribution_control
+        .and_then(|c| c.load().public_base_url.clone())
+        .or_else(|| relay_config.distribution.as_ref().and_then(|d| d.public_base_url.clone()));
+    if let Some(base) = base_url {
+        payload["distribution_base_url"] = serde_json::json!(base);
     }
 
     serde_json::json!({
@@ -622,12 +734,14 @@ fn build_health_message(
 // Command handling
 // ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_manager_message<S>(
     text: &str,
     ctx: &Arc<SessionContext>,
     relay_config: &RelayConfig,
     config_path: &PathBuf,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
+    distribution_control: Option<&Arc<DistributionControl>>,
 ) where
     S: futures_util::Sink<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
@@ -721,6 +835,32 @@ async fn handle_manager_message<S>(
                         "command_id": command_id,
                         "success": result.is_ok(),
                         "error": result.err()
+                    }
+                });
+                if let Ok(json) = serde_json::to_string(&ack) {
+                    let _ = ws_write.send(Message::Text(json.into())).await;
+                }
+                return;
+            }
+
+            // configure_distribution updates the runtime distribution config
+            // (secret, gates, public IP/URL, cascade sources) — the manager
+            // owns the operational policy so the operator never hand-edits the
+            // relay's config.json.
+            if action_type == "configure_distribution" {
+                let result = apply_configure_distribution(distribution_control, action);
+                // Persist to config.json so the config survives a relay restart
+                // without needing the manager to re-push.
+                if result.is_ok() {
+                    persist_distribution_config(distribution_control, relay_config, config_path);
+                }
+                let ack = serde_json::json!({
+                    "type": "command_ack",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": {
+                        "command_id": command_id,
+                        "success": result.is_ok(),
+                        "error": result.err(),
                     }
                 });
                 if let Ok(json) = serde_json::to_string(&ack) {

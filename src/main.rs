@@ -8,6 +8,7 @@ use clap::Parser;
 
 use bilbycast_relay::build_tcp_listener;
 use bilbycast_relay::config::RelayConfig;
+use bilbycast_relay::distribution_control::{DistributionControl, RuntimeDistConfig};
 use bilbycast_relay::stats::RelayStats;
 use bilbycast_relay::{api, manager, observability, server, udp_relay};
 #[cfg(feature = "viewer-distribution")]
@@ -234,6 +235,23 @@ async fn main() -> Result<()> {
         let _ = set.join_next().await;
     });
 
+    // Build the shared distribution runtime-config control up front, so the
+    // manager client can apply `configure_distribution` pushes onto the same
+    // cell the subsystem (below) reads live. Present only on a distribution
+    // build (feature on) where the role isn't opted out (`enabled: false`).
+    // `enabled` defaults true, so a `-distribution` binary comes up as a
+    // distribution node with no config edits and the manager configures it.
+    let distribution_control: Option<Arc<DistributionControl>> = {
+        let dcfg = config.distribution.clone().unwrap_or_default();
+        if cfg!(feature = "viewer-distribution") && dcfg.enabled {
+            let public_ip = dcfg.public_ip_parsed();
+            let rt = RuntimeDistConfig::from_config(&dcfg, public_ip);
+            Some(DistributionControl::new(rt, dcfg.cascade_sources.clone()))
+        } else {
+            None
+        }
+    };
+
     // Start manager client if configured
     let config_path = cli.config.clone().unwrap_or_default();
     let manager_handle = if let Some(ref mgr_config) = config.manager {
@@ -251,6 +269,7 @@ async fn main() -> Result<()> {
                 std::path::PathBuf::from(&config_path),
                 event_rx,
                 event_sender.clone(),
+                distribution_control.clone(),
             ))
         } else {
             None
@@ -290,9 +309,8 @@ async fn main() -> Result<()> {
     // compiled in AND enabled in config. Isolated behind the feature so a
     // plain opaque-forwarder build carries none of it.
     #[cfg(feature = "viewer-distribution")]
-    let distribution_handle = if let Some(dist_cfg) =
-        config.distribution.clone().filter(|d| d.enabled)
-    {
+    let distribution_handle = if let Some(control) = distribution_control.clone() {
+        let dist_cfg = config.distribution.clone().unwrap_or_default();
         let hub = Arc::new(distribution::hub::DistributionHub::new());
         let cancel = tokio_util::sync::CancellationToken::new();
         let events = event_sender.clone();
@@ -300,7 +318,8 @@ async fn main() -> Result<()> {
         tracing::info!("viewer-distribution subsystem enabled");
         Some(tokio::spawn(async move {
             if let Err(e) =
-                distribution::run_distribution(dist_cfg, hub, cancel, events, dist_stats).await
+                distribution::run_distribution(dist_cfg, control, hub, cancel, events, dist_stats)
+                    .await
             {
                 tracing::error!("viewer-distribution subsystem stopped: {e:#}");
             }

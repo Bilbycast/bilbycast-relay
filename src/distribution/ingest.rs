@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::DistributionConfig;
+use crate::distribution_control::DistributionControl;
 use crate::manager::events::{category, EventSender, EventSeverity};
 
 use super::es::{EsFrame, EsKind};
@@ -67,6 +68,7 @@ pub struct IngestHello {
 /// Run the distribution ingest QUIC listener(s).
 pub async fn run_ingest(
     config: DistributionConfig,
+    control: Arc<DistributionControl>,
     hub: Arc<DistributionHub>,
     events: EventSender,
     cancel: CancellationToken,
@@ -102,11 +104,11 @@ pub async fn run_ingest(
         tracing::info!("distribution ingest (edge→relay ES) listening on {addr}");
 
         let hub = hub.clone();
-        let config = config.clone();
+        let control = control.clone();
         let events = events.clone();
         let cancel = cancel.clone();
         set.spawn(async move {
-            accept_loop(endpoint, hub, config, events, cancel).await;
+            accept_loop(endpoint, control, hub, events, cancel).await;
         });
     }
 
@@ -125,8 +127,8 @@ pub async fn run_ingest(
 /// bind an ephemeral endpoint and drive it directly.
 pub async fn accept_loop(
     endpoint: quinn::Endpoint,
+    control: Arc<DistributionControl>,
     hub: Arc<DistributionHub>,
-    config: DistributionConfig,
     events: EventSender,
     cancel: CancellationToken,
 ) {
@@ -136,11 +138,11 @@ pub async fn accept_loop(
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let hub = hub.clone();
-                let config = config.clone();
+                let control = control.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
                     match incoming.await {
-                        Ok(conn) => handle_ingest_connection(conn, hub, config, events).await,
+                        Ok(conn) => handle_ingest_connection(conn, control, hub, events).await,
                         Err(e) => tracing::debug!("distribution ingest accept failed: {e}"),
                     }
                 });
@@ -151,8 +153,8 @@ pub async fn accept_loop(
 
 async fn handle_ingest_connection(
     conn: quinn::Connection,
+    control: Arc<DistributionControl>,
     hub: Arc<DistributionHub>,
-    config: DistributionConfig,
     events: EventSender,
 ) {
     let peer = conn.remote_address();
@@ -161,10 +163,10 @@ async fn handle_ingest_connection(
         match conn.accept_uni().await {
             Ok(recv) => {
                 let hub = hub.clone();
-                let config = config.clone();
+                let control = control.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_ingest_stream(recv, hub, config, events).await {
+                    if let Err(e) = handle_ingest_stream(recv, control, hub, events).await {
                         tracing::debug!("distribution ingest stream from {peer} ended: {e}");
                     }
                 });
@@ -179,8 +181,8 @@ async fn handle_ingest_connection(
 
 async fn handle_ingest_stream(
     mut recv: RecvStream,
+    control: Arc<DistributionControl>,
     hub: Arc<DistributionHub>,
-    config: DistributionConfig,
     events: EventSender,
 ) -> Result<()> {
     // 1. Read the Hello.
@@ -197,9 +199,10 @@ async fn handle_ingest_stream(
         bail!("invalid stream id in ingest hello");
     };
 
-    // 2. Token gate.
-    if config.require_ingest_token {
-        let Some(ref secret) = config.token_secret else {
+    // 2. Token gate (runtime, manager-overridable).
+    let rt = control.load();
+    if rt.require_ingest_token {
+        let Some(ref secret) = rt.token_secret else {
             bail!("ingest token required but no token_secret configured");
         };
         let Some(ref tok) = hello.token else {

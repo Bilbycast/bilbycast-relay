@@ -15,6 +15,7 @@ use quinn::{ClientConfig, Endpoint, TransportConfig};
 use tokio_util::sync::CancellationToken;
 
 use bilbycast_relay::config::DistributionConfig;
+use bilbycast_relay::distribution_control::{DistributionControl, RuntimeDistConfig};
 use bilbycast_relay::distribution::es::EsFrame;
 use bilbycast_relay::distribution::hub::DistributionHub;
 use bilbycast_relay::distribution::ingest::{
@@ -118,10 +119,11 @@ async fn ingest_over_quic_delivers_frames_to_hub() {
     let server = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
 
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&config, None), config.cascade_sources.clone());
     let accept_hub = hub.clone();
     let accept_cancel = cancel.clone();
     tokio::spawn(async move {
-        ingest::accept_loop(server, accept_hub, config, events, accept_cancel).await;
+        ingest::accept_loop(server, control, accept_hub, events, accept_cancel).await;
     });
 
     // A viewer subscribes before ingest starts.
@@ -194,10 +196,11 @@ async fn ingest_rejects_missing_token_when_required() {
     let server_cfg = ingest::build_ingest_server_config().unwrap();
     let server = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&config, None), config.cascade_sources.clone());
     let accept_hub = hub.clone();
     let accept_cancel = cancel.clone();
     tokio::spawn(async move {
-        ingest::accept_loop(server, accept_hub, config, events, accept_cancel).await;
+        ingest::accept_loop(server, control, accept_hub, events, accept_cancel).await;
     });
 
     let mut sub = hub.subscribe("gated");
@@ -413,6 +416,67 @@ async fn whip_ingest_depacketizes_h264_into_hub() {
     assert!(matches!(got, Ok(true)), "WHIP ingest must deliver a reassembled keyframe AU, got {got:?}");
 }
 
+/// Runtime config: flipping `require_viewer_token` on the control cell (as the
+/// manager's `configure_distribution` push does) changes the live WHEP gate —
+/// proving the manager-owned runtime config reaches the request handlers.
+#[tokio::test]
+async fn runtime_control_flips_viewer_gate() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::config::DistributionConfig;
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{build_router, DistributionState};
+    use bilbycast_relay::distribution_control::DistUpdate;
+    use bilbycast_relay::manager::events::event_channel;
+
+    let cancel = CancellationToken::new();
+    let hub = Arc::new(Hub::new());
+    let (events, _rx) = event_channel();
+    // Start ungated (no viewer token required).
+    let cfg = DistributionConfig { require_viewer_token: false, require_ingest_token: false, ..Default::default() };
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let state = DistributionState::new(hub, Arc::new(OriginStore::new(8)), cfg, control.clone(), cancel.clone(), events);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+
+    async fn post(addr: SocketAddr, path: &str, body: &str) -> u16 {
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).lines().next().unwrap_or("").split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
+    }
+
+    // Gate OFF: a WHEP POST is NOT rejected for a missing token (it fails later
+    // on the bogus SDP → 400, not 401).
+    let before = post(addr, "/whep/teststream", "v=0\r\n").await;
+    assert_ne!(before, 401, "gate should be off initially (got {before})");
+
+    // Manager pushes require_viewer_token=true + a secret.
+    control.apply(DistUpdate {
+        token_secret: Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into()),
+        require_viewer_token: Some(true),
+        ..Default::default()
+    });
+
+    // Gate ON: the same tokenless request is now rejected with 401.
+    let after = post(addr, "/whep/teststream", "v=0\r\n").await;
+    assert_eq!(after, 401, "viewer gate must be enforced after the runtime push (got {after})");
+
+    cancel.cancel();
+}
+
 /// Cascade end-to-end: an UPSTREAM relay serves a stream over WHEP; a
 /// DOWNSTREAM relay pulls it as a WHEP client (real HTTP signalling + real
 /// ICE/DTLS/SRTP) and republishes it into its own hub for its own viewers.
@@ -438,11 +502,15 @@ async fn cascade_pulls_upstream_whep_and_republishes() {
         require_ingest_token: false,
         ..Default::default()
     };
+    let up_control = DistributionControl::new(
+        RuntimeDistConfig::from_config(&up_cfg, Some(lo)),
+        up_cfg.cascade_sources.clone(),
+    );
     let up_state = DistributionState::new(
         up_hub.clone(),
         Arc::new(OriginStore::new(8)),
         up_cfg,
-        Some(lo),
+        up_control,
         cancel.clone(),
         up_events,
     );

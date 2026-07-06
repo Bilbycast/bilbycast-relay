@@ -156,10 +156,20 @@ A/V drift, PCR_AC) therefore apply to the **edge's** WHIP-client output (which
 does the AAC→Opus / HEVC→H.264 transcode and is already gated on ship), not to
 the relay. No new gate runs are required for the relay's passthrough SFU.
 
-## Configuration
+## Configuration — manager-managed
 
-Add a `distribution` block to the relay config (see
-`../../testbed/configs/relay-distribution.json`):
+A `-distribution` binary **starts the subsystem by default** (opt out with
+`distribution.enabled: false`) and comes up **idle + secure** (no streams, ingest
+closed) until configured. In a managed deployment you don't hand-edit
+`config.json` at all: from the manager's relay detail page, the **Configure
+distribution** panel pushes the public IP/URL, auth gates, and cascade sources
+(and the shared token secret) over the WS `configure_distribution` command. The
+relay applies them to a live runtime cell **and persists them to `config.json`**,
+so they survive a restart; the manager also re-pushes on reconnect.
+
+The config block below is therefore only a **bootstrap** (or for standalone,
+manager-less use). Ports/listeners are the only settings not runtime-changeable.
+See `../../testbed/configs/relay-distribution.json`:
 
 ```json
 {

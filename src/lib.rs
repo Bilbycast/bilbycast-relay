@@ -12,6 +12,9 @@ pub mod api;
 pub mod config;
 #[cfg(feature = "viewer-distribution")]
 pub mod distribution;
+/// Runtime distribution config the manager pushes over WS. Always compiled so
+/// the (non-feature-gated) manager client can hold a handle.
+pub mod distribution_control;
 pub mod manager;
 pub mod observability;
 pub mod protocol;

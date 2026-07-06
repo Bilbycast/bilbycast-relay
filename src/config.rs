@@ -197,8 +197,11 @@ pub struct RelayConfig {
 /// any of it. Default-off even when compiled in.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DistributionConfig {
-    /// Master switch. When false the subsystem does not start.
-    #[serde(default)]
+    /// Master switch. Defaults to **true** so the `-distribution` binary comes
+    /// up as a distribution node with no hand-editing — the manager then
+    /// configures it over WS. Set `false` to opt a distribution-capable binary
+    /// out of the role. (A plain forwarder build ignores this block entirely.)
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Browser-facing HTTP signaling + LL-HLS origin listener addresses
@@ -281,7 +284,7 @@ pub struct CascadeSource {
 impl Default for DistributionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             http_addrs: None,
             public_ip: None,
             public_base_url: None,
@@ -359,17 +362,10 @@ impl DistributionConfig {
                 anyhow::bail!("distribution.token_secret must be exactly 64 hex chars (32 bytes)");
             }
         }
-        if self.require_viewer_token && self.token_secret.is_none() {
-            anyhow::bail!(
-                "distribution.require_viewer_token=true requires distribution.token_secret to be set"
-            );
-        }
-        if self.enabled && self.require_ingest_token && self.token_secret.is_none() {
-            anyhow::bail!(
-                "distribution.require_ingest_token=true requires distribution.token_secret to be set \
-                 (set token_secret, or set require_ingest_token=false for an open dev ingest)"
-            );
-        }
+        // NB: token gates (`require_viewer_token` / `require_ingest_token`)
+        // may be on with no `token_secret` in config — the manager pushes the
+        // secret at runtime via `configure_distribution`. Until it arrives the
+        // gated surfaces stay closed (fail-safe), so this is not a config error.
         if self.origin_window_segments == 0 || self.origin_window_segments > 64 {
             anyhow::bail!("distribution.origin_window_segments must be in 1..=64");
         }

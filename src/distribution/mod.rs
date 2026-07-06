@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
 use crate::config::DistributionConfig;
+use crate::distribution_control::DistributionControl;
 use crate::manager::events::EventSender;
 
 use self::hub::DistributionHub;
@@ -51,9 +52,10 @@ use self::origin::OriginStore;
 pub struct DistributionState {
     pub hub: Arc<DistributionHub>,
     pub origin: Arc<OriginStore>,
+    /// Static config (listeners, origin window, per-IP cap) — set at startup.
     pub config: DistributionConfig,
-    /// The relay's public IP for WHEP ICE candidates.
-    pub public_ip: Option<std::net::IpAddr>,
+    /// Runtime config the manager can push (secret, gates, public IP/URL).
+    pub control: Arc<DistributionControl>,
     /// Root cancel token for the subsystem.
     pub cancel: CancellationToken,
     /// Live viewer sessions, keyed by session id — for targeted DELETE.
@@ -73,12 +75,14 @@ pub struct ViewerSession {
 
 impl DistributionState {
     /// Construct subsystem state with empty session/ingest registries. Shared
-    /// by `run_distribution` and integration tests.
+    /// by `run_distribution` and integration tests. `control` carries the
+    /// runtime-overridable config (built from `config` at startup; the manager
+    /// may later push updates onto it).
     pub fn new(
         hub: Arc<DistributionHub>,
         origin: Arc<OriginStore>,
         config: DistributionConfig,
-        public_ip: Option<std::net::IpAddr>,
+        control: Arc<DistributionControl>,
         cancel: CancellationToken,
         events: EventSender,
     ) -> Arc<Self> {
@@ -86,13 +90,18 @@ impl DistributionState {
             hub,
             origin,
             config,
-            public_ip,
+            control,
             cancel,
             sessions: DashMap::new(),
             ingests: DashMap::new(),
             viewers_by_ip: DashMap::new(),
             events,
         })
+    }
+
+    /// The relay's currently-advertised public IP for WHEP ICE candidates.
+    pub fn public_ip(&self) -> Option<std::net::IpAddr> {
+        self.control.load().public_ip
     }
 }
 
@@ -101,13 +110,13 @@ impl DistributionState {
 /// subsystem's cancel token fires or every listener dies.
 pub async fn run_distribution(
     config: DistributionConfig,
+    control: Arc<DistributionControl>,
     hub: Arc<DistributionHub>,
     cancel: CancellationToken,
     events: EventSender,
     relay_stats: Arc<crate::stats::RelayStats>,
 ) -> Result<()> {
     let origin = Arc::new(OriginStore::new(config.origin_window_segments));
-    let public_ip = config.public_ip_parsed();
 
     // Telemetry: periodically publish hub + origin counters onto RelayStats so
     // the manager-client health builder (and the local REST/metrics surface)
@@ -141,17 +150,19 @@ pub async fn run_distribution(
         hub.clone(),
         origin.clone(),
         config.clone(),
-        public_ip,
+        control.clone(),
         cancel.clone(),
         events.clone(),
     );
 
-    // Start cascade pulls (this relay as a WHEP client of an upstream relay).
-    for src in config.cascade_sources.clone() {
+    // Cascade supervisor: reconcile the running WHEP-client pulls against the
+    // (manager-updatable) cascade source list.
+    {
         let hub = hub.clone();
+        let control = control.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            cascade::run_cascade(hub, src, public_ip, cancel).await;
+            cascade::run_cascade_supervisor(hub, control, cancel).await;
         });
     }
 
@@ -159,10 +170,17 @@ pub async fn run_distribution(
     let ingest_cancel = cancel.clone();
     let ingest_hub = hub.clone();
     let ingest_config = config.clone();
+    let ingest_control = control.clone();
     let ingest_events = events.clone();
     let ingest_handle = tokio::spawn(async move {
-        if let Err(e) =
-            ingest::run_ingest(ingest_config, ingest_hub, ingest_events, ingest_cancel).await
+        if let Err(e) = ingest::run_ingest(
+            ingest_config,
+            ingest_control,
+            ingest_hub,
+            ingest_events,
+            ingest_cancel,
+        )
+        .await
         {
             tracing::error!("distribution ingest listener stopped: {e:#}");
         }
@@ -256,8 +274,8 @@ async fn whep_offer(
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
 
-    // Optional viewer-token gate (P2).
-    if st.config.require_viewer_token {
+    // Optional viewer-token gate (runtime, manager-overridable).
+    if st.control.load().require_viewer_token {
         if let Err(resp) = check_viewer_token(&st, &stream_id, &headers) {
             return resp;
         }
@@ -288,7 +306,7 @@ async fn whep_offer(
         st.hub.clone(),
         stream_id.clone(),
         &body,
-        st.public_ip,
+        st.public_ip(),
         st.cancel.clone(),
     )
     .await
@@ -361,8 +379,9 @@ async fn whip_ingest_offer(
     };
 
     // Ingest is a write surface — token-gate it unless explicitly disabled.
-    if st.config.require_ingest_token {
-        let Some(ref secret) = st.config.token_secret else {
+    let rt = st.control.load();
+    if rt.require_ingest_token {
+        let Some(ref secret) = rt.token_secret else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "ingest token gate misconfigured").into_response();
         };
         let ok = bearer(&headers)
@@ -381,7 +400,7 @@ async fn whip_ingest_offer(
         st.hub.clone(),
         stream_id.clone(),
         &body,
-        st.public_ip,
+        st.public_ip(),
         st.cancel.clone(),
     )
     .await
@@ -449,7 +468,8 @@ fn check_viewer_token(
     stream_id: &str,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
-    let Some(ref secret) = st.config.token_secret else {
+    let rt = st.control.load();
+    let Some(ref secret) = rt.token_secret else {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "token gate misconfigured").into_response());
     };
     let bearer = headers

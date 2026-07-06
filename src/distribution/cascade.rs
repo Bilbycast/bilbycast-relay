@@ -25,11 +25,77 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use std::collections::HashMap;
+
 use crate::config::CascadeSource;
+use crate::distribution_control::DistributionControl;
 
 use super::hub::DistributionHub;
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 use super::whip_ingest::republish_from_session;
+
+/// Supervise the set of cascade pulls, reconciling running WHEP-client tasks
+/// against the (manager-updatable) source list on every change. Keyed by
+/// `local_stream`; a source whose URL/token changed is cancelled + respawned.
+pub async fn run_cascade_supervisor(
+    hub: Arc<DistributionHub>,
+    control: Arc<DistributionControl>,
+    cancel: CancellationToken,
+) {
+    let mut rx = control.subscribe_cascade();
+    // local_stream -> (source, its cancel token)
+    let mut running: HashMap<String, (CascadeSource, CancellationToken)> = HashMap::new();
+
+    loop {
+        let sources = rx.borrow_and_update().clone();
+        reconcile_cascade(&hub, &control, &cancel, &mut running, sources);
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            changed = rx.changed() => {
+                if changed.is_err() { break; } // control dropped
+            }
+        }
+    }
+    for (_, (_, c)) in running.drain() {
+        c.cancel();
+    }
+}
+
+fn reconcile_cascade(
+    hub: &Arc<DistributionHub>,
+    control: &Arc<DistributionControl>,
+    parent_cancel: &CancellationToken,
+    running: &mut HashMap<String, (CascadeSource, CancellationToken)>,
+    sources: Vec<CascadeSource>,
+) {
+    let desired: HashMap<String, CascadeSource> = sources
+        .into_iter()
+        .map(|s| (s.local_stream.clone(), s))
+        .collect();
+
+    // Cancel pulls that were removed or whose source changed.
+    running.retain(|k, (src, c)| match desired.get(k) {
+        Some(new) if new == src => true,
+        _ => {
+            c.cancel();
+            false
+        }
+    });
+
+    // Spawn pulls that are new (or changed and just cancelled above).
+    for (k, src) in desired {
+        if running.contains_key(&k) {
+            continue;
+        }
+        let child = parent_cancel.child_token();
+        running.insert(k, (src.clone(), child.clone()));
+        let hub = hub.clone();
+        let public_ip = control.load().public_ip;
+        tokio::spawn(async move {
+            run_cascade(hub, src, public_ip, child).await;
+        });
+    }
+}
 
 /// Run one cascade pull, reconnecting on failure until cancelled. The upstream
 /// stream may not exist yet (its edge not connected) — we keep retrying.

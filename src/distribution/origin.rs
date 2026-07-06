@@ -204,9 +204,11 @@ async fn origin_put(
         return (StatusCode::BAD_REQUEST, "invalid object name").into_response();
     }
 
-    // Ingest is a write surface — token-gate it unless explicitly disabled.
-    if st.config.require_ingest_token {
-        if let Some(ref secret) = st.config.token_secret {
+    // Ingest is a write surface — token-gate it unless explicitly disabled
+    // (runtime, manager-overridable).
+    let rt = st.control.load();
+    if rt.require_ingest_token {
+        if let Some(ref secret) = rt.token_secret {
             let tok = bearer_or_query(&headers, None);
             match tok.and_then(|t| token::verify_ingest_token(secret, &stream, &t).ok()) {
                 Some(()) => {}
