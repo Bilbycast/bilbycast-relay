@@ -49,6 +49,12 @@ cargo build --release
 
 Starts with defaults: QUIC on `0.0.0.0:4433`, native SRT/RIST plain-UDP on `0.0.0.0:4434`, REST API on `0.0.0.0:4480`, self-signed TLS certificate. No config file needed.
 
+To build a relay that can also reach browser viewers (see [Viewer Distribution](#viewer-distribution-optional) below), add the feature — releases ship this as the separate `*-linux-distribution` binary:
+
+```bash
+cargo build --release --features viewer-distribution   # str0m + OpenSSL
+```
+
 ### With manager connection (manual config)
 
 1. In the manager UI, create a new node with device type **relay** and copy the registration token.
@@ -130,6 +136,42 @@ All fields are optional. Defaults are used for any omitted field.
 | `manager.accept_self_signed_cert` | `false` | Accept self-signed TLS from manager (requires `BILBYCAST_ALLOW_INSECURE=1` env var) |
 | `manager.cert_fingerprint` | (none) | SHA-256 certificate pin for the manager (hex with colons) |
 | `manager.registration_token` | (none) | One-time registration token from manager |
+
+## Viewer Distribution (optional)
+
+Built with `--features viewer-distribution` (the `*-linux-distribution` release
+binary), a relay can also reach **browser viewers directly** — a **WHEP SFU**
+for sub-second WebRTC plus an **LL-HLS/CMAF origin** for CDN-scale audiences —
+with no external streaming server and no ports opened on the edge. It's a
+separate, **default-off** capability, hard-isolated from the opaque forwarder;
+this binary stays a pure forwarder unless you add a `distribution` block.
+
+Point the edge's existing WebRTC (WHIP) output at `http(s)://<relay>/whip/<stream>`,
+then share `http(s)://<relay>/watch/<stream>`. Front the HTTP listener (`:4485`)
+with a TLS-terminating proxy for the browser secure context.
+
+```json
+{
+  "distribution": {
+    "enabled": true,
+    "http_addrs": ["0.0.0.0:4485", "[::]:4485"],
+    "public_ip": "203.0.113.10",
+    "public_base_url": "https://relay.example.com",
+    "ingest_addrs": ["0.0.0.0:4486", "[::]:4486"],
+    "token_secret": "<64 hex chars, shared with the manager>",
+    "require_viewer_token": false,
+    "require_ingest_token": true,
+    "max_viewers_per_ip": 256,
+    "origin_window_segments": 8,
+    "cascade_sources": []
+  }
+}
+```
+
+Scale past one relay with a **cascade** (regional relays pull from an origin via
+`cascade_sources`) or by fronting the LL-HLS origin with a CDN. Full reference:
+[`docs/distribution.md`](docs/distribution.md) and the
+[website guide](https://docs.bilbycast.com/relay/viewer-distribution/).
 
 ## CLI Options
 
