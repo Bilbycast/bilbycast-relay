@@ -343,6 +343,14 @@ jobs:
             artifacts/bilbycast-relay-aarch64-linux.sha256 \
             artifacts/bilbycast-relay-aarch64-linux.tar.gz \
             artifacts/bilbycast-relay-aarch64-linux.tar.gz.sha256 \
+            artifacts/bilbycast-relay-x86_64-linux-distribution \
+            artifacts/bilbycast-relay-x86_64-linux-distribution.sha256 \
+            artifacts/bilbycast-relay-x86_64-linux-distribution.tar.gz \
+            artifacts/bilbycast-relay-x86_64-linux-distribution.tar.gz.sha256 \
+            artifacts/bilbycast-relay-aarch64-linux-distribution \
+            artifacts/bilbycast-relay-aarch64-linux-distribution.sha256 \
+            artifacts/bilbycast-relay-aarch64-linux-distribution.tar.gz \
+            artifacts/bilbycast-relay-aarch64-linux-distribution.tar.gz.sha256 \
             artifacts/manifest.json \
             artifacts/manifest.sig.bundle \
             packaging/install-relay.sh \
