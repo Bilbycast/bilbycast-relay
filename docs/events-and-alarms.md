@@ -103,6 +103,21 @@ The `flow_id` field contains the tunnel UUID for all tunnel events.
 
 ---
 
+### Viewer Distribution (`distribution`)
+
+Emitted only by a relay built with the optional `viewer-distribution` role (default-off Cargo feature; the shipped distribution artefacts use `viewer-distribution-vendored`). A plain opaque-forwarder relay never emits these; they appear only on a distribution-role build that runs the WHEP SFU + LL-HLS/CMAF origin.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | WHIP ingest opened for stream '{stream}' | A WHIP-in ingest began feeding a stream's hub | `{ stream }` |
+| info | distribution ingest opened for stream '{stream}' | A QUIC ES ingest began feeding a stream's hub | `{ stream, has_audio }` |
+| info | distribution ingest closed for stream '{stream}' | A QUIC ES ingest stopped; the stream tears down | `{ stream }` |
+| warning | per-IP viewer cap ({cap}) reached from {ip} | A WHEP viewer request was rejected — per-source-IP concurrent-viewer cap (`max_viewers_per_ip`) reached | `{ ip, cap }` |
+
+**Source**: `src/distribution/`
+
+---
+
 ## Manager-Generated Events
 
 In addition to events sent by the relay, the manager itself generates these events:
@@ -124,12 +139,17 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `edge` | 6 | Edge QUIC connection lifecycle (now with structured details), incl. per-IP DoS cap |
 | `tunnel` | 8 | Tunnel state changes, authentication, lifecycle (waiting, unbound), per-connection DoS cap, and native plain-UDP register rejections (invalid token + per-IP session cap) |
 | `manager` | 6 | Manager connection and credential management |
-| **Total** | **20** | |
+| `distribution` | 4 | Viewer-distribution ingest lifecycle + per-IP viewer cap (only on `viewer-distribution` builds) |
+| **Total** | **24** | |
+
+The always-compiled `edge`, `tunnel`, and `manager` categories account for 20 events. The `distribution` category (4 events) is present only when the relay is built with the optional `viewer-distribution` role.
 
 ### By Severity
+
+The always-compiled surface (excluding the optional `distribution` category) is critical=1, warning=12, info=7.
 
 | Severity | Count | Description |
 |----------|-------|-------------|
 | critical | 1 | Manager authentication failure |
-| warning | 11 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection + native-UDP session cap), native-UDP token rejections |
-| info | 8 | Connections, tunnel activation/waiting/unbound, secret rotation |
+| warning | 12 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection + native-UDP session cap), native-UDP token rejections |
+| info | 7 | Connections, tunnel activation/waiting/unbound, secret rotation |
