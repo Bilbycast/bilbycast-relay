@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-relay"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2024"
 description = "QUIC relay server for bilbycast IP tunneling between NAT'd edge nodes"
 license = "AGPL-3.0-or-later"
@@ -64,6 +64,11 @@ arc-swap = "1.7.1"
 # is str0m (same as bilbycast-edge) with the OpenSSL DTLS backend — the pure-Rust
 # dimpl DTLS stalls on localhost active↔passive handshakes (see edge Cargo.toml).
 [dependencies.str0m]
+# HELD at 0.19.0 to stay in lockstep with bilbycast-edge — 0.21.0 is out, but
+# the bump is a scoped media-path port (RtpWrite builder, Arc<[u8]> media data,
+# abs-capture-time rework, dimpl 0.7) plus a re-vendor of the patched `is`
+# crate. Both ends of a WHEP session must move together; see the full recipe in
+# bilbycast-edge/Cargo.toml under `[dependencies.str0m]`.
 version = "0.19.0"
 optional = true
 default-features = false
