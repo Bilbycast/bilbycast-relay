@@ -177,7 +177,12 @@ pub(crate) async fn republish_from_session(
                     } else {
                         (numer.saturating_mul(90_000) / denom) as u64
                     };
-                    hub.publish(stream_id, EsFrame::audio(pts_90k, Bytes::from(data)));
+                    // `Bytes` has no `From<Arc<[u8]>>` (str0m 0.20 changed
+                    // `MediaData.data` to that), but `from_owner` takes any
+                    // `AsRef<[u8]> + Send + 'static` and keeps it alive — so
+                    // handing over the `Arc` is zero-copy, where
+                    // `copy_from_slice` would allocate per Opus frame.
+                    hub.publish(stream_id, EsFrame::audio(pts_90k, Bytes::from_owner(data)));
                 }
             }
             SessionEvent::Disconnected => break,

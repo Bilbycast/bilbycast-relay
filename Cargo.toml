@@ -64,12 +64,21 @@ arc-swap = "1.7.1"
 # is str0m (same as bilbycast-edge) with the OpenSSL DTLS backend — the pure-Rust
 # dimpl DTLS stalls on localhost active↔passive handshakes (see edge Cargo.toml).
 [dependencies.str0m]
-# HELD at 0.19.0 to stay in lockstep with bilbycast-edge — 0.21.0 is out, but
-# the bump is a scoped media-path port (RtpWrite builder, Arc<[u8]> media data,
-# abs-capture-time rework, dimpl 0.7) plus a re-vendor of the patched `is`
-# crate. Both ends of a WHEP session must move together; see the full recipe in
+# 0.22.0, moved in lockstep with bilbycast-edge (both ends of a WHEP session
+# must agree). Only one API change reached this crate: `MediaData.data` became
+# `Arc<[u8]>` in 0.20 — see `distribution::webrtc::session`. Rationale and the
+# full audit of the other 0.20/0.21/0.22 changes live in
 # bilbycast-edge/Cargo.toml under `[dependencies.str0m]`.
-version = "0.19.0"
+#
+# KNOWN GAP, pre-dating this bump: unlike bilbycast-edge, this crate carries no
+# `[patch.crates-io]` and no vendored `is`, so it builds against upstream's
+# strict ICE parser and its WHIP ingest REJECTS Binding Requests with no
+# PRIORITY attribute — which is what ffmpeg's WHIP muxer sends. An ffmpeg
+# publisher can therefore feed the edge but not this relay's WHIP ingest. The
+# earlier "in lockstep with bilbycast-edge" comment here was never true of the
+# `is` patchlevel. Fixing it means vendoring `is` here too (or upstreaming the
+# permissive parser); tracked separately so it gets its own interop run.
+version = "0.22.0"
 optional = true
 default-features = false
 features = ["openssl"]

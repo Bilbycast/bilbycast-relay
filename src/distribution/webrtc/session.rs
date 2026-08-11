@@ -15,6 +15,7 @@
 //! by driving the UDP socket and str0m poll loop in a select! loop.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -35,7 +36,12 @@ pub enum SessionEvent {
     MediaData {
         mid: Mid,
         pt: Pt,
-        data: Vec<u8>,
+        /// str0m 0.20 changed `MediaData.data` from `Vec<u8>` to `Arc<[u8]>`.
+        /// Carried through as-is rather than `.to_vec()`'d, matching
+        /// bilbycast-edge's `engine::webrtc::session`. The ingest path never
+        /// needs its own copy: video borrows it into the AU assembler, and
+        /// audio hands the `Arc` itself to `Bytes::from_owner`.
+        data: Arc<[u8]>,
         rtp_time: MediaTime,
         network_time: Instant,
         contiguous: bool,
@@ -281,7 +287,12 @@ impl WebrtcSession {
         data: &[u8],
     ) -> Result<()> {
         if let Some(writer) = self.rtc.writer(mid) {
-            writer.write(pt, wallclock, rtp_time, data.to_vec())
+            // str0m 0.20+ takes `impl Into<Arc<[u8]>>`. Building the `Arc`
+            // straight from the slice costs one allocation + one copy;
+            // going via `to_vec()` would pay for both twice, on every
+            // egress RTP payload, per viewer.
+            writer
+                .write(pt, wallclock, rtp_time, Arc::<[u8]>::from(data))
                 .map_err(|e| anyhow::anyhow!("Write error: {}", e))?;
         }
         Ok(())
