@@ -217,7 +217,7 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   Shares the media receive path with WHIP-in (`republish_from_session`).
   Automatic nearest-relay viewer assignment is deferred (manager orchestration).
 - **str0m PT map** (`webrtc/session.rs`): the level-5.1 H.264 workaround must
-  avoid str0m 0.19's default PTs — notably **Opus = PT 111** and the default
+  avoid str0m's default PTs — notably **Opus = PT 111** and the default
   H.264 RTX slots 121/107/109/120/119/36/115. Reusing 111 as an H.264 RTX slot
   panics str0m ("Pt locked multiple times: 111") once a session negotiates both
   H.264 and Opus (a WHEP client offering audio, or a server answering a
