@@ -141,7 +141,7 @@ pub fn start_manager_client(
     relay_stats: Arc<RelayStats>,
     relay_config: RelayConfig,
     config_path: PathBuf,
-    event_rx: mpsc::UnboundedReceiver<Event>,
+    event_rx: mpsc::Receiver<Event>,
     event_sender: super::events::EventSender,
     distribution_control: Option<Arc<DistributionControl>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -167,7 +167,7 @@ async fn manager_client_loop(
     relay_stats: Arc<RelayStats>,
     relay_config: RelayConfig,
     config_path: PathBuf,
-    mut event_rx: mpsc::UnboundedReceiver<Event>,
+    mut event_rx: mpsc::Receiver<Event>,
     event_sender: super::events::EventSender,
     distribution_control: Option<Arc<DistributionControl>>,
 ) {
@@ -251,7 +251,7 @@ async fn try_connect(
     relay_stats: &Arc<RelayStats>,
     relay_config: &RelayConfig,
     config_path: &PathBuf,
-    event_rx: &mut mpsc::UnboundedReceiver<Event>,
+    event_rx: &mut mpsc::Receiver<Event>,
     event_sender: &super::events::EventSender,
     distribution_control: Option<&Arc<DistributionControl>>,
 ) -> Result<ConnectResult, String> {

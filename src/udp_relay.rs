@@ -126,6 +126,39 @@ fn now_ms() -> u64 {
     crate::stats::now_epoch_ms()
 }
 
+/// Monotonic milliseconds since process start.
+///
+/// The slot hold-down below MUST NOT use wall time: an NTP/PTP step (routine
+/// on a broadcast host — `chrony` settling, `phc2sys` starting) would either
+/// expire every hold-down at once or freeze them for the length of the step.
+fn mono_ms() -> u64 {
+    // `+ 1` so this NEVER returns 0, because 0 is the "slot has never carried
+    // media" sentinel on `ingress_media_ms` / `egress_media_ms`. Without the
+    // offset, media forwarded in the process's first millisecond stamps a slot
+    // with 0 and the hold-down reads it as unprotected — a real (if narrow)
+    // hole, and one that made the hijack test pass an attacker through.
+    crate::observability::monotonic_us() / 1_000 + 1
+}
+
+/// Is a slot protected from being moved to a different source IP?
+///
+/// Pure so the boundary is unit-testable without a 12 s sleep or a clock seam.
+/// `last_media_ms == 0` means the slot has never carried media, and such a
+/// slot is deliberately unprotected — see the hold-down comment in `latch`.
+fn slot_is_protected(last_media_ms: u64, now_ms: u64) -> bool {
+    last_media_ms != 0 && now_ms.saturating_sub(last_media_ms) < SLOT_TAKEOVER_GRACE_MS
+}
+
+/// A latched slot may only move to a DIFFERENT source IP once it has been
+/// silent this long.
+///
+/// Edges re-register every ~5 s and live media refreshes the slot continuously,
+/// so 12 s is two missed keepalives: a flowing session cannot be stolen, while
+/// a genuine WAN-IP change (carrier handover, DHCP move) still recovers well
+/// inside the 30 s `SESSION_IDLE_TIMEOUT`.
+/// Invariant: register cadence (5 s) < this < `SESSION_IDLE_TIMEOUT` (30 s).
+const SLOT_TAKEOVER_GRACE_MS: u64 = 12_000;
+
 /// A native-UDP relay session: two latched edge addresses paired by tunnel UUID.
 pub struct UdpSession {
     pub tunnel_id: Uuid,
@@ -140,6 +173,13 @@ pub struct UdpSession {
     /// pinned all forwarding onto `sockets[0]`. `usize::MAX` = unset.
     ingress_sock: AtomicUsize,
     egress_sock: AtomicUsize,
+    /// Monotonic ms at which each slot last carried MEDIA from its latched
+    /// address. `0` = never. Deliberately NOT refreshed by `Register`: a slot
+    /// earns protection by carrying traffic, so an attacker cannot pre-claim
+    /// an idle slot and then hide behind the hold-down. Distinct from
+    /// `last_seen_ms`, which either side refreshes.
+    ingress_media_ms: AtomicU64,
+    egress_media_ms: AtomicU64,
     /// Source IP that created the session (for per-IP DoS accounting).
     creator_ip: IpAddr,
     pub stats: Arc<TunnelStats>,
@@ -155,6 +195,8 @@ impl UdpSession {
             egress: AtomicAddr::new(),
             ingress_sock: AtomicUsize::new(usize::MAX),
             egress_sock: AtomicUsize::new(usize::MAX),
+            ingress_media_ms: AtomicU64::new(0),
+            egress_media_ms: AtomicU64::new(0),
             creator_ip,
             stats: Arc::new(TunnelStats::new()),
             last_seen_ms: AtomicU64::new(now_ms()),
@@ -208,6 +250,9 @@ pub enum LatchResult {
     Ok(bool),
     /// Per-IP session cap exceeded — registration dropped.
     RejectedDosCap,
+    /// The slot is latched to a different IP that is currently carrying media.
+    /// A `Register` cannot move a live session; see [`SLOT_TAKEOVER_GRACE_MS`].
+    RejectedSlotHeld,
 }
 
 impl UdpSessionRouter {
@@ -250,6 +295,30 @@ impl UdpSessionRouter {
                 v.insert(Arc::new(UdpSession::new(tunnel_id, ip))).clone()
             }
         };
+        // Hold-down: refuse to move a slot that is currently carrying media to
+        // a different source IP.
+        //
+        // `latch` was unconditional last-writer-wins, so any party who could
+        // send one `Register` for a known tunnel id — trivially harvested from
+        // the open-by-default `/api/v1/udp-sessions`, or replayed off the wire
+        // — could point a live tunnel's egress at themselves: the contribution
+        // feed stops reaching the real receiver and is delivered to them.
+        //
+        // Same-IP moves are always allowed: a NAT port rebind, a relay socket
+        // rotation and an edge restart on the same host are all legitimate and
+        // all keep the IP. A slot that has never carried media stays
+        // last-writer-wins, so first contact is byte-identical to before.
+        let (cur_slot, media_ms) = match direction {
+            TunnelDirection::Ingress => (&session.ingress, &session.ingress_media_ms),
+            TunnelDirection::Egress => (&session.egress, &session.egress_media_ms),
+        };
+        if let Some(cur) = cur_slot.load()
+            && cur.ip() != src.ip()
+            && slot_is_protected(media_ms.load(Ordering::Relaxed), mono_ms())
+        {
+            return LatchResult::RejectedSlotHeld;
+        }
+
         match direction {
             TunnelDirection::Ingress => {
                 session.ingress.store(src);
@@ -279,13 +348,16 @@ impl UdpSessionRouter {
         let session = self.sessions.get(&tunnel_id)?;
         let ingress = session.ingress.load();
         let egress = session.egress.load();
+        let now_mono = mono_ms();
         let (target, target_sock) = if Some(src) == ingress {
             // From the destination side → forward to the source side.
             session.stats.bytes_ingress.fetch_add(bytes, Ordering::Relaxed);
+            session.ingress_media_ms.store(now_mono, Ordering::Relaxed);
             (egress?, session.egress_sock.load(Ordering::Relaxed))
         } else if Some(src) == egress {
             // From the source side → forward to the destination side.
             session.stats.bytes_egress.fetch_add(bytes, Ordering::Relaxed);
+            session.egress_media_ms.store(now_mono, Ordering::Relaxed);
             (ingress?, session.ingress_sock.load(Ordering::Relaxed))
         } else {
             // Source addr matches neither latched slot (unregistered or a NAT
@@ -546,6 +618,27 @@ async fn handle_control(
                         tracing::debug!("native-UDP tunnel {tunnel_id} active (both sides latched)");
                     }
                 }
+                LatchResult::RejectedSlotHeld => {
+                    // Deliberately no Ack: the caller is either an attacker
+                    // trying to move a live tunnel, or a stale/duplicate edge.
+                    // Acking would tell an attacker the tunnel id is real.
+                    tracing::warn!(
+                        "native-UDP register rejected for {tunnel_id} from {src}: \
+                         slot is carrying media from a different address"
+                    );
+                    ctx.event_sender.emit_with_id_and_details(
+                        EventSeverity::Warning,
+                        category::TUNNEL,
+                        "Native-UDP register refused: slot held by a live peer",
+                        &tunnel_id.to_string(),
+                        serde_json::json!({
+                            "error_code": "relay_slot_takeover_refused",
+                            "remote_addr": src.to_string(),
+                            "remote_ip": src.ip().to_string(),
+                            "transport": "udp",
+                        }),
+                    );
+                }
                 LatchResult::RejectedDosCap => {
                     tracing::warn!(
                         "native-UDP register rejected for {tunnel_id} from {src}: per-IP session cap"
@@ -676,5 +769,141 @@ mod tests {
             r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0),
             LatchResult::Ok(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod slot_holddown_tests {
+    use super::*;
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse::<IpAddr>().unwrap(), port)
+    }
+
+    /// Mark a slot as having just carried media, as `forward_target` would.
+    fn mark_media(r: &UdpSessionRouter, t: Uuid, dir: TunnelDirection) {
+        let s = r.sessions.get(&t).expect("session exists");
+        let stamp = match dir {
+            TunnelDirection::Ingress => &s.ingress_media_ms,
+            TunnelDirection::Egress => &s.egress_media_ms,
+        };
+        stamp.store(mono_ms(), Ordering::Relaxed);
+    }
+
+    fn slot_addr(r: &UdpSessionRouter, t: Uuid, dir: TunnelDirection) -> Option<SocketAddr> {
+        let s = r.sessions.get(&t)?;
+        match dir {
+            TunnelDirection::Ingress => s.ingress.load(),
+            TunnelDirection::Egress => s.egress.load(),
+        }
+    }
+
+    /// THE HIJACK. A live tunnel's slot must not move to a different IP on the
+    /// strength of one unauthenticated `Register` — that redirects the
+    /// contribution feed away from the real receiver and to the attacker.
+    #[test]
+    fn live_slot_cannot_be_stolen_by_a_different_ip() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let real = addr("198.51.100.10", 5000);
+        let attacker = addr("203.0.113.7", 5000);
+
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, real, 0), LatchResult::Ok(_)));
+        mark_media(&r, t, TunnelDirection::Egress);
+
+        assert!(matches!(
+            r.latch(t, TunnelDirection::Egress, attacker, 0),
+            LatchResult::RejectedSlotHeld
+        ));
+        assert_eq!(
+            slot_addr(&r, t, TunnelDirection::Egress),
+            Some(real),
+            "the live peer must keep the slot"
+        );
+    }
+
+    /// A NAT port rebind keeps the IP and must still re-latch — this is normal
+    /// and frequent, and refusing it would drop real sessions.
+    #[test]
+    fn same_ip_port_rebind_still_relatches() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let before = addr("198.51.100.10", 5000);
+        let after = addr("198.51.100.10", 41234);
+
+        r.latch(t, TunnelDirection::Egress, before, 0);
+        mark_media(&r, t, TunnelDirection::Egress);
+
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, after, 0), LatchResult::Ok(_)));
+        assert_eq!(slot_addr(&r, t, TunnelDirection::Egress), Some(after));
+    }
+
+    /// A slot that has never carried media stays last-writer-wins, so first
+    /// contact and re-provisioning behave exactly as before the hold-down —
+    /// and pre-claiming an idle slot buys an attacker no protection.
+    #[test]
+    fn idle_slot_is_still_last_writer_wins() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let first = addr("198.51.100.10", 5000);
+        let second = addr("203.0.113.7", 5000);
+
+        r.latch(t, TunnelDirection::Egress, first, 0);
+        // No media ever forwarded on this slot.
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, second, 0), LatchResult::Ok(_)));
+        assert_eq!(slot_addr(&r, t, TunnelDirection::Egress), Some(second));
+    }
+
+    /// A genuine WAN-IP change (carrier handover) must recover once the old
+    /// peer has gone quiet for the grace period — well inside the 30 s idle
+    /// timeout, so the session is never stranded. Exercised on the pure
+    /// predicate: faking an "old" stamp is impossible a millisecond into the
+    /// process, and a 12 s sleep has no place in a unit test.
+    #[test]
+    fn takeover_allowed_once_the_incumbent_goes_quiet() {
+        let now = 1_000_000u64;
+        assert!(slot_is_protected(now, now), "just carried media");
+        assert!(
+            slot_is_protected(now - (SLOT_TAKEOVER_GRACE_MS - 1), now),
+            "still inside the grace window"
+        );
+        assert!(
+            !slot_is_protected(now - SLOT_TAKEOVER_GRACE_MS, now),
+            "grace elapsed — a real carrier handover must be able to take over"
+        );
+        assert!(!slot_is_protected(0, now), "never carried media = unprotected");
+        // A stamp in the future (a clock oddity we cannot rule out) saturates
+        // the subtraction to 0 and therefore protects the slot. That is the
+        // safe direction — it expires as the monotonic clock advances past it,
+        // rather than leaving a live slot stealable.
+        assert!(slot_is_protected(now + 5_000, now));
+    }
+
+    /// The hold-down is per-slot: protecting a live egress must not prevent
+    /// the ingress side from latching or moving.
+    #[test]
+    fn holddown_is_per_slot_not_per_session() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        r.latch(t, TunnelDirection::Egress, addr("198.51.100.10", 5000), 0);
+        mark_media(&r, t, TunnelDirection::Egress);
+
+        assert!(matches!(
+            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.9", 6000), 0),
+            LatchResult::Ok(_)
+        ));
+    }
+
+    /// The grace must sit between the register cadence and the idle timeout,
+    /// or the hold-down either blocks live keepalives or outlives the session.
+    #[test]
+    fn grace_window_is_bounded_by_the_register_cadence_and_idle_timeout() {
+        const REGISTER_CADENCE_MS: u64 = 5_000;
+        let grace = SLOT_TAKEOVER_GRACE_MS;
+        assert!(grace > REGISTER_CADENCE_MS, "must exceed the ~5 s register cadence");
+        assert!(
+            grace < SESSION_IDLE_TIMEOUT.as_millis() as u64,
+            "must expire before the session is reaped"
+        );
     }
 }

@@ -203,7 +203,7 @@ fn format_rfc3339_now() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-fn monotonic_us() -> u64 {
+pub(crate) fn monotonic_us() -> u64 {
     use std::time::Instant;
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = *START.get_or_init(Instant::now);
