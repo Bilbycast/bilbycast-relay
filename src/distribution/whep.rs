@@ -24,6 +24,7 @@ use super::es::{split_annex_b_nalus, EsFrame, EsKind};
 use super::hub::{DistributionHub, StreamSubscription};
 use super::webrtc::rtp_h264::H264Packetizer;
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+use crate::manager::events::{category, EventSender, EventSeverity};
 
 /// Handle returned to the HTTP signaling layer once a viewer's SDP offer has
 /// been accepted. The send loop is already running in a detached task.
@@ -43,6 +44,7 @@ pub async fn create_and_spawn_viewer(
     offer_sdp: &str,
     public_ip: Option<IpAddr>,
     parent_cancel: CancellationToken,
+    events: EventSender,
 ) -> Result<ViewerHandle> {
     // ICE-Lite server role. Bind to the public IP if pinned so the per-packet
     // destination matches the advertised host candidate; else 0.0.0.0:0.
@@ -69,7 +71,15 @@ pub async fn create_and_spawn_viewer(
     let loop_stream = stream_id.clone();
     let loop_sid = session_id.clone();
     tokio::spawn(async move {
-        viewer_loop(session, subscription, loop_cancel.clone(), &loop_stream, &loop_sid).await;
+        viewer_loop(
+            session,
+            subscription,
+            loop_cancel.clone(),
+            &loop_stream,
+            &loop_sid,
+            &events,
+        )
+        .await;
         // Cancel our own token on natural exit (viewer disconnect / ingest
         // gone) so any lifecycle watcher — the per-IP reaper, the session
         // registry cleanup — fires on both explicit DELETE and natural end.
@@ -86,6 +96,7 @@ async fn viewer_loop(
     cancel: CancellationToken,
     stream_id: &str,
     session_id: &str,
+    events: &EventSender,
 ) {
     // 1. Wait for ICE + DTLS to complete.
     loop {
@@ -144,7 +155,9 @@ async fn viewer_loop(
                         }
                     }
                     // Keep ICE/DTLS/RTCP alive between media writes.
-                    if matches!(session.drive_udp_io().await, Some(SessionEvent::Disconnected)) {
+                    let ev = session.drive_udp_io().await;
+                    report_offpath(&mut session, events, stream_id, session_id, &sub);
+                    if matches!(ev, Some(SessionEvent::Disconnected)) {
                         break;
                     }
                 }
@@ -158,7 +171,48 @@ async fn viewer_loop(
         }
     }
 
+    // A session can be torn down by the pin's own consequence (its pairs get
+    // pruned), so check once more on the way out — otherwise the very sessions
+    // the control kills are the ones that never report why.
+    report_offpath(&mut session, events, stream_id, session_id, &sub);
     tracing::info!("WHEP viewer '{session_id}' closed (stream '{stream_id}')");
+}
+
+/// Surface the WebRTC ingress source pin's first drop for this session: one
+/// Warning event to the manager plus one telemetry increment. Both are
+/// one-shot — `take_offpath_alert` clears the latch, so a reflection flood
+/// (which is a flood by construction) cannot turn the alarm into its own
+/// amplifier.
+///
+/// This exists because the control WILL fire on a legitimate viewer whose
+/// public IP changes mid-session (Wi-Fi → cellular, CGNAT pool rotation).
+/// Without it the viewer just goes black and the only evidence is one `warn!`
+/// line on a headless relay.
+fn report_offpath(
+    session: &mut WebrtcSession,
+    events: &EventSender,
+    stream_id: &str,
+    session_id: &str,
+    sub: &StreamSubscription,
+) {
+    let Some((pinned, offender)) = session.take_offpath_alert() else {
+        return;
+    };
+    sub.state.add_offpath_session();
+    events.emit_with_id_and_details(
+        EventSeverity::Warning,
+        category::DISTRIBUTION,
+        "WHEP viewer: off-path datagram dropped by the media source pin",
+        session_id,
+        serde_json::json!({
+            "error_code": "webrtc_offpath_source",
+            "stream": stream_id,
+            "session_id": session_id,
+            "pinned_ip": pinned.to_string(),
+            "source_addr": offender.to_string(),
+            "source_ip": offender.ip().to_string(),
+        }),
+    );
 }
 
 /// Split a video access unit into NALUs, RFC 6184-packetize, and hand each

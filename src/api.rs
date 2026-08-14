@@ -458,6 +458,40 @@ async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> impl IntoResp
     let _ = writeln!(out, "bilbycast_relay_udp_datagrams_forwarded_total {udp_datagrams}");
     let _ = writeln!(out);
 
+    // ── Viewer distribution (WHEP SFU + LL-HLS origin) ──
+    //
+    // Emitted only once the subsystem has published a sample, so a relay built
+    // without `viewer-distribution` (or with it disabled) exposes nothing here.
+    // A relay is headless — `offpath_sessions` in particular has no other local
+    // channel, and it is the one counter an operator needs when a viewer goes
+    // black because the WebRTC ingress source pin refused their new IP.
+    if let Some(d) = state.relay_stats.distribution_snapshot() {
+        let _ = writeln!(out, "# HELP bilbycast_relay_distribution_streams Streams currently published to the distribution hub.");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_streams gauge");
+        let _ = writeln!(out, "bilbycast_relay_distribution_streams {}", d.streams);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "# HELP bilbycast_relay_distribution_viewers Connected WHEP viewers across all streams.");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_viewers gauge");
+        let _ = writeln!(out, "bilbycast_relay_distribution_viewers {}", d.viewers);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "# HELP bilbycast_relay_distribution_bytes_out_total Media bytes fanned out to viewers.");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_bytes_out_total counter");
+        let _ = writeln!(out, "bilbycast_relay_distribution_bytes_out_total {}", d.bytes_out);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "# HELP bilbycast_relay_distribution_origin_bytes Bytes held in the LL-HLS origin cache.");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_origin_bytes gauge");
+        let _ = writeln!(out, "bilbycast_relay_distribution_origin_bytes {}", d.origin_bytes);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "# HELP bilbycast_relay_distribution_offpath_sessions Viewer sessions that had a datagram refused by the WebRTC ingress source pin (spoofed ICE reflection attempt, or a viewer whose IP changed mid-session). Counted once per session.");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_offpath_sessions counter");
+        let _ = writeln!(out, "bilbycast_relay_distribution_offpath_sessions {}", d.offpath_sessions);
+        let _ = writeln!(out);
+    }
+
     // Manager-link state (local observability only). Emitted when a
     // manager is configured: 1 = WS link up, 0 = down/reconnecting.
     if let Some(link) = state.relay_stats.manager_link_status() {

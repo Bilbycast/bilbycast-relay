@@ -127,7 +127,7 @@ All fields are optional. Defaults are used for any omitted field.
 | `tls_cert_path` | (auto-generated) | Path to TLS certificate PEM. Self-signed cert generated if absent |
 | `tls_key_path` | (auto-generated) | Path to TLS private key PEM |
 | `api_token` | (none — API open) | Bearer token for REST API auth (32-128 chars). If set, all endpoints except `/health` require `Authorization: Bearer <token>` |
-| `require_bind_auth` | `false` | Reject `TunnelBind` from edges without a manager-registered HMAC token. Recommended `true` for production |
+| `require_bind_auth` | `false` | Reject binds from edges without a manager-registered HMAC token, on **both** planes — QUIC `TunnelBind` *and* native-UDP `Register`. Recommended `true` for production, but only on a relay driven by a manager that pushes bind secrets: strict mode fails closed for every tunnel with no pushed `authorize_tunnel` entry, so on a manager-less relay it refuses every bind and takes the relay off air. On the native plane the permissive default is worse than on QUIC — an unauthenticated `Register` for an unauthorized tunnel can **move** a slot and redirect live media to the sender (media hijack), not merely join a tunnel |
 | `max_connections_per_ip` | `64` | DoS mitigation: max simultaneous QUIC connections per source IP. Excess connections are dropped at handshake |
 | `max_tunnels_per_connection` | `100` | DoS mitigation: max tunnel binds per connection. Excess `TunnelBind` messages are rejected |
 | `logging` | (none) | Optional structured-JSON log shipper for SIEM/NMS pickup. `json_target.kind`: `stdout` / `file` / `syslog`; `format`: `raw` / `splunk` / `dataminer`. Mirrors the edge's shape |

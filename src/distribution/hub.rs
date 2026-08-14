@@ -45,6 +45,11 @@ pub struct StreamState {
     frames_in: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// Viewer sessions on this stream that had a datagram refused by the
+    /// WebRTC ingress source pin (see `webrtc::session::PeerPin`). Counted
+    /// once per session, never per datagram — a reflection attempt is a flood
+    /// by construction and the alarm must not become its own amplifier.
+    offpath_sessions: AtomicU64,
 }
 
 impl StreamState {
@@ -59,6 +64,7 @@ impl StreamState {
             frames_in: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
+            offpath_sessions: AtomicU64::new(0),
         }
     }
 
@@ -92,6 +98,17 @@ impl StreamState {
     /// telemetry).
     pub fn add_bytes_out(&self, n: u64) {
         self.bytes_out.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Sessions on this stream that hit the WebRTC ingress source pin.
+    pub fn offpath_sessions(&self) -> u64 {
+        self.offpath_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Record that one viewer session refused an off-path datagram. Called
+    /// once per session, on its first drop.
+    pub fn add_offpath_session(&self) {
+        self.offpath_sessions.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -211,6 +228,7 @@ impl DistributionHub {
                     frames_in: s.frames_in(),
                     bytes_in: s.bytes_in.load(Ordering::Relaxed),
                     bytes_out: s.bytes_out(),
+                    offpath_sessions: s.offpath_sessions(),
                     has_audio: s.has_audio(),
                     has_keyframe: s.keyframe.load().is_some(),
                 }
@@ -237,6 +255,10 @@ pub struct StreamSnapshot {
     pub frames_in: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// Viewer sessions that had a datagram refused by the WebRTC ingress
+    /// source pin. Non-zero means either a source-spoofed ICE reflection
+    /// attempt or a viewer whose IP changed mid-session.
+    pub offpath_sessions: u64,
     pub has_audio: bool,
     pub has_keyframe: bool,
 }

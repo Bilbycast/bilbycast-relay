@@ -185,6 +185,66 @@ async fn main() -> Result<()> {
              entry accept unauthenticated binds (backwards-compatible mode). Set \
              require_bind_auth=true for fail-closed bind authentication."
         );
+        // The native-UDP plane's consequence is strictly worse than the QUIC
+        // plane's and deserves saying out loud. On QUIC, an unauthenticated
+        // bind lets a stranger *join* a tunnel. On the native-UDP plane the
+        // rendezvous latch turns a source address into a send target, so an
+        // unauthenticated Register can *move* a slot — the contribution feed
+        // stops reaching the real receiver and is delivered to whoever sent
+        // the datagram. Tunnel ids are enumerable from the open-by-default
+        // GET /api/v1/udp-sessions, so the attacker does not need to guess.
+        //
+        // SCOPE — the qualifier the neighbouring line above already carries
+        // applies here too, and dropping it would make this warning false for
+        // most managed operators. `TunnelRouter::verify_bind_token` returns
+        // `!require_bind_auth` ONLY for a tunnel with no `authorize_tunnel`
+        // entry; where an entry exists the exact HMAC is still required, even
+        // in permissive mode. The manager pushes one for every relay-mode
+        // tunnel it creates, so the genuinely exposed cases are narrower: a
+        // relay run with no manager at all (all three testbed relay configs —
+        // relay.json, relay-bondtest.json AND relay-distribution.json, the
+        // last of which omits `udp_relay_enabled` and so gets the `true`
+        // default), a tunnel whose authorize push failed, and the window after
+        // a relay restart before the manager re-pushes (`authorized_tokens` is
+        // an in-memory DashMap, wiped on restart, while edges re-Register
+        // every ~5 s).
+        //
+        // A slot that is currently carrying media is held down (see
+        // udp_relay::SLOT_TAKEOVER_GRACE_MS), which blunts the live hijack —
+        // but a slot that has gone quiet, or has not yet carried media, is
+        // still first-come-first-served without bind auth.
+        if config.native_plane_accepts_unauthenticated() {
+            tracing::warn!(
+                "require_bind_auth=false AND the native-UDP relay plane is enabled — for any \
+                 tunnel the manager has NOT pre-authorized (no authorize_tunnel entry: a relay \
+                 run without a manager, a tunnel whose authorize push failed, or the window \
+                 after a relay restart before the manager re-pushes), an unauthenticated \
+                 Register on that plane can MOVE a tunnel slot and redirect live media to the \
+                 sender (media hijack), not merely join a tunnel as on QUIC. Tunnels that DO \
+                 carry a pushed authorize_tunnel entry still require the exact HMAC. \
+                 Remedies: set require_bind_auth=true — but ONLY on a relay driven by a manager \
+                 that pushes bind secrets, because strict mode fails closed for every tunnel \
+                 with no pushed authorize_tunnel entry on BOTH planes (QUIC TunnelBind and \
+                 native Register), so on a manager-less relay it refuses every bind and takes \
+                 the relay off air; or disable the native plane with `udp_relay_enabled: false` \
+                 in the relay config (or `--no-udp-relay` on the command line)."
+            );
+            // A relay is headless — journald is not where an operator looks.
+            // Put the posture on the manager's Events page too. Purely
+            // additive on an existing message type: no wire change, and the
+            // event channel is a bounded mpsc already alive here (drained once
+            // the manager client starts), so this cannot block startup.
+            event_sender.emit_with_details(
+                manager::events::EventSeverity::Warning,
+                manager::events::category::TUNNEL,
+                "Native-UDP plane accepts unauthenticated registers",
+                serde_json::json!({
+                    "error_code": "relay_native_plane_unauthenticated",
+                    "require_bind_auth": false,
+                    "udp_relay_enabled": true,
+                }),
+            );
+        }
     }
     let api_state = Arc::new(api::ApiState {
         ctx: ctx.clone(),

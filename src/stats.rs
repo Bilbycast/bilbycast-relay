@@ -105,6 +105,11 @@ pub struct RelayStats {
     pub distribution_bytes_out: AtomicU64,
     /// Bytes currently held in the LL-HLS origin cache.
     pub distribution_origin_bytes: AtomicU64,
+    /// Viewer sessions that had a datagram refused by the WebRTC ingress
+    /// source pin (`webrtc::session::PeerPin`). One per session, not per
+    /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
+    /// viewer whose IP changed mid-session.
+    pub distribution_offpath_sessions: AtomicU64,
 }
 
 /// Snapshot of the distribution subsystem telemetry.
@@ -115,6 +120,7 @@ pub struct DistributionStatsSnapshot {
     pub viewers: u64,
     pub bytes_out: u64,
     pub origin_bytes: u64,
+    pub offpath_sessions: u64,
 }
 
 /// Current wall-clock epoch in milliseconds (saturating to 0 before 1970).
@@ -159,16 +165,25 @@ impl RelayStats {
             distribution_viewers: AtomicU64::new(0),
             distribution_bytes_out: AtomicU64::new(0),
             distribution_origin_bytes: AtomicU64::new(0),
+            distribution_offpath_sessions: AtomicU64::new(0),
         }
     }
 
     /// Publish a distribution telemetry sample (called by the subsystem).
-    pub fn set_distribution(&self, streams: u64, viewers: u64, bytes_out: u64, origin_bytes: u64) {
+    pub fn set_distribution(
+        &self,
+        streams: u64,
+        viewers: u64,
+        bytes_out: u64,
+        origin_bytes: u64,
+        offpath_sessions: u64,
+    ) {
         self.distribution_enabled.store(true, Ordering::Relaxed);
         self.distribution_streams.store(streams, Ordering::Relaxed);
         self.distribution_viewers.store(viewers, Ordering::Relaxed);
         self.distribution_bytes_out.store(bytes_out, Ordering::Relaxed);
         self.distribution_origin_bytes.store(origin_bytes, Ordering::Relaxed);
+        self.distribution_offpath_sessions.store(offpath_sessions, Ordering::Relaxed);
     }
 
     /// Snapshot the distribution telemetry. Returns `None` when the subsystem
@@ -183,6 +198,7 @@ impl RelayStats {
             viewers: self.distribution_viewers.load(Ordering::Relaxed),
             bytes_out: self.distribution_bytes_out.load(Ordering::Relaxed),
             origin_bytes: self.distribution_origin_bytes.load(Ordering::Relaxed),
+            offpath_sessions: self.distribution_offpath_sessions.load(Ordering::Relaxed),
         })
     }
 

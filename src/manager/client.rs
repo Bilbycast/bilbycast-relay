@@ -559,6 +559,10 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
             "viewers": d.viewers,
             "bytes_out": d.bytes_out,
             "origin_bytes": d.origin_bytes,
+            // Additive JSON field on an existing stats message — the manager
+            // parses this object loosely, so an older manager simply ignores
+            // it. No wire-format or protocol-version change.
+            "offpath_sessions": d.offpath_sessions,
         });
     }
 
@@ -711,6 +715,7 @@ fn build_health_message(
             "viewers": d.viewers,
             "bytes_out": d.bytes_out,
             "origin_bytes": d.origin_bytes,
+            "offpath_sessions": d.offpath_sessions,
         });
     }
     // Advertised viewer base URL — the runtime (manager-pushed) value wins over

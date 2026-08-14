@@ -302,12 +302,14 @@ async fn whep_viewer_receives_encrypted_media_end_to_end() {
     let (offer_sdp, pending) = client.create_offer(true, true, false).unwrap();
 
     // The relay SFU accepts the offer, answers, and starts fanning out.
+    let (whep_events, _whep_rx) = bilbycast_relay::manager::events::event_channel();
     let handle = whep::create_and_spawn_viewer(
         hub.clone(),
         "live".to_string(),
         &offer_sdp,
         Some(lo),
         cancel.clone(),
+        whep_events,
     )
     .await
     .expect("WHEP setup");
@@ -473,6 +475,32 @@ async fn runtime_control_flips_viewer_gate() {
     // Gate ON: the same tokenless request is now rejected with 401.
     let after = post(addr, "/whep/teststream", "v=0\r\n").await;
     assert_eq!(after, 401, "viewer gate must be enforced after the runtime push (got {after})");
+
+    // ── The `?token=` form, through the REAL router ──
+    //
+    // This is the wiring test the helper-level unit tests cannot be. The bug
+    // was never in a parser: `whep_offer` had no access to the query string at
+    // all. Deleting `RawQuery(query): RawQuery` from the handler's extractor
+    // list (and passing `None` at the call site) leaves `token_from_query`
+    // fully intact and every unit test green — but turns this assertion red,
+    // because the request then presents no credential and 401s.
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+
+    let tok = token::mint_viewer_token(SECRET, "teststream", exp).expect("mint");
+    let admitted = post(addr, &format!("/whep/teststream?token={tok}"), "v=0\r\n").await;
+    assert_ne!(admitted, 401, "?token= must be accepted by the WHEP gate (got {admitted})");
+
+    // …and it must be checked on merit, not merely present: a token minted for
+    // a DIFFERENT stream is rejected, so this is authentication and not a
+    // "any token unlocks any stream" hole.
+    let wrong_stream = token::mint_viewer_token(SECRET, "otherstream", exp).expect("mint");
+    let rejected = post(addr, &format!("/whep/teststream?token={wrong_stream}"), "v=0\r\n").await;
+    assert_eq!(rejected, 403, "a token for another stream must be refused (got {rejected})");
 
     cancel.cancel();
 }

@@ -149,6 +149,63 @@ fn slot_is_protected(last_media_ms: u64, now_ms: u64) -> bool {
     last_media_ms != 0 && now_ms.saturating_sub(last_media_ms) < SLOT_TAKEOVER_GRACE_MS
 }
 
+/// Is `src` an address a real edge could have reached us from, and that we can
+/// therefore safely latch into a tunnel slot?
+///
+/// The latch turns a source address into a *send* target: whatever ends up in a
+/// slot is where the paired side's media is forwarded. So the slot must never
+/// hold an address that no host owns — an unspecified IP, a multicast or
+/// broadcast group, or port 0. None of them can be the genuine post-NAT source
+/// of an edge that dialed out to us, so refusing them costs nothing.
+///
+/// **This is defence in depth, not the reflection mitigation.** On Linux — the
+/// only platform this relay ships on — most of these sources never reach
+/// `recv_from` at all: `ip_route_input_slow()` routes an IPv4 datagram whose
+/// *source* is multicast, limited-broadcast or zeronet to `martian_source` and
+/// drops it, and `ip6_rcv_core()` drops an IPv6 packet with a multicast source
+/// outright. So the check earns its keep only on a kernel that does not filter
+/// martians, or a future non-Linux port. Treat the "free multicast fan-out"
+/// reading as theoretical.
+///
+/// It does **not** address unicast reflection: an attacker who spoofs a
+/// *plausible* unicast source passes this check by construction. The mitigation
+/// for that is `require_bind_auth: true` (plus the [`SLOT_TAKEOVER_GRACE_MS`]
+/// hold-down for a slot already carrying media). The one unicast class that is
+/// genuinely catastrophic — an address that routes back to the relay itself,
+/// turning a session into an unbounded forward loop — is handled by the
+/// dest-equals-source drop in [`UdpSessionRouter::forward_target`] and the
+/// degenerate-latch refusal in [`UdpSessionRouter::latch`], not here.
+///
+/// Those two close the **single-address** loop (one relay-local address in both
+/// slots). They do not close a **two-address** variant, where the slots hold two
+/// *different* addresses that both route back to this relay (its v4 and v6
+/// listeners, say): each hop then matches the opposite slot and bounces back.
+/// Closing that would need the relay's own bound-address set threaded onto this
+/// type, and it is deliberately not done, because the precondition is already
+/// unreachable on a stock Linux host: a datagram arriving on any interface with
+/// a source address the host itself owns is dropped as a martian source by
+/// `__fib_validate_source` (a local source's route type is `RTN_LOCAL`, not
+/// `RTN_UNICAST`, and `net.ipv4.conf.*.accept_local` defaults to 0) — which is
+/// the same reason the two guards above are defence in depth rather than the
+/// mitigation. Record it here so nobody reads them as a total closure; if this
+/// relay is ever ported to a kernel without that filter, thread the bound
+/// addresses in.
+///
+/// Deliberately permissive about **loopback and private ranges**: the testbed
+/// runs the relay and both edges on `127.0.0.1`, and real deployments relay
+/// between RFC1918 / ULA addresses inside an operator network. Rejecting either
+/// would break working configurations, which is a worse bug than the one this
+/// closes.
+fn is_latchable_source(src: SocketAddr) -> bool {
+    if src.port() == 0 {
+        return false;
+    }
+    match src.ip() {
+        IpAddr::V4(v4) => !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()),
+        IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_multicast()),
+    }
+}
+
 /// A latched slot may only move to a DIFFERENT source IP once it has been
 /// silent this long.
 ///
@@ -253,6 +310,11 @@ pub enum LatchResult {
     /// The slot is latched to a different IP that is currently carrying media.
     /// A `Register` cannot move a live session; see [`SLOT_TAKEOVER_GRACE_MS`].
     RejectedSlotHeld,
+    /// The source address can never be a legitimate slot occupant — either it
+    /// is an address no host can own (see [`is_latchable_source`]) or the
+    /// *opposite* slot of this tunnel already holds exactly it, which would
+    /// build a session whose forwarding target is its own source.
+    RejectedInvalidSource,
 }
 
 impl UdpSessionRouter {
@@ -278,6 +340,20 @@ impl UdpSessionRouter {
         sock_idx: usize,
     ) -> LatchResult {
         use dashmap::mapref::entry::Entry;
+
+        // Source-address sanity lives HERE, at the router's own choke point,
+        // not only at the (currently single) call site. `latch` is `pub` on a
+        // `pub struct` in a library crate: the invariant "a slot only ever
+        // holds an address a real edge could have reached us from" belongs to
+        // the type that owns the slot, or the next caller silently reopens it.
+        //
+        // Checked before the session entry so an implausible source can never
+        // create a session — and so cannot burn a legitimate host's per-IP
+        // quota on the way to being rejected.
+        if !is_latchable_source(src) {
+            return LatchResult::RejectedInvalidSource;
+        }
+
         let ip = src.ip();
         let session = match self.sessions.entry(tunnel_id) {
             Entry::Occupied(o) => o.get().clone(),
@@ -295,6 +371,22 @@ impl UdpSessionRouter {
                 v.insert(Arc::new(UdpSession::new(tunnel_id, ip))).clone()
             }
         };
+        // A tunnel's two ends are two distinct edge sockets, so the two slots
+        // can never legitimately hold the same address. Letting them build a
+        // session whose forwarding target IS its own source: if that address
+        // routes back to the relay (its own advertised `public_udp_addr`, say)
+        // one spoofed media datagram is delivered back to our own listening
+        // socket and re-forwarded, forever, at kernel line rate — on a recv
+        // loop shared by every session on that port. `forward_target` drops
+        // dest == src as well; this refuses to reach the state at all.
+        let other = match direction {
+            TunnelDirection::Ingress => &session.egress,
+            TunnelDirection::Egress => &session.ingress,
+        };
+        if other.load() == Some(src) {
+            return LatchResult::RejectedInvalidSource;
+        }
+
         // Hold-down: refuse to move a slot that is currently carrying media to
         // a different source IP.
         //
@@ -348,22 +440,62 @@ impl UdpSessionRouter {
         let session = self.sessions.get(&tunnel_id)?;
         let ingress = session.ingress.load();
         let egress = session.egress.load();
-        let now_mono = mono_ms();
-        let (target, target_sock) = if Some(src) == ingress {
+        // Resolve the direction and the paired target BEFORE touching any
+        // counter: a datagram we are about to drop as a self-loop must not
+        // refresh liveness. Refreshing first is what let a loop hold its own
+        // hold-down open (protecting the attacker on BOTH slots) and outrun the
+        // 30 s idle reaper indefinitely.
+        //
+        // Note the target is kept as an `Option` rather than `?`-unwrapped
+        // here: a datagram from a latched slot whose PEER has not registered
+        // yet is still evidence that this slot is live, and must go on
+        // refreshing its hold-down exactly as it did before this guard existed
+        // (see below). Only the self-loop skips the accounting.
+        let (target, target_sock, bytes_ctr, media_ms) = if Some(src) == ingress {
             // From the destination side → forward to the source side.
-            session.stats.bytes_ingress.fetch_add(bytes, Ordering::Relaxed);
-            session.ingress_media_ms.store(now_mono, Ordering::Relaxed);
-            (egress?, session.egress_sock.load(Ordering::Relaxed))
+            (
+                egress,
+                session.egress_sock.load(Ordering::Relaxed),
+                &session.stats.bytes_ingress,
+                &session.ingress_media_ms,
+            )
         } else if Some(src) == egress {
             // From the source side → forward to the destination side.
-            session.stats.bytes_egress.fetch_add(bytes, Ordering::Relaxed);
-            session.egress_media_ms.store(now_mono, Ordering::Relaxed);
-            (ingress?, session.ingress_sock.load(Ordering::Relaxed))
+            (
+                ingress,
+                session.ingress_sock.load(Ordering::Relaxed),
+                &session.stats.bytes_egress,
+                &session.egress_media_ms,
+            )
         } else {
             // Source addr matches neither latched slot (unregistered or a NAT
             // rebind not yet re-latched by a keepalive). Drop.
             return None;
         };
+
+        // Never forward a datagram back to where it came from. `latch` refuses
+        // to put one address in both slots, but this is the data path's own
+        // choke point: if the address is relay-local, `send_to(data, src)`
+        // delivers straight back to our own listening socket, which forwards it
+        // again — an unbounded loop at kernel line rate starving every other
+        // session sharing this recv loop. One comparison on values already in
+        // registers; the function does two more of the same kind above.
+        if target == Some(src) {
+            return None;
+        }
+
+        // The datagram arrived from a latched slot, so that slot is carrying
+        // media — record it BEFORE the "peer not latched yet" drop below, as
+        // this function always has. A contribution edge that registers and
+        // starts sending while its receiver is still down would otherwise leave
+        // `*_media_ms` at zero, and `slot_is_protected` would then let one
+        // unauthenticated `Register` move its slot: the hold-down would cover
+        // only tunnels that are already flowing end to end.
+        bytes_ctr.fetch_add(bytes, Ordering::Relaxed);
+        media_ms.store(mono_ms(), Ordering::Relaxed);
+
+        // The paired slot is not latched yet: nothing to forward to.
+        let target = target?;
         session.stats.udp_datagrams_total.fetch_add(1, Ordering::Relaxed);
         session.last_seen_ms.store(now_ms(), Ordering::Relaxed);
         Some((target, target_sock))
@@ -587,6 +719,30 @@ async fn handle_control(
                 );
             }
 
+            // Source-address sanity, before anything else touches state: a
+            // slot is a send target, so it must never hold an address no host
+            // can own. See `is_latchable_source`.
+            if !is_latchable_source(src) {
+                tracing::warn!(
+                    "native-UDP register rejected for tunnel {tunnel_id} from {src}: \
+                     source address is not latchable"
+                );
+                ctx.event_sender.emit_with_id_and_details(
+                    EventSeverity::Warning,
+                    category::TUNNEL,
+                    "Native-UDP register rejected: implausible source address",
+                    &tunnel_id.to_string(),
+                    serde_json::json!({
+                        "error_code": "relay_invalid_source_addr",
+                        "reason": "unroutable_source",
+                        "remote_addr": src.to_string(),
+                        "remote_ip": src.ip().to_string(),
+                        "transport": "udp",
+                    }),
+                );
+                return;
+            }
+
             // Reuse the QUIC path's bind-token authorization registry.
             if !ctx
                 .router
@@ -633,6 +789,30 @@ async fn handle_control(
                         &tunnel_id.to_string(),
                         serde_json::json!({
                             "error_code": "relay_slot_takeover_refused",
+                            "remote_addr": src.to_string(),
+                            "remote_ip": src.ip().to_string(),
+                            "transport": "udp",
+                        }),
+                    );
+                }
+                LatchResult::RejectedInvalidSource => {
+                    // The `is_latchable_source` half is already handled by the
+                    // early return above, so reaching here means the DEGENERATE
+                    // latch: the opposite slot of this tunnel already holds
+                    // exactly this address, which would make the session
+                    // forward to its own source. No Ack, same as a held slot.
+                    tracing::warn!(
+                        "native-UDP register rejected for {tunnel_id} from {src}: \
+                         the opposite slot already holds this address (self-loop)"
+                    );
+                    ctx.event_sender.emit_with_id_and_details(
+                        EventSeverity::Warning,
+                        category::TUNNEL,
+                        "Native-UDP register rejected: implausible source address",
+                        &tunnel_id.to_string(),
+                        serde_json::json!({
+                            "error_code": "relay_invalid_source_addr",
+                            "reason": "both_slots_same_address",
                             "remote_addr": src.to_string(),
                             "remote_ip": src.ip().to_string(),
                             "transport": "udp",
@@ -892,6 +1072,167 @@ mod slot_holddown_tests {
             r.latch(t, TunnelDirection::Ingress, addr("203.0.113.9", 6000), 0),
             LatchResult::Ok(_)
         ));
+    }
+
+    /// A slot is a *send* target. Latching an address no host can own turns the
+    /// relay into a black hole (unspecified / port 0) or, worse, a free
+    /// multicast/broadcast fan-out of somebody else's contribution feed.
+    #[test]
+    fn implausible_source_addresses_are_not_latchable() {
+        for bad in [
+            "0.0.0.0:5000",           // unspecified v4
+            "224.0.0.1:5000",         // multicast v4
+            "239.255.1.2:5000",       // admin-scoped multicast v4
+            "255.255.255.255:5000",   // limited broadcast
+            "[::]:5000",              // unspecified v6
+            "[ff02::1]:5000",         // link-local all-nodes multicast v6
+            "198.51.100.10:0",        // port 0
+            "[2001:db8::1]:0",        // port 0, v6
+        ] {
+            assert!(
+                !is_latchable_source(bad.parse().unwrap()),
+                "{bad} must not be latchable"
+            );
+        }
+    }
+
+    /// The check must NOT reject loopback or private ranges — the testbed runs
+    /// relay + both edges on 127.0.0.1, and real deployments relay between
+    /// RFC1918 / ULA addresses. Rejecting these would break working configs.
+    #[test]
+    fn loopback_and_private_sources_stay_latchable() {
+        for good in [
+            "127.0.0.1:5000",
+            "10.0.0.9:5000",
+            "172.16.4.1:41234",
+            "192.168.1.50:4434",
+            "100.64.0.7:5000",  // CGNAT — a very common real post-NAT source
+            "198.51.100.10:5000",
+            "[::1]:5000",
+            "[fd00::1]:5000",   // ULA
+            "[2001:db8::1]:5000",
+        ] {
+            assert!(
+                is_latchable_source(good.parse().unwrap()),
+                "{good} must stay latchable"
+            );
+        }
+    }
+
+    /// `latch` — not just the free predicate — must refuse an unlatchable
+    /// source, and must leave no trace when it does.
+    ///
+    /// This is the wiring test: the predicate having the right opinion is
+    /// worthless if the router never asks it. Deleting the
+    /// `is_latchable_source` guard from `latch` turns this red.
+    #[test]
+    fn latch_refuses_an_unlatchable_source_address() {
+        let r = UdpSessionRouter::new(64);
+        for bad in ["0.0.0.0:5000", "224.0.0.1:5000", "255.255.255.255:5000", "10.0.0.9:0"] {
+            let t = Uuid::new_v4();
+            let src: SocketAddr = bad.parse().unwrap();
+            assert!(
+                matches!(r.latch(t, TunnelDirection::Egress, src, 0), LatchResult::RejectedInvalidSource),
+                "{bad} must be refused by latch, not merely by the predicate"
+            );
+            assert_eq!(
+                slot_addr(&r, t, TunnelDirection::Egress),
+                None,
+                "{bad} must leave the slot unset"
+            );
+            // And it must not have created a session at all — otherwise a
+            // rejected register still burns the source IP's per-IP quota.
+            assert_eq!(r.count(), 0, "{bad} must not create a session");
+        }
+    }
+
+    /// The two ends of a tunnel are two distinct edge sockets. Letting both
+    /// slots hold ONE address builds a session that forwards to its own source
+    /// — an unbounded loop when that address routes back to the relay.
+    #[test]
+    fn both_slots_cannot_hold_the_same_address() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        // The relay's own advertised dial address, as an attacker would spoof it.
+        let relay_self = addr("111.118.193.172", 7400);
+
+        assert!(matches!(r.latch(t, TunnelDirection::Ingress, relay_self, 0), LatchResult::Ok(_)));
+        assert!(
+            matches!(
+                r.latch(t, TunnelDirection::Egress, relay_self, 0),
+                LatchResult::RejectedInvalidSource
+            ),
+            "the opposite slot must refuse an address the other slot already holds"
+        );
+        assert_eq!(slot_addr(&r, t, TunnelDirection::Egress), None);
+        // Not "active", so nothing is forwarded on it either.
+        assert!(r.forward_target(t, relay_self, 100).is_none());
+    }
+
+    /// The data path's own guard: whatever state a session reached, a datagram
+    /// is never forwarded back to where it came from.
+    #[test]
+    fn forward_target_never_returns_its_own_source() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let relay_self = addr("111.118.193.172", 7400);
+
+        // Drive the router into the degenerate state directly, bypassing
+        // `latch`'s refusal — this asserts the drop holds regardless of HOW
+        // both slots came to hold one address.
+        r.latch(t, TunnelDirection::Ingress, addr("198.51.100.10", 5000), 0);
+        let s = r.sessions.get(&t).expect("session exists");
+        s.ingress.store(relay_self);
+        s.egress.store(relay_self);
+        drop(s);
+
+        assert_eq!(
+            r.forward_target(t, relay_self, 100),
+            None,
+            "dest == src is an unbounded forward loop and must be dropped"
+        );
+        // …and the dropped datagram must not refresh liveness, or the loop
+        // would hold its own hold-down open and outrun the idle reaper.
+        let s = r.sessions.get(&t).expect("session exists");
+        assert_eq!(s.ingress_media_ms.load(Ordering::Relaxed), 0, "no media stamp on a drop");
+        assert_eq!(s.egress_media_ms.load(Ordering::Relaxed), 0, "no media stamp on a drop");
+        assert_eq!(s.stats.udp_datagrams_total.load(Ordering::Relaxed), 0);
+    }
+
+    /// The self-loop drop must be the ONLY case that skips accounting. A
+    /// contribution edge that registers and starts sending while its receiver
+    /// is still down is a half-latched session carrying real media: that media
+    /// must keep stamping `*_media_ms`, or `slot_is_protected` stays false and
+    /// one unauthenticated `Register` can move the live contributor's slot —
+    /// the hold-down would then cover only tunnels already flowing end to end.
+    #[test]
+    fn media_from_a_latched_slot_holds_it_down_before_the_peer_arrives() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let contributor = addr("198.51.100.10", 5000);
+
+        assert!(matches!(
+            r.latch(t, TunnelDirection::Ingress, contributor, 0),
+            LatchResult::Ok(false) // peer not latched: session is "waiting"
+        ));
+        // Media arrives with no egress peer yet — nothing to forward to…
+        assert_eq!(r.forward_target(t, contributor, 1316), None);
+
+        // …but the slot is demonstrably live, so it is accounted and held down.
+        let s = r.sessions.get(&t).expect("session exists");
+        assert_eq!(s.stats.bytes_ingress.load(Ordering::Relaxed), 1316);
+        assert!(
+            slot_is_protected(s.ingress_media_ms.load(Ordering::Relaxed), mono_ms()),
+            "a waiting contributor's slot must be held down while it sends"
+        );
+        drop(s);
+
+        // And the hold-down actually refuses the spoofed move.
+        assert!(matches!(
+            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.7", 5000), 0),
+            LatchResult::RejectedSlotHeld
+        ));
+        assert_eq!(slot_addr(&r, t, TunnelDirection::Ingress), Some(contributor));
     }
 
     /// The grace must sit between the register cadence and the idle timeout,

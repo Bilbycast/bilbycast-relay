@@ -87,7 +87,32 @@ scope  ∈ { "viewer", "ingest" }
 
 - `require_ingest_token` (default **true**) gates the write surfaces (WHIP + origin PUT).
 - `require_viewer_token` (default false → public streams) gates WHEP.
-- Viewers pass the token as `?token=…` (player reads it) or `Authorization: Bearer`.
+- Viewers pass the token as `?token=…` or `Authorization: Bearer`. The built-in
+  player reads `?token=` off the `/watch/{stream}` URL and forwards it as a
+  Bearer header; `/whep` accepts the query form directly too, as a convenience
+  for CLI and link-share clients.
+
+### What `require_viewer_token` does *not* cover
+
+**It gates WHEP only.** `GET /origin/{stream}/{file}` — the CMAF / LL-HLS tier —
+performs no token check in any mode, deliberately: it is the CDN-facing half of
+the surface and a CDN pulls it with no credential of the relay's. So for any
+stream that also runs the LL-HLS tier, the viewer gate is bypassable by fetching
+`/origin/{stream}/index.m3u8` directly. If that matters, restrict the origin
+listener at the network / reverse-proxy layer. Do not read "viewer token
+required" as "this stream is not readable without a credential".
+
+### Risk of the URL-borne form
+
+`?token=` is a bearer credential in a URL, and the signaling listener is plain
+HTTP by design (see above) — fronted by a TLS-terminating proxy whose **default
+access-log format records the full request line, query included** (nginx
+`$request`, Apache `%r`, HAProxy, ALB, CloudFront). Viewer tokens are stateless
+with **no revocation path**, and the manager's default TTL is **6 hours**. A
+token lifted from a proxy log or from browser history is therefore replayable
+against a live feed for up to that long. Mint short `ttl_secs` when handing out
+query-form links, prefer the `Authorization: Bearer` form for programmatic
+clients, and strip `token` from the query in your proxy's log format if you can.
 
 ## Scaling beyond one relay
 

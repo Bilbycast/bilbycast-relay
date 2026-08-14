@@ -209,7 +209,14 @@ async fn origin_put(
     let rt = st.control.load();
     if rt.require_ingest_token {
         if let Some(ref secret) = rt.token_secret {
-            let tok = bearer_or_query(&headers, None);
+            // Header-only is correct here: the CMAF uploader is the edge
+            // (`bilbycast-edge/src/engine/cmaf/upload.rs` sets
+            // `Authorization: Bearer`), never a browser. This used to call a
+            // second, subtly divergent bearer+query parser whose query half
+            // was dead (`None` was the only argument ever passed) and whose
+            // empty-value policy disagreed with the shared one. One credential
+            // parser, one policy.
+            let tok = super::bearer(&headers);
             match tok.and_then(|t| token::verify_ingest_token(secret, &stream, &t).ok()) {
                 Some(()) => {}
                 None => return (StatusCode::UNAUTHORIZED, "ingest token required").into_response(),
@@ -228,6 +235,16 @@ async fn origin_put(
 }
 
 /// `GET /origin/{stream}/{file}` — serve a cached object to a player/CDN.
+///
+/// **Deliberately unauthenticated, and `require_viewer_token` does NOT gate
+/// it.** That flag covers the WHEP tier only. This route is the CDN-facing
+/// half of the distribution surface: a CDN pulls it with no credential of the
+/// relay's, which is the point of having an HTTP origin at all. The
+/// consequence is worth stating plainly, because it is easy to assume
+/// otherwise: for any stream that also runs the CMAF/LL-HLS tier, the viewer
+/// gate is bypassable by fetching `/origin/{stream}/index.m3u8` directly.
+/// Restrict this listener at the network/proxy layer if that matters.
+/// Documented in `docs/distribution.md` under "Access tokens".
 async fn origin_get(
     State(st): State<Arc<DistributionState>>,
     Path((stream, file)): Path<(String, String)>,
@@ -258,20 +275,6 @@ async fn origin_get(
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-/// Pull a token from `Authorization: Bearer` or a `?token=` query (parsed
-/// from the raw query string — the extractor path doesn't split it for us).
-fn bearer_or_query(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
-    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if let Some(t) = v.strip_prefix("Bearer ") {
-            return Some(t.to_string());
-        }
-    }
-    query.and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("token=").map(|t| t.to_string()))
-    })
 }
 
 #[cfg(test)]

@@ -757,6 +757,26 @@ impl RelayConfig {
             _ => default_udp_relay_addrs(),
         }
     }
+
+    /// Is this relay running the native plain-UDP plane in the permissive
+    /// bind-auth mode?
+    ///
+    /// Both halves of the shipped defaults, so a zero-config relay answers
+    /// `true`: `require_bind_auth` defaults to `false` and `udp_relay_enabled`
+    /// defaults to `true` (`#[serde(default = "default_true")]`) — which means
+    /// a config that simply omits `udp_relay_enabled` is still in this posture.
+    ///
+    /// It matters because the two planes' consequences differ. On QUIC an
+    /// unauthenticated `TunnelBind` lets a stranger *join* a tunnel; on the
+    /// native plane the rendezvous latch turns a source address into a *send*
+    /// target, so an unauthenticated `Register` can *move* a slot and redirect
+    /// live media to the sender. It applies only to tunnels the manager has
+    /// **not** pre-authorized — `TunnelRouter::verify_bind_token` still demands
+    /// the exact HMAC for any tunnel carrying an `authorize_tunnel` entry, even
+    /// in permissive mode.
+    pub fn native_plane_accepts_unauthenticated(&self) -> bool {
+        !self.require_bind_auth && self.udp_relay_enabled
+    }
 }
 
 #[cfg(test)]
@@ -787,6 +807,40 @@ mod tests {
         assert!(validate_public_addr("host:notaport", "f").is_err());
         assert!(validate_public_addr("-bad.example.com:4433", "f").is_err());
         assert!(validate_public_addr("bad-.example.com:4433", "f").is_err());
+    }
+
+    /// The startup warning fires on exactly one posture: permissive bind auth
+    /// AND the native plane enabled. Strict bind auth, or a disabled plane,
+    /// must stay quiet — a warning on every relay is a warning nobody reads.
+    #[test]
+    fn native_plane_unauthenticated_posture_is_both_halves() {
+        let mut c = RelayConfig {
+            require_bind_auth: false,
+            udp_relay_enabled: true,
+            ..RelayConfig::default()
+        };
+        assert!(c.native_plane_accepts_unauthenticated(), "permissive + plane on");
+
+        c.udp_relay_enabled = false;
+        assert!(!c.native_plane_accepts_unauthenticated(), "plane off — nothing to hijack");
+
+        c.require_bind_auth = true;
+        c.udp_relay_enabled = true;
+        assert!(!c.native_plane_accepts_unauthenticated(), "strict bind auth");
+    }
+
+    /// `testbed/configs/relay-distribution.json`'s shape: it sets
+    /// `require_bind_auth: false` and OMITS `udp_relay_enabled` entirely, which
+    /// `#[serde(default = "default_true")]` resolves to `true`. It is therefore
+    /// a THIRD exposed testbed config, not an unaffected one.
+    #[test]
+    fn omitted_udp_relay_enabled_still_counts_as_exposed() {
+        let c: RelayConfig = serde_json::from_str(
+            r#"{ "quic_addr": "0.0.0.0:4433", "api_addr": "0.0.0.0:4480", "require_bind_auth": false }"#,
+        )
+        .expect("parses");
+        assert!(c.udp_relay_enabled, "omitted field defaults to true");
+        assert!(c.native_plane_accepts_unauthenticated());
     }
 
     #[test]

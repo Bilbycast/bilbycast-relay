@@ -10,11 +10,25 @@
 //! level-5.1-H.264-PT interop workarounds must not diverge across the two
 //! str0m deployments.
 //!
+//! **KNOWN, DELIBERATE DIVERGENCE — do not "resync" it away.** This copy
+//! carries a security control the edge copy does not: [`PeerPin`], an ingress
+//! source filter closing an ICE-Lite peer-reflexive UDP reflector (a spoofed
+//! STUN Binding Request from a credentialed client repoints the whole SRTP
+//! stream at the spoofed address). The edge runs the same vendored state
+//! machine in the same ICE-Lite server role from `engine::input_webrtc`
+//! (WHIP ingest) and `engine::output_webrtc` (WHEP output) on the same
+//! str0m 0.22 / `is` 0.11, and therefore still has the reflector. That is
+//! recorded as accepted residual risk, not as fixed: the edge's WHIP/WHEP
+//! routes sit behind `auth_middleware`, so exploiting it costs one valid edge
+//! API credential — which any legitimate WHEP viewer of that edge holds.
+//! Porting `PeerPin` across is the fix; until then, a sync in either direction
+//! must carry this control forward, never delete it.
+//!
 //! Manages the lifecycle of a single WebRTC PeerConnection: ICE, DTLS,
 //! SRTP, and media I/O. Integrates str0m's sans-I/O model with tokio
 //! by driving the UDP socket and str0m poll loop in a select! loop.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,6 +85,155 @@ pub struct SessionConfig {
     pub ice_lite: bool,
 }
 
+/// Ingress source pin — the anti-reflection control on the media socket.
+///
+/// **Why this exists.** ICE-Lite mints a *peer-reflexive* remote candidate from
+/// any STUN Binding Request that carries a correct MESSAGE-INTEGRITY, and — in
+/// lite mode — marks the resulting pair nominated the instant the request sets
+/// USE-CANDIDATE (`is-0.11.0/src/agent.rs`: `pair.nominate(self.ice_lite)`
+/// forces `NominationState::Success`, then `evaluate_nomination` picks the
+/// highest-**PRIORITY** nominated pair — and PRIORITY is an attribute the
+/// sender chooses). str0m then routes every DTLS/SRTP transmit to that pair's
+/// address (`str0m-0.22.0/src/lib.rs`, the `send_addr` branch of
+/// `poll_output`).
+///
+/// The relay hands its ICE ufrag/pwd to whoever POSTs a WHEP offer, in the 201
+/// answer. So a client that has completed one legitimate session already holds
+/// every credential needed to forge such a request from a **spoofed** source
+/// address. One ~100-byte spoofed datagram repoints the whole SRTP stream at
+/// the spoofed address, and one more every few seconds keeps it there: a UDP
+/// reflector with a four-to-five-order-of-magnitude amplification ratio.
+///
+/// There is no upstream switch for this. `is` 0.11 implements no consent
+/// freshness (RFC 7675) — the word "consent" appears in that crate exactly
+/// once, in a doc comment about RTT measurement.
+///
+/// **The control.** Filter on **ingress**, before `Rtc::handle_input`, so the
+/// spoofed datagram never reaches the ICE agent: no peer-reflexive candidate is
+/// minted, no pair is nominated, and — decisively — no STUN reply is generated.
+/// An egress-only guard would still bounce the reply off the victim.
+///
+/// **When it arms.** Only once DTLS completes, and it pins the address str0m
+/// was sending DTLS records to at that moment. That address is provably the
+/// peer that answered the handshake: DTLS only ever leaves via `send_addr`, so
+/// a spoofer who moved the nomination *before* the handshake finished would
+/// have sent our DTLS to the victim, which cannot answer, and `Connected` would
+/// never fire. Everything before `Connected` stays wide open, because ICE and
+/// DTLS must run from an address nobody has learned yet.
+///
+/// **What it costs.** The pin is on the IP only, so a NAT *port* rebind — the
+/// common case — still passes. A viewer whose **IP** changes mid-stream
+/// (Wi-Fi → cellular) is dropped and must re-POST the WHEP offer. That is a
+/// small incremental cost, because mid-session IP migration barely works here
+/// today either: `evaluate_nomination` ranks nominated pairs purely by
+/// priority with no liveness filter, so a roaming viewer's new pair only wins
+/// if it happens to outrank the dead one. Making migration *safe* rather than
+/// merely absent needs a return-routability check (RFC 7675 consent, or a full
+/// non-lite agent) that neither str0m nor `is` offers today.
+///
+/// It costs one more thing, in the **client** (non-ICE-Lite) role that
+/// `cascade.rs` uses: there the relay is the controlling agent and
+/// `is::handle_timeout` keeps issuing binding requests to *every* candidate
+/// pair, not only the nominated one. A legitimately multi-homed remote peer —
+/// and `select_local_candidate_ips` advertises loopback *and* the
+/// route-discovered LAN IP, so a same-host cascade peer is exactly that —
+/// answers from more than one source IP. After arming, replies from the
+/// non-nominated IP are dropped, those pairs fail `is_still_possible` and get
+/// pruned. The session survives on its nominated pair but silently loses its
+/// ICE failover redundancy.
+///
+/// **Divergence from the edge.** This file is vendored from
+/// `bilbycast-edge::engine::webrtc::session` and the two are meant to be kept
+/// in sync. `PeerPin` is a deliberate, recorded divergence: the relay copy
+/// carries it, the edge copy does not (see the module header). Do not delete
+/// it as "drift" when next syncing the two.
+#[derive(Default)]
+struct PeerPin {
+    /// Remote IP the DTLS handshake completed with. `None` until `Connected`.
+    pinned: Option<IpAddr>,
+    /// Destination of the most recent DTLS record we transmitted. This is the
+    /// nominated peer; STUN replies (which go to whatever address asked, and
+    /// so can be steered by a spoofer) deliberately do NOT update it.
+    last_dtls_dest: Option<IpAddr>,
+    /// Source of the most recent datagram we accepted **and demuxed** — the
+    /// arming fallback if somehow no DTLS record was transmitted before
+    /// `Connected`. Recorded only after the `DatagramRecv` demux succeeds (see
+    /// [`WebrtcSession::ingest`]), so this is never arbitrary unvalidated
+    /// bytes' source.
+    last_recv_src: Option<IpAddr>,
+    /// Off-path datagrams dropped since arming. Exposed for diagnostics.
+    dropped: u64,
+    /// The first off-path source of this session, latched for exactly one read
+    /// by the owning transport (see [`WebrtcSession::take_offpath_alert`]) so
+    /// the drop reaches the manager's Events page once — never per datagram,
+    /// which under a reflection flood would make the alarm its own amplifier.
+    alert: Option<SocketAddr>,
+}
+
+impl PeerPin {
+    /// Does this UDP payload demultiplex as a DTLS record? RFC 9443 §3: STUN
+    /// is 0..=3, DTLS 20..=63, RTP/RTCP 128..=191.
+    fn is_dtls(payload: &[u8]) -> bool {
+        matches!(payload.first(), Some(20..=63))
+    }
+
+    /// Observe an outbound datagram. Only DTLS records move `last_dtls_dest`.
+    fn note_transmit(&mut self, dest: SocketAddr, payload: &[u8]) {
+        if Self::is_dtls(payload) {
+            self.last_dtls_dest = Some(dest.ip());
+        }
+    }
+
+    /// Observe an inbound datagram we are about to hand to str0m.
+    fn note_receive(&mut self, source: SocketAddr) {
+        self.last_recv_src = Some(source.ip());
+    }
+
+    /// Arm the pin on the DTLS peer. Idempotent — `Connected` fires once, but
+    /// re-arming later would be exactly the hole this closes.
+    fn arm(&mut self) {
+        if self.pinned.is_some() {
+            return;
+        }
+        match self.last_dtls_dest.or(self.last_recv_src) {
+            Some(ip) => {
+                self.pinned = Some(ip);
+                tracing::debug!("WebRTC: pinned media peer to {ip} (DTLS complete)");
+            }
+            // Unreachable in practice: `Connected` means a DTLS handshake ran,
+            // which means records went out. Fail open rather than wedge a live
+            // session on a state we did not anticipate — but say so loudly.
+            None => tracing::warn!(
+                "WebRTC: connected without an observed DTLS peer — source pin NOT armed"
+            ),
+        }
+    }
+
+    /// Should this inbound datagram be handed to str0m?
+    fn accept(&mut self, source: SocketAddr) -> bool {
+        match self.pinned {
+            None => true,
+            Some(ip) if ip == source.ip() => true,
+            Some(ip) => {
+                self.dropped += 1;
+                // Loud once, then quiet: a reflection attempt is a flood by
+                // construction and must not become its own log amplifier.
+                if self.dropped == 1 {
+                    self.alert = Some(source);
+                    tracing::warn!(
+                        "WebRTC: dropped an off-path datagram from {source} — this session is \
+                         pinned to {ip}. Either a source-spoofed ICE reflection attempt, or a \
+                         viewer whose IP changed (which must re-POST the WHEP offer)."
+                    );
+                } else {
+                    tracing::trace!("WebRTC: dropped off-path datagram from {source}");
+                }
+                false
+            }
+        }
+    }
+}
+
 /// A WebRTC session wrapping str0m's `Rtc` state machine.
 pub struct WebrtcSession {
     rtc: Rtc,
@@ -84,6 +247,8 @@ pub struct WebrtcSession {
     pub video_mid: Option<Mid>,
     /// Audio track MID (if any).
     pub audio_mid: Option<Mid>,
+    /// Anti-reflection ingress filter. See [`PeerPin`].
+    pin: PeerPin,
     buf: Vec<u8>,
 }
 
@@ -195,8 +360,35 @@ impl WebrtcSession {
             candidate_ips: candidate_ips.clone(),
             video_mid: None,
             audio_mid: None,
+            pin: PeerPin::default(),
             buf: vec![0u8; 2048],
         })
+    }
+
+    /// The remote IP this session's media is pinned to, once DTLS has
+    /// completed. `None` while the handshake is still open. See [`PeerPin`].
+    pub fn pinned_peer_ip(&self) -> Option<IpAddr> {
+        self.pin.pinned
+    }
+
+    /// Datagrams dropped by the ingress source pin — spoofed ICE reflection
+    /// attempts, or a viewer whose IP changed. Non-zero on a healthy session
+    /// only under attack.
+    pub fn offpath_datagrams_dropped(&self) -> u64 {
+        self.pin.dropped
+    }
+
+    /// Take the one-shot off-path alert: `(pinned_ip, offending_source)`, set
+    /// the first time this session drops a datagram from an unpinned address
+    /// and cleared by this read.
+    ///
+    /// The transport layer polls this (see `whep::viewer_loop`) and turns it
+    /// into one Warning event + one telemetry increment per session. Kept as a
+    /// pull rather than a callback so this vendored file takes on no
+    /// dependency on the relay's event channel — the edge's copy has none.
+    pub fn take_offpath_alert(&mut self) -> Option<(IpAddr, SocketAddr)> {
+        let source = self.pin.alert.take()?;
+        Some((self.pin.pinned?, source))
     }
 
     /// Accept an SDP offer (server mode) and return the SDP answer string.
@@ -315,6 +507,7 @@ impl WebrtcSession {
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(transmit)) => {
+                    self.pin.note_transmit(transmit.destination, &transmit.contents);
                     let _ = self.socket.send_to(&transmit.contents, transmit.destination).await;
                 }
                 Ok(Output::Event(event)) => {
@@ -366,6 +559,7 @@ impl WebrtcSession {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(transmit)) => {
                     tracing::trace!("poll_event: Transmit {} bytes -> {}", transmit.contents.len(), transmit.destination);
+                    self.pin.note_transmit(transmit.destination, &transmit.contents);
                     let _ = self.socket.send_to(&transmit.contents, transmit.destination).await;
                     continue;
                 }
@@ -391,29 +585,9 @@ impl WebrtcSession {
                         result = self.socket.recv_from(&mut self.buf) => {
                             match result {
                                 Ok((len, source)) => {
-                                    let now = Instant::now();
-                                    // str0m's DatagramRecv try_into rejects
-                                    // datagrams that aren't STUN/DTLS/RTP/RTCP.
-                                    // Hostile or stray packets must NOT crash
-                                    // the WebRTC session task — drop them and
-                                    // keep going.
-                                    let contents = match (&self.buf[..len]).try_into() {
-                                        Ok(c) => c,
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                "WebRTC: dropped {len}-byte datagram from {source}: {e}"
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    let destination = self.destination_for_source(source);
-                                    let receive = str0m::net::Receive {
-                                        proto: Protocol::Udp,
-                                        source,
-                                        destination,
-                                        contents,
-                                    };
-                                    let _ = self.rtc.handle_input(Input::Receive(now, receive));
+                                    // The ONE ingress path — filter included.
+                                    // See `WebrtcSession::ingest`.
+                                    self.ingest(len, source);
                                     continue;
                                 }
                                 Err(e) => {
@@ -430,6 +604,54 @@ impl WebrtcSession {
                 }
             }
         }
+    }
+
+    /// The **one** path from the UDP socket into str0m.
+    ///
+    /// Both receive loops — `poll_event`'s blocking `recv_from` arm and
+    /// `drive_udp_io`'s non-blocking drain — call exactly this and nothing
+    /// else. That is deliberate and load-bearing: when the anti-reflection
+    /// filter lived inline in both loops it could be (and, in review, was)
+    /// deleted from both with the whole test suite still green, because the
+    /// guard had two copies and neither was reachable from a test. There is
+    /// now one copy, on the only route in, so a third receive path cannot be
+    /// added without it either.
+    ///
+    /// Returns whether the datagram reached str0m. Ordering inside matters:
+    ///
+    /// 1. [`PeerPin::accept`] runs **before** `Rtc::handle_input`, so a
+    ///    spoofed STUN Binding Request mints no peer-reflexive candidate and —
+    ///    decisively — draws no reply. An egress-only guard would still bounce
+    ///    the reply off the victim.
+    /// 2. [`PeerPin::note_receive`] runs **after** the `DatagramRecv` demux
+    ///    succeeds, so the arming fallback can only ever pin on a source whose
+    ///    payload was at least recognisable as STUN/DTLS/RTP/RTCP — never on
+    ///    arbitrary unvalidated bytes.
+    fn ingest(&mut self, len: usize, source: SocketAddr) -> bool {
+        if !self.pin.accept(source) {
+            return false;
+        }
+        let now = Instant::now();
+        // str0m's DatagramRecv try_into rejects datagrams that aren't
+        // STUN/DTLS/RTP/RTCP. Hostile or stray packets must NOT crash the
+        // WebRTC session task — drop them and keep going.
+        let contents = match (&self.buf[..len]).try_into() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("WebRTC: dropped {len}-byte datagram from {source}: {e}");
+                return false;
+            }
+        };
+        self.pin.note_receive(source);
+        let destination = self.destination_for_source(source);
+        let receive = str0m::net::Receive {
+            proto: Protocol::Udp,
+            source,
+            destination,
+            contents,
+        };
+        let _ = self.rtc.handle_input(Input::Receive(now, receive));
+        true
     }
 
     /// Map an incoming packet's source address to the correct local
@@ -468,19 +690,9 @@ impl WebrtcSession {
         loop {
             match self.socket.try_recv_from(&mut self.buf) {
                 Ok((len, source)) => {
-                    let now = Instant::now();
-                    let contents = match (&self.buf[..len]).try_into() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    let destination = self.destination_for_source(source);
-                    let receive = str0m::net::Receive {
-                        proto: Protocol::Udp,
-                        source,
-                        destination,
-                        contents,
-                    };
-                    let _ = self.rtc.handle_input(Input::Receive(now, receive));
+                    // The ONE ingress path — filter included. See
+                    // `WebrtcSession::ingest`.
+                    self.ingest(len, source);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -494,6 +706,7 @@ impl WebrtcSession {
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(transmit)) => {
+                    self.pin.note_transmit(transmit.destination, &transmit.contents);
                     let _ = self.socket.send_to(&transmit.contents, transmit.destination).await;
                 }
                 Ok(Output::Event(ev)) => {
@@ -513,6 +726,9 @@ impl WebrtcSession {
         match event {
             Event::Connected => {
                 tracing::info!("WebRTC connected (ICE + DTLS complete)");
+                // Arm the anti-reflection pin on the peer that just answered
+                // the DTLS handshake. See `PeerPin`.
+                self.pin.arm();
                 Some(SessionEvent::Connected)
             }
             Event::IceConnectionStateChange(state) => {
@@ -925,5 +1141,332 @@ mod tests {
         let local: SocketAddr = "0.0.0.0:5000".parse().unwrap();
         let source: SocketAddr = "10.0.0.1:9999".parse().unwrap();
         assert_eq!(resolve_destination(local, &[], source), local);
+    }
+
+    // ── PeerPin: the anti-reflection ingress filter ────────────────────
+    //
+    // These drive the exact object `WebrtcSession` drives — the session's
+    // recv paths call `pin.accept`, its transmit paths call
+    // `pin.note_transmit`, and `Event::Connected` calls `pin.arm`.
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// A DTLS record (first byte 20..=63) — the payload shape that identifies
+    /// the nominated peer. RFC 9443 §3.
+    const DTLS: &[u8] = &[22, 0xfe, 0xfd];
+    /// A STUN message (first byte 0..=3) — steerable by a spoofer, so it must
+    /// never move the pin.
+    const STUN: &[u8] = &[0x01, 0x01, 0x00, 0x00];
+    /// An SRTP packet (first byte 128..=191).
+    const SRTP: &[u8] = &[0x80, 0x60, 0x00, 0x01];
+    /// A well-formed 20-byte STUN Binding Request — type `0x0001`, zero
+    /// length, RFC 5389 magic cookie `0x2112A442`, 12-byte transaction id.
+    /// This is the reflector's opening move, and it is what the ingress-path
+    /// tests spoof.
+    ///
+    /// Note it does NOT survive str0m's `DatagramRecv` demux on its own
+    /// (`"No message integrity in incoming STUN binding request"` — str0m
+    /// requires MESSAGE-INTEGRITY, which is why the finding's premise needs a
+    /// client holding the relay's ufrag/pwd). That is irrelevant to what these
+    /// tests assert: [`PeerPin::accept`] runs *before* the demux, so a drop
+    /// counted on `offpath_datagrams_dropped()` is unambiguously the pin's
+    /// doing and never the demux's.
+    const STUN_BINDING_REQUEST: &[u8] = &[
+        0x00, 0x01, 0x00, 0x00, // Binding Request, length 0
+        0x21, 0x12, 0xa4, 0x42, // magic cookie
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, // txid
+    ];
+    /// A 16-byte RTP packet — a full 12-byte header plus payload. Unlike the
+    /// STUN request above this *does* demux, so it is what the tests use when
+    /// they need `ingest` to return `true` for an admitted source.
+    const RTP_PACKET: &[u8] = &[
+        0x80, 0x60, 0x00, 0x01, // V=2, PT=96, seq=1
+        0x00, 0x00, 0x00, 0x00, // timestamp
+        0x00, 0x00, 0x00, 0x00, // SSRC
+        0xaa, 0xbb, 0xcc, 0xdd, // payload
+    ];
+
+    #[test]
+    fn dtls_record_types_are_classified_per_rfc9443() {
+        assert!(PeerPin::is_dtls(DTLS));
+        assert!(PeerPin::is_dtls(&[20]));
+        assert!(PeerPin::is_dtls(&[63]));
+        assert!(!PeerPin::is_dtls(STUN));
+        assert!(!PeerPin::is_dtls(SRTP));
+        assert!(!PeerPin::is_dtls(&[19]));
+        assert!(!PeerPin::is_dtls(&[64]));
+        assert!(!PeerPin::is_dtls(&[]));
+    }
+
+    /// Before DTLS completes the filter must be fully open: ICE and DTLS run
+    /// from an address nobody has learned yet, so anything stricter would stop
+    /// every session from ever connecting.
+    #[test]
+    fn unarmed_pin_accepts_every_source() {
+        let mut pin = PeerPin::default();
+        assert!(pin.accept(sa("203.0.113.7:40000")));
+        assert!(pin.accept(sa("198.51.100.10:40000")));
+        assert!(pin.accept(sa("[2001:db8::1]:40000")));
+        assert_eq!(pin.dropped, 0);
+        assert_eq!(pin.pinned, None);
+    }
+
+    /// THE REFLECTOR. An attacker completes ICE + DTLS from its own address,
+    /// then sends ONE spoofed STUN Binding Request carrying USE-CANDIDATE, a
+    /// max PRIORITY and a valid MESSAGE-INTEGRITY (it has the relay's ice-pwd
+    /// from the 201 answer). str0m's ICE-Lite agent would mint a
+    /// peer-reflexive candidate, nominate it on priority alone, and redirect
+    /// the whole SRTP stream at the spoofed victim.
+    ///
+    /// The datagram must be dropped BEFORE str0m sees it — that is what stops
+    /// both the redirect and the STUN reply that an egress-only guard would
+    /// still have bounced off the victim.
+    #[test]
+    fn spoofed_ice_reflection_datagram_is_dropped_before_str0m_sees_it() {
+        let attacker = sa("203.0.113.7:40000");
+        let victim = sa("198.51.100.10:53"); // a DNS resolver, say
+
+        let mut pin = PeerPin::default();
+        // ICE + DTLS from the attacker's real address.
+        assert!(pin.accept(attacker));
+        pin.note_receive(attacker);
+        pin.note_transmit(attacker, DTLS);
+        pin.arm();
+        assert_eq!(pin.pinned, Some(attacker.ip()));
+
+        // The one spoofed packet that used to move the media.
+        assert!(!pin.accept(victim), "spoofed source must not reach str0m");
+        assert_eq!(pin.dropped, 1);
+        // Repeats stay dropped and stay counted (the attack is sustained by
+        // one packet per keepalive interval).
+        assert!(!pin.accept(victim));
+        assert!(!pin.accept(sa("198.51.100.10:19")));
+        assert_eq!(pin.dropped, 3);
+
+        // ...and the legitimate peer is untouched throughout.
+        assert!(pin.accept(attacker));
+    }
+
+    /// The pin follows the DTLS peer, not whatever spoke last. A spoofer that
+    /// injects a Binding Request during setup draws a STUN *reply* to the
+    /// spoofed address — if that reply were allowed to set the pin, the fix
+    /// would arm on the victim and the attacker would then be the one
+    /// filtered, leaving the reflector intact.
+    #[test]
+    fn a_spoofed_stun_reply_target_never_becomes_the_pin() {
+        let real = sa("198.51.100.10:40000");
+        let spoofed = sa("203.0.113.9:1900");
+
+        let mut pin = PeerPin::default();
+        pin.note_receive(real);
+        pin.note_transmit(real, DTLS);
+        // Attacker injects a spoofed Binding Request mid-handshake; str0m
+        // answers it, so we transmit STUN to the spoofed address.
+        pin.note_transmit(spoofed, STUN);
+        // Media/SRTP to the real peer must not be needed to keep it either.
+        pin.arm();
+
+        assert_eq!(pin.pinned, Some(real.ip()), "pin must follow DTLS, not STUN");
+        assert!(!pin.accept(spoofed));
+    }
+
+    /// A NAT *port* rebind keeps the IP and is routine — the pin is on the IP
+    /// alone so it must sail through. Breaking this would drop real viewers
+    /// behind ordinary consumer NAT.
+    #[test]
+    fn same_ip_port_rebind_is_still_accepted() {
+        let mut pin = PeerPin::default();
+        pin.note_transmit(sa("198.51.100.10:40000"), DTLS);
+        pin.arm();
+
+        assert!(pin.accept(sa("198.51.100.10:41234")));
+        assert!(pin.accept(sa("198.51.100.10:9")));
+        assert_eq!(pin.dropped, 0);
+    }
+
+    /// Arming is one-shot. Re-arming on a later `Connected` would let an
+    /// attacker who got one datagram through re-point the pin — exactly the
+    /// hole being closed.
+    #[test]
+    fn arming_is_idempotent() {
+        let mut pin = PeerPin::default();
+        pin.note_transmit(sa("198.51.100.10:40000"), DTLS);
+        pin.arm();
+        pin.note_transmit(sa("203.0.113.7:40000"), DTLS);
+        pin.arm();
+        assert_eq!(pin.pinned, Some("198.51.100.10".parse::<IpAddr>().unwrap()));
+    }
+
+    /// Defensive fallback: `Connected` implies a DTLS handshake ran, so
+    /// `last_dtls_dest` is always set in practice. If it somehow isn't, arm on
+    /// the last **demuxed** source rather than leaving the session unpinned.
+    ///
+    /// The narrowing matters: `note_receive` is now called only after the
+    /// `DatagramRecv` demux succeeds (see [`WebrtcSession::ingest`]), so the
+    /// least-trustworthy signal in the struct can no longer be set by a
+    /// pre-arm attacker sending arbitrary bytes that are not STUN, DTLS, RTP
+    /// or RTCP at all. It was previously recorded before the demux, which made
+    /// "pin on whatever garbage last arrived" the documented behaviour.
+    #[test]
+    fn arm_falls_back_to_the_last_demuxed_source() {
+        let mut pin = PeerPin::default();
+        pin.note_receive(sa("198.51.100.10:40000"));
+        pin.arm();
+        assert_eq!(pin.pinned, Some("198.51.100.10".parse::<IpAddr>().unwrap()));
+        assert!(!pin.accept(sa("203.0.113.7:40000")));
+    }
+
+    /// The narrowing above, asserted through the real ingress path rather than
+    /// on the bare struct: bytes that do not demux as STUN/DTLS/RTP/RTCP must
+    /// leave no trace the pin could later arm on.
+    #[tokio::test]
+    async fn undemuxable_bytes_never_become_the_arming_fallback() {
+        let mut s = test_session().await;
+        let junk: &[u8] = &[0x77, 0x77, 0x77, 0x77]; // 119: not STUN/DTLS/RTP/RTCP
+        s.buf[..junk.len()].copy_from_slice(junk);
+        assert!(
+            !s.ingest(junk.len(), sa("203.0.113.7:40000")),
+            "undemuxable bytes must not reach str0m"
+        );
+        s.pin.arm();
+        assert_eq!(s.pinned_peer_ip(), None, "must not pin on unvalidated bytes");
+    }
+
+    // ── The WIRING: both receive paths run through `ingest` ─────────────
+    //
+    // The tests above drive `PeerPin` directly, which proves the predicate is
+    // right and proves NOTHING about whether it is connected to the socket.
+    // Review demonstrated exactly that gap: deleting the guard from both
+    // receive loops left the suite green. These tests exercise the real
+    // `WebrtcSession` ingress path instead.
+
+    async fn test_session() -> WebrtcSession {
+        WebrtcSession::new(&SessionConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_ip: None,
+            ice_lite: true,
+        })
+        .await
+        .expect("bind test session")
+    }
+
+    /// Arm a session's pin on `peer`, exactly as `Event::Connected` does.
+    fn arm_on(s: &mut WebrtcSession, peer: SocketAddr) {
+        s.pin.note_transmit(peer, DTLS);
+        s.pin.arm();
+        assert_eq!(s.pinned_peer_ip(), Some(peer.ip()), "test setup: pin must arm");
+    }
+
+    /// `ingest` — the single ingress path both receive loops call — must
+    /// refuse an off-path source and admit the pinned one.
+    #[tokio::test]
+    async fn ingest_refuses_off_path_sources_and_admits_the_pinned_peer() {
+        let mut s = test_session().await;
+        let peer = sa("198.51.100.10:40000");
+        arm_on(&mut s, peer);
+
+        s.buf[..STUN_BINDING_REQUEST.len()].copy_from_slice(STUN_BINDING_REQUEST);
+        let spoofed = sa("203.0.113.7:40000");
+        assert!(
+            !s.ingest(STUN_BINDING_REQUEST.len(), spoofed),
+            "off-path datagram must not reach str0m"
+        );
+        assert_eq!(s.offpath_datagrams_dropped(), 1, "the pin, not the demux, dropped it");
+
+        // A NAT *port* rebind on the pinned IP still passes — the common case.
+        s.buf[..RTP_PACKET.len()].copy_from_slice(RTP_PACKET);
+        assert!(
+            s.ingest(RTP_PACKET.len(), sa("198.51.100.10:41234")),
+            "the pinned peer's media must reach str0m across a port rebind"
+        );
+        assert_eq!(s.offpath_datagrams_dropped(), 1, "the pinned peer is never dropped");
+    }
+
+    /// `drive_udp_io` — the non-blocking receive loop used by the WHEP viewer
+    /// send loop — must run its datagrams through the filter. This one goes
+    /// over a real socket: a genuinely different source IP (127.0.0.2, a
+    /// second loopback address) sends to the session's real bound port.
+    ///
+    /// Deleting the `self.ingest(len, source)` call from `drive_udp_io` (or
+    /// the `pin.accept` guard inside `ingest`) turns this red.
+    #[tokio::test]
+    async fn drive_udp_io_filters_off_path_datagrams_over_a_real_socket() {
+        let mut s = test_session().await;
+        let bound = s.local_addr;
+        arm_on(&mut s, sa("127.0.0.1:40000"));
+
+        // Off-path: same host, different source IP.
+        let attacker = tokio::net::UdpSocket::bind("127.0.0.2:0").await.expect("bind 127.0.0.2");
+        attacker.send_to(STUN_BINDING_REQUEST, bound).await.expect("send spoofed");
+        // On-path: the pinned IP, sending something that genuinely demuxes.
+        let real = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind 127.0.0.1");
+        real.send_to(RTP_PACKET, bound).await.expect("send real");
+
+        // Give the kernel a moment to deliver both, then drain.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        s.drive_udp_io().await;
+
+        assert_eq!(
+            s.offpath_datagrams_dropped(),
+            1,
+            "drive_udp_io must run received datagrams through the source pin"
+        );
+        let (pinned, offender) = s.take_offpath_alert().expect("first drop raises one alert");
+        assert_eq!(pinned, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(offender.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+        assert!(s.take_offpath_alert().is_none(), "the alert is one-shot");
+    }
+
+    /// `poll_event` — the blocking receive loop used during setup and by the
+    /// WHIP/cascade paths — must run its datagrams through the same filter.
+    /// Same real-socket shape; `poll_event` blocks for events, so it is driven
+    /// under a timeout and the assertion is made on what it consumed.
+    ///
+    /// Deleting the `self.ingest(len, source)` call from `poll_event` (or the
+    /// `pin.accept` guard inside `ingest`) turns this red.
+    #[tokio::test]
+    async fn poll_event_filters_off_path_datagrams_over_a_real_socket() {
+        let mut s = test_session().await;
+        let bound = s.local_addr;
+        arm_on(&mut s, sa("127.0.0.1:40000"));
+
+        let attacker = tokio::net::UdpSocket::bind("127.0.0.2:0").await.expect("bind 127.0.0.2");
+        attacker.send_to(STUN_BINDING_REQUEST, bound).await.expect("send spoofed");
+
+        let cancel = CancellationToken::new();
+        // poll_event only returns on a session event; there is none here, so
+        // let it spin over the datagram and then time out.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), s.poll_event(&cancel))
+            .await;
+
+        assert_eq!(
+            s.offpath_datagrams_dropped(),
+            1,
+            "poll_event must run received datagrams through the source pin"
+        );
+    }
+
+    /// With nothing observed at all, fail OPEN rather than wedge a live
+    /// session on an unanticipated state (the warning in `arm` is the alarm).
+    #[test]
+    fn arm_with_nothing_observed_leaves_the_filter_open() {
+        let mut pin = PeerPin::default();
+        pin.arm();
+        assert_eq!(pin.pinned, None);
+        assert!(pin.accept(sa("203.0.113.7:40000")));
+    }
+
+    /// IPv6 sessions get the same treatment — the pin compares `IpAddr`, so
+    /// v6 peers pin and v6 spoofs drop.
+    #[test]
+    fn pin_applies_to_ipv6_peers() {
+        let mut pin = PeerPin::default();
+        pin.note_transmit(sa("[2001:db8::10]:40000"), DTLS);
+        pin.arm();
+        assert!(pin.accept(sa("[2001:db8::10]:41111")));
+        assert!(!pin.accept(sa("[2001:db8::999]:40000")));
+        assert_eq!(pin.dropped, 1);
     }
 }
