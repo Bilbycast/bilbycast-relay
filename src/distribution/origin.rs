@@ -426,21 +426,30 @@ async fn origin_get(
     }
     match st.origin.get(&stream, &file).await {
         Some(obj) => {
-            // Only *media segments* are immutable. A segment's bytes never
-            // change once written, so they can be cached forever.
+            // Nothing here may be cached immutably, because no filename in a
+            // live stream is stable across restarts.
             //
-            // Manifests and init segments are not: `init.mp4` is rewritten
-            // whenever the stream is reconfigured — a different resolution,
-            // codec, or track layout — and it keeps its filename when it
-            // changes. Serving it `immutable` pins a viewer to the *first*
-            // init they ever fetched, for a year. The failure that produces
-            // is brutal to diagnose: the browser feeds current segments to a
-            // decoder configured from a stale init, so playback dies inside
-            // the media stack ("audio decoder initialization failed",
-            // bufferAppendError) with nothing wrong on the wire, and it
-            // survives every restart and fix because it never refetches.
+            // `init.mp4` is rewritten whenever the stream is reconfigured
+            // (resolution, codec, track layout) and keeps its name. Media
+            // segment numbering restarts from `seg-00000` every time the
+            // producing flow restarts, so the same URL serves entirely
+            // different pictures from one run to the next.
+            //
+            // `immutable` is a promise about a *URL*, not about a file. Making
+            // it here pins viewers to whatever they fetched first, and the
+            // resulting failure is brutal to diagnose: current segments get
+            // appended against a stale init, or a stale segment against a
+            // current one, so playback dies inside the media stack with
+            // nothing wrong on the wire — and it survives restarts and fixes,
+            // because the browser never refetches. A fresh profile always
+            // works, which makes a server bug look like a client quirk.
+            //
+            // Restoring immutable caching (worthwhile in front of a CDN) needs
+            // globally unique object names — a per-run prefix or an origin-side
+            // rewrite — not a header change. Until then, revalidate.
             let cache = if is_media_segment(&file) {
-                "public, max-age=31536000, immutable"
+                // Still cacheable, but never without checking.
+                "no-cache, max-age=0, must-revalidate"
             } else {
                 "no-cache, no-store, must-revalidate"
             };
@@ -639,17 +648,17 @@ mod tests {
         assert!(s.get("s", "stale.m4s").await.is_none());
     }
 
-    /// Only media segments may be cached immutably. `init.mp4` is rewritten
-    /// on reconfiguration under the same name, so pinning it in a browser
-    /// cache strands the viewer on a decoder config that no longer matches
-    /// the segments being appended.
+    /// The kept/evictable split still drives *how* an object is cached, but
+    /// neither side may be immutable: segment numbering restarts at
+    /// `seg-00000` on every flow restart and `init.mp4` is rewritten in place
+    /// on reconfiguration, so no filename here is stable across runs.
     #[test]
-    fn only_media_segments_are_immutable() {
+    fn media_segments_are_distinguished_from_kept_objects() {
         for f in ["seg-00001.m4s", "seg-00001.ts", "chunk.cmfv"] {
-            assert!(is_media_segment(f), "{f} should be an immutable segment");
+            assert!(is_media_segment(f), "{f} should be an evictable segment");
         }
         for f in ["init.mp4", "manifest.m3u8", "manifest.mpd"] {
-            assert!(!is_media_segment(f), "{f} must NOT be cached immutably");
+            assert!(!is_media_segment(f), "{f} must be a kept object");
         }
     }
 
