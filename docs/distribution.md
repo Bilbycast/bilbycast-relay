@@ -62,7 +62,9 @@ they are not either/or.
 | `DELETE` | `/whep/{stream}/{session}` | Tear down one viewer |
 | `POST` | `/whip/{stream}` | Edge pushes a stream in (SDP offer → answer) |
 | `DELETE` | `/whip/{stream}/{session}` | Stop an ingest |
-| `GET` | `/watch/{stream}` | Built-in minimal `<video>` + WHEP player page |
+| `GET` | `/watch/{stream}` | Built-in minimal `<video>` + WHEP player page (live only) |
+| `GET` | `/dvr/{stream}` | Browser DVR player: live, 60-min scrub-back, frame jog, shuttle |
+| `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |
 | `GET` | `/distribution/health` | Liveness |
@@ -113,6 +115,48 @@ token lifted from a proxy log or from browser history is therefore replayable
 against a live feed for up to that long. Mint short `ttl_secs` when handing out
 query-form links, prefer the `Authorization: Bearer` form for programmatic
 clients, and strip `token` from the query in your proxy's log format if you can.
+
+## Browser DVR player (`/dvr/{stream}`)
+
+A second player surface, distinct from `/watch`. Where `/watch` is WHEP —
+sub-second but live-only, with no buffer, no seekable range and no
+`playbackRate` — `/dvr` plays the LL-HLS origin and can therefore seek back
+across the whole advertised window and step individual frames.
+
+It expects **two renditions** of the same source:
+
+| Rendition | Origin path | Encoding | Used for |
+|---|---|---|---|
+| main | `{stream}` | long-GOP | live, 1x, 0.25–4x forward, coarse scrub |
+| proxy | `{stream}-proxy` | low-res **all-intra** | frame jog, shuttle, reverse |
+
+Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`
+(forwarded to origin requests when the viewer gate is on) and `?fps=`
+(frame-step size; defaults to 25).
+
+**Why a proxy rendition.** Frame-exact seeking works in a plain `<video>` only
+when every frame is a random-access point. On long-GOP video `currentTime`
+lands on the nearest keyframe instead, and every backward step re-decodes from
+the preceding IDR. Encode the proxy with `gop_size: 1` on the edge's CMAF
+output. Note that **NVENC cannot do this** — it refuses `gop_size: 1` outright
+— so use `x264` for the proxy on NVENC hosts rather than `h264_auto`
+(bilbycast-edge#125).
+
+**Reverse playback** is a `requestAnimationFrame` loop stepping `currentTime`,
+because negative `playbackRate` is unimplemented in every browser. The seek
+rate stays at roughly the frame rate regardless of shuttle speed — at 8x the
+player presents every 8th frame — which is what keeps it affordable on a
+tablet.
+
+**Retention must exceed the window the edge advertises.** The playlist is a
+sliding window; if `origin_retention_secs` is shorter than the edge's
+`dvr_window_secs`, the manifest lists segments the origin has already evicted
+and a viewer seeking to the back of the window gets 404s.
+
+hls.js is **vendored** and served from `/dvr/hls.js` rather than a CDN: relays
+are often deployed where viewers have no route to the public internet, and
+Android Chrome has no native HLS, so the page cannot function without it. See
+`src/distribution/vendor/README.md`.
 
 ## Scaling beyond one relay
 
@@ -258,7 +302,9 @@ as ignored at startup.
 | `origin.rs` | LL-HLS/CMAF HTTP origin; manifests in memory, segments on disk, age- and size-bounded |
 | `token.rs` | Short-lived HMAC token mint/verify (viewer + ingest scopes) |
 | `webrtc/` | Vendored str0m session wrapper + RFC 6184 H.264 packetizer |
-| `player.html` | Built-in browser WHEP player |
+| `player.html` | Built-in browser WHEP player (live only) |
+| `dvr.html` | Browser DVR player — main + all-intra proxy, jog / shuttle / reverse |
+| `vendor/` | Vendored browser assets (hls.js); see `vendor/README.md` |
 
 ## Testing
 
