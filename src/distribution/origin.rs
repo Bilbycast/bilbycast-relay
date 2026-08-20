@@ -426,11 +426,23 @@ async fn origin_get(
     }
     match st.origin.get(&stream, &file).await {
         Some(obj) => {
-            let cache = if is_manifest(&file) {
-                "no-cache, no-store, must-revalidate"
-            } else {
-                // Segments are immutable; let CDNs/browsers cache them.
+            // Only *media segments* are immutable. A segment's bytes never
+            // change once written, so they can be cached forever.
+            //
+            // Manifests and init segments are not: `init.mp4` is rewritten
+            // whenever the stream is reconfigured — a different resolution,
+            // codec, or track layout — and it keeps its filename when it
+            // changes. Serving it `immutable` pins a viewer to the *first*
+            // init they ever fetched, for a year. The failure that produces
+            // is brutal to diagnose: the browser feeds current segments to a
+            // decoder configured from a stale init, so playback dies inside
+            // the media stack ("audio decoder initialization failed",
+            // bufferAppendError) with nothing wrong on the wire, and it
+            // survives every restart and fix because it never refetches.
+            let cache = if is_media_segment(&file) {
                 "public, max-age=31536000, immutable"
+            } else {
+                "no-cache, no-store, must-revalidate"
             };
             (
                 StatusCode::OK,
@@ -625,6 +637,20 @@ mod tests {
         let s = store(&tmp, 8);
         assert!(!root.join("s/stale.m4s").exists());
         assert!(s.get("s", "stale.m4s").await.is_none());
+    }
+
+    /// Only media segments may be cached immutably. `init.mp4` is rewritten
+    /// on reconfiguration under the same name, so pinning it in a browser
+    /// cache strands the viewer on a decoder config that no longer matches
+    /// the segments being appended.
+    #[test]
+    fn only_media_segments_are_immutable() {
+        for f in ["seg-00001.m4s", "seg-00001.ts", "chunk.cmfv"] {
+            assert!(is_media_segment(f), "{f} should be an immutable segment");
+        }
+        for f in ["init.mp4", "manifest.m3u8", "manifest.mpd"] {
+            assert!(!is_media_segment(f), "{f} must NOT be cached immutably");
+        }
     }
 
     #[test]
