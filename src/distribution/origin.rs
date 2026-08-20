@@ -29,6 +29,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::extract::DefaultBodyLimit;
 use axum::routing::put;
 use axum::Router;
 use dashmap::DashMap;
@@ -346,9 +347,19 @@ fn valid_object_name(file: &str) -> bool {
 }
 
 /// Origin routes, merged into the distribution router.
+/// Largest object the origin will accept in one PUT.
+///
+/// This must be applied as an axum body limit as well as checked in the
+/// handler: axum's default is 2 MiB and it rejects *before* the handler runs,
+/// which made the handler's own check unreachable. A 2 s segment of 8 Mbps
+/// video is already past 2 MiB, so real broadcast bitrates failed with an
+/// opaque 413 while a low-bitrate test pattern sailed through.
+pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn routes() -> Router<Arc<DistributionState>> {
     Router::new()
         .route("/origin/{stream}/{file}", put(origin_put).get(origin_get))
+        .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
 }
 
 /// `PUT /origin/{stream}/{file}` — accept an edge CMAF/HLS upload.
@@ -387,7 +398,7 @@ async fn origin_put(
         }
     }
 
-    if body.len() > 64 * 1024 * 1024 {
+    if body.len() > MAX_OBJECT_BYTES {
         return (StatusCode::PAYLOAD_TOO_LARGE, "object too large").into_response();
     }
 
@@ -660,6 +671,21 @@ mod tests {
         for f in ["init.mp4", "manifest.m3u8", "manifest.mpd"] {
             assert!(!is_media_segment(f), "{f} must be a kept object");
         }
+    }
+
+    /// The body limit has to be at least as large as a realistic segment.
+    /// axum's 2 MiB default rejects before the handler is reached, so this
+    /// bound is what actually decides whether broadcast bitrates work.
+    #[test]
+    fn body_limit_admits_a_realistic_segment() {
+        // 4 s of 50 Mbps video, comfortably above anything the edge emits.
+        let big = 4 * 50_000_000 / 8;
+        assert!(
+            MAX_OBJECT_BYTES >= big,
+            "MAX_OBJECT_BYTES {MAX_OBJECT_BYTES} is below a {big}-byte segment"
+        );
+        // And well above axum's default, which is the trap this guards.
+        assert!(MAX_OBJECT_BYTES > 2 * 1024 * 1024);
     }
 
     #[test]
