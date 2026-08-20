@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DVR — __STREAM_ID__</title>
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14181d; --line: #232a32;
+    --fg: #e8edf2; --dim: #93a1b0; --accent: #37d3a6; --live: #ff4d4f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+    /* A tablet in a gallery or truck is often handled with one thumb. */
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header { padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .id { color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #stage { position: relative; flex: 1; min-height: 0; background: #000; }
+  #stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #proxy { display: none; }
+  body[data-mode="jog"] #proxy, body[data-mode="shuttle"] #proxy { display: block; }
+  body[data-mode="jog"] #main,  body[data-mode="shuttle"] #main  { display: none; }
+  #badge {
+    position: absolute; top: 10px; left: 10px; padding: 3px 9px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    background: #2a3038; color: var(--dim);
+  }
+  body[data-live="1"] #badge { background: var(--live); color: #fff; }
+  #status { position: absolute; top: 10px; right: 10px; font-family: ui-monospace, Menlo, monospace;
+            font-size: 11px; color: var(--dim); background: rgba(0,0,0,.55); padding: 3px 8px; border-radius: 6px; }
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 14px 14px; }
+  .timeline { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .timeline input[type=range] { flex: 1; min-width: 0; }
+  .t { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--dim); min-width: 5.5em; }
+  .t.right { text-align: right; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button {
+    background: #1c222a; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font-size: 14px; font-weight: 600;
+    min-width: 44px; min-height: 44px; /* touch target */
+    cursor: pointer;
+  }
+  button:active { background: #263039; }
+  button[aria-pressed="true"] { background: var(--accent); color: #05231b; border-color: var(--accent); }
+  button.live[aria-pressed="true"] { background: var(--live); color: #fff; border-color: var(--live); }
+  button:disabled { opacity: .4; cursor: default; }
+  .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+  .grow { flex: 1; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .err { color: #ffb4b4; font-size: 12px; margin-top: 8px; min-height: 1.2em; }
+  @media (max-width: 560px) { .label-long { display: none; } }
+</style>
+</head>
+<body data-mode="live" data-live="1">
+<header>
+  <h1>DVR</h1><span class="id">__STREAM_ID__</span>
+</header>
+
+<div id="stage">
+  <video id="main" playsinline muted></video>
+  <video id="proxy" playsinline muted></video>
+  <div id="badge">live</div>
+  <div id="status">—</div>
+</div>
+
+<footer>
+  <div class="timeline">
+    <span class="t" id="tPos">--:--:--</span>
+    <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
+    <span class="t right" id="tDur">--:--</span>
+  </div>
+
+  <div class="row">
+    <button id="btnLive" class="live" aria-pressed="true" title="Jump to live">LIVE</button>
+    <button id="btnPlay" title="Play / pause">Play</button>
+    <div class="sep"></div>
+
+    <button data-jog="-1" title="Step back one frame">&#9664;|</button>
+    <button data-jog="1" title="Step forward one frame">|&#9654;</button>
+    <div class="sep"></div>
+
+    <button data-rate="-8" title="Shuttle back 8x">&#171;8</button>
+    <button data-rate="-2" title="Shuttle back 2x">&#171;2</button>
+    <button data-rate="-1" title="Play backwards">&#171;1</button>
+    <button data-rate="0.25">.25</button>
+    <button data-rate="1" aria-pressed="true">1&times;</button>
+    <button data-rate="2">2&times;</button>
+    <button data-rate="4">4&times;</button>
+    <button data-rate="8" title="Shuttle forward 8x">8&raquo;</button>
+  </div>
+  <div class="hint">
+    Keys: <b>J</b>/<b>K</b>/<b>L</b> shuttle &middot; <b>,</b>/<b>.</b> frame step &middot;
+    <b>Space</b> play/pause &middot; <b>End</b> live
+  </div>
+  <div class="err" id="err"></div>
+</footer>
+
+<script src="/dvr/hls.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // The edge publishes two renditions of the same source. The main one is
+  // long-GOP and carries the picture you actually watch; the proxy is
+  // low-resolution and ALL-INTRA, which is what makes frame-exact seeking
+  // possible at all — see WEB_DVR_PLAYER_PLAN.md.
+  var STREAM = "__STREAM_ID__";
+  var qs     = new URLSearchParams(location.search);
+  var MAIN   = qs.get("main")  || STREAM;
+  var PROXY  = qs.get("proxy") || (STREAM + "-proxy");
+  var TOKEN  = qs.get("token") || "";
+  var FPS    = parseFloat(qs.get("fps") || "25");
+  var FRAME  = 1 / FPS;
+
+  var main = document.getElementById("main");
+  var proxy = document.getElementById("proxy");
+  var scrub = document.getElementById("scrub");
+  var tPos = document.getElementById("tPos");
+  var tDur = document.getElementById("tDur");
+  var status = document.getElementById("status");
+  var errEl = document.getElementById("err");
+  var btnLive = document.getElementById("btnLive");
+  var btnPlay = document.getElementById("btnPlay");
+
+  var mode = "live";     // live | scrub | jog | shuttle
+  var rate = 1;          // requested rate; negative means reverse
+  var scrubbing = false;
+  var shuttleRAF = null;
+
+  function url(stream, file) {
+    return "/origin/" + encodeURIComponent(stream) + "/" + file + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "");
+  }
+  function fail(msg) { errEl.textContent = msg || ""; }
+  function fmt(t) {
+    if (!isFinite(t) || t < 0) return "--:--:--";
+    var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = Math.floor(t % 60);
+    var f = Math.floor((t % 1) * FPS);
+    return (h ? String(h).padStart(2, "0") + ":" : "") +
+           String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + "." + String(f).padStart(2, "0");
+  }
+
+  // ── seekable window ────────────────────────────────────────────────────
+  // The DVR depth is whatever the manifest lists, which is a server-side
+  // sliding window. That is why a viewer can scrub back to before they
+  // joined: nothing here depends on what this client has buffered.
+  function range(v) {
+    if (!v.seekable || v.seekable.length === 0) return null;
+    return { start: v.seekable.start(0), end: v.seekable.end(v.seekable.length - 1) };
+  }
+  function activeVideo() { return (mode === "jog" || mode === "shuttle") ? proxy : main; }
+
+  // ── attach ─────────────────────────────────────────────────────────────
+  function attach(video, stream, label) {
+    var src = url(stream, "manifest.m3u8");
+    if (window.Hls && window.Hls.isSupported()) {
+      var hls = new Hls({
+        // A DVR window is thousands of segments; let the player hold a
+        // generous back buffer so short jogs never refetch.
+        backBufferLength: 120,
+        maxBufferLength: 30,
+        lowLatencyMode: false
+      });
+      hls.on(Hls.Events.ERROR, function (_e, data) {
+        if (data && data.fatal) fail(label + ": " + data.type + " / " + data.details);
+      });
+      hls.loadSource(src);
+      hls.attachMedia(video);
+      return hls;
+    }
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src; // Safari native HLS
+      return null;
+    }
+    fail("This browser cannot play HLS (no MSE and no native support).");
+    return null;
+  }
+
+  // ── mode switching ─────────────────────────────────────────────────────
+  // Handoff is by PTS: whichever element takes over is positioned to the
+  // one leaving, so the picture does not jump.
+  function setMode(next) {
+    if (mode === next) return;
+    var from = activeVideo();
+    var t = from.currentTime;
+    mode = next;
+    document.body.dataset.mode = next;
+    var to = activeVideo();
+    if (to !== from && isFinite(t) && t > 0) {
+      try { to.currentTime = t; } catch (e) { /* not seekable yet */ }
+    }
+    if (next === "jog" || next === "shuttle") { main.pause(); }
+    else { proxy.pause(); stopShuttle(); }
+    document.body.dataset.live = (next === "live") ? "1" : "0";
+    btnLive.setAttribute("aria-pressed", next === "live" ? "true" : "false");
+    syncRateButtons();
+  }
+
+  function goLive() {
+    stopShuttle();
+    setMode("live");
+    var r = range(main);
+    if (r) main.currentTime = r.end;
+    rate = 1; main.playbackRate = 1;
+    main.play().catch(function () {});
+    syncRateButtons();
+  }
+
+  // ── jog ────────────────────────────────────────────────────────────────
+  // One exact seek per step, on the all-intra proxy. On a long-GOP source
+  // this would land on the nearest keyframe instead, which is the whole
+  // reason the proxy exists.
+  function jog(dir) {
+    setMode("jog");
+    proxy.pause();
+    var r = range(proxy);
+    var t = proxy.currentTime + dir * FRAME;
+    if (r) t = Math.max(r.start, Math.min(r.end, t));
+    proxy.currentTime = t;
+    render();
+  }
+
+  // ── shuttle ────────────────────────────────────────────────────────────
+  // Negative playbackRate is unimplemented in every browser, so reverse is
+  // driven by stepping currentTime. The important property: the seek rate
+  // stays ~FPS/s no matter the speed — at 8x we present every 8th frame,
+  // not every frame. That is what keeps it sustainable on a tablet.
+  function startShuttle(r) {
+    setMode("shuttle");
+    proxy.pause();
+    stopShuttle();
+    rate = r;
+    var last = performance.now();
+    var step = function (now) {
+      var dt = (now - last) / 1000;
+      last = now;
+      var rng = range(proxy);
+      var t = proxy.currentTime + rate * dt;
+      if (rng) {
+        if (t <= rng.start) { t = rng.start; stopShuttle(); }
+        if (t >= rng.end)   { t = rng.end;   stopShuttle(); goLive(); return; }
+      }
+      try { proxy.currentTime = t; } catch (e) { /* mid-load */ }
+      render();
+      if (shuttleRAF !== null) shuttleRAF = requestAnimationFrame(step);
+    };
+    shuttleRAF = requestAnimationFrame(step);
+  }
+  function stopShuttle() {
+    if (shuttleRAF !== null) { cancelAnimationFrame(shuttleRAF); shuttleRAF = null; }
+  }
+
+  function setRate(r) {
+    fail("");
+    if (r < 0) { startShuttle(r); syncRateButtons(); return; }
+    stopShuttle();
+    if (mode === "jog" || mode === "shuttle") setMode("scrub");
+    rate = r;
+    main.playbackRate = r;
+    main.play().catch(function () {});
+    syncRateButtons();
+  }
+  function syncRateButtons() {
+    document.querySelectorAll("[data-rate]").forEach(function (b) {
+      var on = (mode === "shuttle" || mode === "jog")
+        ? parseFloat(b.dataset.rate) === rate && rate < 0
+        : parseFloat(b.dataset.rate) === rate && rate > 0;
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    btnPlay.textContent = activeVideo().paused ? "Play" : "Pause";
+  }
+
+  // ── scrub bar ──────────────────────────────────────────────────────────
+  scrub.addEventListener("pointerdown", function () { scrubbing = true; });
+  scrub.addEventListener("input", function () {
+    var v = activeVideo();
+    var r = range(v);
+    if (!r) return;
+    if (mode === "live") setMode("scrub");
+    var t = r.start + (r.end - r.start) * (scrub.value / 1000);
+    try { v.currentTime = t; } catch (e) {}
+    tPos.textContent = fmt(t - r.start);
+  });
+  scrub.addEventListener("pointerup", function () { scrubbing = false; });
+  scrub.addEventListener("change", function () { scrubbing = false; });
+
+  // ── render loop ────────────────────────────────────────────────────────
+  function render() {
+    var v = activeVideo();
+    var r = range(v);
+    if (r) {
+      var dur = r.end - r.start;
+      tPos.textContent = fmt(v.currentTime - r.start);
+      tDur.textContent = "-" + fmt(Math.max(0, r.end - v.currentTime)).replace(/\.\d+$/, "");
+      if (!scrubbing && dur > 0) {
+        scrub.value = String(Math.round(((v.currentTime - r.start) / dur) * 1000));
+      }
+      var atLive = (r.end - v.currentTime) < 3;
+      document.body.dataset.live = (mode === "live" && atLive) ? "1" : "0";
+      document.getElementById("badge").textContent =
+        mode === "jog" ? "jog" : mode === "shuttle" ? (rate > 0 ? rate + "x" : rate + "x") :
+        atLive ? "live" : "delayed";
+    }
+    status.textContent = mode + " | " + (mode === "jog" || mode === "shuttle" ? "proxy" : "main") +
+                         " | " + (rate > 0 ? rate + "x" : rate + "x");
+  }
+  setInterval(render, 200);
+
+  // ── controls ───────────────────────────────────────────────────────────
+  btnLive.addEventListener("click", goLive);
+  btnPlay.addEventListener("click", function () {
+    var v = activeVideo();
+    if (v.paused) { if (mode === "jog") setMode("scrub"); activeVideo().play().catch(function () {}); }
+    else { v.pause(); stopShuttle(); }
+    syncRateButtons();
+  });
+  document.querySelectorAll("[data-jog]").forEach(function (b) {
+    b.addEventListener("click", function () { jog(parseInt(b.dataset.jog, 10)); });
+  });
+  document.querySelectorAll("[data-rate]").forEach(function (b) {
+    b.addEventListener("click", function () { setRate(parseFloat(b.dataset.rate)); });
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+    switch (e.key) {
+      case "j": setRate(rate < 0 ? Math.max(-16, rate * 2) : -1); break;
+      case "k": activeVideo().pause(); stopShuttle(); syncRateButtons(); break;
+      case "l": setRate(rate > 1 ? Math.min(16, rate * 2) : 1); break;
+      case ",": jog(-1); break;
+      case ".": jog(1); break;
+      case "End": goLive(); break;
+      case " ": e.preventDefault(); btnPlay.click(); break;
+      default: return;
+    }
+  });
+
+  // ── start ──────────────────────────────────────────────────────────────
+  attach(main, MAIN, "main");
+  attach(proxy, PROXY, "proxy");
+  main.addEventListener("loadedmetadata", function () { goLive(); });
+  main.addEventListener("playing", syncRateButtons);
+  main.addEventListener("pause", syncRateButtons);
+  // The proxy is only ever a still frame source; never let it run on its own.
+  proxy.addEventListener("play", function () { if (mode !== "shuttle") proxy.pause(); });
+})();
+</script>
+</body>
+</html>

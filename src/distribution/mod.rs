@@ -257,6 +257,11 @@ pub fn build_router(state: Arc<DistributionState>) -> Router {
         .route("/whip/{stream_id}/{session_id}", delete(whip_ingest_delete))
         // Minimal built-in player page.
         .route("/watch/{stream_id}", get(watch_page))
+        // Browser DVR surface: live + scrub-back + frame jog / shuttle.
+        // The literal `hls.js` route must be registered before the
+        // `{stream_id}` one it would otherwise be captured by.
+        .route("/dvr/hls.js", get(dvr_hls_js))
+        .route("/dvr/{stream_id}", get(dvr_page))
         // LL-HLS origin (Tier 1) — see origin.rs for the route handlers.
         .merge(origin::routes())
         .layer(CorsLayer::permissive())
@@ -594,9 +599,76 @@ fn player_html(stream_id: &str) -> String {
     include_str!("player.html").replace("__STREAM_ID__", stream_id)
 }
 
+/// Browser DVR player page.
+///
+/// Distinct from `/watch` (WHEP, sub-second, live-only): this one plays the
+/// LL-HLS origin, so it can seek back over the whole advertised window and
+/// step frames. It expects **two** renditions — a main one under `stream_id`
+/// and an all-intra proxy under `{stream_id}-proxy` (override with
+/// `?main=` / `?proxy=`). The proxy is what makes frame-exact jog and reverse
+/// shuttle possible; see `WEB_DVR_PLAYER_PLAN.md`.
+async fn dvr_page(Path(stream_id): Path<String>) -> Response {
+    let Some(stream_id) = sanitize_stream_id(&stream_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+    };
+    let html = include_str!("dvr.html").replace("__STREAM_ID__", &stream_id);
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+/// Vendored hls.js, served to the DVR page.
+///
+/// It is vendored rather than pulled from a CDN because the relay is often
+/// deployed where viewers have no route to the public internet, and because a
+/// player that silently stops working when a CDN changes is not a broadcast
+/// tool. Android Chrome has no native HLS, so this is not optional there.
+async fn dvr_hls_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_str!("vendor/hls.min.js"),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DVR page must carry the stream id through and leave no placeholder
+    /// behind — a stray `__STREAM_ID__` would have the player fetch a
+    /// literally-named stream and show nothing, with no error anywhere.
+    #[test]
+    fn dvr_page_interpolates_stream_id() {
+        let html = include_str!("dvr.html").replace("__STREAM_ID__", "bigshow");
+        assert!(!html.contains("__STREAM_ID__"), "placeholder left in page");
+        assert!(html.contains("bigshow"));
+        // The proxy rendition is what makes frame jog work; the page must
+        // derive it rather than silently play only the main one.
+        assert!(html.contains("-proxy"), "page does not reference a proxy rendition");
+    }
+
+    /// hls.js is vendored, not fetched. Android Chrome has no native HLS, so a
+    /// CDN reference would make the player fail exactly on the primary target
+    /// whenever the relay is deployed without public internet.
+    #[test]
+    fn dvr_page_has_no_external_script_references() {
+        let html = include_str!("dvr.html");
+        for host in ["cdn.jsdelivr.net", "unpkg.com", "cdnjs", "//cdn."] {
+            assert!(!html.contains(host), "external reference to {host}");
+        }
+        assert!(html.contains("/dvr/hls.js"), "page does not load the vendored hls.js");
+    }
+
+    /// The vendored bundle must actually be hls.js, not a stub or an error
+    /// page saved by mistake.
+    #[test]
+    fn vendored_hls_js_is_present_and_plausible() {
+        let js = include_str!("vendor/hls.min.js");
+        assert!(js.len() > 100_000, "hls.js suspiciously small: {} bytes", js.len());
+        assert!(js.contains("Hls"), "bundle does not mention Hls");
+    }
 
     #[test]
     fn sanitize_accepts_reasonable_ids() {
