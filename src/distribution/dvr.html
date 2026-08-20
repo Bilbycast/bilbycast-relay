@@ -129,6 +129,13 @@
   var btnLive = document.getElementById("btnLive");
   var btnPlay = document.getElementById("btnPlay");
 
+  var mainHls = null, proxyHls = null;
+  // How far behind the seekable end "live" sits. Seeking to seekable.end
+  // parks the playhead past the last decodable frame: the picture never
+  // paints and hls.js reports bufferStalledError. Three target durations is
+  // the LL-HLS hold-back convention.
+  var LIVE_BACKOFF = 3;
+
   var mode = "live";     // live | scrub | jog | shuttle
   var rate = 1;          // requested rate; negative means reverse
   var scrubbing = false;
@@ -168,7 +175,14 @@
         lowLatencyMode: false
       });
       hls.on(Hls.Events.ERROR, function (_e, data) {
-        if (data && data.fatal) fail(label + ": " + data.type + " / " + data.details);
+        if (!data) return;
+        if (data.fatal) {
+          fail(label + ": " + data.type + " / " + data.details);
+        } else if (data.details === "bufferStalledError") {
+          // Usually means the playhead is sitting past what is buffered.
+          // Nudge back to the live sync point rather than sitting black.
+          if (video === main && mode === "live") goLive();
+        }
       });
       hls.loadSource(src);
       hls.attachMedia(video);
@@ -202,11 +216,26 @@
     syncRateButtons();
   }
 
+  function liveTarget() {
+    // hls.js knows the real live sync point (it accounts for HOLD-BACK and
+    // what is actually buffered). Fall back to a fixed back-off from the
+    // seekable end when playing native HLS.
+    if (mainHls && typeof mainHls.liveSyncPosition === "number" && isFinite(mainHls.liveSyncPosition)) {
+      return mainHls.liveSyncPosition;
+    }
+    var r = range(main);
+    return r ? Math.max(r.start, r.end - LIVE_BACKOFF) : null;
+  }
+
   function goLive() {
     stopShuttle();
     setMode("live");
-    var r = range(main);
-    if (r) main.currentTime = r.end;
+    var t = liveTarget();
+    // Only nudge if we are actually away from live; forcing a seek on every
+    // call fights hls.js's own edge tracking and re-stalls the buffer.
+    if (t !== null && Math.abs(main.currentTime - t) > 1) {
+      try { main.currentTime = t; } catch (e) {}
+    }
     rate = 1; main.playbackRate = 1;
     main.play().catch(function () {});
     syncRateButtons();
@@ -244,7 +273,7 @@
       var t = proxy.currentTime + rate * dt;
       if (rng) {
         if (t <= rng.start) { t = rng.start; stopShuttle(); }
-        if (t >= rng.end)   { t = rng.end;   stopShuttle(); goLive(); return; }
+        if (t >= rng.end)   { stopShuttle(); goLive(); return; }
       }
       try { proxy.currentTime = t; } catch (e) { /* mid-load */ }
       render();
@@ -342,8 +371,8 @@
   });
 
   // ── start ──────────────────────────────────────────────────────────────
-  attach(main, MAIN, "main");
-  attach(proxy, PROXY, "proxy");
+  mainHls = attach(main, MAIN, "main");
+  proxyHls = attach(proxy, PROXY, "proxy");
   main.addEventListener("loadedmetadata", function () { goLive(); });
   main.addEventListener("playing", syncRateButtons);
   main.addEventListener("pause", syncRateButtons);
