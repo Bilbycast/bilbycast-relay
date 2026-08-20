@@ -612,7 +612,17 @@ async fn dvr_page(Path(stream_id): Path<String>) -> Response {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
     let html = include_str!("dvr.html").replace("__STREAM_ID__", &stream_id);
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+    // The page is an app shell that changes with the build. Without this a
+    // browser will happily serve a cached copy after an upgrade, so a fixed
+    // player looks unfixed. (`/dvr/hls.js` stays immutable — it is versioned.)
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, must-revalidate"),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 /// Vendored hls.js, served to the DVR page.
