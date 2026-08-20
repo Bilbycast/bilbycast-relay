@@ -39,7 +39,25 @@ Events are sent as WebSocket messages with type `"event"`:
 
 ### Buffering
 
-Events are queued in an unbounded in-memory channel. When the relay is not connected to the manager, events accumulate and are delivered once the connection is re-established.
+Events are queued in a **bounded** in-memory channel — capacity 1024
+(`EVENT_CHANNEL_CAPACITY` in `src/manager/events.rs`) — and drained by the
+manager WebSocket client loop. While the relay is disconnected from the manager,
+events queue up to that depth and every further event is **dropped on arrival**:
+the queue keeps the events already in it and discards the new ones. So a long
+disconnection does not replay a full backlog on reconnect — it replays at most
+the first 1024 events of the outage.
+
+The bound exists because the queue was the leak: every rejected native-UDP
+`Register` datagram queues an event carrying two strings and a JSON object, and
+on an unbounded channel with no manager attached an inbound flood at 50k pps
+retains tens of MB/s of heap on a headless relay.
+
+Drops are counted (`EventSender::dropped_total`) and logged at most once per
+second — `event queue full — dropping events`. When the `logging` structured-JSON shipper is
+configured it sees every event *before* the queue, so a dropped event still
+reaches the configured stdout / file / syslog target even though the manager
+never gets it. A closed receiver — a standalone relay with no manager
+configured — discards events silently and counts nothing.
 
 ---
 
@@ -116,6 +134,7 @@ Emitted only by a relay built with the optional `viewer-distribution` role (defa
 | info | distribution ingest opened for stream '{stream}' | A QUIC ES ingest began feeding a stream's hub | `{ stream, has_audio }` |
 | info | distribution ingest closed for stream '{stream}' | A QUIC ES ingest stopped; the stream tears down | `{ stream }` |
 | warning | per-IP viewer cap ({cap}) reached from {ip} | A WHEP viewer request was rejected — per-source-IP concurrent-viewer cap (`max_viewers_per_ip`) reached | `{ ip, cap }` |
+| warning | WHEP viewer: off-path datagram dropped by the media source pin | A datagram for a live WHEP session arrived from an address other than the one that completed DTLS, and was dropped before str0m saw it. Two causes: a source-spoofed ICE reflection attempt (the relay is ICE-Lite and str0m implements no RFC 7675 consent freshness, so the pin is the control), or a legitimate viewer whose public IP changed mid-session (Wi-Fi → cellular, CGNAT pool rotation) — that viewer goes black until it re-POSTs its WHEP offer. Emitted **once per session**, so a reflection flood cannot amplify its own alarm | `{ error_code: "webrtc_offpath_source", stream, session_id, pinned_ip, source_addr, source_ip }` |
 
 **Source**: `src/distribution/`
 
@@ -140,19 +159,19 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | Category | Count | Description |
 |----------|-------|-------------|
 | `edge` | 6 | Edge QUIC connection lifecycle (now with structured details), incl. per-IP DoS cap |
-| `tunnel` | 8 | Tunnel state changes, authentication, lifecycle (waiting, unbound), per-connection DoS cap, and native plain-UDP register rejections (invalid token + per-IP session cap) |
+| `tunnel` | 11 | Tunnel state changes, authentication, lifecycle (waiting, unbound), per-connection DoS cap, native plain-UDP register rejections (invalid token, per-IP session cap, implausible source address, live-slot takeover), and the one-shot startup posture warning |
 | `manager` | 6 | Manager connection and credential management |
-| `distribution` | 4 | Viewer-distribution ingest lifecycle + per-IP viewer cap (only on `viewer-distribution` builds) |
-| **Total** | **24** | |
+| `distribution` | 5 | Viewer-distribution ingest lifecycle, per-IP viewer cap, and the WebRTC media source pin (only on `viewer-distribution` builds) |
+| **Total** | **28** | |
 
-The always-compiled `edge`, `tunnel`, and `manager` categories account for 20 events. The `distribution` category (4 events) is present only when the relay is built with the optional `viewer-distribution` role.
+The always-compiled `edge`, `tunnel`, and `manager` categories account for 23 events. The `distribution` category (5 events) is present only when the relay is built with the optional `viewer-distribution` role.
 
 ### By Severity
 
-The always-compiled surface (excluding the optional `distribution` category) is critical=1, warning=12, info=7.
+The always-compiled surface (excluding the optional `distribution` category) is critical=1, warning=15, info=7.
 
 | Severity | Count | Description |
 |----------|-------|-------------|
 | critical | 1 | Manager authentication failure |
-| warning | 12 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection + native-UDP session cap), native-UDP token rejections |
+| warning | 15 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection + native-UDP session cap), native-UDP token rejections, native-UDP source-plausibility and live-slot-takeover refusals, and the unauthenticated-native-plane startup warning |
 | info | 7 | Connections, tunnel activation/waiting/unbound, secret rotation |

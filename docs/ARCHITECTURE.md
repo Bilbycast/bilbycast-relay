@@ -266,12 +266,31 @@ tunnel).
   reserved nil (all-zero) UUID prefix; real tunnel IDs are random v4 UUIDs.
   Relay holds no media key — it forwards ciphertext verbatim.
   Idle sessions (no register/data for 30s) are reaped.
+  A Register does NOT always latch — see the admission rules below.
 ```
 
 Auth reuses the QUIC path's bind-token registry (the manager's `authorize_tunnel`
-tokens), and the same per-IP session cap bounds DoS. Bind failures on `:4434` are
-non-fatal — the relay logs, drops the `udp-relay` capability, and continues
-QUIC-only, so an upgrade never bricks a relay over a busy port.
+tokens), and the same per-IP session cap bounds DoS.
+
+Two further rules bound the rendezvous, both inside `UdpSessionRouter::latch` so
+they hold for every caller. A `Register` from an address no host can own
+(unspecified / multicast / broadcast / port 0), or from an address that already
+occupies this tunnel's *opposite* slot — which would build a session forwarding
+to its own source, a line-rate loop on a shared recv loop if that address routes
+back to the relay — is refused outright (`relay_invalid_source_addr`). And a slot
+that has itself carried media does not move to a different source **IP** until
+12 s (`SLOT_TAKEOVER_GRACE_MS`, monotonic; two missed 5 s keepalives, comfortably
+inside the 30 s idle reap) after the last datagram forwarded from that address
+(`relay_slot_takeover_refused`, and no `Ack` — acking would confirm the tunnel id
+is real). A same-IP port rebind is always allowed, and a slot that has never
+carried media is still first-come-first-served. Note the liveness stamp is
+written on the slot a datagram arrived *from*, and keepalives deliberately do not
+stamp, so on a one-way path only the transmitting end's slot is protected — the
+hold-down raises the cost of a takeover, `require_bind_auth: true` is the control.
+
+Bind failures on `:4434` are non-fatal — the relay logs, drops the `udp-relay`
+capability, and continues QUIC-only, so an upgrade never bricks a relay over a
+busy port.
 
 ## Security Layers
 

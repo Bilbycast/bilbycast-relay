@@ -73,6 +73,32 @@ context, so front it with a TLS-terminating reverse proxy / load balancer (the
 DTLS/SRTP media path is independently encrypted regardless. Native in-relay TLS
 is a planned follow-up.
 
+### Media source pin
+
+The relay runs the **ICE-Lite server** role for WHEP viewers and WHIP ingest,
+and neither str0m nor its ICE agent implements RFC 7675 consent freshness, so
+once a session's DTLS handshake completes the relay **pins that session's media
+ingress to the DTLS peer's IP** (`PeerPin`,
+`src/distribution/webrtc/session.rs`). A datagram arriving from any other IP is
+dropped before str0m sees it. This is the anti-reflection control: without it a
+spoofed ICE binding can steer a session's SRTP fan-out at an unrelated victim.
+Everything *before* `Connected` stays open — ICE and DTLS have to run from an
+address nobody has learned yet.
+
+The pin is on the IP only, so an ordinary NAT **port** rebind still passes. The
+operational consequence worth knowing: **a viewer whose public IP changes
+mid-session goes black** — a Wi-Fi → cellular handover, a CGNAT pool rotation —
+and recovers only by re-POSTing its WHEP offer, which mints a new session. That
+is not a relay fault and there is no per-session override. Mid-session IP
+migration barely worked here before the pin either; making it *safe* rather than
+merely absent needs a return-routability check (RFC 7675 consent, or a full
+non-lite agent) that neither str0m nor its ICE agent implements today.
+
+The first such drop in a WHEP session raises the warning event
+`webrtc_offpath_source` and increments
+`bilbycast_relay_distribution_offpath_sessions` — once per session, never per
+datagram, so a reflection flood cannot amplify its own alarm.
+
 ## Access tokens
 
 Short-lived, stateless HMAC-SHA256 tokens (same pattern as `authorize_tunnel`
@@ -113,6 +139,27 @@ token lifted from a proxy log or from browser history is therefore replayable
 against a live feed for up to that long. Mint short `ttl_secs` when handing out
 query-form links, prefer the `Authorization: Bearer` form for programmatic
 clients, and strip `token` from the query in your proxy's log format if you can.
+
+## Observability
+
+`GET /metrics` on the REST listener (`:4480`, Bearer-gated when `api_token` is
+set) exposes five distribution series. They are emitted only once the subsystem
+has published a sample, so a plain forwarder build — or a relay with
+distribution disabled — exposes none of them, and a dashboard should treat their
+absence as "not running", not as zero.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `bilbycast_relay_distribution_streams` | gauge | Streams currently published to the hub |
+| `bilbycast_relay_distribution_viewers` | gauge | Connected WHEP viewers across all streams |
+| `bilbycast_relay_distribution_bytes_out_total` | counter | Media bytes fanned out to viewers |
+| `bilbycast_relay_distribution_origin_bytes` | gauge | Bytes currently held in the LL-HLS origin cache |
+| `bilbycast_relay_distribution_offpath_sessions` | counter | WHEP sessions that had a datagram refused by the media source pin — a spoofed ICE reflection attempt, or a viewer whose IP changed mid-session. Counted once per session |
+
+The same figures ride to the manager on the health payload's `distribution`
+object, and the per-stream `StreamSnapshot` carries `offpath_sessions` too. A
+relay is headless: `offpath_sessions` has no other local channel, and it is the
+counter to look at first when a viewer reports going black.
 
 ## Scaling beyond one relay
 
