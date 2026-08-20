@@ -35,6 +35,11 @@
   body[data-live="1"] #badge { background: var(--live); color: #fff; }
   #status { position: absolute; top: 10px; right: 10px; font-family: ui-monospace, Menlo, monospace;
             font-size: 11px; color: var(--dim); background: rgba(0,0,0,.55); padding: 3px 8px; border-radius: 6px; }
+  #debug { display: none; position: absolute; left: 10px; top: 40px; margin: 0;
+           font: 11px/1.45 ui-monospace, Menlo, monospace; color: #9ef;
+           background: rgba(0,0,0,.75); padding: 8px 10px; border-radius: 6px;
+           white-space: pre; pointer-events: none; }
+  body[data-debug="1"] #debug { display: block; }
   footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 14px 14px; }
   .timeline { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .timeline input[type=range] { flex: 1; min-width: 0; }
@@ -68,6 +73,7 @@
   <video id="proxy" playsinline muted></video>
   <div id="badge">live</div>
   <div id="status">—</div>
+  <pre id="debug"></pre>
 </div>
 
 <footer>
@@ -117,6 +123,7 @@
   var PROXY  = qs.get("proxy") || (STREAM + "-proxy");
   var TOKEN  = qs.get("token") || "";
   var FPS    = parseFloat(qs.get("fps") || "25");
+  var dbg    = null;
   var FRAME  = 1 / FPS;
 
   var main = document.getElementById("main");
@@ -129,7 +136,7 @@
   var btnLive = document.getElementById("btnLive");
   var btnPlay = document.getElementById("btnPlay");
 
-  var mainHls = null, proxyHls = null;
+  var mainHls = null, proxyHls = null, proxyAttached = false;
   // How far behind the seekable end "live" sits. Seeking to seekable.end
   // parks the playhead past the last decodable frame: the picture never
   // paints and hls.js reports bufferStalledError. Three target durations is
@@ -144,6 +151,7 @@
   function url(stream, file) {
     return "/origin/" + encodeURIComponent(stream) + "/" + file + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "");
   }
+  var lastHlsError = null;
   function fail(msg) { errEl.textContent = msg || ""; }
   function fmt(t) {
     if (!isFinite(t) || t < 0) return "--:--:--";
@@ -176,6 +184,7 @@
       });
       hls.on(Hls.Events.ERROR, function (_e, data) {
         if (!data) return;
+        lastHlsError = label + ":" + data.details + (data.fatal ? " (fatal)" : "");
         if (data.fatal) {
           fail(label + ": " + data.type + " / " + data.details);
         } else if (data.details === "bufferStalledError") {
@@ -246,6 +255,7 @@
   // this would land on the nearest keyframe instead, which is the whole
   // reason the proxy exists.
   function jog(dir) {
+    ensureProxy();
     setMode("jog");
     proxy.pause();
     var r = range(proxy);
@@ -261,6 +271,7 @@
   // stays ~FPS/s no matter the speed — at 8x we present every 8th frame,
   // not every frame. That is what keeps it sustainable on a tablet.
   function startShuttle(r) {
+    ensureProxy();
     setMode("shuttle");
     proxy.pause();
     stopShuttle();
@@ -338,6 +349,38 @@
     }
     status.textContent = mode + " | " + (mode === "jog" || mode === "shuttle" ? "proxy" : "main") +
                          " | " + (rate > 0 ? rate + "x" : rate + "x");
+    if (dbg) renderDebug();
+  }
+
+  // ── debug overlay (?debug=1) ───────────────────────────────────────────
+  // A video that reports readyState 4, correct dimensions and rising frame
+  // counts while showing nothing is a compositing/decoder problem, not a
+  // stream problem. This makes that distinction visible without a console.
+  function ranges(m) {
+    var a = [];
+    for (var i = 0; i < m.length; i++) a.push(m.start(i).toFixed(1) + "-" + m.end(i).toFixed(1));
+    return a.join(",") || "-";
+  }
+  function renderDebug() {
+    var v = activeVideo();
+    var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+    dbg.textContent = [
+      "mode=" + mode + "  rate=" + rate + "  element=" + (v === main ? "main" : "proxy"),
+      "readyState=" + v.readyState + "  networkState=" + v.networkState + "  paused=" + v.paused,
+      "videoWidth=" + v.videoWidth + "x" + v.videoHeight,
+      "currentTime=" + v.currentTime.toFixed(2),
+      "buffered=[" + ranges(v.buffered) + "]",
+      "seekable=[" + ranges(v.seekable) + "]",
+      "decodedFrames=" + (q ? q.totalVideoFrames : "n/a") +
+        "  dropped=" + (q ? q.droppedVideoFrames : "n/a"),
+      "mediaError=" + (v.error ? v.error.code + " " + v.error.message : "none"),
+      "proxyAttached=" + proxyAttached,
+      "lastHlsError=" + (lastHlsError || "none"),
+      "",
+      "If decodedFrames is RISING but the picture is black, the stream is fine",
+      "and the browser is not compositing it — try chrome://settings 'Use",
+      "graphics acceleration when available' off, then reload.",
+    ].join("\n");
   }
   setInterval(render, 200);
 
@@ -371,8 +414,21 @@
   });
 
   // ── start ──────────────────────────────────────────────────────────────
+  if (qs.get("debug") === "1") {
+    dbg = document.getElementById("debug");
+    document.body.dataset.debug = "1";
+  }
   mainHls = attach(main, MAIN, "main");
-  proxyHls = attach(proxy, PROXY, "proxy");
+  // The proxy is NOT attached up front. Two live MSE elements hold two
+  // decoders, and Chrome's hardware decoder budget is small and shared —
+  // exhausting it makes the *visible* element play with no picture, which
+  // looks exactly like a black stream. Attach on first jog/shuttle instead.
+  function ensureProxy() {
+    if (!proxyAttached) {
+      proxyAttached = true;
+      proxyHls = attach(proxy, PROXY, "proxy");
+    }
+  }
   main.addEventListener("loadedmetadata", function () { goLive(); });
   main.addEventListener("playing", syncRateButtons);
   main.addEventListener("pause", syncRateButtons);
