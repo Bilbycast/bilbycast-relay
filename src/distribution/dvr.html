@@ -85,7 +85,8 @@
 
   <div class="row">
     <button id="btnLive" class="live" aria-pressed="true" title="Jump to live">LIVE</button>
-    <button id="btnPlay" title="Play / pause">Play</button>
+    <button id="btnPlay" title="Play">&#9654;</button>
+    <button id="btnPause" title="Pause">&#10073;&#10073;</button>
     <div class="sep"></div>
 
     <button data-jog="-1" title="Step back one frame">&#9664;|</button>
@@ -133,6 +134,7 @@
   var errEl = document.getElementById("err");
   var btnLive = document.getElementById("btnLive");
   var btnPlay = document.getElementById("btnPlay");
+  var btnPause = document.getElementById("btnPause");
   var btnRew = document.getElementById("btnRew");
   var btnFf = document.getElementById("btnFf");
 
@@ -176,6 +178,19 @@
     return { start: v.seekable.start(0), end: v.seekable.end(v.seekable.length - 1) };
   }
   function activeVideo() { return (mode === "jog" || mode === "shuttle") ? proxy : main; }
+
+  /// Seek `v` to `t`, deferring until it can actually accept a seek.
+  ///
+  /// The proxy is attached lazily, so the first jog or shuttle hands over to
+  /// an element with no metadata yet. Assigning `currentTime` then is silently
+  /// dropped, leaving it at 0 — and the shuttle would start winding from the
+  /// beginning of the window instead of from where the operator was.
+  function seekWhenReady(v, t) {
+    if (!isFinite(t) || t <= 0) return;
+    var apply = function () { try { v.currentTime = t; } catch (e) {} };
+    if (v.readyState >= 1 && v.seekable.length) apply();
+    else v.addEventListener("loadedmetadata", apply, { once: true });
+  }
 
   // ── attach ─────────────────────────────────────────────────────────────
   function attach(video, stream, label) {
@@ -221,9 +236,7 @@
     mode = next;
     document.body.dataset.mode = next;
     var to = activeVideo();
-    if (to !== from && isFinite(t) && t > 0) {
-      try { to.currentTime = t; } catch (e) { /* not seekable yet */ }
-    }
+    if (to !== from) seekWhenReady(to, t);
     if (next === "jog" || next === "shuttle") { main.pause(); }
     else { proxy.pause(); stopShuttle(); }
     document.body.dataset.live = (next === "live") ? "1" : "0";
@@ -262,12 +275,19 @@
   // reason the proxy exists.
   function jog(dir) {
     ensureProxy();
+    // A frame step is an instruction to stop and look. Without this the
+    // shuttle loop kept running underneath and immediately walked away from
+    // the frame that was just stepped to.
+    stopShuttle();
+    rate = 1;
     setMode("jog");
+    main.pause();
     proxy.pause();
     var r = range(proxy);
     var t = proxy.currentTime + dir * FRAME;
     if (r) t = Math.max(r.start, Math.min(r.end, t));
     proxy.currentTime = t;
+    syncRateButtons();
     render();
   }
 
@@ -282,9 +302,20 @@
     proxy.pause();
     stopShuttle();
     rate = r;
-    var last = performance.now();
+    // Seed the clock inside the first callback, not here. The gap between
+    // starting a shuttle and the first animation frame covers attaching the
+    // proxy and seeking it, which can be hundreds of milliseconds — charging
+    // that to the first delta threw the playhead forward before the speed
+    // settled.
+    var last = null;
     var step = function (now) {
-      var dt = (now - last) / 1000;
+      if (last === null) {
+        last = now;
+        shuttleRAF = requestAnimationFrame(step);
+        return;
+      }
+      // Clamp so a stalled tab or a slow seek cannot produce one huge jump.
+      var dt = Math.min((now - last) / 1000, 0.25);
       last = now;
       var rng = range(proxy);
       var t = proxy.currentTime + rate * dt;
@@ -326,7 +357,11 @@
     btnFf.setAttribute("aria-pressed", ffOn ? "true" : "false");
     btnRew.textContent = rewOn ? "\u25C0\u25C0 " + Math.abs(rate) + "\u00D7" : "\u25C0\u25C0";
     btnFf.textContent = ffOn ? "\u25B6\u25B6 " + rate + "\u00D7" : "\u25B6\u25B6";
-    btnPlay.textContent = activeVideo().paused && mode !== "shuttle" ? "Play" : "Pause";
+    // A shuttle counts as running even though the element is paused: the loop
+    // is driving currentTime itself.
+    var running = mode === "shuttle" || !activeVideo().paused;
+    btnPlay.setAttribute("aria-pressed", running ? "true" : "false");
+    btnPause.setAttribute("aria-pressed", running ? "false" : "true");
   }
 
   /// Step to the next speed in the cycle for `dir` (-1 rewind, +1 forward).
@@ -448,12 +483,34 @@
 
   // ── controls ───────────────────────────────────────────────────────────
   btnLive.addEventListener("click", goLive);
+  // Separate play and pause rather than one toggle: on a transport you press
+  // the control you want, without first reading the button to find out what
+  // it currently means.
   btnPlay.addEventListener("click", function () {
-    var v = activeVideo();
-    if (v.paused) { if (mode === "jog") setMode("scrub"); activeVideo().play().catch(function () {}); }
-    else { v.pause(); stopShuttle(); }
-    syncRateButtons();
+    stopShuttle();
+    if (mode === "jog") setMode("scrub");
+    setRate(rate > 0 ? rate : 1);
   });
+  /// Stop the transport, whatever it was doing.
+  ///
+  /// A shuttle leaves the media element *paused* while the loop drives
+  /// `currentTime`, so "is the element paused?" is not the same question as
+  /// "is the transport running?". A single toggle that asked the former
+  /// needed two presses to stop a fast-forward: the first saw a paused
+  /// element and started playback.
+  ///
+  /// Leaving shuttle mode also hands the picture back to the main rendition,
+  /// so a stopped transport shows the full-resolution frame rather than the
+  /// low-res proxy still.
+  function pauseTransport() {
+    stopShuttle();
+    if (mode === "shuttle" || mode === "jog") setMode("scrub");
+    rate = 1;
+    main.pause();
+    proxy.pause();
+    syncRateButtons();
+  }
+  btnPause.addEventListener("click", pauseTransport);
   document.querySelectorAll("[data-jog]").forEach(function (b) {
     b.addEventListener("click", function () { jog(parseInt(b.dataset.jog, 10)); });
   });
@@ -467,12 +524,16 @@
     if (e.target && /input|textarea/i.test(e.target.tagName)) return;
     switch (e.key) {
       case "j": cycleShuttle(-1); break;
-      case "k": activeVideo().pause(); stopShuttle(); setRate(1); activeVideo().pause(); syncRateButtons(); break;
+      case "k": pauseTransport(); break;
       case "l": cycleShuttle(1); break;
       case ",": jog(-1); break;
       case ".": jog(1); break;
       case "End": goLive(); break;
-      case " ": e.preventDefault(); btnPlay.click(); break;
+      case " ":
+        e.preventDefault();
+        if (mode === "shuttle" || !activeVideo().paused) pauseTransport();
+        else btnPlay.click();
+        break;
       default: return;
     }
   });
