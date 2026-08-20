@@ -5,8 +5,12 @@
 //!
 //! Components throughout the relay (session handler, tunnel router, etc.) hold
 //! an `EventSender` clone and call its helper methods to report state changes.
-//! Events are queued in an unbounded mpsc channel and drained by the manager
-//! WebSocket client loop.
+//! Events are queued in a **bounded** mpsc channel
+//! ([`EVENT_CHANNEL_CAPACITY`]) and drained by the manager WebSocket client
+//! loop. It was unbounded until the event queue itself turned out to be the
+//! leak: with no manager attached, one rejected native-UDP datagram per packet
+//! queued an `Event` nothing ever drained. Over capacity, events are dropped
+//! and counted rather than retained — see [`Drops`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
