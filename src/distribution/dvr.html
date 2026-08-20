@@ -317,7 +317,38 @@
   }
 
   // ── scrub bar ──────────────────────────────────────────────────────────
-  scrub.addEventListener("pointerdown", function () { scrubbing = true; });
+  // Holding the thumb freezes the picture on the frame under it. A drag is a
+  // request to *look* at a position, not to keep running from the old one —
+  // and leaving playback going also means every seek fights the playhead.
+  // Releasing resumes at whatever transport rate is still selected.
+  var resumeAfterScrub = null;
+
+  function beginScrub() {
+    if (scrubbing) return;
+    scrubbing = true;
+    var v = activeVideo();
+    // `rate < 0` counts as playing: a reverse shuttle drives currentTime
+    // itself, so the element is paused even though the transport is running.
+    resumeAfterScrub = { playing: !v.paused || rate < 0, rate: rate };
+    stopShuttle();
+    v.pause();
+    if (mode === "live") setMode("scrub");
+    syncRateButtons();
+  }
+
+  function endScrub() {
+    if (!scrubbing) return;
+    scrubbing = false;
+    var st = resumeAfterScrub;
+    resumeAfterScrub = null;
+    if (st && st.playing) {
+      setRate(st.rate);   // restarts the shuttle loop when the rate is negative
+    } else {
+      syncRateButtons();
+    }
+  }
+
+  scrub.addEventListener("pointerdown", beginScrub);
   scrub.addEventListener("input", function () {
     var v = activeVideo();
     var r = range(v);
@@ -327,8 +358,11 @@
     try { v.currentTime = t; } catch (e) {}
     tPos.textContent = fmt(t - r.start);
   });
-  scrub.addEventListener("pointerup", function () { scrubbing = false; });
-  scrub.addEventListener("change", function () { scrubbing = false; });
+  // Release is caught on the window, not the input: dragging off the track
+  // (easy with a thumb on a tablet) still ends the scrub.
+  window.addEventListener("pointerup", endScrub);
+  window.addEventListener("pointercancel", endScrub);
+  scrub.addEventListener("change", endScrub);
 
   // ── render loop ────────────────────────────────────────────────────────
   function render() {
