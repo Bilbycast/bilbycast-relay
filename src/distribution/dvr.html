@@ -179,17 +179,43 @@
   }
   function activeVideo() { return (mode === "jog" || mode === "shuttle") ? proxy : main; }
 
-  /// Seek `v` to `t`, deferring until it can actually accept a seek.
+  /// A handover seek that has not been applied yet: `{ el, t }`.
   ///
   /// The proxy is attached lazily, so the first jog or shuttle hands over to
-  /// an element with no metadata yet. Assigning `currentTime` then is silently
-  /// dropped, leaving it at 0 — and the shuttle would start winding from the
-  /// beginning of the window instead of from where the operator was.
+  /// an element with no metadata. Assigning `currentTime` then is silently
+  /// dropped and it stays at 0. Everything that reads a position must go
+  /// through `playhead()` rather than the element, or it will do arithmetic
+  /// against 0 and wind away from where the operator actually is — then jump
+  /// again when the deferred seek finally lands.
+  var pendingSeek = null;
+
+  /// Seek `v` to `t`, deferring until it can actually accept a seek.
   function seekWhenReady(v, t) {
     if (!isFinite(t) || t <= 0) return;
-    var apply = function () { try { v.currentTime = t; } catch (e) {} };
-    if (v.readyState >= 1 && v.seekable.length) apply();
-    else v.addEventListener("loadedmetadata", apply, { once: true });
+    var apply = function () {
+      try { v.currentTime = t; } catch (e) {}
+      if (pendingSeek && pendingSeek.el === v) pendingSeek = null;
+    };
+    if (v.readyState >= 1 && v.seekable.length) {
+      pendingSeek = null;
+      apply();
+      return;
+    }
+    pendingSeek = { el: v, t: t };
+    v.addEventListener("loadedmetadata", apply, { once: true });
+  }
+
+  /// Where the transport *is*, which is not always where the element is.
+  /// While a handover seek is outstanding the element still reads its old
+  /// position, so this reports the intended one instead.
+  function playhead(v) {
+    if (pendingSeek && pendingSeek.el === v) return pendingSeek.t;
+    return v.currentTime;
+  }
+
+  /// True while `v` has not yet taken the position handed to it.
+  function awaitingSeek(v) {
+    return !!(pendingSeek && pendingSeek.el === v);
   }
 
   // ── attach ─────────────────────────────────────────────────────────────
@@ -232,7 +258,7 @@
   function setMode(next) {
     if (mode === next) return;
     var from = activeVideo();
-    var t = from.currentTime;
+    var t = playhead(from);
     mode = next;
     document.body.dataset.mode = next;
     var to = activeVideo();
@@ -283,6 +309,14 @@
     setMode("jog");
     main.pause();
     proxy.pause();
+    // Step from where the transport is, not from a proxy that may still be
+    // sitting at 0 waiting for its handover seek.
+    if (awaitingSeek(proxy)) {
+      pendingSeek.t += dir * FRAME;
+      syncRateButtons();
+      render();
+      return;
+    }
     var r = range(proxy);
     var t = proxy.currentTime + dir * FRAME;
     if (r) t = Math.max(r.start, Math.min(r.end, t));
@@ -310,6 +344,13 @@
     var last = null;
     var step = function (now) {
       if (last === null) {
+        last = now;
+        shuttleRAF = requestAnimationFrame(step);
+        return;
+      }
+      // Hold position until the handover seek lands, or the loop would wind
+      // away from 0 and then jump when it does.
+      if (awaitingSeek(proxy)) {
         last = now;
         shuttleRAF = requestAnimationFrame(step);
         return;
@@ -418,6 +459,7 @@
     if (!r) return;
     if (mode === "live") setMode("scrub");
     var t = r.start + (r.end - r.start) * (scrub.value / 1000);
+    pendingSeek = null;   // the operator is choosing a position explicitly
     try { v.currentTime = t; } catch (e) {}
     tPos.textContent = fmt(t - r.start);
   });
@@ -433,12 +475,13 @@
     var r = range(v);
     if (r) {
       var dur = r.end - r.start;
-      tPos.textContent = fmt(v.currentTime - r.start);
-      tDur.textContent = "-" + fmt(Math.max(0, r.end - v.currentTime)).replace(/\.\d+$/, "");
+      var pos = playhead(v);
+      tPos.textContent = fmt(pos - r.start);
+      tDur.textContent = "-" + fmt(Math.max(0, r.end - pos)).replace(/\.\d+$/, "");
       if (!scrubbing && dur > 0) {
-        scrub.value = String(Math.round(((v.currentTime - r.start) / dur) * 1000));
+        scrub.value = String(Math.round(((pos - r.start) / dur) * 1000));
       }
-      var atLive = (r.end - v.currentTime) < 3;
+      var atLive = (r.end - pos) < 3;
       document.body.dataset.live = (mode === "live" && atLive) ? "1" : "0";
       document.getElementById("badge").textContent =
         mode === "jog" ? "jog" : mode === "shuttle" ? (rate > 0 ? rate + "x" : rate + "x") :
