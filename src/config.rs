@@ -254,10 +254,44 @@ pub struct DistributionConfig {
     #[serde(default = "default_max_viewers_per_ip")]
     pub max_viewers_per_ip: u32,
 
-    /// LL-HLS origin retention: how many recent media segments (+ their
-    /// parts) to keep per stream in the in-memory sliding window. Default 8.
+    /// LL-HLS origin retention floor: the minimum number of recent media
+    /// segments kept per stream, whatever `origin_retention_secs` and
+    /// `origin_max_bytes_per_stream` say. Default 8.
+    ///
+    /// Since the origin became disk-backed this is a **floor**, not the
+    /// policy — time is the policy. It stops a stalled or very-low-bitrate
+    /// stream having its whole window aged out from under a live player.
     #[serde(default = "default_origin_window_segments")]
     pub origin_window_segments: usize,
+
+    /// LL-HLS origin retention: how long a media segment is kept, in seconds.
+    /// Default 60.
+    ///
+    /// This is the knob that sets DVR depth. Size it to the window the edge
+    /// advertises in its playlist **plus headroom** — the playlist is a
+    /// sliding window, so a viewer parked mid-window must not have the segment
+    /// under them deleted. Retaining less than the edge advertises produces
+    /// 404s on seek, which is the failure this pairing exists to prevent.
+    #[serde(default = "default_origin_retention_secs")]
+    pub origin_retention_secs: u64,
+
+    /// LL-HLS origin safety bound: maximum bytes of media segments held per
+    /// stream. Default 8 GiB.
+    ///
+    /// A bitrate spike must not fill the volume just because
+    /// `origin_retention_secs` has not elapsed. Total disk is roughly this
+    /// times the number of live streams; hitting it evicts oldest-first and
+    /// silently shortens the DVR window, so size it above what the retention
+    /// window is expected to cost.
+    #[serde(default = "default_origin_max_bytes_per_stream")]
+    pub origin_max_bytes_per_stream: u64,
+
+    /// Directory the origin writes media segments under. Defaults to
+    /// `/var/lib/bilbycast/relay/origin` (inside the packaged unit's
+    /// `ReadWritePaths`). Wiped on startup — segments from a previous run are
+    /// unaddressable, because the manifests referencing them are gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_storage_dir: Option<String>,
 
     /// Cascade sources: streams this (downstream/regional) relay pulls from an
     /// upstream relay's WHEP and re-fans-out locally. Empty by default. See
@@ -294,6 +328,9 @@ impl Default for DistributionConfig {
             require_ingest_token: true,
             max_viewers_per_ip: default_max_viewers_per_ip(),
             origin_window_segments: default_origin_window_segments(),
+            origin_retention_secs: default_origin_retention_secs(),
+            origin_max_bytes_per_stream: default_origin_max_bytes_per_stream(),
+            origin_storage_dir: None,
             cascade_sources: Vec::new(),
         }
     }
@@ -305,6 +342,20 @@ fn default_max_viewers_per_ip() -> u32 {
 
 fn default_origin_window_segments() -> usize {
     8
+}
+
+fn default_origin_retention_secs() -> u64 {
+    60
+}
+
+fn default_origin_max_bytes_per_stream() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+/// Default origin storage root. Under the packaged unit's data root, which is
+/// already in `ReadWritePaths`.
+pub fn default_origin_storage_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/bilbycast/relay/origin")
 }
 
 fn default_distribution_http_addrs() -> Vec<String> {
@@ -368,6 +419,17 @@ impl DistributionConfig {
         // gated surfaces stay closed (fail-safe), so this is not a config error.
         if self.origin_window_segments == 0 || self.origin_window_segments > 64 {
             anyhow::bail!("distribution.origin_window_segments must be in 1..=64");
+        }
+        // 24 h ceiling: past that the operator almost certainly wants an
+        // archive, not a live origin's sliding window.
+        if self.origin_retention_secs == 0 || self.origin_retention_secs > 86_400 {
+            anyhow::bail!("distribution.origin_retention_secs must be in 1..=86400");
+        }
+        if self.origin_max_bytes_per_stream < 16 * 1024 * 1024 {
+            anyhow::bail!(
+                "distribution.origin_max_bytes_per_stream must be at least 16 MiB (got {})",
+                self.origin_max_bytes_per_stream
+            );
         }
         if self.cascade_sources.len() > 64 {
             anyhow::bail!("distribution.cascade_sources: at most 64 entries");

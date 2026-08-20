@@ -208,7 +208,10 @@ See `../../testbed/configs/relay-distribution.json`:
     "require_viewer_token": false,
     "require_ingest_token": true,
     "max_viewers_per_ip": 256,
-    "origin_window_segments": 8
+    "origin_window_segments": 8,
+    "origin_retention_secs": 60,
+    "origin_max_bytes_per_stream": 8589934592,
+    "origin_storage_dir": "/var/lib/bilbycast/relay/origin"
   }
 }
 ```
@@ -218,6 +221,25 @@ See `../../testbed/configs/relay-distribution.json`:
   connect the media socket.
 - `token_secret` must be the **same** 64-hex value the manager holds so its
   minted tokens validate.
+- `origin_retention_secs` sets **DVR depth** — how far back a browser can seek.
+  Size it to the window the edge advertises in its playlist **plus headroom**.
+  The playlist is a sliding window, so retaining less than the edge advertises
+  produces 404s on seek for anyone parked mid-window. 60 s is a live-only
+  default; a scrub-back surface wants minutes to hours.
+- `origin_max_bytes_per_stream` is the safety bound, not the policy. A bitrate
+  spike must not fill the volume just because the retention window has not
+  elapsed. Hitting it evicts oldest-first and silently shortens the DVR window,
+  so size it above what the retention window is expected to cost — roughly
+  `bitrate × origin_retention_secs / 8`.
+- `origin_window_segments` is now a **floor**, not the window: the minimum
+  number of recent segments kept whatever the other two say. It stops a stalled
+  or very-low-bitrate stream having its whole window aged out from under a live
+  player.
+- `origin_storage_dir` is **wiped on startup**. Segments from a previous run are
+  unaddressable anyway, because the manifests referencing them are held in
+  memory and die with the process. Point it at a volume with room for
+  `origin_max_bytes_per_stream` times the number of live streams; the default is
+  inside the packaged unit's `ReadWritePaths`.
 
 A config block present on a plain (feature-off) build parses fine and is logged
 as ignored at startup.
@@ -233,7 +255,7 @@ as ignored at startup.
 | `whip_ingest.rs` | WHIP-in: terminate DTLS/SRTP, depacketize → access units → hub |
 | `cascade.rs` | Relay-to-relay: WHEP-client pull from an upstream relay → local hub |
 | `ingest.rs` | QUIC ES ingest (future lower-overhead edge path) |
-| `origin.rs` | LL-HLS/CMAF HTTP origin + sliding-window cache |
+| `origin.rs` | LL-HLS/CMAF HTTP origin; manifests in memory, segments on disk, age- and size-bounded |
 | `token.rs` | Short-lived HMAC token mint/verify (viewer + ingest scopes) |
 | `webrtc/` | Vendored str0m session wrapper + RFC 6184 H.264 packetizer |
 | `player.html` | Built-in browser WHEP player |
