@@ -165,8 +165,11 @@ mod tests {
     fn tampered_signature_rejected() {
         let exp = now_unix() + 300;
         let mut tok = mint_viewer_token(SECRET, "s", exp).unwrap();
-        tok.pop();
-        tok.push('0');
+        // Flip the last character to something it is not. Unconditionally
+        // pushing '0' left the token untouched whenever the signature already
+        // ended in '0' — a hex digit, so this test failed roughly 1 run in 16.
+        let last = tok.pop().expect("token is never empty");
+        tok.push(if last == '0' { '1' } else { '0' });
         assert!(verify_viewer_token(SECRET, "s", &tok).is_err());
     }
 
