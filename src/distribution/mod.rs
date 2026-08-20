@@ -116,7 +116,24 @@ pub async fn run_distribution(
     events: EventSender,
     relay_stats: Arc<crate::stats::RelayStats>,
 ) -> Result<()> {
-    let origin = Arc::new(OriginStore::new(config.origin_window_segments));
+    let origin_cfg = crate::distribution::origin::OriginConfig {
+        root: config
+            .origin_storage_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(crate::config::default_origin_storage_dir),
+        retention: std::time::Duration::from_secs(config.origin_retention_secs),
+        max_bytes_per_stream: config.origin_max_bytes_per_stream,
+        min_segments: config.origin_window_segments,
+    };
+    tracing::info!(
+        root = %origin_cfg.root.display(),
+        retention_secs = config.origin_retention_secs,
+        max_bytes_per_stream = config.origin_max_bytes_per_stream,
+        min_segments = config.origin_window_segments,
+        "distribution origin: disk-backed store"
+    );
+    let origin = Arc::new(OriginStore::new(origin_cfg)?);
 
     // Telemetry: periodically publish hub + origin counters onto RelayStats so
     // the manager-client health builder (and the local REST/metrics surface)

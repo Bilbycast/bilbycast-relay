@@ -21,7 +21,7 @@ use bilbycast_relay::distribution::hub::DistributionHub;
 use bilbycast_relay::distribution::ingest::{
     self, encode_eos, encode_frame, encode_hello, IngestHello,
 };
-use bilbycast_relay::distribution::origin::OriginStore;
+use bilbycast_relay::distribution::origin::{OriginConfig, OriginStore};
 use bilbycast_relay::distribution::token;
 use bilbycast_relay::manager::events::event_channel;
 
@@ -77,18 +77,46 @@ fn viewer_and_ingest_tokens_are_scoped_and_expiring() {
     assert!(token::verify_ingest_token(secret, "show", &it).is_ok());
 }
 
-#[test]
-fn origin_sliding_window_and_manifest_persistence() {
-    let store = OriginStore::new(3);
-    store.put("s", "index.m3u8", Bytes::from_static(b"#EXTM3U"));
-    for i in 0..6 {
-        store.put("s", &format!("seg{i}.m4s"), Bytes::from(vec![0u8; 100]));
+/// A store root that nothing else is using. `OriginStore::new` creates and
+/// wipes it, so it does not need to exist first.
+fn test_origin_config(min_segments: usize, max_bytes_per_stream: u64) -> OriginConfig {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    OriginConfig {
+        root: std::env::temp_dir()
+            .join(format!("bilbycast-relay-test-origin-{}-{unique}", std::process::id())),
+        retention: std::time::Duration::from_secs(3600),
+        max_bytes_per_stream,
+        min_segments,
     }
-    // Manifest kept; only last 3 segments retained.
-    assert!(store.get("s", "index.m3u8").is_some());
-    assert!(store.get("s", "seg0.m4s").is_none());
-    assert!(store.get("s", "seg5.m4s").is_some());
-    assert_eq!(store.get("s", "seg5.m4s").unwrap().content_type, "video/mp4");
+}
+
+#[tokio::test]
+async fn origin_sliding_window_and_manifest_persistence() {
+    // Segment count is only a floor now, so drive eviction with the byte
+    // bound: 350 bytes at 100 bytes a segment keeps roughly the last three.
+    let store = OriginStore::new(test_origin_config(1, 350)).unwrap();
+    store
+        .put("s", "index.m3u8", Bytes::from_static(b"#EXTM3U"))
+        .await
+        .unwrap();
+    for i in 0..6 {
+        store
+            .put("s", &format!("seg{i}.m4s"), Bytes::from(vec![0u8; 100]))
+            .await
+            .unwrap();
+    }
+    // Manifest kept; the oldest segments are gone.
+    assert!(store.get("s", "index.m3u8").await.is_some());
+    assert!(store.get("s", "seg0.m4s").await.is_none());
+    assert!(store.get("s", "seg5.m4s").await.is_some());
+    assert_eq!(
+        store.get("s", "seg5.m4s").await.unwrap().content_type,
+        "video/mp4"
+    );
+    store.remove_stream("s").await;
 }
 
 #[test]
@@ -439,7 +467,7 @@ async fn runtime_control_flips_viewer_gate() {
     // Start ungated (no viewer token required).
     let cfg = DistributionConfig { require_viewer_token: false, require_ingest_token: false, ..Default::default() };
     let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
-    let state = DistributionState::new(hub, Arc::new(OriginStore::new(8)), cfg, control.clone(), cancel.clone(), events);
+    let state = DistributionState::new(hub, Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap()), cfg, control.clone(), cancel.clone(), events);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -536,7 +564,7 @@ async fn cascade_pulls_upstream_whep_and_republishes() {
     );
     let up_state = DistributionState::new(
         up_hub.clone(),
-        Arc::new(OriginStore::new(8)),
+        Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap()),
         up_cfg,
         up_control,
         cancel.clone(),
