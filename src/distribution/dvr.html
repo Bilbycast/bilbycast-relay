@@ -92,17 +92,15 @@
     <button data-jog="1" title="Step forward one frame">|&#9654;</button>
     <div class="sep"></div>
 
-    <button data-rate="-8" title="Shuttle back 8x">&#171;8</button>
-    <button data-rate="-2" title="Shuttle back 2x">&#171;2</button>
-    <button data-rate="-1" title="Play backwards">&#171;1</button>
-    <button data-rate="0.25">.25</button>
-    <button data-rate="1" aria-pressed="true">1&times;</button>
-    <button data-rate="2">2&times;</button>
-    <button data-rate="4">4&times;</button>
-    <button data-rate="8" title="Shuttle forward 8x">8&raquo;</button>
+    <button id="btnRew" title="Rewind — click again for 4x, 8x, 16x">&#9664;&#9664;</button>
+    <button data-rate="0.3333" title="Play at one third speed">33%</button>
+    <button data-rate="0.5" title="Play at half speed">50%</button>
+    <button data-rate="1" aria-pressed="true" title="Play at normal speed">100%</button>
+    <button id="btnFf" title="Fast forward — click again for 4x, 8x, 16x">&#9654;&#9654;</button>
   </div>
   <div class="hint">
-    Keys: <b>J</b>/<b>K</b>/<b>L</b> shuttle &middot; <b>,</b>/<b>.</b> frame step &middot;
+    Keys: <b>J</b>/<b>L</b> rewind/forward (press again to speed up) &middot;
+    <b>K</b> stop &middot; <b>,</b>/<b>.</b> frame step &middot;
     <b>Space</b> play/pause &middot; <b>End</b> live
   </div>
   <div class="err" id="err"></div>
@@ -135,6 +133,8 @@
   var errEl = document.getElementById("err");
   var btnLive = document.getElementById("btnLive");
   var btnPlay = document.getElementById("btnPlay");
+  var btnRew = document.getElementById("btnRew");
+  var btnFf = document.getElementById("btnFf");
 
   var mainHls = null, proxyHls = null, proxyAttached = false;
   // How far behind the seekable end "live" sits. Seeking to seekable.end
@@ -142,6 +142,12 @@
   // paints and hls.js reports bufferStalledError. Three target durations is
   // the LL-HLS hold-back convention.
   var LIVE_BACKOFF = 3;
+
+  // Fast-forward / rewind cycle through these on repeated presses, then wrap.
+  // They run on the shuttle path, not `playbackRate`: the loop presents every
+  // Nth frame, so the seek rate stays ~fps/s at any speed instead of demanding
+  // 16x the bandwidth and decode.
+  var SHUTTLE_STEPS = [2, 4, 8, 16];
 
   var mode = "live";     // live | scrub | jog | shuttle
   var rate = 1;          // requested rate; negative means reverse
@@ -307,13 +313,35 @@
     syncRateButtons();
   }
   function syncRateButtons() {
+    var shuttling = mode === "shuttle";
     document.querySelectorAll("[data-rate]").forEach(function (b) {
-      var on = (mode === "shuttle" || mode === "jog")
-        ? parseFloat(b.dataset.rate) === rate && rate < 0
-        : parseFloat(b.dataset.rate) === rate && rate > 0;
+      var on = !shuttling && parseFloat(b.dataset.rate) === rate;
       b.setAttribute("aria-pressed", on ? "true" : "false");
     });
-    btnPlay.textContent = activeVideo().paused ? "Play" : "Pause";
+    // The active shuttle speed lives on the button, so the operator can see
+    // where they are in the cycle without a separate readout.
+    var rewOn = shuttling && rate < 0;
+    var ffOn = shuttling && rate > 0;
+    btnRew.setAttribute("aria-pressed", rewOn ? "true" : "false");
+    btnFf.setAttribute("aria-pressed", ffOn ? "true" : "false");
+    btnRew.textContent = rewOn ? "\u25C0\u25C0 " + Math.abs(rate) + "\u00D7" : "\u25C0\u25C0";
+    btnFf.textContent = ffOn ? "\u25B6\u25B6 " + rate + "\u00D7" : "\u25B6\u25B6";
+    btnPlay.textContent = activeVideo().paused && mode !== "shuttle" ? "Play" : "Pause";
+  }
+
+  /// Step to the next speed in the cycle for `dir` (-1 rewind, +1 forward).
+  /// Coming from anything that is not already shuttling that way — normal
+  /// play, or shuttling the other direction — starts at the bottom.
+  function cycleShuttle(dir) {
+    var next;
+    if (mode === "shuttle" && Math.sign(rate) === dir) {
+      var i = SHUTTLE_STEPS.indexOf(Math.abs(rate));
+      next = SHUTTLE_STEPS[(i + 1) % SHUTTLE_STEPS.length];
+    } else {
+      next = SHUTTLE_STEPS[0];
+    }
+    startShuttle(dir * next);
+    syncRateButtons();
   }
 
   // ── scrub bar ──────────────────────────────────────────────────────────
@@ -432,13 +460,15 @@
   document.querySelectorAll("[data-rate]").forEach(function (b) {
     b.addEventListener("click", function () { setRate(parseFloat(b.dataset.rate)); });
   });
+  btnRew.addEventListener("click", function () { cycleShuttle(-1); });
+  btnFf.addEventListener("click", function () { cycleShuttle(1); });
 
   document.addEventListener("keydown", function (e) {
     if (e.target && /input|textarea/i.test(e.target.tagName)) return;
     switch (e.key) {
-      case "j": setRate(rate < 0 ? Math.max(-16, rate * 2) : -1); break;
-      case "k": activeVideo().pause(); stopShuttle(); syncRateButtons(); break;
-      case "l": setRate(rate > 1 ? Math.min(16, rate * 2) : 1); break;
+      case "j": cycleShuttle(-1); break;
+      case "k": activeVideo().pause(); stopShuttle(); setRate(1); activeVideo().pause(); syncRateButtons(); break;
+      case "l": cycleShuttle(1); break;
       case ",": jog(-1); break;
       case ".": jog(1); break;
       case "End": goLive(); break;
