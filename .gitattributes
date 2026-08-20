@@ -1,0 +1,3 @@
+# Vendored browser assets are upstream artefacts - keep them byte-for-byte
+# as published so a checksum against upstream stays meaningful.
+src/distribution/vendor/hls.min.js -text
