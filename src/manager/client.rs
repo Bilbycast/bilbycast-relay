@@ -1170,3 +1170,75 @@ fn persist_credentials(
         }
     }
 }
+
+#[cfg(test)]
+mod manager_contract_tests {
+    use super::*;
+    use crate::config::DistributionConfig;
+    use crate::distribution_control::{DistributionControl, RuntimeDistConfig};
+
+    /// The relay must accept **the exact body bilbycast-manager builds**.
+    ///
+    /// This JSON is not hand-written: it is the literal output of
+    /// `manager_core::db::dvr_sessions::relay_push_body`, captured from
+    /// `cargo test -p manager-core dump_contract -- --nocapture`. The two
+    /// sides were written independently, and a field-name disagreement here
+    /// would not error — `apply_configure_distribution` applies what it
+    /// recognises and ignores the rest, so a mismatch presents as a retention
+    /// window that is stored, reported as pushed, and never takes effect.
+    #[test]
+    fn the_managers_dvr_push_is_understood() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+
+        let from_manager = serde_json::json!({
+            "type": "configure_distribution",
+            "token_secret": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "origin_stream_policies": {
+                "e2e":       { "retention_secs": 300 },
+                "e2e-proxy": { "retention_secs": 300 }
+            },
+            "require_origin_token": false
+        });
+
+        apply_configure_distribution(Some(&control), &from_manager)
+            .expect("the relay must accept the manager's push");
+
+        // Applied, not merely parsed.
+        let mut rx = control.subscribe_origin();
+        let update = rx.borrow_and_update().clone();
+        let per = update.per_stream.expect("per-stream overrides must arrive");
+        assert_eq!(per.len(), 2, "both renditions must be carried");
+        let names: Vec<&str> = per.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(names.contains(&"e2e") && names.contains(&"e2e-proxy"));
+        assert_eq!(
+            per[0].1.retention_secs,
+            Some(300),
+            "the window must survive the wire"
+        );
+    }
+
+    /// The gate is a separate field and must also land.
+    #[test]
+    fn the_managers_gate_flag_is_understood() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "require_origin_token": true,
+                "origin_stream_policies": {}
+            }),
+        )
+        .expect("accepted");
+        assert!(control.load().require_origin_token, "the gate must be applied");
+
+        // An empty override object is meaningful: it clears the set. It must
+        // arrive as Some(empty), not None, or the last session to stop would
+        // never get its window released.
+        let mut rx = control.subscribe_origin();
+        let update = rx.borrow_and_update().clone();
+        assert_eq!(update.per_stream, Some(Vec::new()));
+    }
+}
