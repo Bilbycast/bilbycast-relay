@@ -25,8 +25,8 @@
   #stage { position: relative; flex: 1; min-height: 0; background: #000; }
   #stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
   #proxy { display: none; }
-  body[data-mode="jog"] #proxy, body[data-mode="shuttle"] #proxy { display: block; }
-  body[data-mode="jog"] #main,  body[data-mode="shuttle"] #main  { display: none; }
+  body[data-mode="shuttle"] #proxy { display: block; }
+  body[data-mode="shuttle"] #main  { display: none; }
   #badge {
     position: absolute; top: 10px; left: 10px; padding: 3px 9px; border-radius: 999px;
     font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
@@ -165,16 +165,6 @@
   // 16x the bandwidth and decode.
   var SHUTTLE_STEPS = [2, 4, 8, 16];
 
-  // How long after the last frame step before the still is handed back to the
-  // main rendition.
-  //
-  // The proxy is a positioning tool, not something to look at: it is 640x360
-  // and the operator is usually jogging in order to *examine* a frame. But
-  // seeking `main` costs a decode from the preceding keyframe, so doing it on
-  // every step would make held stepping sluggish. Stay on the proxy while
-  // stepping, hand back once the operator stops.
-  var JOG_SETTLE_MS = 400;
-  var jogSettleTimer = null;
 
   // proxyTime = mainTime + timelineOffset.
   //
@@ -217,7 +207,22 @@
     if (!v.seekable || v.seekable.length === 0) return null;
     return { start: v.seekable.start(0), end: v.seekable.end(v.seekable.length - 1) };
   }
-  function activeVideo() { return (mode === "jog" || mode === "shuttle") ? proxy : main; }
+  // Only shuttle runs on the proxy. Jog stays on the main rendition: an
+  // operator stepping frames is examining them, and stepping is one seek, not
+  // the ~fps/s a shuttle needs.
+  function activeVideo() { return mode === "shuttle" ? proxy : main; }
+
+  /// Index of the frame containing `t`.
+  function frameIndexAt(t) { return Math.floor(t * FPS + 1e-6); }
+
+  /// Midpoint of frame `i`.
+  ///
+  /// Seeking to a frame *boundary* is ambiguous — the browser may present
+  /// either side of it, and accumulating `+= 1/fps` lands on boundaries every
+  /// time. Measured against burnt-in timecode, that dropped roughly one step
+  /// in three (255.04 -> :01, 255.08 -> :01, 255.12 -> :02). A midpoint names
+  /// exactly one frame.
+  function frameCentre(i) { return (i + 0.5) / FPS; }
 
   /// Samples of the raw offset measurement, newest last.
   var offsetSamples = [];
@@ -373,7 +378,6 @@
   }
 
   function goLive() {
-    cancelJogSettle();
     stopShuttle();
     setMode("live");
     var t = liveTarget();
@@ -392,48 +396,24 @@
   // this would land on the nearest keyframe instead, which is the whole
   // reason the proxy exists.
   function jog(dir) {
-    ensureProxy();
-    // A frame step is an instruction to stop and look. Without this the
-    // shuttle loop kept running underneath and immediately walked away from
-    // the frame that was just stepped to.
+    // A frame step is an instruction to stop and look, so it ends any shuttle
+    // and hands the picture back to the main rendition.
     stopShuttle();
     rate = 1;
-    setMode("jog");
+    // Leave live as well as shuttle: stepping means the operator has
+    // positioned deliberately, and staying in `live` would let the
+    // stall-recovery path yank the playhead to the edge mid-step.
+    if (mode === "live" || mode === "shuttle") setMode("scrub");
     main.pause();
     proxy.pause();
-    // Step from where the transport is, not from a proxy that may still be
-    // sitting at 0 waiting for its handover seek.
-    if (awaitingSeek(proxy)) {
-      // A frame step is a delta, identical on either clock.
-      pendingSeek.mainT += dir * FRAME;
-      syncRateButtons();
-      render();
-      return;
-    }
-    var r = range(proxy);
-    var t = proxy.currentTime + dir * FRAME;
+
+    var base = awaitingSeek(main) ? playhead(main) : main.currentTime;
+    var t = frameCentre(frameIndexAt(base) + dir);
+    var r = range(main);
     if (r) t = Math.max(r.start, Math.min(r.end, t));
-    proxy.currentTime = t;
+    main.currentTime = t;
     syncRateButtons();
     render();
-    scheduleJogSettle();
-  }
-
-  /// After the last frame step, show the frame at full resolution.
-  ///
-  /// Re-armed on every step, so holding the button keeps the responsive
-  /// low-resolution path and only the final position is re-rendered from the
-  /// main rendition.
-  function scheduleJogSettle() {
-    if (jogSettleTimer) clearTimeout(jogSettleTimer);
-    jogSettleTimer = setTimeout(function () {
-      jogSettleTimer = null;
-      if (mode !== "jog") return;   // play/scrub/shuttle took over
-      setMode("scrub");             // converts the position across timelines
-      main.pause();
-      syncRateButtons();
-      render();
-    }, JOG_SETTLE_MS);
   }
 
   // ── shuttle ────────────────────────────────────────────────────────────
@@ -442,7 +422,6 @@
   // stays ~FPS/s no matter the speed — at 8x we present every 8th frame,
   // not every frame. That is what keeps it sustainable on a tablet.
   function startShuttle(r) {
-    cancelJogSettle();
     ensureProxy();
     setMode("shuttle");
     proxy.pause();
@@ -486,15 +465,6 @@
     if (shuttleRAF !== null) { cancelAnimationFrame(shuttleRAF); shuttleRAF = null; }
   }
 
-  /// Drop a pending jog settle. Anything that deliberately changes what is on
-  /// screen must call this, or the timer fires afterwards and switches modes
-  /// underneath it.
-  function cancelJogSettle() {
-    if (jogSettleTimer) {
-      clearTimeout(jogSettleTimer);
-      jogSettleTimer = null;
-    }
-  }
 
   function setRate(r) {
     fail("");
@@ -551,7 +521,6 @@
 
   function beginScrub() {
     if (scrubbing) return;
-    cancelJogSettle();
     scrubbing = true;
     var v = activeVideo();
     // `rate < 0` counts as playing: a reverse shuttle drives currentTime
@@ -627,10 +596,10 @@
       var atLive = liveState;
       document.body.dataset.live = atLive ? "1" : "0";
       document.getElementById("badge").textContent =
-        mode === "jog" ? "jog" : mode === "shuttle" ? (rate > 0 ? rate + "x" : rate + "x") :
+        mode === "shuttle" ? (rate > 0 ? rate + "x" : rate + "x") :
         atLive ? "live" : "delayed";
     }
-    status.textContent = mode + " | " + (mode === "jog" || mode === "shuttle" ? "proxy" : "main") +
+    status.textContent = mode + " | " + (mode === "shuttle" ? "proxy" : "main") +
                          " | " + (rate > 0 ? rate + "x" : rate + "x");
     if (dbg) renderDebug();
   }
@@ -677,7 +646,6 @@
   // the control you want, without first reading the button to find out what
   // it currently means.
   btnPlay.addEventListener("click", function () {
-    cancelJogSettle();
     stopShuttle();
     if (mode === "jog") setMode("scrub");
     setRate(rate > 0 ? rate : 1);
@@ -694,9 +662,8 @@
   /// so a stopped transport shows the full-resolution frame rather than the
   /// low-res proxy still.
   function pauseTransport() {
-    cancelJogSettle();
     stopShuttle();
-    if (mode === "shuttle" || mode === "jog") setMode("scrub");
+    if (mode === "shuttle") setMode("scrub");
     rate = 1;
     main.pause();
     proxy.pause();
