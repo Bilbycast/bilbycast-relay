@@ -163,6 +163,8 @@ with a TLS-terminating proxy for the browser secure context.
     "require_ingest_token": true,
     "max_viewers_per_ip": 256,
     "origin_window_segments": 8,
+    "origin_retention_secs": 60,
+    "origin_max_bytes_per_stream": 8589934592,
     "cascade_sources": []
   }
 }
