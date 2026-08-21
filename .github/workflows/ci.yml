@@ -1,0 +1,119 @@
+name: CI
+
+# The repo's first CI. Until now `nightly-release.yml` was the only workflow
+# this repo has ever had — it triggers on `workflow_dispatch` and
+# `push.tags: v*`, and its only build step is `cargo build --release`, which
+# does not compile test targets. So no `cargo test`, no `cargo clippy` and no
+# `cargo check --all-targets` had ever run automatically, and the first
+# automated build of any change was the release build, *after* the tag was
+# pushed. See issue #3.
+#
+# (The CodeQL runs visible on this repo come from GitHub's default
+# code-scanning setup, not from a workflow file here, and CodeQL runs neither
+# the test suite nor clippy.)
+#
+# This file sits BESIDE the release workflow and must not replace or rename it:
+# `nightly-release.yml` is baked into the cosign `--certificate-identity-regexp`
+# in that file, so renaming it invalidates every published `manifest.sig.bundle`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Both triggers are branch-scoped on purpose.
+#
+# An unfiltered `push` also fires on tag refs, so every `release-all.sh` run
+# would spin this whole job up on the tag ref, racing the Release build for the
+# same runner pool and the same repo cache. Scoping to `main` also removes the
+# push/PR double-run for free: a PR branch push no longer matches `push`, so
+# only `pull_request` runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deliberately narrower than the release workflow, which needs `contents: write`
+# (it pushes tags) and `id-token: write` (it mints a Fulcio cert). CI needs
+# neither, so a compromised action in this path cannot do either.
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+
+    env:
+      # Six cargo invocations (check/clippy/test across two feature configs)
+      # share one target dir. Debug info is the dominant term in target-dir
+      # size and link time, and nothing here debugs a CI binary — panics still
+      # carry file and line, which is all the test output uses. bilbycast-manager
+      # added this after `ld` died with SIGBUS on a full filesystem; this repo
+      # is a single crate rather than a workspace plus npm plus Postgres, so it
+      # is preventative here rather than a fix for an observed failure.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      # Registry dependencies are compiled with `--cap-lints allow`, so this
+      # only promotes warnings in this crate's own code.
+      RUSTFLAGS: "-D warnings"
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # A disjoint namespace from the release workflow on purpose. Release
+          # uses the prefix `<target>-cargo-relay-` (a musl target,
+          # release profile, LTO), and caches written on `main` are readable
+          # from tag refs — so a shared prefix would drop this host-gnu dev
+          # profile `target/` into a musl release build.
+          key: ci-gnu-cargo-relay-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-gnu-cargo-relay-
+
+      # ---------------------------------------------------------------
+      # Default features: the pure opaque forwarder.
+      # ---------------------------------------------------------------
+      - name: cargo check (default features)
+        run: cargo check --all-targets
+
+      # The accepted-lint set lives in `[lints.clippy]` in Cargo.toml, one
+      # documented reason per entry — so this is `-D warnings` with no inline
+      # `-A` flags to drift out of sync with the manifest.
+      - name: cargo clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test (default features)
+        run: cargo test
+
+      # ---------------------------------------------------------------
+      # `viewer-distribution`: the WHEP SFU + LL-HLS/CMAF origin.
+      #
+      # This half is NOT optional coverage. The feature is off by default, so
+      # every command above compiles right past `src/distribution/` — 12 files
+      # and ~4.5k lines, including the whole WebRTC session and token surface.
+      # Before this workflow existed, the only thing that ever built that code
+      # was `cargo build --release --features viewer-distribution-vendored` in
+      # the release job, which compiles no test targets and runs no lint. The
+      # first run of this step found a test in there that had been failing
+      # about one run in sixteen since it was written
+      # (`tampered_signature_rejected`).
+      #
+      # Uses plain `viewer-distribution` rather than the release's
+      # `viewer-distribution-vendored`: the two compile the same Rust, and the
+      # vendored variant differs only by statically building OpenSSL, which
+      # costs several minutes and proves nothing extra about this code.
+      # ---------------------------------------------------------------
+      - name: cargo check (viewer-distribution)
+        run: cargo check --all-targets --features viewer-distribution
+
+      - name: cargo clippy (viewer-distribution)
+        run: cargo clippy --all-targets --features viewer-distribution -- -D warnings
+
+      - name: cargo test (viewer-distribution)
+        run: cargo test --features viewer-distribution

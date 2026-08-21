@@ -260,3 +260,21 @@ Integration tests (`tests/integration.rs`) spin up the full QUIC relay, connect 
 `tests/distribution.rs` (requires `--features viewer-distribution`) exercises the **real** `bilbycast_relay::distribution` code via the library target, including **real-network** end-to-end coverage: QUIC ES ingest → hub → subscriber; a WHEP viewer completing ICE + DTLS + SRTP and receiving decrypted media; and a WHIP client pushing H.264 over DTLS/SRTP that the relay depacketizes + reassembles into access units. Browser interop, cellular-hardware e2e, and multi-relay cascade at scale remain to be verified on real infrastructure.
 
 Test coverage: tunnel state transitions (waiting/active), bidirectional TCP forwarding, UDP datagram forwarding, ping/pong keepalive.
+
+**CI** (`.github/workflows/ci.yml`, added for issue #3): `cargo check` + `cargo
+clippy -D warnings` + `cargo test` on **both** feature configurations — default
+(the opaque forwarder) and `viewer-distribution`. The second half is not
+optional coverage: the feature is off by default, so a default-only run compiles
+right past `src/distribution/` entirely. Before this workflow the only thing that
+ever built that code was the release job's `cargo build --release`, which
+compiles no test targets and runs no lint — which is how
+`tampered_signature_rejected` sat failing roughly one run in sixteen without
+anyone seeing it.
+
+The accepted-lint set lives in `[lints.clippy]` in `Cargo.toml`, one documented
+reason per entry, so CI runs `-D warnings` with no inline `-A` flags to drift out
+of sync with the manifest.
+
+Triggers are branch-scoped (`branches: [main]` on both `push` and
+`pull_request`) — an unfiltered `push` also fires on tag refs, which would race
+`release-all.sh` for the same runner pool and cache.
