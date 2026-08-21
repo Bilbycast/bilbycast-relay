@@ -105,11 +105,32 @@ pub struct RelayStats {
     pub distribution_bytes_out: AtomicU64,
     /// Bytes currently held in the LL-HLS origin cache.
     pub distribution_origin_bytes: AtomicU64,
+    /// Per-stream breakdown of the above. An `ArcSwap` rather than an atomic
+    /// because it is a list; published on the same slow telemetry tick, read
+    /// by the health builder — never on a media path.
+    pub distribution_origin_streams: arc_swap::ArcSwap<Vec<OriginStreamUsage>>,
     /// Viewer sessions that had a datagram refused by the WebRTC ingress
     /// source pin (`webrtc::session::PeerPin`). One per session, not per
     /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
     /// viewer whose IP changed mid-session.
     pub distribution_offpath_sessions: AtomicU64,
+}
+
+/// What one origin stream is costing on disk.
+///
+/// `origin_bytes` alone says the node is full but not which stream filled it,
+/// which is the question actually asked at that moment. Plain data (no
+/// feature-gated types) so this compiles on a plain forwarder build.
+#[derive(Debug, Clone, Serialize)]
+pub struct OriginStreamUsage {
+    pub stream: String,
+    pub segments: u64,
+    pub bytes: u64,
+    /// Seconds since the last successful PUT.
+    pub idle_secs: u64,
+    /// Whether a per-stream retention override is in force, so the operator
+    /// can tell a deliberately long window from a drifted one.
+    pub policy_overridden: bool,
 }
 
 /// Snapshot of the distribution subsystem telemetry.
@@ -121,6 +142,8 @@ pub struct DistributionStatsSnapshot {
     pub bytes_out: u64,
     pub origin_bytes: u64,
     pub offpath_sessions: u64,
+    /// Per-stream breakdown of `origin_bytes`.
+    pub origin_streams: Vec<OriginStreamUsage>,
 }
 
 /// Current wall-clock epoch in milliseconds (saturating to 0 before 1970).
@@ -165,6 +188,7 @@ impl RelayStats {
             distribution_viewers: AtomicU64::new(0),
             distribution_bytes_out: AtomicU64::new(0),
             distribution_origin_bytes: AtomicU64::new(0),
+            distribution_origin_streams: arc_swap::ArcSwap::from_pointee(Vec::new()),
             distribution_offpath_sessions: AtomicU64::new(0),
         }
     }
@@ -177,7 +201,10 @@ impl RelayStats {
         bytes_out: u64,
         origin_bytes: u64,
         offpath_sessions: u64,
+        origin_streams: Vec<OriginStreamUsage>,
     ) {
+        self.distribution_origin_streams
+            .store(std::sync::Arc::new(origin_streams));
         self.distribution_enabled.store(true, Ordering::Relaxed);
         self.distribution_streams.store(streams, Ordering::Relaxed);
         self.distribution_viewers.store(viewers, Ordering::Relaxed);
@@ -199,6 +226,7 @@ impl RelayStats {
             bytes_out: self.distribution_bytes_out.load(Ordering::Relaxed),
             origin_bytes: self.distribution_origin_bytes.load(Ordering::Relaxed),
             offpath_sessions: self.distribution_offpath_sessions.load(Ordering::Relaxed),
+            origin_streams: self.distribution_origin_streams.load().as_ref().clone(),
         })
     }
 

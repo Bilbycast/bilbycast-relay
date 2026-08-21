@@ -50,10 +50,49 @@ impl RuntimeDistConfig {
     }
 }
 
+/// A partial change to one origin retention policy. Every field is optional;
+/// an absent field inherits whatever it is being applied to.
+///
+/// Seconds and bytes rather than `Duration` because this is the wire shape the
+/// manager sends, and it is applied on the far side of a JSON boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OriginPolicyPatch {
+    pub retention_secs: Option<u64>,
+    pub max_bytes_per_stream: Option<u64>,
+    pub min_segments: Option<usize>,
+    pub idle_grace_secs: Option<u64>,
+}
+
+impl OriginPolicyPatch {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The manager's storage-policy push: a node-wide default plus per-stream
+/// overrides.
+///
+/// A per-stream entry is applied **on top of the resulting default**, so an
+/// override that names only `retention_secs` still gets the node's byte bound
+/// and floor rather than zeroes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OriginPolicyUpdate {
+    pub default: Option<OriginPolicyPatch>,
+    /// `Some` **replaces** the whole override set (an ended session's override
+    /// must not survive); `None` leaves the existing set untouched.
+    pub per_stream: Option<Vec<(String, OriginPolicyPatch)>>,
+}
+
 /// Shared, lock-free runtime config + a cascade-source change channel.
 pub struct DistributionControl {
     cfg: ArcSwap<RuntimeDistConfig>,
     cascade_tx: watch::Sender<Vec<CascadeSource>>,
+    /// Storage-policy pushes. A `watch` like the cascade channel: the origin
+    /// store is the single consumer and only ever needs the latest value.
+    origin_tx: watch::Sender<OriginPolicyUpdate>,
+    /// Keeps `origin_tx` with a receiver so `send` never errors before the
+    /// origin subscribes.
+    origin_keep: watch::Receiver<OriginPolicyUpdate>,
     /// Kept so `cascade_tx.send` always has a receiver (never errors) even
     /// before the cascade supervisor subscribes; also read by `cascade_now`.
     cascade_keep: watch::Receiver<Vec<CascadeSource>>,
@@ -62,11 +101,29 @@ pub struct DistributionControl {
 impl DistributionControl {
     pub fn new(initial: RuntimeDistConfig, cascade: Vec<CascadeSource>) -> Arc<Self> {
         let (cascade_tx, keep) = watch::channel(cascade);
+        let (origin_tx, origin_keep) = watch::channel(OriginPolicyUpdate::default());
         Arc::new(Self {
             cfg: ArcSwap::from_pointee(initial),
             cascade_tx,
             cascade_keep: keep,
+            origin_tx,
+            origin_keep,
         })
+    }
+
+    /// Subscribe to storage-policy pushes (the origin store).
+    pub fn subscribe_origin(&self) -> watch::Receiver<OriginPolicyUpdate> {
+        self.origin_tx.subscribe()
+    }
+
+    /// Current storage policy push (for persistence / reporting).
+    pub fn origin_policy_now(&self) -> OriginPolicyUpdate {
+        self.origin_keep.borrow().clone()
+    }
+
+    /// Push a storage-policy change (manager). The origin store applies it.
+    pub fn set_origin_policy(&self, update: OriginPolicyUpdate) {
+        let _ = self.origin_tx.send(update);
     }
 
     /// Current cascade-source list (for persistence to config.json).

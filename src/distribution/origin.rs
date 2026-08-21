@@ -67,6 +67,78 @@ pub struct OriginConfig {
     pub idle_grace: Duration,
 }
 
+impl OriginConfig {
+    /// The retention knobs on their own, as the store's starting policy.
+    pub fn policy(&self) -> OriginPolicy {
+        OriginPolicy {
+            retention: self.retention,
+            max_bytes_per_stream: self.max_bytes_per_stream,
+            min_segments: self.min_segments,
+            idle_grace: self.idle_grace,
+        }
+    }
+}
+
+/// The retention knobs, separated from `root` because these four are the ones
+/// the manager owns and can change while the relay runs — per relay, or for
+/// one stream.
+///
+/// A DVR session is the reason it has to be per stream: a 60-minute window on
+/// one feed and a 5-minute window on the rest of the node are not reconcilable
+/// through a single node-wide number, and sizing the node-wide number to the
+/// longest session would hold every other stream's disk for an hour.
+///
+/// `root` deliberately stays out: moving the storage directory under a running
+/// store would strand every segment already written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginPolicy {
+    pub retention: Duration,
+    pub max_bytes_per_stream: u64,
+    pub min_segments: usize,
+    pub idle_grace: Duration,
+}
+
+impl OriginPolicy {
+    /// This policy with the patch's present fields overlaid.
+    ///
+    /// The floor is held at 1: a `min_segments` of 0 lets a live stream be
+    /// evicted to nothing between a player's manifest fetch and its segment
+    /// fetch, which is a 404 mid-playback rather than a shorter window.
+    pub fn patched(self, p: &crate::distribution_control::OriginPolicyPatch) -> Self {
+        Self {
+            retention: p
+                .retention_secs
+                .map(Duration::from_secs)
+                .unwrap_or(self.retention),
+            max_bytes_per_stream: p
+                .max_bytes_per_stream
+                .unwrap_or(self.max_bytes_per_stream),
+            min_segments: p.min_segments.unwrap_or(self.min_segments).max(1),
+            idle_grace: p
+                .idle_grace_secs
+                .map(Duration::from_secs)
+                .unwrap_or(self.idle_grace),
+        }
+    }
+}
+
+/// What one stream is currently costing, for the manager's health report.
+///
+/// Without this the operator can see the node's total disk but not which
+/// stream is spending it, which is the question actually asked when a volume
+/// fills.
+#[derive(Debug, Clone)]
+pub struct StreamUsage {
+    pub stream: String,
+    pub segments: usize,
+    pub bytes: u64,
+    /// Seconds since the last successful PUT — how stale this stream is.
+    pub idle_secs: u64,
+    /// True when a per-stream override is in force rather than the node
+    /// default, so the operator can tell a deliberate window from a drifted one.
+    pub policy_overridden: bool,
+}
+
 /// An object served to a player or CDN.
 pub struct ObjectResponse {
     pub bytes: Bytes,
@@ -139,6 +211,13 @@ impl StreamOrigin {
 /// opaque-bytes contract the in-memory version had.
 pub struct OriginStore {
     cfg: OriginConfig,
+    /// Live node-wide retention policy. Seeded from `cfg`, then owned by the
+    /// manager. Read on every PUT and every sweep, so it is an `ArcSwap`
+    /// rather than a lock.
+    policy: arc_swap::ArcSwap<OriginPolicy>,
+    /// Per-stream overrides, keyed by stream id. An entry here wins over
+    /// `policy` for that stream and nothing else.
+    stream_policy: DashMap<String, OriginPolicy>,
     streams: DashMap<String, Arc<StreamOrigin>>,
     total_bytes: AtomicU64,
     /// Anchor for `last_put_ms`, so idle time needs no wall clock.
@@ -157,12 +236,98 @@ impl OriginStore {
             std::fs::remove_dir_all(&cfg.root)?;
         }
         std::fs::create_dir_all(&cfg.root)?;
+        let policy = arc_swap::ArcSwap::from_pointee(cfg.policy());
         Ok(Self {
             cfg,
+            policy,
+            stream_policy: DashMap::new(),
             streams: DashMap::new(),
             total_bytes: AtomicU64::new(0),
             started: Instant::now(),
         })
+    }
+
+    /// The policy in force for one stream: its override if it has one, else
+    /// the node-wide default.
+    pub fn policy_for(&self, stream: &str) -> OriginPolicy {
+        if let Some(p) = self.stream_policy.get(stream) {
+            return *p;
+        }
+        **self.policy.load()
+    }
+
+    /// The node-wide default currently in force.
+    pub fn default_policy(&self) -> OriginPolicy {
+        **self.policy.load()
+    }
+
+    /// Replace the node-wide default (manager push). Streams carrying an
+    /// override are unaffected.
+    pub fn set_default_policy(&self, policy: OriginPolicy) {
+        self.policy.store(Arc::new(policy));
+    }
+
+    /// Apply a manager storage-policy push.
+    ///
+    /// Per-stream entries are patched against the **resulting** default, so an
+    /// override naming only one field inherits the rest of the node policy
+    /// rather than defaulting it to zero.
+    pub fn apply_policy_update(
+        &self,
+        update: &crate::distribution_control::OriginPolicyUpdate,
+    ) {
+        let base = self.default_policy();
+        let next_default = match &update.default {
+            Some(p) => base.patched(p),
+            None => base,
+        };
+        self.set_default_policy(next_default);
+        if let Some(list) = &update.per_stream {
+            self.set_stream_policies(
+                list.iter()
+                    .map(|(s, p)| (s.clone(), next_default.patched(p)))
+                    .collect(),
+            );
+        }
+    }
+
+    /// Replace the whole set of per-stream overrides.
+    ///
+    /// Deliberately a replace rather than a merge: the manager holds the
+    /// authoritative session list, and a merge would leave an override behind
+    /// after its session ended, quietly pinning that stream's disk at the old
+    /// window for as long as the relay ran.
+    pub fn set_stream_policies(&self, policies: Vec<(String, OriginPolicy)>) {
+        let incoming: std::collections::HashSet<&str> =
+            policies.iter().map(|(s, _)| s.as_str()).collect();
+        self.stream_policy
+            .retain(|k, _| incoming.contains(k.as_str()));
+        for (stream, p) in policies {
+            self.stream_policy.insert(stream, p);
+        }
+    }
+
+    /// Per-stream disk usage, newest-first by idle time, for health reporting.
+    pub fn usage(&self) -> Vec<StreamUsage> {
+        let now_ms = self.now_ms();
+        let mut out: Vec<StreamUsage> = self
+            .streams
+            .iter()
+            .map(|e| {
+                let o = e.value();
+                StreamUsage {
+                    stream: e.key().clone(),
+                    segments: o.segments.len(),
+                    bytes: o.bytes.load(Ordering::Relaxed),
+                    idle_secs: now_ms
+                        .saturating_sub(o.last_put_ms.load(Ordering::Relaxed))
+                        / 1000,
+                    policy_overridden: self.stream_policy.contains_key(e.key()),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.idle_secs.cmp(&b.idle_secs).then(a.stream.cmp(&b.stream)));
+        out
     }
 
     fn ensure(&self, stream: &str) -> Arc<StreamOrigin> {
@@ -221,7 +386,8 @@ impl OriginStore {
         origin.bytes.fetch_add(len, Ordering::Relaxed);
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
 
-        self.evict(&origin, self.cfg.min_segments).await;
+        let pol = self.policy_for(stream);
+        self.evict(&origin, &pol, pol.min_segments).await;
         Ok(())
     }
 
@@ -233,7 +399,7 @@ impl OriginStore {
     /// passes 0 for a stream that has stopped publishing: there is no live
     /// player to protect and the floor would otherwise pin those segments on
     /// disk forever.
-    async fn evict(&self, origin: &StreamOrigin, floor: usize) {
+    async fn evict(&self, origin: &StreamOrigin, pol: &OriginPolicy, floor: usize) {
         loop {
             let mut order = origin.order.lock().await;
             if order.len() <= floor {
@@ -247,8 +413,8 @@ impl OriginStore {
                 order.pop_front();
                 continue;
             };
-            let too_old = meta.stored_at.elapsed() >= self.cfg.retention;
-            let too_big = origin.bytes.load(Ordering::Relaxed) > self.cfg.max_bytes_per_stream;
+            let too_old = meta.stored_at.elapsed() >= pol.retention;
+            let too_big = origin.bytes.load(Ordering::Relaxed) > pol.max_bytes_per_stream;
             if !too_old && !too_big {
                 break;
             }
@@ -332,17 +498,20 @@ impl OriginStore {
     /// directory plus a manifest advertising nothing.
     pub async fn sweep(&self) {
         let now_ms = self.now_ms();
-        let idle_cutoff = (self.cfg.retention + self.cfg.idle_grace).as_millis() as u64;
 
         let names: Vec<String> = self.streams.iter().map(|e| e.key().clone()).collect();
         for name in names {
             let Some(origin) = self.streams.get(&name).map(|s| s.clone()) else {
                 continue;
             };
+            // Resolved per stream, so a stream with a long session window is
+            // not reclaimed on the node's shorter default.
+            let pol = self.policy_for(&name);
+            let idle_cutoff = (pol.retention + pol.idle_grace).as_millis() as u64;
             let idle_ms = now_ms.saturating_sub(origin.last_put_ms.load(Ordering::Relaxed));
             let dead = idle_ms >= idle_cutoff;
 
-            self.evict(&origin, if dead { 0 } else { self.cfg.min_segments })
+            self.evict(&origin, &pol, if dead { 0 } else { pol.min_segments })
                 .await;
 
             if dead && origin.order.lock().await.is_empty() {
@@ -562,6 +731,138 @@ mod tests {
         s.put(stream, name, Bytes::from(vec![0u8; len]))
             .await
             .expect("put should succeed");
+    }
+
+    use crate::distribution_control::{OriginPolicyPatch, OriginPolicyUpdate};
+
+    fn patch_bytes(n: u64) -> OriginPolicyPatch {
+        OriginPolicyPatch {
+            max_bytes_per_stream: Some(n),
+            ..Default::default()
+        }
+    }
+
+    /// A per-stream override must bound only its own stream.
+    ///
+    /// This is the whole point of the per-stream layer: a DVR session's long
+    /// window must not be imposed on every other stream on the node, and the
+    /// node default must not truncate the session.
+    #[tokio::test]
+    async fn a_stream_override_bounds_only_that_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 1);
+        s.apply_policy_update(&OriginPolicyUpdate {
+            default: Some(patch_bytes(16 * 1024 * 1024)),
+            per_stream: Some(vec![("tight".into(), patch_bytes(30))]),
+        });
+
+        for i in 0..6 {
+            put_seg(&s, "tight", &format!("seg{i}.m4s"), 10).await;
+            put_seg(&s, "roomy", &format!("seg{i}.m4s"), 10).await;
+        }
+
+        // 30-byte bound at 10 bytes a segment: the oldest are gone.
+        assert!(s.get("tight", "seg0.m4s").await.is_none());
+        assert!(s.get("tight", "seg5.m4s").await.is_some());
+        // The node default is 16 MiB, so nothing was evicted here.
+        assert!(
+            s.get("roomy", "seg0.m4s").await.is_some(),
+            "the override must not apply to a stream it does not name"
+        );
+    }
+
+    /// An override that names one field must inherit the rest of the node
+    /// policy, not zero it. A `max_bytes` of 0 would evict every segment on
+    /// arrival -- a stream that accepts PUTs and serves an empty window.
+    #[test]
+    fn an_override_inherits_the_fields_it_does_not_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 4);
+        s.apply_policy_update(&OriginPolicyUpdate {
+            default: None,
+            per_stream: Some(vec![(
+                "one".into(),
+                OriginPolicyPatch {
+                    retention_secs: Some(60),
+                    ..Default::default()
+                },
+            )]),
+        });
+        let p = s.policy_for("one");
+        assert_eq!(p.retention, Duration::from_secs(60));
+        assert_eq!(p.max_bytes_per_stream, 1 << 30, "byte bound must be inherited");
+        assert_eq!(p.min_segments, 4, "floor must be inherited");
+    }
+
+    /// Pushing a new override set must drop the overrides it omits.
+    ///
+    /// A merge would leave an ended session's window in force for the life of
+    /// the relay, pinning that stream's disk with nothing left to say so.
+    #[test]
+    fn a_new_override_set_replaces_the_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 1);
+        s.apply_policy_update(&OriginPolicyUpdate {
+            default: None,
+            per_stream: Some(vec![
+                ("a".into(), patch_bytes(30)),
+                ("b".into(), patch_bytes(30)),
+            ]),
+        });
+        assert_eq!(s.policy_for("a").max_bytes_per_stream, 30);
+
+        // "a" is not named this time, so it must fall back to the default.
+        s.apply_policy_update(&OriginPolicyUpdate {
+            default: None,
+            per_stream: Some(vec![("b".into(), patch_bytes(30))]),
+        });
+        assert_eq!(
+            s.policy_for("a").max_bytes_per_stream,
+            1 << 30,
+            "an omitted stream must revert to the node default"
+        );
+        assert_eq!(s.policy_for("b").max_bytes_per_stream, 30);
+    }
+
+    /// `min_segments` may never reach 0: a live stream evicted to nothing
+    /// between a player's manifest fetch and its segment fetch is a 404
+    /// mid-playback, not a shorter window.
+    #[test]
+    fn the_segment_floor_never_reaches_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        s.apply_policy_update(&OriginPolicyUpdate {
+            default: Some(OriginPolicyPatch {
+                min_segments: Some(0),
+                ..Default::default()
+            }),
+            per_stream: None,
+        });
+        assert_eq!(s.default_policy().min_segments, 1);
+    }
+
+    /// Usage has to name the stream spending the disk -- a node total cannot
+    /// answer the question an operator actually asks when a volume fills.
+    #[tokio::test]
+    async fn usage_reports_bytes_per_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        put_seg(&s, "big", "seg0.m4s", 500).await;
+        put_seg(&s, "big", "seg1.m4s", 500).await;
+        put_seg(&s, "small", "seg0.m4s", 100).await;
+        s.apply_policy_update(&OriginPolicyUpdate {
+            default: None,
+            per_stream: Some(vec![("big".into(), patch_bytes(16 * 1024 * 1024))]),
+        });
+
+        let u = s.usage();
+        assert_eq!(u.len(), 2);
+        let big = u.iter().find(|x| x.stream == "big").unwrap();
+        let small = u.iter().find(|x| x.stream == "small").unwrap();
+        assert_eq!((big.segments, big.bytes), (2, 1000));
+        assert_eq!((small.segments, small.bytes), (1, 100));
+        assert!(big.policy_overridden, "an override must be visible to the operator");
+        assert!(!small.policy_overridden);
     }
 
     #[tokio::test]
