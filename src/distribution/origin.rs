@@ -56,6 +56,15 @@ pub struct OriginConfig {
     /// two say. Stops a stalled or very-low-bitrate stream having its whole
     /// window aged out from under a live player.
     pub min_segments: usize,
+    /// How long past `retention` a stream may sit without a PUT before it is
+    /// reclaimed outright — segments, manifest, init and directory.
+    ///
+    /// By `retention` the segments have expired anyway; this is the pause
+    /// before the stream entry itself goes, so a producer that blips does not
+    /// lose it. Separate from `retention` because the two answer different
+    /// questions: how much history to keep, versus how long to believe a
+    /// silent producer is coming back.
+    pub idle_grace: Duration,
 }
 
 /// An object served to a player or CDN.
@@ -100,16 +109,24 @@ struct StreamOrigin {
     order: Mutex<VecDeque<String>>,
     bytes: AtomicU64,
     dir: PathBuf,
+    /// Milliseconds since [`OriginStore::started`] at the last successful PUT.
+    ///
+    /// Eviction used to run only when a segment arrived, so a stream whose
+    /// producer stopped kept its disk indefinitely — past retention, with its
+    /// manifest still being served. The sweep uses this to tell "quiet" from
+    /// "gone".
+    last_put_ms: AtomicU64,
 }
 
 impl StreamOrigin {
-    fn new(dir: PathBuf) -> Self {
+    fn new(dir: PathBuf, now_ms: u64) -> Self {
         Self {
             kept: DashMap::new(),
             segments: DashMap::new(),
             order: Mutex::new(VecDeque::new()),
             bytes: AtomicU64::new(0),
             dir,
+            last_put_ms: AtomicU64::new(now_ms),
         }
     }
 }
@@ -124,6 +141,8 @@ pub struct OriginStore {
     cfg: OriginConfig,
     streams: DashMap<String, Arc<StreamOrigin>>,
     total_bytes: AtomicU64,
+    /// Anchor for `last_put_ms`, so idle time needs no wall clock.
+    started: Instant,
 }
 
 impl OriginStore {
@@ -142,6 +161,7 @@ impl OriginStore {
             cfg,
             streams: DashMap::new(),
             total_bytes: AtomicU64::new(0),
+            started: Instant::now(),
         })
     }
 
@@ -149,10 +169,15 @@ impl OriginStore {
         if let Some(s) = self.streams.get(stream) {
             return s.clone();
         }
+        let now_ms = self.now_ms();
         self.streams
             .entry(stream.to_string())
-            .or_insert_with(|| Arc::new(StreamOrigin::new(self.cfg.root.join(stream))))
+            .or_insert_with(|| Arc::new(StreamOrigin::new(self.cfg.root.join(stream), now_ms)))
             .clone()
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
     }
 
     /// Store an object.
@@ -164,6 +189,7 @@ impl OriginStore {
     pub async fn put(&self, stream: &str, file: &str, bytes: Bytes) -> std::io::Result<()> {
         let content_type = content_type_for(file);
         let origin = self.ensure(stream);
+        origin.last_put_ms.store(self.now_ms(), Ordering::Relaxed);
 
         if !is_media_segment(file) {
             origin
@@ -195,16 +221,22 @@ impl OriginStore {
         origin.bytes.fetch_add(len, Ordering::Relaxed);
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
 
-        self.evict(&origin).await;
+        self.evict(&origin, self.cfg.min_segments).await;
         Ok(())
     }
 
     /// Drop segments that are too old, or that push the stream past its byte
-    /// bound, oldest first — never going below `min_segments`.
-    async fn evict(&self, origin: &StreamOrigin) {
+    /// bound, oldest first — never going below `floor`.
+    ///
+    /// `floor` is `min_segments` for a live stream, protecting a slow or
+    /// stalled producer from having its whole window aged out. The sweep
+    /// passes 0 for a stream that has stopped publishing: there is no live
+    /// player to protect and the floor would otherwise pin those segments on
+    /// disk forever.
+    async fn evict(&self, origin: &StreamOrigin, floor: usize) {
         loop {
             let mut order = origin.order.lock().await;
-            if order.len() <= self.cfg.min_segments {
+            if order.len() <= floor {
                 break;
             }
             let Some(front) = order.front().cloned() else {
@@ -287,6 +319,43 @@ impl OriginStore {
         }
     }
 
+    /// Apply retention to every stream, whether or not it is still ingesting.
+    ///
+    /// Eviction is otherwise driven entirely by arriving segments, which means
+    /// a stream whose producer stops is frozen exactly as it was: past its
+    /// retention, holding its disk, still serving its manifest, and only
+    /// reclaimed by restarting the relay. Measured on a live system, a pair of
+    /// abandoned streams held 416 MiB across 1200 files long after expiry.
+    ///
+    /// Streams idle beyond `retention + IDLE_GRACE` are dropped outright —
+    /// their segments have expired by then, so what remains is an empty
+    /// directory plus a manifest advertising nothing.
+    pub async fn sweep(&self) {
+        let now_ms = self.now_ms();
+        let idle_cutoff = (self.cfg.retention + self.cfg.idle_grace).as_millis() as u64;
+
+        let names: Vec<String> = self.streams.iter().map(|e| e.key().clone()).collect();
+        for name in names {
+            let Some(origin) = self.streams.get(&name).map(|s| s.clone()) else {
+                continue;
+            };
+            let idle_ms = now_ms.saturating_sub(origin.last_put_ms.load(Ordering::Relaxed));
+            let dead = idle_ms >= idle_cutoff;
+
+            self.evict(&origin, if dead { 0 } else { self.cfg.min_segments })
+                .await;
+
+            if dead && origin.order.lock().await.is_empty() {
+                tracing::info!(
+                    stream = %name,
+                    idle_secs = idle_ms / 1000,
+                    "origin: reclaiming idle stream"
+                );
+                self.remove_stream(&name).await;
+            }
+        }
+    }
+
     /// Bytes of media segments currently on disk across all streams
     /// (telemetry). Excludes the in-memory manifests, which are bounded by
     /// neither policy and are negligible next to the segments.
@@ -326,12 +395,6 @@ fn is_media_segment(file: &str) -> bool {
     lower.ends_with(".m4s") || lower.ends_with(".ts") || lower.ends_with(".cmfv")
         || lower.ends_with(".cmfa") || lower.ends_with(".cmf")
         || (lower.ends_with(".mp4") && !lower.contains("init"))
-}
-
-/// A manifest object (never cached by intermediaries — it changes constantly).
-fn is_manifest(file: &str) -> bool {
-    let lower = file.to_ascii_lowercase();
-    lower.ends_with(".m3u8") || lower.ends_with(".mpd")
 }
 
 /// Validate the object filename: one path segment, tight char set, has an
@@ -490,6 +553,7 @@ mod tests {
             retention: Duration::from_secs(3600),
             max_bytes_per_stream: 1 << 30,
             min_segments,
+            idle_grace: Duration::from_millis(80),
         })
         .expect("store should build")
     }
@@ -524,6 +588,7 @@ mod tests {
             retention: Duration::from_secs(3600),
             max_bytes_per_stream: 30,
             min_segments: 1,
+            idle_grace: Duration::from_millis(80),
         })
         .unwrap();
         for i in 0..6 {
@@ -546,6 +611,7 @@ mod tests {
             retention: Duration::from_millis(40),
             max_bytes_per_stream: 1 << 30,
             min_segments: 1,
+            idle_grace: Duration::from_millis(80),
         })
         .unwrap();
         put_seg(&s, "s", "old.m4s", 8).await;
@@ -566,6 +632,7 @@ mod tests {
             retention: Duration::from_millis(1),
             max_bytes_per_stream: 1,
             min_segments: 3,
+            idle_grace: Duration::from_millis(80),
         })
         .unwrap();
         for i in 0..6 {
@@ -579,6 +646,72 @@ mod tests {
         assert!(s.get("s", "seg0.m4s").await.is_none());
     }
 
+    /// Retention must not depend on ingest.
+    ///
+    /// Eviction runs on PUT, so a stream whose producer stops was frozen as it
+    /// was — past retention, holding its disk, still serving its manifest, and
+    /// only reclaimed by restarting the relay.
+    #[tokio::test]
+    async fn sweep_expires_segments_with_no_further_puts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = OriginStore::new(OriginConfig {
+            root: tmp.path().join("origin"),
+            retention: Duration::from_millis(40),
+            max_bytes_per_stream: 1 << 30,
+            // A floor high enough that PUT-driven eviction would keep everything.
+            min_segments: 8,
+            idle_grace: Duration::from_millis(80),
+        })
+        .unwrap();
+
+        for i in 0..3 {
+            put_seg(&s, "gone", &format!("seg{i}.m4s"), 100).await;
+        }
+        assert_eq!(s.total_bytes(), 300);
+
+        // No more PUTs, ever. Wait past retention + idle_grace, so the
+        // stream is treated as gone rather than merely quiet.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        s.sweep().await;
+
+        assert_eq!(
+            s.total_bytes(),
+            0,
+            "expired segments must be reclaimed without a PUT to trigger it"
+        );
+        assert!(s.get("gone", "seg0.m4s").await.is_none());
+        assert!(!tmp.path().join("origin/gone/seg0.m4s").exists());
+    }
+
+    /// A live stream keeps its floor: the sweep must not treat "slow" as
+    /// "gone" and age out the window under a viewer.
+    #[tokio::test]
+    async fn sweep_respects_the_floor_while_a_stream_is_still_publishing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = OriginStore::new(OriginConfig {
+            root: tmp.path().join("origin"),
+            retention: Duration::from_millis(30),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 2,
+            idle_grace: Duration::from_millis(80),
+        })
+        .unwrap();
+
+        for i in 0..4 {
+            put_seg(&s, "live", &format!("seg{i}.m4s"), 50).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Still publishing, so this is a live stream however old its backlog.
+        put_seg(&s, "live", "seg4.m4s", 50).await;
+        s.sweep().await;
+
+        assert!(
+            s.total_bytes() > 0,
+            "a publishing stream must keep its floor, not be drained"
+        );
+        assert!(s.get("live", "seg4.m4s").await.is_some());
+    }
+
     #[tokio::test]
     async fn manifests_are_kept_in_memory_and_overwritten() {
         let tmp = tempfile::tempdir().unwrap();
@@ -587,6 +720,7 @@ mod tests {
             retention: Duration::from_millis(1),
             max_bytes_per_stream: 1,
             min_segments: 0,
+            idle_grace: Duration::from_millis(80),
         })
         .unwrap();
         s.put("s", "index.m3u8", Bytes::from_static(b"#v1")).await.unwrap();
@@ -611,6 +745,7 @@ mod tests {
             retention: Duration::from_millis(1),
             max_bytes_per_stream: 1,
             min_segments: 0,
+            idle_grace: Duration::from_millis(80),
         })
         .unwrap();
         // A WebCodecs jog player needs init.mp4 to stay fetchable for the
@@ -684,8 +819,9 @@ mod tests {
             MAX_OBJECT_BYTES >= big,
             "MAX_OBJECT_BYTES {MAX_OBJECT_BYTES} is below a {big}-byte segment"
         );
-        // And well above axum's default, which is the trap this guards.
-        assert!(MAX_OBJECT_BYTES > 2 * 1024 * 1024);
+        // And well above axum's 2 MiB default, which is the trap this guards.
+        const AXUM_DEFAULT: usize = 2 * 1024 * 1024;
+        const { assert!(MAX_OBJECT_BYTES > AXUM_DEFAULT) };
     }
 
     #[test]

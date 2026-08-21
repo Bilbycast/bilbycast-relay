@@ -125,6 +125,7 @@ pub async fn run_distribution(
         retention: std::time::Duration::from_secs(config.origin_retention_secs),
         max_bytes_per_stream: config.origin_max_bytes_per_stream,
         min_segments: config.origin_window_segments,
+        idle_grace: std::time::Duration::from_secs(60),
     };
     tracing::info!(
         root = %origin_cfg.root.display(),
@@ -134,6 +135,24 @@ pub async fn run_distribution(
         "distribution origin: disk-backed store"
     );
     let origin = Arc::new(OriginStore::new(origin_cfg)?);
+
+    // Retention sweep. Eviction is otherwise driven only by arriving segments,
+    // so a stream whose producer stops keeps its disk indefinitely — past
+    // retention, still serving its manifest, reclaimed only by a restart.
+    {
+        let origin = origin.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => origin.sweep().await,
+                }
+            }
+        });
+    }
 
     // Telemetry: periodically publish hub + origin counters onto RelayStats so
     // the manager-client health builder (and the local REST/metrics surface)
