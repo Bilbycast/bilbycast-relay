@@ -105,9 +105,53 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Verify a viewer token (WHEP access).
+/// Suffixes that mark a stream as a **derived rendition** of another.
+///
+/// A viewer token is minted for a *source*, and covers that source's derived
+/// renditions as well. Kept as one named list rather than open-ended prefix
+/// matching, so what a token grants stays enumerable.
+const RENDITION_SUFFIXES: &[&str] = &["-proxy"];
+
+/// The source a derived rendition belongs to, if this name is one.
+///
+/// `"show-proxy"` -> `Some("show")`; `"show"` -> `None`.
+fn rendition_source(stream: &str) -> Option<&str> {
+    RENDITION_SUFFIXES
+        .iter()
+        .find_map(|suffix| stream.strip_suffix(suffix))
+        .filter(|base| !base.is_empty())
+}
+
+/// Verify a viewer token (WHEP + the origin GET when gated).
+///
+/// **One token covers a source and its derived renditions.** A viewer of the
+/// DVR player is watching one thing, but it is delivered as a *pair* --
+/// `{stream}` for playback and `{stream}-proxy` for shuttle -- and the two are
+/// the same content at two encodings. Requiring a token each meant the main
+/// rendition played while the first shuttle silently buffered nothing, with
+/// `video.error` still null: it read as a broken transport, not an auth
+/// failure.
+///
+/// A token minted for `show` therefore also admits `show-proxy`. The converse
+/// does not hold: a token minted for `show-proxy` admits only `show-proxy`, so
+/// handing someone the low-resolution rendition does not hand them the
+/// full-resolution one.
+///
+/// The consequence to be aware of: an unrelated stream *named* `show-proxy` is
+/// reachable with a `show` token. Rendition names are derived by convention
+/// (`{stream}-proxy`), so that collision is a naming choice, not an accident
+/// waiting to happen -- but it is why the suffix list is closed and why the
+/// widening is here, in one place, rather than spread across the callers.
 pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
-    verify(secret_hex, SCOPE_VIEWER, stream, token)
+    match verify(secret_hex, SCOPE_VIEWER, stream, token) {
+        Ok(()) => Ok(()),
+        Err(e) => match rendition_source(stream) {
+            // Fall back to the source only for a *derived* name, and only
+            // after the exact match has already failed.
+            Some(source) => verify(secret_hex, SCOPE_VIEWER, source, token).map_err(|_| e),
+            None => Err(e),
+        },
+    }
 }
 
 /// Verify an ingest token (edge → relay distribution ingest).
@@ -130,6 +174,62 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// One token covers a source and its derived renditions.
+    ///
+    /// The DVR player fetches `{stream}` and `{stream}-proxy` as one viewing
+    /// session. Scoping a token to a single name meant the main rendition
+    /// played and the first shuttle silently buffered nothing.
+    #[test]
+    fn a_source_token_covers_its_derived_renditions() {
+        let exp = now_unix() + 300;
+        let tok = mint_viewer_token(SECRET, "show", exp).unwrap();
+        assert!(verify_viewer_token(SECRET, "show", &tok).is_ok());
+        assert!(verify_viewer_token(SECRET, "show-proxy", &tok).is_ok());
+    }
+
+    /// ...and only in that direction. Handing someone the low-resolution
+    /// rendition must not hand them the full-resolution one.
+    #[test]
+    fn a_rendition_token_does_not_grant_its_source() {
+        let exp = now_unix() + 300;
+        let tok = mint_viewer_token(SECRET, "show-proxy", exp).unwrap();
+        assert!(verify_viewer_token(SECRET, "show-proxy", &tok).is_ok());
+        assert!(verify_viewer_token(SECRET, "show", &tok).is_err());
+    }
+
+    /// The widening must not become "any name that ends in a known suffix".
+    #[test]
+    fn the_widening_does_not_reach_unrelated_streams() {
+        let exp = now_unix() + 300;
+        let tok = mint_viewer_token(SECRET, "show", exp).unwrap();
+        assert!(verify_viewer_token(SECRET, "other", &tok).is_err());
+        assert!(verify_viewer_token(SECRET, "other-proxy", &tok).is_err());
+        assert!(verify_viewer_token(SECRET, "showx-proxy", &tok).is_err());
+        // A bare suffix has no source to fall back to.
+        assert!(verify_viewer_token(SECRET, "-proxy", &tok).is_err());
+    }
+
+    /// Ingest is a WRITE surface and is deliberately not widened: a token to
+    /// publish a source must not also grant publishing its rendition, which
+    /// is a different producer.
+    #[test]
+    fn ingest_tokens_are_not_widened() {
+        let exp = now_unix() + 300;
+        let tok = mint_ingest_token(SECRET, "show", exp).unwrap();
+        assert!(verify_ingest_token(SECRET, "show", &tok).is_ok());
+        assert!(verify_ingest_token(SECRET, "show-proxy", &tok).is_err());
+    }
+
+    /// An expired token stays expired however it is matched -- the fallback
+    /// must not become a way around the expiry check.
+    #[test]
+    fn the_fallback_does_not_revive_an_expired_token() {
+        let expired = now_unix() - 1;
+        let tok = mint_viewer_token(SECRET, "show", expired).unwrap();
+        assert!(verify_viewer_token(SECRET, "show", &tok).is_err());
+        assert!(verify_viewer_token(SECRET, "show-proxy", &tok).is_err());
+    }
 
     #[test]
     fn viewer_token_roundtrips() {

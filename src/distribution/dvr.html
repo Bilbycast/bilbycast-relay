@@ -121,31 +121,26 @@
   var qs     = new URLSearchParams(location.search);
   var MAIN   = qs.get("main")  || STREAM;
   var PROXY  = qs.get("proxy") || (STREAM + "-proxy");
-  // TWO tokens, because this player is two streams.
+  // ONE token for both renditions.
   //
-  // A relay viewer token is scoped to one stream id, and the DVR is a pair --
-  // `{stream}` and `{stream}-proxy`. Carrying one token for both looks fine
-  // until `require_origin_token` is on, and then the main rendition plays
-  // while the first shuttle 403s: measured, not assumed. The alternative was
-  // to widen a viewer token to cover `{stream}-proxy` implicitly, which
-  // quietly changes what every existing token grants, including on WHEP.
+  // The player is two streams -- `{stream}` and `{stream}-proxy` -- but it is
+  // one thing being watched, so it takes one credential. The relay's viewer
+  // token covers a source and its derived renditions
+  // (`token::verify_viewer_token`), which is what makes that work.
   //
-  // A session that mints one of these mints both. `proxy_token` may be
-  // omitted when the origin is ungated, which is the default.
-  var TOKEN       = qs.get("token") || "";
-  var PROXY_TOKEN = qs.get("proxy_token") || "";
-  function tokenFor(stream) { return stream === PROXY ? PROXY_TOKEN : TOKEN; }
+  // Only needed when the origin is gated (`require_origin_token`), which is
+  // off by default.
+  var TOKEN = qs.get("token") || "";
 
   // With MSE we can send the token as a request header, so it never has to
   // sit in a URL -- out of the address bar, the history, and any Referer.
   // Native HLS (iOS Safari) hands the URL straight to the media stack and
   // cannot set headers, so there the query form is the only option.
   var TOKEN_IN_HEADER = !!(window.Hls && window.Hls.isSupported());
-  if ((TOKEN || PROXY_TOKEN) && window.history && history.replaceState) {
-    // Drop them from the visible URL either way: a viewer copying the address
+  if (TOKEN && window.history && history.replaceState) {
+    // Drop it from the visible URL either way: a viewer copying the address
     // out of the bar should not be handing out their credential with it.
     qs.delete("token");
-    qs.delete("proxy_token");
     var q = qs.toString();
     history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
   }
@@ -216,8 +211,7 @@
   var shuttleRAF = null;
 
   function url(stream, file) {
-    var t = tokenFor(stream);
-    var q = (t && !TOKEN_IN_HEADER) ? "?token=" + encodeURIComponent(t) : "";
+    var q = (TOKEN && !TOKEN_IN_HEADER) ? "?token=" + encodeURIComponent(TOKEN) : "";
     return "/origin/" + encodeURIComponent(stream) + "/" + file + q;
   }
   var lastHlsError = null;
@@ -386,9 +380,7 @@
         // Every manifest and segment fetch carries the credential. Applies to
         // both because hls.js routes them through the same hook.
         xhrSetup: function (xhr) {
-          // Per rendition: this hls.js instance only ever fetches `stream`.
-          var t = tokenFor(stream);
-          if (TOKEN_IN_HEADER && t) xhr.setRequestHeader("Authorization", "Bearer " + t);
+          if (TOKEN_IN_HEADER && TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
         }
       });
       hls.on(Hls.Events.ERROR, function (_e, data) {

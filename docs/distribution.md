@@ -141,19 +141,36 @@ to probe which streams or segments exist. Restricting the listener at the
 network / reverse-proxy layer remains the option when no per-stream credential
 is wanted at all.
 
-#### A DVR session needs **two** tokens
+#### One token covers a source and its renditions
 
-Tokens are scoped to one stream id, and the DVR player is a rendition *pair* —
-`{stream}` and `{stream}-proxy`. One token covers one of them. With
-`require_origin_token` on and a single token, the main rendition plays and the
-first shuttle silently buffers nothing: the proxy's fetches 403 while
-`video.error` stays `null`, so it reads as a broken shuttle rather than an auth
-failure.
+A DVR viewer is watching one thing, but it is delivered as a *pair* —
+`{stream}` for playback and `{stream}-proxy` for shuttle — at two encodings of
+the same content. So a `viewer` token minted for a source also admits that
+source's derived renditions, and the player takes a single `?token=`.
 
-So a session mints **both**, and the player takes `?token=` and
-`?proxy_token=`. Widening a `viewer` token to implicitly also grant
-`{stream}-proxy` was rejected deliberately: it would change what every
-already-minted token grants, including on WHEP.
+This is not incidental. Scoping a token to one exact name meant the main
+rendition played while the first shuttle silently buffered nothing: the
+proxy's fetches 403'd while `video.error` stayed `null`, so it read as a
+broken transport rather than an auth failure.
+
+The widening is **one-directional and closed**:
+
+- A token for `show` admits `show` and `show-proxy`.
+- A token for `show-proxy` admits **only** `show-proxy` — handing someone the
+  low-resolution rendition does not hand them the full-resolution one.
+- The suffix list (`RENDITION_SUFFIXES`, currently just `-proxy`) is a named,
+  enumerable list, not open-ended prefix matching. `showx-proxy` and
+  `other-proxy` are not reachable with a `show` token.
+- **Ingest tokens are not widened at all.** Ingest is a write surface, and a
+  token to publish a source must not also grant publishing its rendition,
+  which is a different producer.
+- Expiry is checked on both paths, so the fallback is not a way around it.
+
+The consequence to be aware of: an unrelated stream *named* `show-proxy` is
+readable with a `show` token. Rendition names are derived by convention, so
+that is a naming choice rather than an accident — but it is why the suffix
+list is closed and why the widening lives in `verify_viewer_token` alone
+rather than being spread across callers.
 
 ### Risk of the URL-borne form
 
@@ -181,15 +198,14 @@ It expects **two renditions** of the same source:
 | main | `{stream}` | long-GOP | live, 1x, 0.25–4x forward, coarse scrub |
 | proxy | `{stream}-proxy` | low-res **all-intra** | frame jog, shuttle, reverse |
 
-Override either with `?main=` / `?proxy=`. Other query parameters:
-`?token=` and `?proxy_token=` (one per rendition — see "A DVR session needs two
-tokens"; required only when `require_origin_token` is on) and `?fps=`
-(frame-step size; defaults to 25).
+Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`
+(one token covers both renditions — see above; required only when
+`require_origin_token` is on) and `?fps=` (frame-step size; defaults to 25).
 
-The player does not leave credentials in the URL. Under MSE it attaches them
-with hls.js's `xhrSetup` as a Bearer header and scrubs both query parameters
-via `history.replaceState` on load, so a viewer copying the address out of the
-bar is not handing out their credential with it. Native HLS (iOS Safari) hands
+The player does not leave the credential in the URL. Under MSE it attaches it
+with hls.js's `xhrSetup` as a Bearer header and scrubs the query parameter via
+`history.replaceState` on load, so a viewer copying the address out of the bar
+is not handing out their credential with it. Native HLS (iOS Safari) hands
 the URL straight to the media stack and cannot set headers, so there the query
 form is kept.
 

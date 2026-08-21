@@ -566,11 +566,14 @@ async fn origin_get_gate_is_off_by_default_and_enforced_when_pushed() {
     };
     let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
     let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
-    // Put a real object there, so a 200 means "served" and not "not found".
-    origin
-        .put("teststream", "seg-00000.m4s", axum::body::Bytes::from_static(b"abcd"))
-        .await
-        .expect("seed segment");
+    // Seed BOTH renditions with a real object, so a 200 means "served" and not
+    // "not found" -- the point of the test is which of them a token admits.
+    for stream in ["teststream", "teststream-proxy"] {
+        origin
+            .put(stream, "seg-00000.m4s", axum::body::Bytes::from_static(b"abcd"))
+            .await
+            .expect("seed segment");
+    }
     let state = DistributionState::new(
         hub,
         origin,
@@ -649,13 +652,31 @@ async fn origin_get_gate_is_off_by_default_and_enforced_when_pushed() {
         "?token= must be admitted too"
     );
 
-    // Checked on merit: a token minted for another stream is refused, so this
-    // is authentication and not "any token unlocks any stream".
+    // Checked on merit: a token for an unrelated stream is refused, so this is
+    // authentication and not "any token unlocks any stream".
     let wrong = token::mint_viewer_token(SECRET, "otherstream", exp).expect("mint");
     assert_eq!(
         get(addr, OBJ, Some(&wrong)).await,
         403,
-        "a token for another stream must be refused"
+        "a token for an unrelated stream must be refused"
+    );
+
+    // ONE token covers the pair. The DVR player fetches `{stream}` and
+    // `{stream}-proxy`; requiring a token each made the main rendition play
+    // while the first shuttle silently buffered nothing.
+    assert_eq!(
+        get(addr, "/origin/teststream-proxy/seg-00000.m4s", Some(&tok)).await,
+        200,
+        "the source's token must also admit its derived rendition"
+    );
+
+    // ...but only in that direction. Handing someone the low-resolution
+    // rendition must not hand them the full-resolution one.
+    let proxy_only = token::mint_viewer_token(SECRET, "teststream-proxy", exp).expect("mint");
+    assert_eq!(
+        get(addr, OBJ, Some(&proxy_only)).await,
+        403,
+        "a rendition token must not grant its source"
     );
 
     // The gate must run BEFORE the store is consulted, or a 404-vs-401 split
