@@ -145,6 +145,20 @@
   // the LL-HLS hold-back convention.
   var LIVE_BACKOFF = 3;
 
+  // Hysteresis for the LIVE badge.
+  //
+  // Live playback deliberately sits ~LIVE_BACKOFF behind the edge, and the
+  // distance to that edge sawtooths by a whole segment: it jumps outward each
+  // time a segment is appended, then closes again as playback advances
+  // (measured swinging 1.06s -> 2.47s with 1 s segments). A single threshold
+  // anywhere near the operating point therefore flips every second or so.
+  //
+  // Two thresholds instead: become live well inside the band, and only report
+  // delayed once genuinely well outside it.
+  var LIVE_ENTER = 6;    // within this of the edge => live
+  var LIVE_LEAVE = 12;   // only past this do we admit to being behind
+  var liveState = false;
+
   // Fast-forward / rewind cycle through these on repeated presses, then wrap.
   // They run on the shuttle path, not `playbackRate`: the loop presents every
   // Nth frame, so the seek rate stays ~fps/s at any speed instead of demanding
@@ -519,6 +533,20 @@
   scrub.addEventListener("change", endScrub);
 
   // ── render loop ────────────────────────────────────────────────────────
+  /// Latch the live/delayed state with hysteresis, so a distance hovering
+  /// near the boundary does not flap the badge.
+  function updateLiveState(distance) {
+    if (mode !== "live") {
+      liveState = false;
+      return;
+    }
+    if (liveState) {
+      if (distance > LIVE_LEAVE) liveState = false;
+    } else if (distance < LIVE_ENTER) {
+      liveState = true;
+    }
+  }
+
   function render() {
     var v = activeVideo();
     if (proxyAttached) measureTimelineOffset();
@@ -533,8 +561,9 @@
       if (!scrubbing && dur > 0) {
         scrub.value = String(Math.round(((pos - r.start) / dur) * 1000));
       }
-      var atLive = (r.end - pos) < 3;
-      document.body.dataset.live = (mode === "live" && atLive) ? "1" : "0";
+      updateLiveState(r.end - pos);
+      var atLive = liveState;
+      document.body.dataset.live = atLive ? "1" : "0";
       document.getElementById("badge").textContent =
         mode === "jog" ? "jog" : mode === "shuttle" ? (rate > 0 ? rate + "x" : rate + "x") :
         atLive ? "live" : "delayed";
