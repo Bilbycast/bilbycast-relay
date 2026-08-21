@@ -5,6 +5,27 @@ edition = "2024"
 description = "QUIC relay server for bilbycast IP tunneling between NAT'd edge nodes"
 license = "AGPL-3.0-or-later"
 
+[lints.clippy]
+# Each entry is a deliberate exemption with a reason — do not add one to
+# silence a lint you have not looked at. Mirrors the policy blocks in
+# bilbycast-edge and bilbycast-manager, and the first three entries are
+# adjudicated the same way there.
+
+# Would add `Default` impls that nothing constructs, i.e. dead code — which the
+# project bar forbids outright. Both sites (`TunnelStats`, `RelayStats`) are
+# built by `new()` at startup and never defaulted. Same call as edge/manager.
+new_without_default = "allow"
+# Wants `if denom == 0 { 0 } else { numer * 90_000 / denom }` rewritten as
+# `checked_div` + `if let`. The guard states "the RTP clock rate is not known
+# yet", which is the condition a reader of the WHIP ingest path cares about —
+# not "this division might trap". Same reasoning as edge's entry.
+manual_checked_ops = "allow"
+# Fires on the axum handler-helper shape `Result<(), Response>`, where the
+# `Err` variant *is* the HTTP response that gets returned to the client. That
+# is the idiomatic axum form; boxing it would add an allocation and an unbox at
+# every call site to satisfy a size heuristic aimed at ordinary error enums.
+result_large_err = "allow"
+
 [dependencies]
 # QUIC
 quinn = "0.11.11"

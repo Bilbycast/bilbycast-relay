@@ -96,7 +96,7 @@ fn verify(secret_hex: &str, scope: &str, stream: &str, token: &str) -> Result<()
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("bad hex");
     }
     (0..s.len())
@@ -165,8 +165,14 @@ mod tests {
     fn tampered_signature_rejected() {
         let exp = now_unix() + 300;
         let mut tok = mint_viewer_token(SECRET, "s", exp).unwrap();
-        tok.pop();
-        tok.push('0');
+        // Flip the last signature nibble to a value it is not already, rather
+        // than pushing a fixed '0'. `exp` moves every second, so one second in
+        // sixteen minted a signature already ending in '0' — the "tamper" was
+        // then a no-op and this assertion failed. Nothing caught it: the repo
+        // had no CI, and this module only compiles under `viewer-distribution`,
+        // which is off by default.
+        let last = tok.pop().expect("token is non-empty");
+        tok.push(if last == '0' { '1' } else { '0' });
         assert!(verify_viewer_token(SECRET, "s", &tok).is_err());
     }
 

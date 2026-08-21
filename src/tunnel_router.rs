@@ -190,20 +190,18 @@ impl TunnelRouter {
         if let Some(mut entry) = self.tunnels.get_mut(tunnel_id) {
             let state = entry.value_mut();
 
-            if let Some(ref ingress) = state.ingress {
-                if ingress.connection_id == connection_id {
+            if let Some(ref ingress) = state.ingress
+                && ingress.connection_id == connection_id {
                     state.ingress = None;
                     peer_connection_id =
                         state.egress.as_ref().map(|e| e.connection_id.clone());
                 }
-            }
-            if let Some(ref egress) = state.egress {
-                if egress.connection_id == connection_id {
+            if let Some(ref egress) = state.egress
+                && egress.connection_id == connection_id {
                     state.egress = None;
                     peer_connection_id =
                         state.ingress.as_ref().map(|e| e.connection_id.clone());
                 }
-            }
 
             // If both sides are gone, remove the tunnel entirely
             if state.ingress.is_none() && state.egress.is_none() {

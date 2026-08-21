@@ -357,11 +357,10 @@ impl DistributionConfig {
                 anyhow::bail!("distribution.public_base_url too long (max 2048 chars)");
             }
         }
-        if let Some(ref secret) = self.token_secret {
-            if secret.len() != 64 || !secret.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Some(ref secret) = self.token_secret
+            && (secret.len() != 64 || !secret.chars().all(|c| c.is_ascii_hexdigit())) {
                 anyhow::bail!("distribution.token_secret must be exactly 64 hex chars (32 bytes)");
             }
-        }
         // NB: token gates (`require_viewer_token` / `require_ingest_token`)
         // may be on with no `token_secret` in config — the manager pushes the
         // secret at runtime via `configure_distribution`. Until it arrives the
@@ -507,16 +506,15 @@ impl RelayConfig {
         }
 
         // Validate API token length if set
-        if let Some(ref token) = self.api_token {
-            if token.len() < 32 || token.len() > 128 {
+        if let Some(ref token) = self.api_token
+            && (token.len() < 32 || token.len() > 128) {
                 anyhow::bail!("api_token must be 32-128 characters, got {}", token.len());
             }
-        }
 
         // Validate manager URL list if enabled (1..16, each wss://,
         // ≤2048 chars, unique — same rules as bilbycast-edge).
-        if let Some(ref mgr) = self.manager {
-            if mgr.enabled {
+        if let Some(ref mgr) = self.manager
+            && mgr.enabled {
                 if mgr.urls.is_empty() {
                     anyhow::bail!(
                         "Manager urls[] cannot be empty when manager is enabled"
@@ -547,7 +545,6 @@ impl RelayConfig {
                     }
                 }
             }
-        }
 
         // Validate logging shipper if present
         if let Some(ref logging) = self.logging {
@@ -845,8 +842,10 @@ mod tests {
 
     #[test]
     fn relay_config_validate_picks_up_bad_public_addr() {
-        let mut c = RelayConfig::default();
-        c.public_quic_addr = Some("0.0.0.0:4433".to_string());
+        let mut c = RelayConfig {
+            public_quic_addr: Some("0.0.0.0:4433".to_string()),
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
         c.public_quic_addr = Some("54.1.2.3:4433".to_string());
         assert!(c.validate().is_ok());

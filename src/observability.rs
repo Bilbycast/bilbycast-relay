@@ -12,7 +12,7 @@
 //! source project.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -311,7 +311,7 @@ fn writer_task_file_blocking(
     }
 }
 
-fn rotate_file(path: &PathBuf, max_backups: u32) -> std::io::Result<()> {
+fn rotate_file(path: &Path, max_backups: u32) -> std::io::Result<()> {
     if max_backups == 0 {
         return std::fs::OpenOptions::new()
             .write(true)
@@ -334,7 +334,7 @@ fn rotate_file(path: &PathBuf, max_backups: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn backup_path(path: &PathBuf, n: u32) -> PathBuf {
+fn backup_path(path: &Path, n: u32) -> PathBuf {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("log");
     path.with_extension(format!("{ext}.{n}"))
 }

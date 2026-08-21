@@ -166,7 +166,7 @@ pub(crate) async fn republish_from_session(
                 let is_audio = session.audio_mid == Some(mid);
                 if is_video {
                     // str0m video MediaTime is already the 90 kHz clock.
-                    let pts_90k = rtp_time.numer() as u64;
+                    let pts_90k = rtp_time.numer();
                     asm.push(hub, pts_90k, &data);
                 } else if is_audio {
                     // Opus 48 kHz clock → 90 kHz.

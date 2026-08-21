@@ -537,13 +537,11 @@ impl WebrtcSession {
     /// negotiated" bug). Call this after Connected to flush any
     /// pending events.
     pub fn drain_pending_events(&mut self) {
-        loop {
-            match self.rtc.poll_output() {
-                Ok(Output::Event(event)) => {
-                    let _ = self.handle_event(event);
-                }
-                Ok(Output::Transmit(_)) | Ok(Output::Timeout(_)) | Err(_) => break,
-            }
+        // Anything that is not a pending Event (a Transmit, a Timeout, or an
+        // error) ends the drain, exactly as the previous `match … => break`
+        // arm did — the non-Event value is discarded either way.
+        while let Ok(Output::Event(event)) = self.rtc.poll_output() {
+            let _ = self.handle_event(event);
         }
     }
 
@@ -741,10 +739,9 @@ impl WebrtcSession {
                 }
             }
             Event::MediaAdded(added) => {
-                let kind = if let Some(media) = self.rtc.media(added.mid) {
+                let kind = {
+                    let media = self.rtc.media(added.mid)?;
                     media.kind()
-                } else {
-                    return None;
                 };
                 match kind {
                     MediaKind::Video => self.video_mid = Some(added.mid),
@@ -814,11 +811,10 @@ fn select_local_candidate_ips(
     }
     let mut out: Vec<std::net::IpAddr> =
         vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
-    if let Some(lan) = route_discovered_lan_ip() {
-        if !out.contains(&lan) {
+    if let Some(lan) = route_discovered_lan_ip()
+        && !out.contains(&lan) {
             out.push(lan);
         }
-    }
     out
 }
 

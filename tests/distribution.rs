@@ -281,7 +281,7 @@ async fn whep_viewer_receives_encrypted_media_end_to_end() {
                 _ = tick.tick() => {
                     pts += 2700; // ~30 fps at 90 kHz
                     // Periodic IDR so a late DTLS completion still decodes.
-                    if pts % 27_000 == 0 {
+                    if pts.is_multiple_of(27_000) {
                         pub_hub.publish("live", EsFrame::video(pts, idr_au(), true));
                     } else {
                         pub_hub.publish("live", EsFrame::video(
@@ -561,7 +561,7 @@ async fn cascade_pulls_upstream_whep_and_republishes() {
                 _ = pub_cancel.cancelled() => break,
                 _ = tick.tick() => {
                     pts += 2700;
-                    if pts % 27_000 == 0 {
+                    if pts.is_multiple_of(27_000) {
                         pub_hub.publish("big-game", EsFrame::video(pts, idr_au(), true));
                     } else {
                         pub_hub.publish("big-game", EsFrame::video(pts, Bytes::from_static(&[0,0,0,1,0x41,0x9a]), false));

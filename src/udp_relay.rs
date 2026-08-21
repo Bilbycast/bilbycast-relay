@@ -588,7 +588,7 @@ fn build_relay_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 
 /// Pick the bound socket whose address family matches `dest` (falls back to the
 /// first socket — covers single-family deployments and IPv4-mapped sends).
-fn socket_for<'a>(sockets: &'a [Arc<UdpSocket>], dest: SocketAddr) -> &'a Arc<UdpSocket> {
+fn socket_for(sockets: &[Arc<UdpSocket>], dest: SocketAddr) -> &Arc<UdpSocket> {
     let want_v6 = dest.is_ipv6();
     sockets
         .iter()

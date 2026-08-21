@@ -578,8 +578,8 @@ pub(crate) async fn notify_tunnel_down(
     tunnel_id: Uuid,
     reason: &str,
 ) {
-    if let Some(conn) = ctx.edge_connections.get(edge_id) {
-        if let Ok(mut send) = conn.open_uni().await {
+    if let Some(conn) = ctx.edge_connections.get(edge_id)
+        && let Ok(mut send) = conn.open_uni().await {
             let msg = RelayMessage::TunnelDown {
                 tunnel_id,
                 reason: reason.to_string(),
@@ -587,5 +587,4 @@ pub(crate) async fn notify_tunnel_down(
             let _ = write_message(&mut send, &msg).await;
             let _ = send.finish();
         }
-    }
 }

@@ -403,20 +403,18 @@ async fn try_connect(
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "payload": build_stats_payload(ctx, relay_stats)
                 });
-                if let Ok(json) = serde_json::to_string(&envelope) {
-                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&envelope)
+                    && ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-                }
             }
 
             _ = health_interval.tick() => {
                 let envelope = build_health_message(ctx, relay_stats, relay_config, distribution_control);
-                if let Ok(json) = serde_json::to_string(&envelope) {
-                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&envelope)
+                    && ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-                }
             }
 
             msg = ws_read.next() => {
@@ -438,11 +436,10 @@ async fn try_connect(
             // Forward queued events to the manager
             Some(event) = event_rx.recv() => {
                 let envelope = build_event_envelope(&event);
-                if let Ok(json) = serde_json::to_string(&envelope) {
-                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&envelope)
+                    && ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-                }
             }
         }
     }
@@ -783,16 +780,14 @@ async fn handle_manager_message<S>(
                 tracing::info!("Manager command: get_config");
                 let mut config_json = serde_json::to_value(relay_config).unwrap_or_default();
                 // Redact secrets
-                if let Some(mgr) = config_json.get_mut("manager") {
-                    if let Some(obj) = mgr.as_object_mut() {
-                        if obj.contains_key("node_secret") {
+                if let Some(mgr) = config_json.get_mut("manager")
+                    && let Some(obj) = mgr.as_object_mut()
+                        && obj.contains_key("node_secret") {
                             obj.insert(
                                 "node_secret".to_string(),
                                 serde_json::json!("***REDACTED***"),
                             );
                         }
-                    }
-                }
                 if config_json.get("api_token").is_some() {
                     config_json["api_token"] = serde_json::json!("***REDACTED***");
                 }
@@ -819,12 +814,11 @@ async fn handle_manager_message<S>(
                         if let Some(ref mut mgr) = updated.manager {
                             mgr.node_secret = Some(new_secret.to_string());
                         }
-                        if let Ok(json) = serde_json::to_string_pretty(&updated) {
-                            if let Err(e) = std::fs::write(config_path, &json) {
+                        if let Ok(json) = serde_json::to_string_pretty(&updated)
+                            && let Err(e) = std::fs::write(config_path, &json) {
                                 tracing::warn!("Failed to persist rotated secret: {e}");
                                 ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
                             }
-                        }
                         tracing::info!("Node secret rotated and persisted");
                         ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
                         Ok(())

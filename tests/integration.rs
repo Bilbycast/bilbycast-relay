@@ -328,14 +328,12 @@ async fn handle_test_edge(
                                 TunnelDirection::Egress => state.ingress.as_ref().map(|e| e.edge_id.clone()),
                             };
                             drop(entry);
-                            if let Some(peer_id) = peer_edge_id {
-                                if let Some(peer_conn) = edge_connections.get(&peer_id) {
-                                    if let Ok(mut uni) = peer_conn.open_uni().await {
+                            if let Some(peer_id) = peer_edge_id
+                                && let Some(peer_conn) = edge_connections.get(&peer_id)
+                                    && let Ok(mut uni) = peer_conn.open_uni().await {
                                         let _ = write_msg(&mut uni, &RelayMessage::TunnelReady { tunnel_id }).await;
                                         let _ = uni.finish();
                                     }
-                                }
-                            }
                         } else {
                             let _ = write_msg(&mut send, &RelayMessage::TunnelWaiting { tunnel_id }).await;
                         }
@@ -627,11 +625,8 @@ async fn test_tcp_tunnel_bidirectional() {
     // Read forwarded data
     let mut received = Vec::new();
     let mut buf = vec![0u8; 65536];
-    loop {
-        match data_recv_e.read(&mut buf).await.unwrap() {
-            Some(n) => received.extend_from_slice(&buf[..n]),
-            None => break,
-        }
+    while let Some(n) = data_recv_e.read(&mut buf).await.unwrap() {
+        received.extend_from_slice(&buf[..n]);
     }
     assert_eq!(&received, test_data);
 
@@ -642,11 +637,8 @@ async fn test_tcp_tunnel_bidirectional() {
 
     // Read response on ingress side
     let mut response = Vec::new();
-    loop {
-        match data_recv_i.read(&mut buf).await.unwrap() {
-            Some(n) => response.extend_from_slice(&buf[..n]),
-            None => break,
-        }
+    while let Some(n) = data_recv_i.read(&mut buf).await.unwrap() {
+        response.extend_from_slice(&buf[..n]);
     }
     assert_eq!(&response, response_data);
 }
