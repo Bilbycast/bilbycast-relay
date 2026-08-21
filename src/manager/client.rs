@@ -566,9 +566,72 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
     stats
 }
 
+/// Parse one origin retention policy patch, bounding every field.
+///
+/// The bounds are not decoration. `max_bytes_per_stream` below one segment
+/// evicts each segment as it lands, which presents as a stream that accepts
+/// PUTs and serves an empty window — healthy-looking and unplayable. A
+/// retention of zero does the same by age.
+fn parse_origin_policy_patch(
+    v: &serde_json::Value,
+) -> Result<crate::distribution_control::OriginPolicyPatch, String> {
+    let obj = v.as_object().ok_or_else(|| "must be an object".to_string())?;
+    for k in obj.keys() {
+        if !matches!(
+            k.as_str(),
+            "retention_secs" | "max_bytes_per_stream" | "min_segments" | "idle_grace_secs"
+        ) {
+            return Err(format!("unknown field '{k}'"));
+        }
+    }
+    let num = |name: &str| -> Result<Option<u64>, String> {
+        match obj.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(x) => x
+                .as_u64()
+                .ok_or_else(|| format!("{name} must be a non-negative integer"))
+                .map(Some),
+        }
+    };
+
+    let mut patch = crate::distribution_control::OriginPolicyPatch::default();
+
+    if let Some(n) = num("retention_secs")? {
+        // 24 h ceiling: the DVR feature asks for 60 minutes, and a runaway
+        // value here fills the volume rather than erroring.
+        if !(1..=86_400).contains(&n) {
+            return Err("retention_secs must be 1..=86400".to_string());
+        }
+        patch.retention_secs = Some(n);
+    }
+    if let Some(n) = num("max_bytes_per_stream")? {
+        // 16 MiB floor comfortably exceeds one 2 s segment of high-bitrate HD.
+        if n < 16 * 1024 * 1024 {
+            return Err("max_bytes_per_stream must be at least 16 MiB".to_string());
+        }
+        patch.max_bytes_per_stream = Some(n);
+    }
+    if let Some(n) = num("min_segments")? {
+        if !(1..=64).contains(&n) {
+            return Err("min_segments must be 1..=64".to_string());
+        }
+        patch.min_segments = Some(n as usize);
+    }
+    if let Some(n) = num("idle_grace_secs")? {
+        if n > 86_400 {
+            return Err("idle_grace_secs must be <= 86400".to_string());
+        }
+        patch.idle_grace_secs = Some(n);
+    }
+    if patch.is_empty() {
+        return Err("no recognised fields".to_string());
+    }
+    Ok(patch)
+}
+
 /// Apply a manager `configure_distribution` command onto the runtime control
-/// cell (secret / gates / public IP+URL / cascade sources). Partial: only the
-/// fields present in the action are changed.
+/// cell (secret / gates / public IP+URL / storage policy / cascade sources).
+/// Partial: only the fields present in the action are changed.
 fn apply_configure_distribution(
     control: Option<&Arc<DistributionControl>>,
     action: &serde_json::Value,
@@ -606,6 +669,37 @@ fn apply_configure_distribution(
         update.public_base_url = Some(s.to_string());
     }
     control.apply(update);
+
+    // Storage policy: node-wide default plus per-stream overrides. Both
+    // optional, so a push that only rotates the token secret leaves retention
+    // exactly as it was.
+    let mut origin_update = crate::distribution_control::OriginPolicyUpdate::default();
+    let mut origin_touched = false;
+    if let Some(v) = action.get("origin_policy") {
+        let patch = parse_origin_policy_patch(v).map_err(|e| format!("origin_policy: {e}"))?;
+        origin_update.default = Some(patch);
+        origin_touched = true;
+    }
+    if let Some(v) = action.get("origin_stream_policies") {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| "origin_stream_policies must be an object keyed by stream id".to_string())?;
+        let mut per_stream = Vec::with_capacity(obj.len());
+        for (stream, pv) in obj {
+            if stream.is_empty() || stream.len() > 128 {
+                return Err(format!("invalid stream id '{stream}'"));
+            }
+            let patch = parse_origin_policy_patch(pv)
+                .map_err(|e| format!("origin_stream_policies['{stream}']: {e}"))?;
+            per_stream.push((stream.clone(), patch));
+        }
+        // An empty object is meaningful: it clears every override.
+        origin_update.per_stream = Some(per_stream);
+        origin_touched = true;
+    }
+    if origin_touched {
+        control.set_origin_policy(origin_update);
+    }
 
     if let Some(arr) = action.get("cascade_sources").and_then(|v| v.as_array()) {
         let mut sources = Vec::with_capacity(arr.len());
@@ -713,6 +807,13 @@ fn build_health_message(
             "bytes_out": d.bytes_out,
             "origin_bytes": d.origin_bytes,
             "offpath_sessions": d.offpath_sessions,
+            // Per-stream breakdown of origin_bytes, so an operator watching a
+            // volume fill can see *which* stream is spending it and whether a
+            // retention override put it there. Rides health (15 s), not stats
+            // (1 s): it changes on the scale of a segment, and a list on every
+            // stats tick is bandwidth for nothing. Additive — an older manager
+            // parses the object loosely and ignores it.
+            "origin_streams": d.origin_streams,
         });
     }
     // Advertised viewer base URL — the runtime (manager-pushed) value wins over

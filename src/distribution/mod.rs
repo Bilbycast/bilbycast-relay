@@ -136,6 +136,43 @@ pub async fn run_distribution(
     );
     let origin = Arc::new(OriginStore::new(origin_cfg)?);
 
+    // Storage policy from the manager. The bootstrap values above are only a
+    // seed; from here the manager owns retention, and a DVR session can widen
+    // the window for its own stream without holding every other stream's disk
+    // for the same hour.
+    {
+        let origin = origin.clone();
+        let cancel = cancel.clone();
+        let mut rx = control.subscribe_origin();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break; // control dropped
+                        }
+                        let update = rx.borrow_and_update().clone();
+                        origin.apply_policy_update(&update);
+                        let d = origin.default_policy();
+                        tracing::info!(
+                            retention_secs = d.retention.as_secs(),
+                            max_bytes_per_stream = d.max_bytes_per_stream,
+                            min_segments = d.min_segments,
+                            idle_grace_secs = d.idle_grace.as_secs(),
+                            stream_overrides = update
+                                .per_stream
+                                .as_ref()
+                                .map(|v| v.len())
+                                .unwrap_or(0),
+                            "distribution origin: storage policy updated by manager"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     // Retention sweep. Eviction is otherwise driven only by arriving segments,
     // so a stream whose producer stops keeps its disk indefinitely — past
     // retention, still serving its manifest, reclaimed only by a restart.
@@ -177,6 +214,17 @@ pub async fn run_distribution(
                             bytes_out,
                             origin.total_bytes(),
                             offpath,
+                            origin
+                                .usage()
+                                .into_iter()
+                                .map(|u| crate::stats::OriginStreamUsage {
+                                    stream: u.stream,
+                                    segments: u.segments as u64,
+                                    bytes: u.bytes,
+                                    idle_secs: u.idle_secs,
+                                    policy_overridden: u.policy_overridden,
+                                })
+                                .collect(),
                         );
                     }
                 }
