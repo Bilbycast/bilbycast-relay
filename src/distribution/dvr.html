@@ -215,7 +215,14 @@
     return "/origin/" + encodeURIComponent(stream) + "/" + file + q;
   }
   var lastHlsError = null;
-  function fail(msg) { errEl.textContent = msg || ""; }
+  // Once access has expired, every later error is a consequence of it. Latch,
+  // so a generic "network error" cannot overwrite the one message that tells
+  // the viewer what to do.
+  var accessExpired = false;
+  function fail(msg) {
+    if (accessExpired && msg && msg.indexOf("expired") === -1) return;
+    errEl.textContent = msg || "";
+  }
   function fmt(t) {
     if (!isFinite(t) || t < 0) return "--:--:--";
     var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = Math.floor(t % 60);
@@ -386,6 +393,26 @@
       hls.on(Hls.Events.ERROR, function (_e, data) {
         if (!data) return;
         lastHlsError = label + ":" + data.details + (data.fatal ? " (fatal)" : "");
+
+        // An expiring viewing token is the one failure a viewer can act on, so
+        // it must not arrive as a generic stall.
+        //
+        // The token is short-lived on purpose — its TTL *is* the revocation
+        // latency, since the relay's HMAC tokens cannot be recalled once
+        // minted. Nothing renews it yet, so a long watch eventually starts
+        // 401ing mid-stream and hls.js reports a network error like any other:
+        // the picture simply stops, with a message that means nothing to the
+        // person watching.
+        //
+        // Reloading genuinely fixes it (the *grant* is still valid and mints a
+        // fresh token), so say that rather than making them guess.
+        var status = (data.response && data.response.code) || 0;
+        if (status === 401 || status === 403) {
+          accessExpired = true;
+          fail("Your viewing access has expired — reload the page to continue.");
+          return;
+        }
+
         if (data.fatal) {
           fail(label + ": " + data.type + " / " + data.details);
         } else if (data.details === "bufferStalledError") {
