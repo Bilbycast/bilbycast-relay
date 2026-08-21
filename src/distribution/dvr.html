@@ -165,6 +165,17 @@
   // 16x the bandwidth and decode.
   var SHUTTLE_STEPS = [2, 4, 8, 16];
 
+  // How long after the last frame step before the still is handed back to the
+  // main rendition.
+  //
+  // The proxy is a positioning tool, not something to look at: it is 640x360
+  // and the operator is usually jogging in order to *examine* a frame. But
+  // seeking `main` costs a decode from the preceding keyframe, so doing it on
+  // every step would make held stepping sluggish. Stay on the proxy while
+  // stepping, hand back once the operator stops.
+  var JOG_SETTLE_MS = 400;
+  var jogSettleTimer = null;
+
   // proxyTime = mainTime + timelineOffset.
   //
   // The two renditions are separate hls.js instances over separate playlists,
@@ -208,17 +219,37 @@
   }
   function activeVideo() { return (mode === "jog" || mode === "shuttle") ? proxy : main; }
 
+  /// Samples of the raw offset measurement, newest last.
+  var offsetSamples = [];
+  var OFFSET_SAMPLES = 25;   // ~5 s at the render cadence
+
   /// Re-measure the offset between the two timelines.
   ///
+  /// The raw signal is `proxy.seekable.end - main.seekable.end`. Both track the
+  /// same live edge, but each end is quantised to *its own* segment boundary,
+  /// so the difference sawtooths by up to a segment — and by a whole segment
+  /// more when the two renditions use different segment durations, or when one
+  /// has published a segment the other has not yet.
+  ///
+  /// The true offset is a constant, so take the **median** of a rolling window
+  /// rather than the latest sample. A median rejects the periodic excursions a
+  /// mean would smear, and settles on the value the measurement spends most of
+  /// its time at.
+  ///
   /// Only meaningful once the proxy has a real window; measuring while it is
-  /// still filling its first fragments gives a value that is wrong and then
-  /// silently sticks.
+  /// still filling its first fragments gives a value that is wrong and, before
+  /// this was a median, then silently stuck.
   function measureTimelineOffset() {
     var m = range(main);
     var p = range(proxy);
     if (!m || !p) return;
     if (p.end - p.start < 5) return;
-    timelineOffset = p.end - m.end;
+
+    offsetSamples.push(p.end - m.end);
+    if (offsetSamples.length > OFFSET_SAMPLES) offsetSamples.shift();
+
+    var sorted = offsetSamples.slice().sort(function (a, b) { return a - b; });
+    timelineOffset = sorted[Math.floor(sorted.length / 2)];
   }
 
   /// Convert between the two clocks. Everything the operator sees — the
@@ -342,6 +373,7 @@
   }
 
   function goLive() {
+    cancelJogSettle();
     stopShuttle();
     setMode("live");
     var t = liveTarget();
@@ -384,6 +416,24 @@
     proxy.currentTime = t;
     syncRateButtons();
     render();
+    scheduleJogSettle();
+  }
+
+  /// After the last frame step, show the frame at full resolution.
+  ///
+  /// Re-armed on every step, so holding the button keeps the responsive
+  /// low-resolution path and only the final position is re-rendered from the
+  /// main rendition.
+  function scheduleJogSettle() {
+    if (jogSettleTimer) clearTimeout(jogSettleTimer);
+    jogSettleTimer = setTimeout(function () {
+      jogSettleTimer = null;
+      if (mode !== "jog") return;   // play/scrub/shuttle took over
+      setMode("scrub");             // converts the position across timelines
+      main.pause();
+      syncRateButtons();
+      render();
+    }, JOG_SETTLE_MS);
   }
 
   // ── shuttle ────────────────────────────────────────────────────────────
@@ -392,6 +442,7 @@
   // stays ~FPS/s no matter the speed — at 8x we present every 8th frame,
   // not every frame. That is what keeps it sustainable on a tablet.
   function startShuttle(r) {
+    cancelJogSettle();
     ensureProxy();
     setMode("shuttle");
     proxy.pause();
@@ -433,6 +484,16 @@
   }
   function stopShuttle() {
     if (shuttleRAF !== null) { cancelAnimationFrame(shuttleRAF); shuttleRAF = null; }
+  }
+
+  /// Drop a pending jog settle. Anything that deliberately changes what is on
+  /// screen must call this, or the timer fires afterwards and switches modes
+  /// underneath it.
+  function cancelJogSettle() {
+    if (jogSettleTimer) {
+      clearTimeout(jogSettleTimer);
+      jogSettleTimer = null;
+    }
   }
 
   function setRate(r) {
@@ -490,6 +551,7 @@
 
   function beginScrub() {
     if (scrubbing) return;
+    cancelJogSettle();
     scrubbing = true;
     var v = activeVideo();
     // `rate < 0` counts as playing: a reverse shuttle drives currentTime
@@ -615,6 +677,7 @@
   // the control you want, without first reading the button to find out what
   // it currently means.
   btnPlay.addEventListener("click", function () {
+    cancelJogSettle();
     stopShuttle();
     if (mode === "jog") setMode("scrub");
     setRate(rate > 0 ? rate : 1);
@@ -631,6 +694,7 @@
   /// so a stopped transport shows the full-resolution frame rather than the
   /// low-res proxy still.
   function pauseTransport() {
+    cancelJogSettle();
     stopShuttle();
     if (mode === "shuttle" || mode === "jog") setMode("scrub");
     rate = 1;
@@ -680,6 +744,15 @@
     if (!proxyAttached) {
       proxyAttached = true;
       proxyHls = attach(proxy, PROXY, "proxy");
+      // Sample the offset as soon as the proxy has a window, so the first
+      // handover is not working from a single cold reading.
+      proxy.addEventListener("loadedmetadata", function () {
+        var n = 0;
+        var t = setInterval(function () {
+          measureTimelineOffset();
+          if (++n >= OFFSET_SAMPLES) clearInterval(t);
+        }, 60);
+      }, { once: true });
     }
   }
   main.addEventListener("loadedmetadata", function () { goLive(); });
