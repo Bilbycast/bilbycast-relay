@@ -29,6 +29,9 @@ use crate::config::{CascadeSource, DistributionConfig};
 pub struct RuntimeDistConfig {
     pub token_secret: Option<String>,
     pub require_viewer_token: bool,
+    /// Gate `GET /origin/...` as well as WHEP. Default false — see
+    /// [`crate::config::DistributionConfig::require_origin_token`].
+    pub require_origin_token: bool,
     pub require_ingest_token: bool,
     /// Public IP advertised in WHEP ICE candidates.
     pub public_ip: Option<IpAddr>,
@@ -43,6 +46,7 @@ impl RuntimeDistConfig {
         Self {
             token_secret: cfg.token_secret.clone(),
             require_viewer_token: cfg.require_viewer_token,
+            require_origin_token: cfg.require_origin_token,
             require_ingest_token: cfg.require_ingest_token,
             public_ip: public_ip.or_else(|| cfg.public_ip_parsed()),
             public_base_url: cfg.public_base_url.clone(),
@@ -148,6 +152,7 @@ impl DistributionControl {
         let next = RuntimeDistConfig {
             token_secret: update.token_secret.or_else(|| cur.token_secret.clone()),
             require_viewer_token: update.require_viewer_token.unwrap_or(cur.require_viewer_token),
+            require_origin_token: update.require_origin_token.unwrap_or(cur.require_origin_token),
             require_ingest_token: update.require_ingest_token.unwrap_or(cur.require_ingest_token),
             public_ip: update.public_ip.or(cur.public_ip),
             public_base_url: update.public_base_url.or_else(|| cur.public_base_url.clone()),
@@ -172,6 +177,7 @@ impl DistributionControl {
 pub struct DistUpdate {
     pub token_secret: Option<String>,
     pub require_viewer_token: Option<bool>,
+    pub require_origin_token: Option<bool>,
     pub require_ingest_token: Option<bool>,
     pub public_ip: Option<IpAddr>,
     pub public_base_url: Option<String>,
@@ -185,6 +191,7 @@ mod tests {
         RuntimeDistConfig {
             token_secret: Some("aa".into()),
             require_viewer_token: false,
+            require_origin_token: false,
             require_ingest_token: true,
             public_ip: None,
             public_base_url: None,

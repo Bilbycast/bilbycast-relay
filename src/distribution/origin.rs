@@ -648,24 +648,41 @@ async fn origin_put(
 
 /// `GET /origin/{stream}/{file}` — serve a cached object to a player/CDN.
 ///
-/// **Deliberately unauthenticated, and `require_viewer_token` does NOT gate
-/// it.** That flag covers the WHEP tier only. This route is the CDN-facing
-/// half of the distribution surface: a CDN pulls it with no credential of the
-/// relay's, which is the point of having an HTTP origin at all. The
-/// consequence is worth stating plainly, because it is easy to assume
-/// otherwise: for any stream that also runs the CMAF/LL-HLS tier, the viewer
-/// gate is bypassable by fetching `/origin/{stream}/index.m3u8` directly.
-/// Restrict this listener at the network/proxy layer if that matters.
-/// Documented in `docs/distribution.md` under "Access tokens".
+/// **Unauthenticated by default, and `require_viewer_token` does NOT gate
+/// it** — that flag covers the WHEP tier only. The default is deliberate:
+/// this route is the CDN-facing half of the distribution surface, a CDN pulls
+/// it with no credential of the relay's, and that is the point of having an
+/// HTTP origin at all.
+///
+/// The consequence of the default is worth stating plainly, because it is
+/// easy to assume otherwise: for any stream that also runs the CMAF/LL-HLS
+/// tier, a WHEP viewer gate is bypassable by fetching
+/// `/origin/{stream}/index.m3u8` directly.
+///
+/// `require_origin_token` closes that. It is off by default to preserve the
+/// CDN case and is expected to be turned on **per session**, by the manager,
+/// for a gated audience with no CDN in front. It accepts the same credential
+/// as WHEP — `Authorization: Bearer` or `?token=` — because a segment fetch
+/// from hls.js can carry a header but the first manifest fetch on native HLS
+/// cannot. Documented in `docs/distribution.md` under "Access tokens".
 async fn origin_get(
     State(st): State<Arc<DistributionState>>,
     Path((stream, file)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
     let Some(stream) = super::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
     if !valid_object_name(&file) {
         return (StatusCode::BAD_REQUEST, "invalid object name").into_response();
+    }
+    // Checked before the store is touched, so a rejected request cannot be
+    // used to probe which streams or segments exist.
+    if st.control.load().require_origin_token
+        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
+    {
+        return resp;
     }
     match st.origin.get(&stream, &file).await {
         Some(obj) => {

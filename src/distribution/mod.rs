@@ -625,10 +625,12 @@ fn token_from_query(raw: Option<&str>) -> Option<String> {
 /// than a player-page convention. Prefer a short `ttl_secs` when minting links
 /// for the query form.
 ///
-/// **Scope.** This gates the WHEP tier only. `GET /origin/{stream}/{file}`
-/// (the CMAF/LL-HLS tier) is unauthenticated in every mode — see the note on
+/// **Scope.** This is the shared viewer-credential check. `require_viewer_token`
+/// applies it to the WHEP tier; `require_origin_token` applies it to
+/// `GET /origin/{stream}/{file}` (the CMAF/LL-HLS tier), which is
+/// unauthenticated unless that second flag is on — see the note on
 /// `origin::origin_get` and `docs/distribution.md`.
-fn check_viewer_token(
+pub(super) fn check_viewer_token(
     st: &DistributionState,
     stream_id: &str,
     headers: &HeaderMap,
