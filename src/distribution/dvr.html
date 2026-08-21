@@ -87,6 +87,7 @@
     <button id="btnLive" class="live" aria-pressed="true" title="Jump to live">LIVE</button>
     <button id="btnPlay" title="Play">&#9654;</button>
     <button id="btnPause" title="Pause">&#10073;&#10073;</button>
+    <button id="btnMute" aria-pressed="true" title="Unmute">&#128263;</button>
     <div class="sep"></div>
 
     <button data-jog="-1" title="Step back one frame">&#9664;|</button>
@@ -135,6 +136,7 @@
   var btnLive = document.getElementById("btnLive");
   var btnPlay = document.getElementById("btnPlay");
   var btnPause = document.getElementById("btnPause");
+  var btnMute = document.getElementById("btnMute");
   var btnRew = document.getElementById("btnRew");
   var btnFf = document.getElementById("btnFf");
 
@@ -207,6 +209,38 @@
     if (!v.seekable || v.seekable.length === 0) return null;
     return { start: v.seekable.start(0), end: v.seekable.end(v.seekable.length - 1) };
   }
+  // ── audio ──────────────────────────────────────────────────────────────
+  //
+  // Both elements load muted, and must: a tablet refuses to autoplay an
+  // unmuted element, so starting unmuted means starting not playing at all.
+  // The operator opts in with a gesture, which is what the policy wants.
+  //
+  // Only `main` is ever audible. The proxy exists to be seeked at speed --
+  // its audio would be a scrub artefact, and with both elements loaded it
+  // would play *underneath* main rather than instead of it.
+  var wantAudio = false;
+
+  function applyAudio() {
+    // Audible only when the operator asked for it AND main is the element on
+    // screen. Shuttle hands over to the proxy, so audio drops out for the
+    // duration and comes back on its own -- no second control to remember.
+    main.muted = !(wantAudio && mode !== "shuttle");
+    proxy.muted = true;
+    btnMute.setAttribute("aria-pressed", wantAudio ? "false" : "true");
+    btnMute.textContent = wantAudio ? "🔊" : "🔇";
+    btnMute.title = wantAudio ? "Mute" : "Unmute";
+  }
+
+  btnMute.addEventListener("click", function () {
+    wantAudio = !wantAudio;
+    applyAudio();
+    // Safari/iOS only honours volume changes inside the gesture that asked
+    // for them, so nudge playback here rather than on the next tick.
+    if (wantAudio && mode !== "shuttle" && main.paused && mode === "live") {
+      main.play().catch(function () { /* autoplay refusal is not fatal */ });
+    }
+  });
+
   // Only shuttle runs on the proxy. Jog stays on the main rendition: an
   // operator stepping frames is examining them, and stepping is one seek, not
   // the ~fps/s a shuttle needs.
@@ -363,6 +397,9 @@
     else { proxy.pause(); stopShuttle(); }
     document.body.dataset.live = (next === "live") ? "1" : "0";
     btnLive.setAttribute("aria-pressed", next === "live" ? "true" : "false");
+    // Mode decides which element is on screen, so it also decides what may be
+    // heard -- shuttle mutes, and returning restores without asking again.
+    applyAudio();
     syncRateButtons();
   }
 
@@ -725,6 +762,9 @@
   main.addEventListener("loadedmetadata", function () { goLive(); });
   main.addEventListener("playing", syncRateButtons);
   main.addEventListener("pause", syncRateButtons);
+  // Put the mute button in the state the elements are actually in, rather
+  // than trusting the markup and the script to agree.
+  applyAudio();
   // The proxy is only ever a still frame source; never let it run on its own.
   proxy.addEventListener("play", function () { if (mode !== "shuttle") proxy.pause(); });
 })();
