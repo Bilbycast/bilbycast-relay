@@ -90,6 +90,7 @@ fn test_origin_config(min_segments: usize, max_bytes_per_stream: u64) -> OriginC
         retention: std::time::Duration::from_secs(3600),
         max_bytes_per_stream,
         min_segments,
+        idle_grace: std::time::Duration::from_secs(60),
     }
 }
 
