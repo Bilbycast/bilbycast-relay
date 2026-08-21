@@ -244,6 +244,20 @@ pub struct DistributionConfig {
     #[serde(default)]
     pub require_viewer_token: bool,
 
+    /// Require a valid signed viewer token on `GET /origin/{stream}/{file}`
+    /// too — the CMAF / LL-HLS tier, not just WHEP. Default **false**, which
+    /// is what makes the origin usable by a CDN: a CDN pulls with no
+    /// credential of the relay's, and that is the point of having an HTTP
+    /// origin at all.
+    ///
+    /// Turning it on closes a gap worth stating plainly: with it off, a
+    /// `require_viewer_token` WHEP gate is bypassable on any stream that also
+    /// runs the CMAF tier, by fetching `/origin/{stream}/index.m3u8`
+    /// directly. Turn it on per session when the audience is gated and no CDN
+    /// sits in front.
+    #[serde(default)]
+    pub require_origin_token: bool,
+
     /// Require a valid signed ingest token on every edge → relay ingest
     /// connection. Default true — the ingest is a write surface.
     #[serde(default = "default_true")]
@@ -325,6 +339,7 @@ impl Default for DistributionConfig {
             ingest_addrs: None,
             token_secret: None,
             require_viewer_token: false,
+            require_origin_token: false,
             require_ingest_token: true,
             max_viewers_per_ip: default_max_viewers_per_ip(),
             origin_window_segments: default_origin_window_segments(),

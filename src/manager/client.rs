@@ -653,6 +653,9 @@ fn apply_configure_distribution(
     if let Some(b) = action.get("require_viewer_token").and_then(|v| v.as_bool()) {
         update.require_viewer_token = Some(b);
     }
+    if let Some(b) = action.get("require_origin_token").and_then(|v| v.as_bool()) {
+        update.require_origin_token = Some(b);
+    }
     if let Some(b) = action.get("require_ingest_token").and_then(|v| v.as_bool()) {
         update.require_ingest_token = Some(b);
     }
