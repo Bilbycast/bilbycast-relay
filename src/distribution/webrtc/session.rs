@@ -16,8 +16,10 @@
 //! STUN Binding Request from a credentialed client repoints the whole SRTP
 //! stream at the spoofed address). The edge runs the same vendored state
 //! machine in the same ICE-Lite server role from `engine::input_webrtc`
-//! (WHIP ingest) and `engine::output_webrtc` (WHEP output) on the same
-//! str0m 0.22 / `is` 0.11, and therefore still has the reflector. That is
+//! (WHIP ingest) and `engine::output_webrtc` (WHEP output) on the same str0m
+//! release (see either Cargo.toml — deliberately not a numeral here, since the
+//! two crates move in lockstep and a number goes stale on every bump while the
+//! claim it supports does not), and therefore still has the reflector. That is
 //! recorded as accepted residual risk, not as fixed: the edge's WHIP/WHEP
 //! routes sit behind `auth_middleware`, so exploiting it costs one valid edge
 //! API credential — which any legitimate WHEP viewer of that edge holds.
