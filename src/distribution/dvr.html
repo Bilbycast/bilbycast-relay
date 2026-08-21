@@ -151,6 +151,21 @@
   // 16x the bandwidth and decode.
   var SHUTTLE_STEPS = [2, 4, 8, 16];
 
+  // proxyTime = mainTime + timelineOffset.
+  //
+  // The two renditions are separate hls.js instances over separate playlists,
+  // and hls.js zeroes each timeline at the first fragment *it* loaded. The
+  // proxy attaches lazily, so its zero is a later instant than main's and the
+  // two clocks are offset by a fixed amount — measured at 6 s when the proxy
+  // was attached 2.5 s after load, 18 s when attached 13 s after. Without
+  // correcting it every handover shows content from the wrong moment, which is
+  // both invisible in the numbers and inconsistent between sessions.
+  //
+  // Both playlists track the same live edge, so the difference between their
+  // seekable ends *is* that offset. It was measured constant to 0.00 s over
+  // 80 s, so this is a fixed correction, not drift.
+  var timelineOffset = 0;
+
   var mode = "live";     // live | scrub | jog | shuttle
   var rate = 1;          // requested rate; negative means reverse
   var scrubbing = false;
@@ -179,6 +194,25 @@
   }
   function activeVideo() { return (mode === "jog" || mode === "shuttle") ? proxy : main; }
 
+  /// Re-measure the offset between the two timelines.
+  ///
+  /// Only meaningful once the proxy has a real window; measuring while it is
+  /// still filling its first fragments gives a value that is wrong and then
+  /// silently sticks.
+  function measureTimelineOffset() {
+    var m = range(main);
+    var p = range(proxy);
+    if (!m || !p) return;
+    if (p.end - p.start < 5) return;
+    timelineOffset = p.end - m.end;
+  }
+
+  /// Convert between the two clocks. Everything the operator sees — the
+  /// timecode, the scrub bar — is expressed on main's, so the reading does not
+  /// jump when the picture hands over.
+  function toMainTime(t, el) { return el === proxy ? t - timelineOffset : t; }
+  function fromMainTime(t, el) { return el === proxy ? t + timelineOffset : t; }
+
   /// A handover seek that has not been applied yet: `{ el, t }`.
   ///
   /// The proxy is attached lazily, so the first jog or shuttle hands over to
@@ -189,11 +223,19 @@
   /// again when the deferred seek finally lands.
   var pendingSeek = null;
 
-  /// Seek `v` to `t`, deferring until it can actually accept a seek.
-  function seekWhenReady(v, t) {
-    if (!isFinite(t) || t <= 0) return;
+  /// Seek `v` to `mainT` — a position on **main's** clock — deferring until
+  /// the element can accept a seek.
+  ///
+  /// The conversion happens here rather than at the call site because on first
+  /// use the proxy is created moments earlier and has no seekable window yet,
+  /// so the offset is not measurable and the correction would be a silent
+  /// no-op. By apply-time the element has metadata and can be measured.
+  function seekWhenReady(v, mainT) {
+    if (!isFinite(mainT) || mainT <= 0) return;
     var apply = function () {
-      try { v.currentTime = t; } catch (e) {}
+      measureTimelineOffset();
+      var target = pendingSeek && pendingSeek.el === v ? pendingSeek.mainT : mainT;
+      try { v.currentTime = fromMainTime(target, v); } catch (e) {}
       if (pendingSeek && pendingSeek.el === v) pendingSeek = null;
     };
     if (v.readyState >= 1 && v.seekable.length) {
@@ -201,15 +243,15 @@
       apply();
       return;
     }
-    pendingSeek = { el: v, t: t };
+    pendingSeek = { el: v, mainT: mainT };
     v.addEventListener("loadedmetadata", apply, { once: true });
   }
 
-  /// Where the transport *is*, which is not always where the element is.
-  /// While a handover seek is outstanding the element still reads its old
-  /// position, so this reports the intended one instead.
+  /// Where the transport *is*, in `v`'s own clock. While a handover seek is
+  /// outstanding the element still reads its old position, so this reports the
+  /// intended one instead.
   function playhead(v) {
-    if (pendingSeek && pendingSeek.el === v) return pendingSeek.t;
+    if (pendingSeek && pendingSeek.el === v) return fromMainTime(pendingSeek.mainT, v);
     return v.currentTime;
   }
 
@@ -262,7 +304,11 @@
     mode = next;
     document.body.dataset.mode = next;
     var to = activeVideo();
-    if (to !== from) seekWhenReady(to, t);
+    if (to !== from) {
+      // Hand over by *content*, not by number: the two elements do not share a
+      // clock. The target travels on main's, and is converted when it lands.
+      seekWhenReady(to, toMainTime(t, from));
+    }
     if (next === "jog" || next === "shuttle") { main.pause(); }
     else { proxy.pause(); stopShuttle(); }
     document.body.dataset.live = (next === "live") ? "1" : "0";
@@ -312,7 +358,8 @@
     // Step from where the transport is, not from a proxy that may still be
     // sitting at 0 waiting for its handover seek.
     if (awaitingSeek(proxy)) {
-      pendingSeek.t += dir * FRAME;
+      // A frame step is a delta, identical on either clock.
+      pendingSeek.mainT += dir * FRAME;
       syncRateButtons();
       render();
       return;
@@ -455,12 +502,14 @@
   scrub.addEventListener("pointerdown", beginScrub);
   scrub.addEventListener("input", function () {
     var v = activeVideo();
-    var r = range(v);
+    // The bar is calibrated on main's clock (see `render`), so pick the
+    // position there and convert for whichever element is showing.
+    var r = range(main);
     if (!r) return;
     if (mode === "live") setMode("scrub");
     var t = r.start + (r.end - r.start) * (scrub.value / 1000);
     pendingSeek = null;   // the operator is choosing a position explicitly
-    try { v.currentTime = t; } catch (e) {}
+    try { v.currentTime = fromMainTime(t, v); } catch (e) {}
     tPos.textContent = fmt(t - r.start);
   });
   // Release is caught on the window, not the input: dragging off the track
@@ -472,10 +521,13 @@
   // ── render loop ────────────────────────────────────────────────────────
   function render() {
     var v = activeVideo();
-    var r = range(v);
+    if (proxyAttached) measureTimelineOffset();
+    // Always present the window and the position on main's clock, so the
+    // readout does not shift when the picture hands over to the proxy.
+    var r = range(main);
     if (r) {
       var dur = r.end - r.start;
-      var pos = playhead(v);
+      var pos = toMainTime(playhead(v), v);
       tPos.textContent = fmt(pos - r.start);
       tDur.textContent = "-" + fmt(Math.max(0, r.end - pos)).replace(/\.\d+$/, "");
       if (!scrubbing && dur > 0) {
@@ -514,7 +566,11 @@
       "decodedFrames=" + (q ? q.totalVideoFrames : "n/a") +
         "  dropped=" + (q ? q.droppedVideoFrames : "n/a"),
       "mediaError=" + (v.error ? v.error.code + " " + v.error.message : "none"),
-      "proxyAttached=" + proxyAttached,
+      "proxyAttached=" + proxyAttached +
+        "  timelineOffset=" + timelineOffset.toFixed(2) + "s",
+      "mainT=" + main.currentTime.toFixed(2) +
+        "  proxyT=" + proxy.currentTime.toFixed(2) +
+        "  (same instant when proxyT - mainT = offset)",
       "lastHlsError=" + (lastHlsError || "none"),
       "",
       "If decodedFrames is RISING but the picture is black, the stream is fine",
