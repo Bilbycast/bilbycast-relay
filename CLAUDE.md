@@ -253,11 +253,48 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
 
 Build a distribution-capable relay: `cargo build --release --features viewer-distribution`.
 
+### Viewer portal (feature `portal`, default OFF, SECOND BINARY)
+
+`bilbycast-portal` is a small web service that runs *beside* the relay on its
+VPS: a viewer signs in through **Authelia**, sees the feeds they are entitled
+to, and clicks through to the DVR player with a token for those feeds only.
+Full reference: [`docs/portal.md`](docs/portal.md).
+
+It is a **separate binary** (`src/portal_bin.rs`, module `src/portal/`) rather
+than a mode of the relay, for the same reason `viewer-distribution` is a
+feature: the portal is public-facing and it is not the data plane, so a bug in
+a web page must not be able to take the box's media termination with it. Its
+systemd unit runs as its own user. The `portal` feature is independent of
+`viewer-distribution` — it links neither str0m nor OpenSSL.
+
+What it deliberately does not hold: **the token secret** (it asks the manager
+to mint, and the manager re-checks the entitlement first) and **the
+entitlements** (read from the manager per page load, so a withdrawal takes
+effect on the viewer's next click rather than on the next successful push).
+
+The trust boundary is the one thing to get right. Identity arrives in a header
+(`Remote-User`) that the authenticating proxy sets, which is a *claim*, not a
+proof. Two fail-closed controls hold it: `listen_addr` defaults to loopback, and
+`trusted_proxies` — checked **before** the header is read — defaults to loopback
+and treats an empty list as *nobody*, never *any*.
+
+Build: `cargo build --release --features portal`.
+
 ### Testing
 
 Integration tests (`tests/integration.rs`) spin up the full QUIC relay, connect two simulated edges, and verify TCP/UDP data forwarding. They duplicate the wire protocol types since this is a binary crate (not a library).
 
 `tests/distribution.rs` (requires `--features viewer-distribution`) exercises the **real** `bilbycast_relay::distribution` code via the library target, including **real-network** end-to-end coverage: QUIC ES ingest → hub → subscriber; a WHEP viewer completing ICE + DTLS + SRTP and receiving decrypted media; and a WHIP client pushing H.264 over DTLS/SRTP that the relay depacketizes + reassembles into access units. Browser interop, cellular-hardware e2e, and multi-relay cascade at scale remain to be verified on real infrastructure.
+
+`tests/portal.rs` (requires `--features portal`) runs the portal over real HTTP
+against a stub manager that **records what it was asked**, so a call to the
+wrong path or one that arrives without its service token fails there rather than
+at deployment. It pins the things only a real request can be wrong about: that
+the peer address reaches the handler at all (it does not, without
+`into_make_service_with_connect_info` — and without it the trusted-proxy gate
+silently reads as something else), that a username in the request *body* is
+ignored in favour of the proxy's header, and that an unreachable manager is
+reported as a gateway failure rather than as the viewer not being signed in.
 
 Test coverage: tunnel state transitions (waiting/active), bidirectional TCP forwarding, UDP datagram forwarding, ping/pong keepalive.
 

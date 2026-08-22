@@ -1,0 +1,8 @@
+# systemd-sysusers config for the bilbycast-portal service account.
+# Drop into /etc/sysusers.d/ during install.
+#
+# Distinct from `bilbycast-relay` even though the two normally share a host.
+# The portal is the public-facing half and the relay terminates media for every
+# viewer on the box; one account for both would mean a portal compromise could
+# read the relay's config and the manager secret in it.
+u bilbycast-portal - "bilbycast portal service account" /var/lib/bilbycast/portal /usr/sbin/nologin
