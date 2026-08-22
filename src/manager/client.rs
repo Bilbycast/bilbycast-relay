@@ -724,6 +724,52 @@ fn apply_configure_distribution(
     Ok(())
 }
 
+/// Rewrite the config file, changing only what `edit` touches.
+///
+/// **Read from disk, not from the startup snapshot.** Three separate places
+/// persist to this one file — registration credentials, a rotated secret, and
+/// the distribution config the manager pushes — and each used to rebuild the
+/// whole file from the `RelayConfig` captured at startup. Whichever wrote last
+/// silently reverted the others.
+///
+/// That was not theoretical. A relay registers, writes its `node_secret` and
+/// clears the consumed `registration_token`; the manager then pushes a
+/// distribution config, which rewrites the file from the startup snapshot —
+/// restoring the burnt registration token and erasing the secret. The relay
+/// keeps running, because it is already authenticated. On its next restart it
+/// presents a token the manager has already consumed, is refused with
+/// "Invalid registration token", and never reconnects. It goes on forwarding
+/// media while being invisible to the manager, until an operator notices and
+/// reissues a token by hand.
+///
+/// Falling back to the in-memory config when the file cannot be read keeps the
+/// old behaviour for the case it was written for — a file that is missing or
+/// unparseable — rather than refusing to persist at all.
+fn update_config_file(
+    config_path: &PathBuf,
+    fallback: &RelayConfig,
+    edit: impl FnOnce(&mut RelayConfig),
+) -> Result<(), String> {
+    if config_path.as_os_str().is_empty() {
+        return Ok(()); // running without a config file — nothing to persist to
+    }
+    let mut config = match std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<RelayConfig>(&t).ok())
+    {
+        Some(on_disk) => on_disk,
+        None => {
+            tracing::warn!(
+                "could not re-read {config_path:?}; persisting from the in-memory config,                  which may drop changes another writer made since startup"
+            );
+            fallback.clone()
+        }
+    };
+    edit(&mut config);
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(config_path, &json).map_err(|e| e.to_string())
+}
+
 /// Persist the current runtime distribution config into the relay's config.json
 /// so it survives a restart without the manager having to re-push. Best-effort:
 /// a write failure is logged, not fatal (the manager re-pushes on reconnect).
@@ -737,26 +783,21 @@ fn persist_distribution_config(
         return; // running without a config file — nothing to persist to
     }
     let rt = control.load();
-    let mut updated = relay_config.clone();
-    let dcfg = updated
-        .distribution
-        .get_or_insert_with(crate::config::DistributionConfig::default);
-    dcfg.enabled = true;
-    dcfg.token_secret = rt.token_secret.clone();
-    dcfg.require_viewer_token = rt.require_viewer_token;
-    dcfg.require_ingest_token = rt.require_ingest_token;
-    dcfg.public_ip = rt.public_ip.map(|ip| ip.to_string());
-    dcfg.public_base_url = rt.public_base_url.clone();
-    dcfg.portal_url = rt.portal_url.clone();
-    dcfg.cascade_sources = control.cascade_now();
-
-    match serde_json::to_string_pretty(&updated) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(config_path, &json) {
-                tracing::warn!("failed to persist distribution config to {config_path:?}: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("failed to serialize config for persistence: {e}"),
+    let cascade = control.cascade_now();
+    if let Err(e) = update_config_file(config_path, relay_config, |config| {
+        let dcfg = config
+            .distribution
+            .get_or_insert_with(crate::config::DistributionConfig::default);
+        dcfg.enabled = true;
+        dcfg.token_secret = rt.token_secret.clone();
+        dcfg.require_viewer_token = rt.require_viewer_token;
+        dcfg.require_ingest_token = rt.require_ingest_token;
+        dcfg.public_ip = rt.public_ip.map(|ip| ip.to_string());
+        dcfg.public_base_url = rt.public_base_url.clone();
+        dcfg.portal_url = rt.portal_url.clone();
+        dcfg.cascade_sources = cascade;
+    }) {
+        tracing::warn!("failed to persist distribution config to {config_path:?}: {e}");
     }
 }
 
@@ -920,16 +961,17 @@ async fn handle_manager_message<S>(
                         Err("Empty new_secret".to_string())
                     } else {
                         tracing::info!("Manager command: rotate_secret — updating node authentication secret");
-                        // Persist new secret to config file
-                        let mut updated = relay_config.clone();
-                        if let Some(ref mut mgr) = updated.manager {
-                            mgr.node_secret = Some(new_secret.to_string());
-                        }
-                        if let Ok(json) = serde_json::to_string_pretty(&updated)
-                            && let Err(e) = std::fs::write(config_path, &json) {
-                                tracing::warn!("Failed to persist rotated secret: {e}");
-                                ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
+                        // Persist new secret to config file. Through the
+                        // shared helper: rotating must not revert the
+                        // distribution config the manager pushed since startup.
+                        if let Err(e) = update_config_file(config_path, relay_config, |config| {
+                            if let Some(ref mut mgr) = config.manager {
+                                mgr.node_secret = Some(new_secret.to_string());
                             }
+                        }) {
+                            tracing::warn!("Failed to persist rotated secret: {e}");
+                            ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
+                        }
                         tracing::info!("Node secret rotated and persisted");
                         ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
                         Ok(())
@@ -1160,21 +1202,151 @@ fn persist_credentials(
     node_id: &str,
     node_secret: &str,
 ) {
-    let mut config = relay_config.clone();
-    if let Some(ref mut mgr) = config.manager {
-        mgr.registration_token = None;
-        mgr.node_id = Some(node_id.to_string());
-        mgr.node_secret = Some(node_secret.to_string());
-    }
-    if let Ok(json) = serde_json::to_string_pretty(&config) {
-        if let Err(e) = std::fs::write(config_path, &json) {
-            tracing::warn!("Failed to persist manager credentials: {e}");
-        } else {
-            tracing::info!(
-                "Manager credentials saved to {}",
-                config_path.display()
-            );
+    match update_config_file(config_path, relay_config, |config| {
+        if let Some(ref mut mgr) = config.manager {
+            mgr.registration_token = None;
+            mgr.node_id = Some(node_id.to_string());
+            mgr.node_secret = Some(node_secret.to_string());
         }
+    }) {
+        Ok(()) => tracing::info!("Manager credentials saved to {}", config_path.display()),
+        Err(e) => tracing::warn!("Failed to persist manager credentials: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use crate::config::{DistributionConfig, ManagerConfig, RelayConfig};
+    use crate::distribution_control::{DistributionControl, RuntimeDistConfig};
+
+    fn registered_config() -> RelayConfig {
+        let manager = Some(ManagerConfig {
+            enabled: true,
+            urls: vec!["wss://m.example/ws/node".into()],
+            accept_self_signed_cert: false,
+            cert_fingerprint: None,
+            registration_token: Some("one-time-token".into()),
+            node_id: None,
+            node_secret: None,
+        });
+        RelayConfig { manager, ..Default::default() }
+    }
+
+    /// Registering then receiving a distribution push must leave BOTH on disk.
+    ///
+    /// This is the sequence that broke it. Each writer rebuilt the whole file
+    /// from the config captured at startup, so the distribution push restored
+    /// the burnt registration token and erased the secret registration had
+    /// just written. The relay kept running — it was already authenticated —
+    /// and could never reconnect after a restart, having been left holding a
+    /// credential the manager had already consumed.
+    #[test]
+    fn a_distribution_push_does_not_revert_the_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.json");
+        let startup = registered_config();
+        std::fs::write(&path, serde_json::to_string_pretty(&startup).unwrap()).unwrap();
+
+        // 1. Registration lands.
+        persist_credentials(&startup, &path, "node-1", "the-secret");
+        let after_reg: RelayConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let m = after_reg.manager.as_ref().unwrap();
+        assert_eq!(m.node_secret.as_deref(), Some("the-secret"));
+        assert_eq!(m.registration_token, None, "the used token must be cleared");
+
+        // 2. The manager pushes a distribution config. `startup` is passed on
+        //    purpose — it is the stale snapshot the old code always used.
+        let control = DistributionControl::new(
+            RuntimeDistConfig::from_config(&DistributionConfig::default(), None),
+            vec![],
+        );
+        control.apply(crate::distribution_control::DistUpdate {
+            public_base_url: Some("https://relay.example".into()),
+            ..Default::default()
+        });
+        persist_distribution_config(Some(&control), &startup, &path);
+
+        // 3. Both must be on disk.
+        let after_push: RelayConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let m = after_push.manager.as_ref().unwrap();
+        assert_eq!(
+            m.node_secret.as_deref(),
+            Some("the-secret"),
+            "the distribution push erased the node secret"
+        );
+        assert_eq!(
+            m.registration_token, None,
+            "the distribution push restored a registration token the manager has consumed"
+        );
+        assert_eq!(
+            after_push
+                .distribution
+                .as_ref()
+                .and_then(|d| d.public_base_url.as_deref()),
+            Some("https://relay.example"),
+            "the push itself did not land"
+        );
+    }
+
+    /// ...and the other way round: persisting credentials must not throw away
+    /// a distribution config that arrived before registration completed.
+    #[test]
+    fn registering_does_not_revert_a_distribution_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.json");
+        let startup = registered_config();
+
+        let with_dist = RelayConfig {
+            distribution: Some(DistributionConfig {
+                public_base_url: Some("https://relay.example".into()),
+                ..Default::default()
+            }),
+            ..startup.clone()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&with_dist).unwrap()).unwrap();
+
+        persist_credentials(&startup, &path, "node-1", "the-secret");
+
+        let after: RelayConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.distribution.as_ref().and_then(|d| d.public_base_url.as_deref()),
+            Some("https://relay.example"),
+            "registering discarded the distribution config already on disk"
+        );
+        assert_eq!(
+            after.manager.as_ref().unwrap().node_secret.as_deref(),
+            Some("the-secret")
+        );
+    }
+
+    /// An unreadable file falls back to the in-memory config rather than
+    /// refusing to persist — the case the old code was written for.
+    #[test]
+    fn an_unreadable_file_still_gets_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        persist_credentials(&registered_config(), &path, "node-1", "the-secret");
+
+        let after: RelayConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.manager.as_ref().unwrap().node_secret.as_deref(),
+            Some("the-secret")
+        );
+    }
+
+    /// No config file (CLI-only relay) must not create one.
+    #[test]
+    fn no_config_file_means_nothing_to_write() {
+        let empty = PathBuf::new();
+        persist_credentials(&registered_config(), &empty, "node-1", "s");
+        assert!(!std::path::Path::new("").exists());
     }
 }
 
