@@ -665,6 +665,12 @@ fn apply_configure_distribution(
             Err(_) => return Err(format!("invalid public_ip '{s}'")),
         }
     }
+    if let Some(s) = action.get("portal_url").and_then(|v| v.as_str()) {
+        if !s.starts_with("http://") && !s.starts_with("https://") {
+            return Err("portal_url must start with http:// or https://".to_string());
+        }
+        update.portal_url = Some(s.to_string());
+    }
     if let Some(s) = action.get("public_base_url").and_then(|v| v.as_str()) {
         if !(s.starts_with("http://") || s.starts_with("https://")) {
             return Err("public_base_url must start with http:// or https://".to_string());
@@ -741,6 +747,7 @@ fn persist_distribution_config(
     dcfg.require_ingest_token = rt.require_ingest_token;
     dcfg.public_ip = rt.public_ip.map(|ip| ip.to_string());
     dcfg.public_base_url = rt.public_base_url.clone();
+    dcfg.portal_url = rt.portal_url.clone();
     dcfg.cascade_sources = control.cascade_now();
 
     match serde_json::to_string_pretty(&updated) {
@@ -1215,6 +1222,51 @@ mod manager_contract_tests {
             per[0].1.retention_secs,
             Some(300),
             "the window must survive the wire"
+        );
+    }
+
+    /// `portal_url` must survive the wire, and a bad one must be refused.
+    ///
+    /// The relay renders this as a link a viewer is invited to click, so the
+    /// consequence of the manager and the relay disagreeing about the field
+    /// name is not a warning — it is a page that quietly reverts to telling a
+    /// portal viewer to reload, which is the one thing that cannot help them.
+    #[test]
+    fn the_managers_portal_url_is_understood() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+        assert_eq!(control.load().portal_url, None, "starts unset");
+
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "portal_url": "https://portal.example.com"
+            }),
+        )
+        .expect("the relay must accept a portal url from the manager");
+        assert_eq!(
+            control.load().portal_url.as_deref(),
+            Some("https://portal.example.com"),
+            "the portal url did not reach the live config"
+        );
+
+        // A scheme-less or `javascript:` value must not reach a page that
+        // presents it as the way back in. Checked on both sides on purpose.
+        for bad in ["javascript:alert(1)", "portal.example.com", "//evil.example"] {
+            assert!(
+                apply_configure_distribution(
+                    Some(&control),
+                    &serde_json::json!({ "type": "configure_distribution", "portal_url": bad }),
+                )
+                .is_err(),
+                "accepted {bad}"
+            );
+        }
+        // ...and the refusal left the good one in place rather than clearing it.
+        assert_eq!(
+            control.load().portal_url.as_deref(),
+            Some("https://portal.example.com")
         );
     }
 

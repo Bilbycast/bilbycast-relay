@@ -227,6 +227,14 @@ pub struct DistributionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
 
+    /// The viewer portal's URL, offered to a viewer whose token has expired.
+    ///
+    /// Set here or pushed by the manager. Without it the player can only say
+    /// that access ended, because a viewer who arrived from the portal has a
+    /// dead token in their URL and reloading re-presents it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal_url: Option<String>,
+
     /// Distribution ingest (edge → relay) QUIC listener addresses. The edge
     /// ships browser-ready H.264+Opus elementary frames here. Default
     /// `:4486`.
@@ -336,6 +344,7 @@ impl Default for DistributionConfig {
             http_addrs: None,
             public_ip: None,
             public_base_url: None,
+            portal_url: None,
             ingest_addrs: None,
             token_secret: None,
             require_viewer_token: false,
@@ -414,6 +423,14 @@ impl DistributionConfig {
             ip.parse::<std::net::IpAddr>().map_err(|e| {
                 anyhow::anyhow!("distribution.public_ip '{ip}' is not a valid IP: {e}")
             })?;
+        }
+        if let Some(ref url) = self.portal_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                anyhow::bail!("distribution.portal_url must start with http:// or https://");
+            }
+            if url.len() > 2048 {
+                anyhow::bail!("distribution.portal_url too long (max 2048 chars)");
+            }
         }
         if let Some(ref url) = self.public_base_url {
             if !(url.starts_with("http://") || url.starts_with("https://")) {

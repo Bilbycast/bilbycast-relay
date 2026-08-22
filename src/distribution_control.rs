@@ -38,6 +38,19 @@ pub struct RuntimeDistConfig {
     /// Public base URL used to build shareable viewer links (reported to the
     /// manager on health).
     pub public_base_url: Option<String>,
+
+    /// Where a viewer whose access has expired goes to get more.
+    ///
+    /// The player cannot work this out and must not guess. A viewer who came
+    /// through the **portal** landed here with a token in the URL, so
+    /// reloading re-presents the dead one and changes nothing — the honest
+    /// instruction is "sign in again", and that needs somewhere to point.
+    ///
+    /// It comes from the relay's own config (pushed by the manager), never
+    /// from a query parameter: a URL the page will offer as a link, taken from
+    /// the request that asked for the page, is a phishing hop with extra steps.
+    /// `None` means say what happened without offering a link.
+    pub portal_url: Option<String>,
 }
 
 impl RuntimeDistConfig {
@@ -50,6 +63,7 @@ impl RuntimeDistConfig {
             require_ingest_token: cfg.require_ingest_token,
             public_ip: public_ip.or_else(|| cfg.public_ip_parsed()),
             public_base_url: cfg.public_base_url.clone(),
+            portal_url: cfg.portal_url.clone(),
         }
     }
 }
@@ -156,6 +170,7 @@ impl DistributionControl {
             require_ingest_token: update.require_ingest_token.unwrap_or(cur.require_ingest_token),
             public_ip: update.public_ip.or(cur.public_ip),
             public_base_url: update.public_base_url.or_else(|| cur.public_base_url.clone()),
+            portal_url: update.portal_url.or_else(|| cur.portal_url.clone()),
         };
         self.store(next);
     }
@@ -181,6 +196,7 @@ pub struct DistUpdate {
     pub require_ingest_token: Option<bool>,
     pub public_ip: Option<IpAddr>,
     pub public_base_url: Option<String>,
+    pub portal_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -195,6 +211,7 @@ mod tests {
             require_ingest_token: true,
             public_ip: None,
             public_base_url: None,
+            portal_url: None,
         }
     }
 
@@ -205,6 +222,7 @@ mod tests {
             token_secret: Some("bb".into()),
             require_viewer_token: Some(true),
             public_base_url: Some("https://r".into()),
+            portal_url: Some("https://portal.example".into()),
             ..Default::default()
         });
         let g = c.load();
@@ -213,6 +231,7 @@ mod tests {
         // Untouched fields keep their prior value.
         assert!(g.require_ingest_token);
         assert_eq!(g.public_base_url.as_deref(), Some("https://r"));
+        assert_eq!(g.portal_url.as_deref(), Some("https://portal.example"));
     }
 
     #[tokio::test]

@@ -676,11 +676,32 @@ fn player_html(stream_id: &str) -> String {
 /// and an all-intra proxy under `{stream_id}-proxy` (override with
 /// `?main=` / `?proxy=`). The proxy is what makes frame-exact jog and reverse
 /// shuttle possible; see `WEB_DVR_PLAYER_PLAN.md`.
-async fn dvr_page(Path(stream_id): Path<String>) -> Response {
+async fn dvr_page(
+    State(st): State<Arc<DistributionState>>,
+    Path(stream_id): Path<String>,
+) -> Response {
     let Some(stream_id) = sanitize_stream_id(&stream_id) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
-    let html = include_str!("dvr.html").replace("__STREAM_ID__", &stream_id);
+    // Where an expired viewer goes next. From the relay's own config, never
+    // from the request — the page offers it as a link, and a link taken from
+    // the URL that asked for the page is a phishing hop with extra steps.
+    // Quotes and backslashes are stripped rather than escaped: the value is a
+    // URL and cannot legitimately contain either, so anything that does is not
+    // a URL we should be sending a viewer to.
+    let portal = st
+        .control
+        .load()
+        .portal_url
+        .clone()
+        .filter(|u| {
+            (u.starts_with("http://") || u.starts_with("https://"))
+                && !u.bytes().any(|b| matches!(b, b'"' | b'\\' | b'<' | b'>'))
+        })
+        .unwrap_or_default();
+    let html = include_str!("dvr.html")
+        .replace("__STREAM_ID__", &stream_id)
+        .replace("__PORTAL_URL__", &portal);
     // The page is an app shell that changes with the build. Without this a
     // browser will happily serve a cached copy after an upgrade, so a fixed
     // player looks unfixed. (`/dvr/hls.js` stays immutable — it is versioned.)
@@ -726,6 +747,59 @@ mod tests {
         // The proxy rendition is what makes frame jog work; the page must
         // derive it rather than silently play only the main one.
         assert!(html.contains("-proxy"), "page does not reference a proxy rendition");
+    }
+
+    /// Both placeholders must be substituted, and the page must offer the
+    /// portal only when there is one.
+    ///
+    /// A stray `__PORTAL_URL__` would become a link to a literally-named page,
+    /// which is worse than the no-portal case it replaced: the viewer clicks
+    /// it and lands nowhere, having been told that was the way back.
+    #[test]
+    fn dvr_page_offers_the_portal_only_when_one_is_configured() {
+        let with = include_str!("dvr.html")
+            .replace("__STREAM_ID__", "bigshow")
+            .replace("__PORTAL_URL__", "https://portal.example");
+        assert!(!with.contains("__PORTAL_URL__"), "placeholder left in page");
+        assert!(with.contains("https://portal.example"));
+
+        // With no portal, the page must not tell a viewer to reload: someone
+        // who came from a portal has a dead token in their URL, so reloading
+        // re-presents it and changes nothing.
+        let without = include_str!("dvr.html")
+            .replace("__STREAM_ID__", "bigshow")
+            .replace("__PORTAL_URL__", "");
+        assert!(!without.contains("__PORTAL_URL__"));
+        assert!(
+            without.contains("Open the feed again"),
+            "no instruction for a viewer with no portal to return to"
+        );
+        assert!(
+            !without.contains("reload the page to continue"),
+            "page still promises a reload that cannot help a portal viewer"
+        );
+    }
+
+    /// The link the page offers comes from the relay's config, never from the
+    /// request. A page that would render a URL supplied by whoever asked for
+    /// it is a phishing hop with extra steps, so the page must not read one
+    /// out of its own query string.
+    #[test]
+    fn the_portal_link_is_not_taken_from_the_url() {
+        let html = include_str!("dvr.html");
+        let after = html
+            .split("var PORTAL_URL")
+            .nth(1)
+            .expect("PORTAL_URL not found");
+        let decl = after.lines().next().unwrap();
+        assert!(
+            decl.contains("__PORTAL_URL__"),
+            "PORTAL_URL is not the server-substituted placeholder: {decl}"
+        );
+        assert!(
+            !decl.contains("location") && !decl.contains("param"),
+            "PORTAL_URL reads from the request: {decl}"
+        );
     }
 
     /// hls.js is vendored, not fetched. Android Chrome has no native HLS, so a

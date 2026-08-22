@@ -60,23 +60,26 @@ pulls in neither str0m nor OpenSSL.
 
 ## Installing
 
-**There is no signed-release path for the portal yet.** `install-relay.sh` and
-`upgrade-relay.sh` install from a cosign-verified release manifest, and that
-manifest carries no portal artefact — adding one is release-pipeline work.
-Until it exists, deploy by hand:
+The portal ships **inside the distribution relay's release tarball** —
+`bilbycast-relay-<arch>-linux-distribution.tar.gz`, the same signed artefact
+`install-relay.sh` verifies. A distribution relay is the box the portal runs
+beside, so they travel together; they still run as two processes under two
+users.
 
 ```bash
-cargo build --release --features portal
+tar xzf bilbycast-relay-x86_64-linux-distribution.tar.gz
+cd bilbycast-relay-*-x86_64-linux-distribution
 
 sudo install -D -m0644 packaging/bilbycast-portal.sysusers /etc/sysusers.d/bilbycast-portal.conf
 sudo systemd-sysusers
 
-sudo install -D -m0755 target/release/bilbycast-portal /opt/bilbycast/portal/bilbycast-portal
+sudo install -D -m0755 bilbycast-portal /opt/bilbycast/portal/bilbycast-portal
 sudo install -d -o bilbycast-portal -g bilbycast-portal /var/lib/bilbycast/portal
 sudo install -D -m0644 portal-config.example.json /etc/bilbycast/portal.json
 sudo install -D -m0644 packaging/bilbycast-portal.service /etc/systemd/system/bilbycast-portal.service
 
-# The service token, from the manager (see below).
+# The service token, from the manager (see below). Kept out of portal.json so
+# it can have its own permissions.
 sudo install -D -m0600 /dev/null /etc/bilbycast/portal.env
 sudo chgrp bilbycast-portal /etc/bilbycast/portal.env
 echo 'BILBYCAST_PORTAL_TOKEN=...' | sudo tee /etc/bilbycast/portal.env >/dev/null
@@ -84,10 +87,16 @@ echo 'BILBYCAST_PORTAL_TOKEN=...' | sudo tee /etc/bilbycast/portal.env >/dev/nul
 sudo systemctl daemon-reload && sudo systemctl enable --now bilbycast-portal
 ```
 
-Edit `/etc/bilbycast/portal.json` to point at the manager before starting: the
-service refuses to start without a `manager_url` and a token, which is
-deliberate — a portal that came up misconfigured would fail every viewer with a
-message that reads like their account being wrong.
+Point `/etc/bilbycast/portal.json` at the manager before starting. The service
+refuses to start without a `manager_url` and a token, which is deliberate: a
+portal that came up misconfigured would fail every viewer with a message that
+reads like their account being wrong.
+
+`install-relay.sh` does **not** install the portal, and neither does
+`upgrade-relay.sh` — both are single-binary by design, discovering the relay's
+path from `systemctl cat` and swapping one file. Teaching them a second unit is
+worth doing once more than one site runs a portal; until then an upgrade is the
+four lines above against the new tarball.
 
 ## Configuring
 
