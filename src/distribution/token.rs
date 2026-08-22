@@ -143,6 +143,12 @@ fn rendition_source(stream: &str) -> Option<&str> {
 /// waiting to happen -- but it is why the suffix list is closed and why the
 /// widening is here, in one place, rather than spread across the callers.
 pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
+    // Three-part token: it carries the list of streams it admits.
+    if let Some(rest) = token.split('.').nth(1)
+        && token.split('.').count() == 3
+    {
+        return verify_multi(secret_hex, stream, token, rest);
+    }
     match verify(secret_hex, SCOPE_VIEWER, stream, token) {
         Ok(()) => Ok(()),
         Err(e) => match rendition_source(stream) {
@@ -154,6 +160,44 @@ pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Resul
     }
 }
 
+/// Verify a token that carries its own list of admitted streams.
+///
+/// The signature is checked **before** the list is trusted for anything. A
+/// list is attacker-supplied text until the HMAC over it verifies, so reading
+/// membership first would let anyone append a stream name to someone else's
+/// token and be believed.
+fn verify_multi(secret_hex: &str, stream: &str, token: &str, joined: &str) -> Result<()> {
+    let mut parts = token.split('.');
+    let exp_str = parts.next().ok_or_else(|| anyhow!("malformed token"))?;
+    let _ = parts.next();
+    let hmac_hex = parts.next().ok_or_else(|| anyhow!("malformed token"))?;
+
+    let exp: u64 = exp_str.parse().map_err(|_| anyhow!("bad exp"))?;
+    if exp < now_unix() {
+        bail!("token expired");
+    }
+    let secret = decode_secret(secret_hex)?;
+    let expected = compute_hmac(&secret, SCOPE_VIEWER, joined, exp);
+    if !ct_eq(&expected, &decode_hex(hmac_hex)?) {
+        bail!("signature mismatch");
+    }
+
+    // Only now is the list trustworthy.
+    let admits = |name: &str| joined.split(STREAM_SEP).any(|s| s == name);
+    if admits(stream) {
+        return Ok(());
+    }
+    // A derived rendition is admitted by its source, exactly as for the
+    // single-stream form — the player fetches `{s}` and `{s}-proxy` off one
+    // credential.
+    if let Some(source) = rendition_source(stream)
+        && admits(source)
+    {
+        return Ok(());
+    }
+    bail!("token does not admit this stream")
+}
+
 /// Verify an ingest token (edge → relay distribution ingest).
 pub fn verify_ingest_token(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
     verify(secret_hex, SCOPE_INGEST, stream, token)
@@ -162,6 +206,49 @@ pub fn verify_ingest_token(secret_hex: &str, stream: &str, token: &str) -> Resul
 /// Mint a viewer token (used by tests / manager-side parity checks).
 pub fn mint_viewer_token(secret_hex: &str, stream: &str, exp: u64) -> Result<String> {
     mint(secret_hex, SCOPE_VIEWER, stream, exp)
+}
+
+/// Separator between stream names inside a multi-stream token.
+///
+/// Safe because `sanitize_stream_id` admits only `[A-Za-z0-9_.-]`, so a comma
+/// can never appear inside a name and the list is unambiguous to split.
+const STREAM_SEP: char = ',';
+
+/// Mint a viewer token that admits **several** streams.
+///
+/// One viewer holds one credential, and what it opens is decided when it is
+/// issued rather than by which feed they happen to ask for. That is what lets
+/// the origin be gated for everything at once: a viewer is not "allowed on
+/// this relay", they are allowed on *these streams*.
+///
+/// The list is sorted so the same set always mints the same token, and it
+/// travels **in the token**: the relay holds no per-viewer state, so it can
+/// only check membership against a list it can see. The HMAC covers that list,
+/// so adding a name to it invalidates the signature.
+///
+/// A one-element list produces a token byte-identical to
+/// [`mint_viewer_token`], which is what keeps every already-issued WHEP token
+/// valid.
+pub fn mint_viewer_token_multi(secret_hex: &str, streams: &[&str], exp: u64) -> Result<String> {
+    if streams.is_empty() {
+        bail!("a viewer token must admit at least one stream");
+    }
+    let mut sorted: Vec<&str> = streams.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    for s in &sorted {
+        if s.is_empty() || s.contains(STREAM_SEP) {
+            bail!("invalid stream name in token");
+        }
+    }
+    let joined = sorted.join(&STREAM_SEP.to_string());
+    let secret = decode_secret(secret_hex)?;
+    let mac = compute_hmac(&secret, SCOPE_VIEWER, &joined, exp);
+    // Single-stream stays two-part, so it is byte-identical to the old form.
+    if sorted.len() == 1 {
+        return Ok(format!("{exp}.{}", hex_encode(&mac)));
+    }
+    Ok(format!("{exp}.{joined}.{}", hex_encode(&mac)))
 }
 
 /// Mint an ingest token.
@@ -229,6 +316,78 @@ mod tests {
         let tok = mint_viewer_token(SECRET, "show", expired).unwrap();
         assert!(verify_viewer_token(SECRET, "show", &tok).is_err());
         assert!(verify_viewer_token(SECRET, "show-proxy", &tok).is_err());
+    }
+
+    /// One credential, several feeds — the whole point of gating every stream
+    /// rather than gating a relay.
+    #[test]
+    fn a_multi_stream_token_admits_each_of_its_streams() {
+        let exp = now_unix() + 300;
+        let tok = mint_viewer_token_multi(SECRET, &["alpha", "bravo"], exp).unwrap();
+        assert!(verify_viewer_token(SECRET, "alpha", &tok).is_ok());
+        assert!(verify_viewer_token(SECRET, "bravo", &tok).is_ok());
+        // ...and their proxies, since the player fetches both renditions.
+        assert!(verify_viewer_token(SECRET, "alpha-proxy", &tok).is_ok());
+        assert!(verify_viewer_token(SECRET, "bravo-proxy", &tok).is_ok());
+    }
+
+    /// A stream NOT in the list is refused even though the signature is valid
+    /// for the token as a whole.
+    #[test]
+    fn a_multi_stream_token_admits_nothing_else() {
+        let exp = now_unix() + 300;
+        let tok = mint_viewer_token_multi(SECRET, &["alpha", "bravo"], exp).unwrap();
+        assert!(verify_viewer_token(SECRET, "charlie", &tok).is_err());
+        assert!(verify_viewer_token(SECRET, "charlie-proxy", &tok).is_err());
+        assert!(verify_viewer_token(SECRET, "alph", &tok).is_err());
+    }
+
+    /// The list is attacker-supplied text until the HMAC over it verifies.
+    /// Appending a name to someone else's token must not widen it.
+    #[test]
+    fn appending_a_stream_to_the_list_invalidates_the_token() {
+        let exp = now_unix() + 300;
+        let tok = mint_viewer_token_multi(SECRET, &["alpha", "bravo"], exp).unwrap();
+        let parts: Vec<&str> = tok.split('.').collect();
+        assert_eq!(parts.len(), 3, "a multi-stream token carries its list");
+        let tampered = format!("{}.{},charlie.{}", parts[0], parts[1], parts[2]);
+        assert!(verify_viewer_token(SECRET, "charlie", &tampered).is_err());
+        // ...and the streams it legitimately held are refused too, because the
+        // signature no longer covers what the token now claims.
+        assert!(verify_viewer_token(SECRET, "alpha", &tampered).is_err());
+    }
+
+    /// A one-element list must produce the OLD two-part token byte for byte,
+    /// so every already-issued WHEP credential keeps working.
+    #[test]
+    fn a_single_stream_multi_token_is_the_old_format() {
+        let exp = now_unix() + 300;
+        let old = mint_viewer_token(SECRET, "solo", exp).unwrap();
+        let new = mint_viewer_token_multi(SECRET, &["solo"], exp).unwrap();
+        assert_eq!(old, new, "the single-stream form must not change");
+        assert_eq!(new.split('.').count(), 2);
+    }
+
+    /// Order and duplicates must not change the token, or the same
+    /// entitlement would mint differently on each call and be impossible to
+    /// compare.
+    #[test]
+    fn the_stream_list_is_canonical() {
+        let exp = now_unix() + 300;
+        let a = mint_viewer_token_multi(SECRET, &["bravo", "alpha"], exp).unwrap();
+        let b = mint_viewer_token_multi(SECRET, &["alpha", "bravo", "alpha"], exp).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_multi_stream_token_still_expires() {
+        let tok = mint_viewer_token_multi(SECRET, &["alpha", "bravo"], now_unix() - 1).unwrap();
+        assert!(verify_viewer_token(SECRET, "alpha", &tok).is_err());
+    }
+
+    #[test]
+    fn an_empty_stream_list_is_refused_at_mint() {
+        assert!(mint_viewer_token_multi(SECRET, &[], now_unix() + 300).is_err());
     }
 
     #[test]
