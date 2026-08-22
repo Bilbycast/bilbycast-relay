@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      # Six cargo invocations (check/clippy/test across two feature configs)
+      # Nine cargo invocations (check/clippy/test across three feature configs)
       # share one target dir. Debug info is the dominant term in target-dir
       # size and link time, and nothing here debugs a CI binary — panics still
       # carry file and line, which is all the test output uses. bilbycast-manager
@@ -117,3 +117,27 @@ jobs:
 
       - name: cargo test (viewer-distribution)
         run: cargo test --features viewer-distribution
+
+      # ---------------------------------------------------------------
+      # `portal`: the viewer portal binary.
+      #
+      # Same argument as the block above, and the same trap: `portal` is off by
+      # default, and it is a SECOND binary with `required-features`, so every
+      # command above compiles right past `src/portal/`, `src/portal_bin.rs`
+      # and `tests/portal.rs` without so much as a syntax check. The code it
+      # covers is the trust boundary between an authenticating proxy and the
+      # manager's entitlement store, which is the last thing that should first
+      # be compiled by a release build.
+      #
+      # A separate config rather than folded into the line above: the portal is
+      # deliberately independent of `viewer-distribution` (it links neither
+      # str0m nor OpenSSL), and running them together would stop proving that.
+      # ---------------------------------------------------------------
+      - name: cargo check (portal)
+        run: cargo check --all-targets --features portal
+
+      - name: cargo clippy (portal)
+        run: cargo clippy --all-targets --features portal -- -D warnings
+
+      - name: cargo test (portal)
+        run: cargo test --features portal

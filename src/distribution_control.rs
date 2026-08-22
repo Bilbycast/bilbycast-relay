@@ -29,12 +29,28 @@ use crate::config::{CascadeSource, DistributionConfig};
 pub struct RuntimeDistConfig {
     pub token_secret: Option<String>,
     pub require_viewer_token: bool,
+    /// Gate `GET /origin/...` as well as WHEP. Default false — see
+    /// [`crate::config::DistributionConfig::require_origin_token`].
+    pub require_origin_token: bool,
     pub require_ingest_token: bool,
     /// Public IP advertised in WHEP ICE candidates.
     pub public_ip: Option<IpAddr>,
     /// Public base URL used to build shareable viewer links (reported to the
     /// manager on health).
     pub public_base_url: Option<String>,
+
+    /// Where a viewer whose access has expired goes to get more.
+    ///
+    /// The player cannot work this out and must not guess. A viewer who came
+    /// through the **portal** landed here with a token in the URL, so
+    /// reloading re-presents the dead one and changes nothing — the honest
+    /// instruction is "sign in again", and that needs somewhere to point.
+    ///
+    /// It comes from the relay's own config (pushed by the manager), never
+    /// from a query parameter: a URL the page will offer as a link, taken from
+    /// the request that asked for the page, is a phishing hop with extra steps.
+    /// `None` means say what happened without offering a link.
+    pub portal_url: Option<String>,
 }
 
 impl RuntimeDistConfig {
@@ -43,17 +59,58 @@ impl RuntimeDistConfig {
         Self {
             token_secret: cfg.token_secret.clone(),
             require_viewer_token: cfg.require_viewer_token,
+            require_origin_token: cfg.require_origin_token,
             require_ingest_token: cfg.require_ingest_token,
             public_ip: public_ip.or_else(|| cfg.public_ip_parsed()),
             public_base_url: cfg.public_base_url.clone(),
+            portal_url: cfg.portal_url.clone(),
         }
     }
+}
+
+/// A partial change to one origin retention policy. Every field is optional;
+/// an absent field inherits whatever it is being applied to.
+///
+/// Seconds and bytes rather than `Duration` because this is the wire shape the
+/// manager sends, and it is applied on the far side of a JSON boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OriginPolicyPatch {
+    pub retention_secs: Option<u64>,
+    pub max_bytes_per_stream: Option<u64>,
+    pub min_segments: Option<usize>,
+    pub idle_grace_secs: Option<u64>,
+}
+
+impl OriginPolicyPatch {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The manager's storage-policy push: a node-wide default plus per-stream
+/// overrides.
+///
+/// A per-stream entry is applied **on top of the resulting default**, so an
+/// override that names only `retention_secs` still gets the node's byte bound
+/// and floor rather than zeroes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OriginPolicyUpdate {
+    pub default: Option<OriginPolicyPatch>,
+    /// `Some` **replaces** the whole override set (an ended session's override
+    /// must not survive); `None` leaves the existing set untouched.
+    pub per_stream: Option<Vec<(String, OriginPolicyPatch)>>,
 }
 
 /// Shared, lock-free runtime config + a cascade-source change channel.
 pub struct DistributionControl {
     cfg: ArcSwap<RuntimeDistConfig>,
     cascade_tx: watch::Sender<Vec<CascadeSource>>,
+    /// Storage-policy pushes. A `watch` like the cascade channel: the origin
+    /// store is the single consumer and only ever needs the latest value.
+    origin_tx: watch::Sender<OriginPolicyUpdate>,
+    /// Keeps `origin_tx` with a receiver so `send` never errors before the
+    /// origin subscribes.
+    origin_keep: watch::Receiver<OriginPolicyUpdate>,
     /// Kept so `cascade_tx.send` always has a receiver (never errors) even
     /// before the cascade supervisor subscribes; also read by `cascade_now`.
     cascade_keep: watch::Receiver<Vec<CascadeSource>>,
@@ -62,11 +119,29 @@ pub struct DistributionControl {
 impl DistributionControl {
     pub fn new(initial: RuntimeDistConfig, cascade: Vec<CascadeSource>) -> Arc<Self> {
         let (cascade_tx, keep) = watch::channel(cascade);
+        let (origin_tx, origin_keep) = watch::channel(OriginPolicyUpdate::default());
         Arc::new(Self {
             cfg: ArcSwap::from_pointee(initial),
             cascade_tx,
             cascade_keep: keep,
+            origin_tx,
+            origin_keep,
         })
+    }
+
+    /// Subscribe to storage-policy pushes (the origin store).
+    pub fn subscribe_origin(&self) -> watch::Receiver<OriginPolicyUpdate> {
+        self.origin_tx.subscribe()
+    }
+
+    /// Current storage policy push (for persistence / reporting).
+    pub fn origin_policy_now(&self) -> OriginPolicyUpdate {
+        self.origin_keep.borrow().clone()
+    }
+
+    /// Push a storage-policy change (manager). The origin store applies it.
+    pub fn set_origin_policy(&self, update: OriginPolicyUpdate) {
+        let _ = self.origin_tx.send(update);
     }
 
     /// Current cascade-source list (for persistence to config.json).
@@ -91,9 +166,11 @@ impl DistributionControl {
         let next = RuntimeDistConfig {
             token_secret: update.token_secret.or_else(|| cur.token_secret.clone()),
             require_viewer_token: update.require_viewer_token.unwrap_or(cur.require_viewer_token),
+            require_origin_token: update.require_origin_token.unwrap_or(cur.require_origin_token),
             require_ingest_token: update.require_ingest_token.unwrap_or(cur.require_ingest_token),
             public_ip: update.public_ip.or(cur.public_ip),
             public_base_url: update.public_base_url.or_else(|| cur.public_base_url.clone()),
+            portal_url: update.portal_url.or_else(|| cur.portal_url.clone()),
         };
         self.store(next);
     }
@@ -115,9 +192,11 @@ impl DistributionControl {
 pub struct DistUpdate {
     pub token_secret: Option<String>,
     pub require_viewer_token: Option<bool>,
+    pub require_origin_token: Option<bool>,
     pub require_ingest_token: Option<bool>,
     pub public_ip: Option<IpAddr>,
     pub public_base_url: Option<String>,
+    pub portal_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -128,9 +207,11 @@ mod tests {
         RuntimeDistConfig {
             token_secret: Some("aa".into()),
             require_viewer_token: false,
+            require_origin_token: false,
             require_ingest_token: true,
             public_ip: None,
             public_base_url: None,
+            portal_url: None,
         }
     }
 
@@ -141,6 +222,7 @@ mod tests {
             token_secret: Some("bb".into()),
             require_viewer_token: Some(true),
             public_base_url: Some("https://r".into()),
+            portal_url: Some("https://portal.example".into()),
             ..Default::default()
         });
         let g = c.load();
@@ -149,6 +231,7 @@ mod tests {
         // Untouched fields keep their prior value.
         assert!(g.require_ingest_token);
         assert_eq!(g.public_base_url.as_deref(), Some("https://r"));
+        assert_eq!(g.portal_url.as_deref(), Some("https://portal.example"));
     }
 
     #[tokio::test]

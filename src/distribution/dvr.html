@@ -121,7 +121,29 @@
   var qs     = new URLSearchParams(location.search);
   var MAIN   = qs.get("main")  || STREAM;
   var PROXY  = qs.get("proxy") || (STREAM + "-proxy");
-  var TOKEN  = qs.get("token") || "";
+  // ONE token for both renditions.
+  //
+  // The player is two streams -- `{stream}` and `{stream}-proxy` -- but it is
+  // one thing being watched, so it takes one credential. The relay's viewer
+  // token covers a source and its derived renditions
+  // (`token::verify_viewer_token`), which is what makes that work.
+  //
+  // Only needed when the origin is gated (`require_origin_token`), which is
+  // off by default.
+  var TOKEN = qs.get("token") || "";
+
+  // With MSE we can send the token as a request header, so it never has to
+  // sit in a URL -- out of the address bar, the history, and any Referer.
+  // Native HLS (iOS Safari) hands the URL straight to the media stack and
+  // cannot set headers, so there the query form is the only option.
+  var TOKEN_IN_HEADER = !!(window.Hls && window.Hls.isSupported());
+  if (TOKEN && window.history && history.replaceState) {
+    // Drop it from the visible URL either way: a viewer copying the address
+    // out of the bar should not be handing out their credential with it.
+    qs.delete("token");
+    var q = qs.toString();
+    history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
+  }
   var FPS    = parseFloat(qs.get("fps") || "25");
   var dbg    = null;
   var FRAME  = 1 / FPS;
@@ -189,10 +211,56 @@
   var shuttleRAF = null;
 
   function url(stream, file) {
-    return "/origin/" + encodeURIComponent(stream) + "/" + file + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "");
+    var q = (TOKEN && !TOKEN_IN_HEADER) ? "?token=" + encodeURIComponent(TOKEN) : "";
+    return "/origin/" + encodeURIComponent(stream) + "/" + file + q;
   }
   var lastHlsError = null;
-  function fail(msg) { errEl.textContent = msg || ""; }
+  // Once access has expired, every later error is a consequence of it. Latch,
+  // so a generic "network error" cannot overwrite the one message that tells
+  // the viewer what to do.
+  var accessExpired = false;
+
+  // Substituted by the relay from its own config (pushed by the manager),
+  // NEVER from a query parameter. This string becomes a link the page invites
+  // the viewer to click, and one taken from the URL that asked for the page is
+  // a phishing hop with extra steps. Empty when no portal is configured.
+  var PORTAL_URL = "__PORTAL_URL__";
+
+  function fail(msg) {
+    if (accessExpired && msg && msg.indexOf("expired") === -1) return;
+    errEl.textContent = msg || "";
+  }
+
+  /* Access has run out, and what the viewer should do depends on how they got
+   * here — which the player cannot know.
+   *
+   * A viewer who followed a revocable LINK can reload: the grant is still
+   * valid and mints a fresh token. A viewer who came from the PORTAL cannot —
+   * they were handed a token in this URL, so reloading re-presents the dead
+   * one and nothing changes. Telling them to reload is telling them to do the
+   * one thing that will not work.
+   *
+   * So: when a portal is configured, offer it. When one is not, say what
+   * happened and where to go, without promising a reload that may not help. */
+  function failExpired() {
+    accessExpired = true;
+    errEl.textContent = "";
+    var span = document.createElement("span");
+    span.textContent = "Your viewing access has expired. ";
+    errEl.appendChild(span);
+    if (PORTAL_URL) {
+      var a = document.createElement("a");
+      a.href = PORTAL_URL;
+      a.textContent = "Sign in again to keep watching";
+      a.rel = "noopener";
+      a.style.color = "inherit";
+      errEl.appendChild(a);
+      errEl.appendChild(document.createTextNode("."));
+    } else {
+      errEl.appendChild(document.createTextNode(
+        "Open the feed again from wherever you got the link."));
+    }
+  }
   function fmt(t) {
     if (!isFinite(t) || t < 0) return "--:--:--";
     var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = Math.floor(t % 60);
@@ -353,11 +421,35 @@
         // generous back buffer so short jogs never refetch.
         backBufferLength: 120,
         maxBufferLength: 30,
-        lowLatencyMode: false
+        lowLatencyMode: false,
+        // Every manifest and segment fetch carries the credential. Applies to
+        // both because hls.js routes them through the same hook.
+        xhrSetup: function (xhr) {
+          if (TOKEN_IN_HEADER && TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
+        }
       });
       hls.on(Hls.Events.ERROR, function (_e, data) {
         if (!data) return;
         lastHlsError = label + ":" + data.details + (data.fatal ? " (fatal)" : "");
+
+        // An expiring viewing token is the one failure a viewer can act on, so
+        // it must not arrive as a generic stall.
+        //
+        // The token is short-lived on purpose — its TTL *is* the revocation
+        // latency, since the relay's HMAC tokens cannot be recalled once
+        // minted. Nothing renews it yet, so a long watch eventually starts
+        // 401ing mid-stream and hls.js reports a network error like any other:
+        // the picture simply stops, with a message that means nothing to the
+        // person watching.
+        //
+        // What fixes it depends on how they arrived, so `failExpired` decides
+        // rather than this branch asserting one of the two answers.
+        var status = (data.response && data.response.code) || 0;
+        if (status === 401 || status === 403) {
+          failExpired();
+          return;
+        }
+
         if (data.fatal) {
           fail(label + ": " + data.type + " / " + data.details);
         } else if (data.details === "bufferStalledError") {

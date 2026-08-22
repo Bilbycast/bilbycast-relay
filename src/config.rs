@@ -227,6 +227,14 @@ pub struct DistributionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
 
+    /// The viewer portal's URL, offered to a viewer whose token has expired.
+    ///
+    /// Set here or pushed by the manager. Without it the player can only say
+    /// that access ended, because a viewer who arrived from the portal has a
+    /// dead token in their URL and reloading re-presents it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal_url: Option<String>,
+
     /// Distribution ingest (edge → relay) QUIC listener addresses. The edge
     /// ships browser-ready H.264+Opus elementary frames here. Default
     /// `:4486`.
@@ -243,6 +251,20 @@ pub struct DistributionConfig {
     /// false (public streams). Set true for token-gated distribution.
     #[serde(default)]
     pub require_viewer_token: bool,
+
+    /// Require a valid signed viewer token on `GET /origin/{stream}/{file}`
+    /// too — the CMAF / LL-HLS tier, not just WHEP. Default **false**, which
+    /// is what makes the origin usable by a CDN: a CDN pulls with no
+    /// credential of the relay's, and that is the point of having an HTTP
+    /// origin at all.
+    ///
+    /// Turning it on closes a gap worth stating plainly: with it off, a
+    /// `require_viewer_token` WHEP gate is bypassable on any stream that also
+    /// runs the CMAF tier, by fetching `/origin/{stream}/index.m3u8`
+    /// directly. Turn it on per session when the audience is gated and no CDN
+    /// sits in front.
+    #[serde(default)]
+    pub require_origin_token: bool,
 
     /// Require a valid signed ingest token on every edge → relay ingest
     /// connection. Default true — the ingest is a write surface.
@@ -322,9 +344,11 @@ impl Default for DistributionConfig {
             http_addrs: None,
             public_ip: None,
             public_base_url: None,
+            portal_url: None,
             ingest_addrs: None,
             token_secret: None,
             require_viewer_token: false,
+            require_origin_token: false,
             require_ingest_token: true,
             max_viewers_per_ip: default_max_viewers_per_ip(),
             origin_window_segments: default_origin_window_segments(),
@@ -399,6 +423,14 @@ impl DistributionConfig {
             ip.parse::<std::net::IpAddr>().map_err(|e| {
                 anyhow::anyhow!("distribution.public_ip '{ip}' is not a valid IP: {e}")
             })?;
+        }
+        if let Some(ref url) = self.portal_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                anyhow::bail!("distribution.portal_url must start with http:// or https://");
+            }
+            if url.len() > 2048 {
+                anyhow::bail!("distribution.portal_url too long (max 2048 chars)");
+            }
         }
         if let Some(ref url) = self.public_base_url {
             if !(url.starts_with("http://") || url.starts_with("https://")) {

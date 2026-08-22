@@ -1,0 +1,68 @@
+[Unit]
+Description=bilbycast viewer portal (DVR)
+Documentation=https://bilbycast.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Its own user, NOT the relay's. The portal is public-facing and the relay
+# terminates media for every viewer on this box; sharing an account would mean
+# a portal compromise could read the relay's config and its manager secret.
+User=bilbycast-portal
+Group=bilbycast-portal
+WorkingDirectory=/var/lib/bilbycast/portal
+
+ExecStart=/opt/bilbycast/portal/bilbycast-portal --config /etc/bilbycast/portal.json
+
+Restart=always
+RestartSec=3
+StartLimitInterval=300
+StartLimitBurst=10
+
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# ── Hardening ──
+# Stricter than the relay's, because the portal does even less: it reads one
+# config file, listens on loopback, and makes outbound HTTPS calls to the
+# manager. Nothing here needs to write anywhere.
+ProtectSystem=strict
+# Read-only, unlike the relay's: the portal never persists anything. It holds
+# no node identity to write back, so a writable /etc/bilbycast would only
+# widen what a compromise could reach.
+ReadOnlyPaths=/etc/bilbycast
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+NoNewPrivileges=true
+# Loopback :8088 by default — above 1024, no capability needed.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# One viewer at a time clicking a link. Nothing like the relay's connection
+# count, so the default ceiling is ample and left alone.
+
+# The manager service token lives here, not in portal.json, so it can be mode
+# 0600 root:bilbycast-portal and stay out of any config file that gets copied
+# around while someone is debugging. Set BILBYCAST_PORTAL_TOKEN in it.
+EnvironmentFile=/etc/bilbycast/portal.env
+
+[Install]
+WantedBy=multi-user.target

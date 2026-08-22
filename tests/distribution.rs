@@ -534,6 +534,162 @@ async fn runtime_control_flips_viewer_gate() {
     cancel.cancel();
 }
 
+/// `require_origin_token` gates the CMAF/LL-HLS tier, through the real router.
+///
+/// This is the wiring test the helper-level unit tests cannot be. The whole
+/// point of the flag is that `GET /origin/...` is otherwise reachable with no
+/// credential, so a WHEP viewer gate is bypassable on any stream that also
+/// runs the CMAF tier. Deleting the `HeaderMap` / `RawQuery` extractors from
+/// `origin_get` leaves every token helper intact and every unit test green,
+/// and turns this red.
+#[tokio::test]
+async fn origin_get_gate_is_off_by_default_and_enforced_when_pushed() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::config::DistributionConfig;
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{build_router, DistributionState};
+    use bilbycast_relay::distribution_control::DistUpdate;
+    use bilbycast_relay::manager::events::event_channel;
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    let cancel = CancellationToken::new();
+    let hub = Arc::new(Hub::new());
+    let (events, _rx) = event_channel();
+    let cfg = DistributionConfig {
+        require_viewer_token: false,
+        require_ingest_token: false,
+        ..Default::default()
+    };
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
+    // Seed BOTH renditions with a real object, so a 200 means "served" and not
+    // "not found" -- the point of the test is which of them a token admits.
+    for stream in ["teststream", "teststream-proxy"] {
+        origin
+            .put(stream, "seg-00000.m4s", axum::body::Bytes::from_static(b"abcd"))
+            .await
+            .expect("seed segment");
+    }
+    let state = DistributionState::new(
+        hub,
+        origin,
+        cfg,
+        control.clone(),
+        cancel.clone(),
+        events,
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+            .await;
+    });
+
+    async fn get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> u16 {
+        let auth = bearer
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n");
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    const OBJ: &str = "/origin/teststream/seg-00000.m4s";
+
+    // Default OFF: the CDN case. No credential, served.
+    assert_eq!(
+        get(addr, OBJ, None).await,
+        200,
+        "the origin must be open by default -- a CDN pulls with no credential"
+    );
+
+    control.apply(DistUpdate {
+        token_secret: Some(SECRET.into()),
+        require_origin_token: Some(true),
+        ..Default::default()
+    });
+
+    // ON: the same request is now refused.
+    assert_eq!(
+        get(addr, OBJ, None).await,
+        401,
+        "origin GET must be gated once the manager pushes require_origin_token"
+    );
+
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+
+    // Both credential forms, because a segment fetch from hls.js can carry a
+    // header but the first manifest fetch on native HLS cannot.
+    let tok = token::mint_viewer_token(SECRET, "teststream", exp).expect("mint");
+    assert_eq!(
+        get(addr, OBJ, Some(&tok)).await,
+        200,
+        "a valid bearer token must be admitted"
+    );
+    assert_eq!(
+        get(addr, &format!("{OBJ}?token={tok}"), None).await,
+        200,
+        "?token= must be admitted too"
+    );
+
+    // Checked on merit: a token for an unrelated stream is refused, so this is
+    // authentication and not "any token unlocks any stream".
+    let wrong = token::mint_viewer_token(SECRET, "otherstream", exp).expect("mint");
+    assert_eq!(
+        get(addr, OBJ, Some(&wrong)).await,
+        403,
+        "a token for an unrelated stream must be refused"
+    );
+
+    // ONE token covers the pair. The DVR player fetches `{stream}` and
+    // `{stream}-proxy`; requiring a token each made the main rendition play
+    // while the first shuttle silently buffered nothing.
+    assert_eq!(
+        get(addr, "/origin/teststream-proxy/seg-00000.m4s", Some(&tok)).await,
+        200,
+        "the source's token must also admit its derived rendition"
+    );
+
+    // ...but only in that direction. Handing someone the low-resolution
+    // rendition must not hand them the full-resolution one.
+    let proxy_only = token::mint_viewer_token(SECRET, "teststream-proxy", exp).expect("mint");
+    assert_eq!(
+        get(addr, OBJ, Some(&proxy_only)).await,
+        403,
+        "a rendition token must not grant its source"
+    );
+
+    // The gate must run BEFORE the store is consulted, or a 404-vs-401 split
+    // tells an unauthenticated caller which segments exist.
+    assert_eq!(
+        get(addr, "/origin/teststream/seg-99999.m4s", None).await,
+        401,
+        "a missing object must not leak its absence to an unauthenticated caller"
+    );
+
+    cancel.cancel();
+}
+
 /// Cascade end-to-end: an UPSTREAM relay serves a stream over WHEP; a
 /// DOWNSTREAM relay pulls it as a WHEP client (real HTTP signalling + real
 /// ICE/DTLS/SRTP) and republishes it into its own hub for its own viewers.

@@ -17,6 +17,11 @@ pub mod distribution;
 pub mod distribution_control;
 pub mod manager;
 pub mod observability;
+/// The viewer portal that runs beside the relay on its VPS (binary
+/// `bilbycast-portal`). Feature-gated so the default relay build pulls in no
+/// HTTP client.
+#[cfg(feature = "portal")]
+pub mod portal;
 pub mod protocol;
 pub mod server;
 pub mod session;

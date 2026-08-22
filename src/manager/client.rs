@@ -566,9 +566,72 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
     stats
 }
 
+/// Parse one origin retention policy patch, bounding every field.
+///
+/// The bounds are not decoration. `max_bytes_per_stream` below one segment
+/// evicts each segment as it lands, which presents as a stream that accepts
+/// PUTs and serves an empty window — healthy-looking and unplayable. A
+/// retention of zero does the same by age.
+fn parse_origin_policy_patch(
+    v: &serde_json::Value,
+) -> Result<crate::distribution_control::OriginPolicyPatch, String> {
+    let obj = v.as_object().ok_or_else(|| "must be an object".to_string())?;
+    for k in obj.keys() {
+        if !matches!(
+            k.as_str(),
+            "retention_secs" | "max_bytes_per_stream" | "min_segments" | "idle_grace_secs"
+        ) {
+            return Err(format!("unknown field '{k}'"));
+        }
+    }
+    let num = |name: &str| -> Result<Option<u64>, String> {
+        match obj.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(x) => x
+                .as_u64()
+                .ok_or_else(|| format!("{name} must be a non-negative integer"))
+                .map(Some),
+        }
+    };
+
+    let mut patch = crate::distribution_control::OriginPolicyPatch::default();
+
+    if let Some(n) = num("retention_secs")? {
+        // 24 h ceiling: the DVR feature asks for 60 minutes, and a runaway
+        // value here fills the volume rather than erroring.
+        if !(1..=86_400).contains(&n) {
+            return Err("retention_secs must be 1..=86400".to_string());
+        }
+        patch.retention_secs = Some(n);
+    }
+    if let Some(n) = num("max_bytes_per_stream")? {
+        // 16 MiB floor comfortably exceeds one 2 s segment of high-bitrate HD.
+        if n < 16 * 1024 * 1024 {
+            return Err("max_bytes_per_stream must be at least 16 MiB".to_string());
+        }
+        patch.max_bytes_per_stream = Some(n);
+    }
+    if let Some(n) = num("min_segments")? {
+        if !(1..=64).contains(&n) {
+            return Err("min_segments must be 1..=64".to_string());
+        }
+        patch.min_segments = Some(n as usize);
+    }
+    if let Some(n) = num("idle_grace_secs")? {
+        if n > 86_400 {
+            return Err("idle_grace_secs must be <= 86400".to_string());
+        }
+        patch.idle_grace_secs = Some(n);
+    }
+    if patch.is_empty() {
+        return Err("no recognised fields".to_string());
+    }
+    Ok(patch)
+}
+
 /// Apply a manager `configure_distribution` command onto the runtime control
-/// cell (secret / gates / public IP+URL / cascade sources). Partial: only the
-/// fields present in the action are changed.
+/// cell (secret / gates / public IP+URL / storage policy / cascade sources).
+/// Partial: only the fields present in the action are changed.
 fn apply_configure_distribution(
     control: Option<&Arc<DistributionControl>>,
     action: &serde_json::Value,
@@ -590,6 +653,9 @@ fn apply_configure_distribution(
     if let Some(b) = action.get("require_viewer_token").and_then(|v| v.as_bool()) {
         update.require_viewer_token = Some(b);
     }
+    if let Some(b) = action.get("require_origin_token").and_then(|v| v.as_bool()) {
+        update.require_origin_token = Some(b);
+    }
     if let Some(b) = action.get("require_ingest_token").and_then(|v| v.as_bool()) {
         update.require_ingest_token = Some(b);
     }
@@ -599,6 +665,12 @@ fn apply_configure_distribution(
             Err(_) => return Err(format!("invalid public_ip '{s}'")),
         }
     }
+    if let Some(s) = action.get("portal_url").and_then(|v| v.as_str()) {
+        if !s.starts_with("http://") && !s.starts_with("https://") {
+            return Err("portal_url must start with http:// or https://".to_string());
+        }
+        update.portal_url = Some(s.to_string());
+    }
     if let Some(s) = action.get("public_base_url").and_then(|v| v.as_str()) {
         if !(s.starts_with("http://") || s.starts_with("https://")) {
             return Err("public_base_url must start with http:// or https://".to_string());
@@ -606,6 +678,37 @@ fn apply_configure_distribution(
         update.public_base_url = Some(s.to_string());
     }
     control.apply(update);
+
+    // Storage policy: node-wide default plus per-stream overrides. Both
+    // optional, so a push that only rotates the token secret leaves retention
+    // exactly as it was.
+    let mut origin_update = crate::distribution_control::OriginPolicyUpdate::default();
+    let mut origin_touched = false;
+    if let Some(v) = action.get("origin_policy") {
+        let patch = parse_origin_policy_patch(v).map_err(|e| format!("origin_policy: {e}"))?;
+        origin_update.default = Some(patch);
+        origin_touched = true;
+    }
+    if let Some(v) = action.get("origin_stream_policies") {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| "origin_stream_policies must be an object keyed by stream id".to_string())?;
+        let mut per_stream = Vec::with_capacity(obj.len());
+        for (stream, pv) in obj {
+            if stream.is_empty() || stream.len() > 128 {
+                return Err(format!("invalid stream id '{stream}'"));
+            }
+            let patch = parse_origin_policy_patch(pv)
+                .map_err(|e| format!("origin_stream_policies['{stream}']: {e}"))?;
+            per_stream.push((stream.clone(), patch));
+        }
+        // An empty object is meaningful: it clears every override.
+        origin_update.per_stream = Some(per_stream);
+        origin_touched = true;
+    }
+    if origin_touched {
+        control.set_origin_policy(origin_update);
+    }
 
     if let Some(arr) = action.get("cascade_sources").and_then(|v| v.as_array()) {
         let mut sources = Vec::with_capacity(arr.len());
@@ -644,6 +747,7 @@ fn persist_distribution_config(
     dcfg.require_ingest_token = rt.require_ingest_token;
     dcfg.public_ip = rt.public_ip.map(|ip| ip.to_string());
     dcfg.public_base_url = rt.public_base_url.clone();
+    dcfg.portal_url = rt.portal_url.clone();
     dcfg.cascade_sources = control.cascade_now();
 
     match serde_json::to_string_pretty(&updated) {
@@ -713,6 +817,13 @@ fn build_health_message(
             "bytes_out": d.bytes_out,
             "origin_bytes": d.origin_bytes,
             "offpath_sessions": d.offpath_sessions,
+            // Per-stream breakdown of origin_bytes, so an operator watching a
+            // volume fill can see *which* stream is spending it and whether a
+            // retention override put it there. Rides health (15 s), not stats
+            // (1 s): it changes on the scale of a segment, and a list on every
+            // stats tick is bandwidth for nothing. Additive — an older manager
+            // parses the object loosely and ignores it.
+            "origin_streams": d.origin_streams,
         });
     }
     // Advertised viewer base URL — the runtime (manager-pushed) value wins over
@@ -1064,5 +1175,122 @@ fn persist_credentials(
                 config_path.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod manager_contract_tests {
+    use super::*;
+    use crate::config::DistributionConfig;
+    use crate::distribution_control::{DistributionControl, RuntimeDistConfig};
+
+    /// The relay must accept **the exact body bilbycast-manager builds**.
+    ///
+    /// This JSON is not hand-written: it is the literal output of
+    /// `manager_core::db::dvr_sessions::relay_push_body`, captured from
+    /// `cargo test -p manager-core dump_contract -- --nocapture`. The two
+    /// sides were written independently, and a field-name disagreement here
+    /// would not error — `apply_configure_distribution` applies what it
+    /// recognises and ignores the rest, so a mismatch presents as a retention
+    /// window that is stored, reported as pushed, and never takes effect.
+    #[test]
+    fn the_managers_dvr_push_is_understood() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+
+        let from_manager = serde_json::json!({
+            "type": "configure_distribution",
+            "token_secret": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "origin_stream_policies": {
+                "e2e":       { "retention_secs": 300 },
+                "e2e-proxy": { "retention_secs": 300 }
+            },
+            "require_origin_token": false
+        });
+
+        apply_configure_distribution(Some(&control), &from_manager)
+            .expect("the relay must accept the manager's push");
+
+        // Applied, not merely parsed.
+        let mut rx = control.subscribe_origin();
+        let update = rx.borrow_and_update().clone();
+        let per = update.per_stream.expect("per-stream overrides must arrive");
+        assert_eq!(per.len(), 2, "both renditions must be carried");
+        let names: Vec<&str> = per.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(names.contains(&"e2e") && names.contains(&"e2e-proxy"));
+        assert_eq!(
+            per[0].1.retention_secs,
+            Some(300),
+            "the window must survive the wire"
+        );
+    }
+
+    /// `portal_url` must survive the wire, and a bad one must be refused.
+    ///
+    /// The relay renders this as a link a viewer is invited to click, so the
+    /// consequence of the manager and the relay disagreeing about the field
+    /// name is not a warning — it is a page that quietly reverts to telling a
+    /// portal viewer to reload, which is the one thing that cannot help them.
+    #[test]
+    fn the_managers_portal_url_is_understood() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+        assert_eq!(control.load().portal_url, None, "starts unset");
+
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "portal_url": "https://portal.example.com"
+            }),
+        )
+        .expect("the relay must accept a portal url from the manager");
+        assert_eq!(
+            control.load().portal_url.as_deref(),
+            Some("https://portal.example.com"),
+            "the portal url did not reach the live config"
+        );
+
+        // A scheme-less or `javascript:` value must not reach a page that
+        // presents it as the way back in. Checked on both sides on purpose.
+        for bad in ["javascript:alert(1)", "portal.example.com", "//evil.example"] {
+            assert!(
+                apply_configure_distribution(
+                    Some(&control),
+                    &serde_json::json!({ "type": "configure_distribution", "portal_url": bad }),
+                )
+                .is_err(),
+                "accepted {bad}"
+            );
+        }
+        // ...and the refusal left the good one in place rather than clearing it.
+        assert_eq!(
+            control.load().portal_url.as_deref(),
+            Some("https://portal.example.com")
+        );
+    }
+
+    /// The gate is a separate field and must also land.
+    #[test]
+    fn the_managers_gate_flag_is_understood() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "require_origin_token": true,
+                "origin_stream_policies": {}
+            }),
+        )
+        .expect("accepted");
+        assert!(control.load().require_origin_token, "the gate must be applied");
+
+        // An empty override object is meaningful: it clears the set. It must
+        // arrive as Some(empty), not None, or the last session to stop would
+        // never get its window released.
+        let mut rx = control.subscribe_origin();
+        let update = rx.borrow_and_update().clone();
+        assert_eq!(update.per_stream, Some(Vec::new()));
     }
 }

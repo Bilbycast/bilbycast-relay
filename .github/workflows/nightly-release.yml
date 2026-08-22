@@ -89,14 +89,21 @@ jobs:
           # OpenSSL, statically linked). Runtime opt-in via config
           # (`distribution.enabled`); the binary carries the capability but
           # stays a pure forwarder unless configured.
+          #
+          # `portal` rides along in THIS variant only, and it is a second
+          # binary rather than a feature of the first. A distribution relay is
+          # the box the viewer portal runs beside, so shipping them together is
+          # what makes the portal installable at all — but they stay separate
+          # processes under separate users, because the portal is public-facing
+          # and the relay terminates media for every viewer on the host.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             artifact_suffix: x86_64-linux-distribution
-            features: "viewer-distribution-vendored"
+            features: "viewer-distribution-vendored,portal"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact_suffix: aarch64-linux-distribution
-            features: "viewer-distribution-vendored"
+            features: "viewer-distribution-vendored,portal"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout repository
@@ -164,6 +171,19 @@ jobs:
           mkdir -p "${STAGE}/packaging"
           cp packaging/bilbycast-relay.service  "${STAGE}/packaging/"
           cp packaging/bilbycast-relay.sysusers "${STAGE}/packaging/"
+          # The viewer portal, when this variant built one. Guarded on the
+          # file rather than on the matrix entry so the lean forwarder's
+          # packaging step stays byte-identical and a future variant that
+          # gains the feature is picked up without editing this step.
+          PORTAL="target/${{ matrix.target }}/release/bilbycast-portal"
+          if [ -f "${PORTAL}" ]; then
+            cp "${PORTAL}" "${STAGE}/bilbycast-portal"
+            chmod +x "${STAGE}/bilbycast-portal"
+            cp packaging/bilbycast-portal.service  "${STAGE}/packaging/"
+            cp packaging/bilbycast-portal.sysusers "${STAGE}/packaging/"
+            cp portal-config.example.json "${STAGE}/portal-config.example.json"
+            echo "Staged bilbycast-portal alongside the relay"
+          fi
           TARBALL="bilbycast-relay-${{ matrix.artifact_suffix }}.tar.gz"
           tar czf "${TARBALL}" "${STAGE}"
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"

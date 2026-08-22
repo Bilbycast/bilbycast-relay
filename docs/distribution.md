@@ -115,6 +115,8 @@ scope  ∈ { "viewer", "ingest" }
 
 - `require_ingest_token` (default **true**) gates the write surfaces (WHIP + origin PUT).
 - `require_viewer_token` (default false → public streams) gates WHEP.
+- `require_origin_token` (default false) gates `GET /origin/{stream}/{file}` —
+  the CMAF / LL-HLS tier — with the same `viewer`-scope credential.
 - Viewers pass the token as `?token=…` or `Authorization: Bearer`. The built-in
   player reads `?token=` off the `/watch/{stream}` URL and forwards it as a
   Bearer header; `/whep` accepts the query form directly too, as a convenience
@@ -122,13 +124,53 @@ scope  ∈ { "viewer", "ingest" }
 
 ### What `require_viewer_token` does *not* cover
 
-**It gates WHEP only.** `GET /origin/{stream}/{file}` — the CMAF / LL-HLS tier —
-performs no token check in any mode, deliberately: it is the CDN-facing half of
-the surface and a CDN pulls it with no credential of the relay's. So for any
-stream that also runs the LL-HLS tier, the viewer gate is bypassable by fetching
-`/origin/{stream}/index.m3u8` directly. If that matters, restrict the origin
-listener at the network / reverse-proxy layer. Do not read "viewer token
-required" as "this stream is not readable without a credential".
+**It gates WHEP only.** By default `GET /origin/{stream}/{file}` — the CMAF /
+LL-HLS tier — performs no token check, deliberately: it is the CDN-facing half
+of the surface and a CDN pulls it with no credential of the relay's. So with
+that default, for any stream that also runs the LL-HLS tier, the viewer gate is
+bypassable by fetching `/origin/{stream}/index.m3u8` directly. Do not read
+"viewer token required" as "this stream is not readable without a credential".
+
+Set **`require_origin_token`** to close it. It is off by default to preserve
+the CDN case and is meant to be turned on per session, by the manager, for a
+gated audience with no CDN in front. It accepts the same credential in either
+form — `Authorization: Bearer` or `?token=` — because a segment fetch from
+hls.js can set a header but the first manifest fetch on native HLS cannot. The
+check runs before the store is consulted, so a rejected request cannot be used
+to probe which streams or segments exist. Restricting the listener at the
+network / reverse-proxy layer remains the option when no per-stream credential
+is wanted at all.
+
+#### One token covers a source and its renditions
+
+A DVR viewer is watching one thing, but it is delivered as a *pair* —
+`{stream}` for playback and `{stream}-proxy` for shuttle — at two encodings of
+the same content. So a `viewer` token minted for a source also admits that
+source's derived renditions, and the player takes a single `?token=`.
+
+This is not incidental. Scoping a token to one exact name meant the main
+rendition played while the first shuttle silently buffered nothing: the
+proxy's fetches 403'd while `video.error` stayed `null`, so it read as a
+broken transport rather than an auth failure.
+
+The widening is **one-directional and closed**:
+
+- A token for `show` admits `show` and `show-proxy`.
+- A token for `show-proxy` admits **only** `show-proxy` — handing someone the
+  low-resolution rendition does not hand them the full-resolution one.
+- The suffix list (`RENDITION_SUFFIXES`, currently just `-proxy`) is a named,
+  enumerable list, not open-ended prefix matching. `showx-proxy` and
+  `other-proxy` are not reachable with a `show` token.
+- **Ingest tokens are not widened at all.** Ingest is a write surface, and a
+  token to publish a source must not also grant publishing its rendition,
+  which is a different producer.
+- Expiry is checked on both paths, so the fallback is not a way around it.
+
+The consequence to be aware of: an unrelated stream *named* `show-proxy` is
+readable with a `show` token. Rendition names are derived by convention, so
+that is a naming choice rather than an accident — but it is why the suffix
+list is closed and why the widening lives in `verify_viewer_token` alone
+rather than being spread across callers.
 
 ### Risk of the URL-borne form
 
@@ -157,8 +199,15 @@ It expects **two renditions** of the same source:
 | proxy | `{stream}-proxy` | low-res **all-intra** | frame jog, shuttle, reverse |
 
 Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`
-(forwarded to origin requests when the viewer gate is on) and `?fps=`
-(frame-step size; defaults to 25).
+(one token covers both renditions — see above; required only when
+`require_origin_token` is on) and `?fps=` (frame-step size; defaults to 25).
+
+The player does not leave the credential in the URL. Under MSE it attaches it
+with hls.js's `xhrSetup` as a Bearer header and scrubs the query parameter via
+`history.replaceState` on load, so a viewer copying the address out of the bar
+is not handing out their credential with it. Native HLS (iOS Safari) hands
+the URL straight to the media stack and cannot set headers, so there the query
+form is kept.
 
 **Why a proxy rendition.** Frame-exact seeking works in a plain `<video>` only
 when every frame is a random-access point. On long-GOP video `currentTime`
@@ -297,6 +346,7 @@ See `../../testbed/configs/relay-distribution.json`:
     "ingest_addrs": ["0.0.0.0:4486", "[::]:4486"],
     "token_secret": "<64 hex chars, shared with the manager>",
     "require_viewer_token": false,
+    "require_origin_token": false,
     "require_ingest_token": true,
     "max_viewers_per_ip": 256,
     "origin_window_segments": 8,
@@ -326,6 +376,44 @@ See `../../testbed/configs/relay-distribution.json`:
   number of recent segments kept whatever the other two say. It stops a stalled
   or very-low-bitrate stream having its whole window aged out from under a live
   player.
+- **Retention is manager-owned at runtime, and can be set per stream.** The
+  four values above are only the node's starting policy;
+  `configure_distribution` carries a live replacement plus per-stream
+  overrides:
+
+  ```jsonc
+  {
+    "origin_policy": { "retention_secs": 3900 },          // node default
+    "origin_stream_policies": {                            // per stream
+      "match-feed":       { "retention_secs": 7200 },
+      "match-feed-proxy": { "retention_secs": 7200 }
+    }
+  }
+  ```
+
+  Every field within a policy is optional, and a per-stream entry is applied
+  **on top of the resulting default** — so an override naming only
+  `retention_secs` still inherits the node's byte bound and floor rather than
+  zeroing them. This is what makes a DVR session possible without taxing the
+  whole node: a 60-minute window on one feed, minutes on everything else.
+
+  `origin_stream_policies` **replaces** the whole override set rather than
+  merging into it. A merge would leave an ended session's window in force for
+  the life of the relay, holding that stream's disk with nothing on any surface
+  to say why. An empty object therefore means "clear every override", and is
+  honoured as such.
+
+  Values are bounded at the command handler, and `min_segments` is floored at 1
+  in the store as well. Not decoration: a `max_bytes_per_stream` below one
+  segment evicts each segment as it lands, and a `min_segments` of 0 lets a
+  live stream be evicted to nothing between a player's manifest fetch and its
+  segment fetch. Both present as a stream that accepts PUTs, serves a manifest,
+  and cannot be played.
+
+  Health reports the result per stream on `distribution.origin_streams[]` —
+  segments, bytes, idle seconds, and whether an override is in force — because
+  `origin_bytes` alone says the node is full but not which stream filled it.
+
 - `origin_storage_dir` is **wiped on startup**. Segments from a previous run are
   unaddressable anyway, because the manifests referencing them are held in
   memory and die with the process. Point it at a volume with room for
