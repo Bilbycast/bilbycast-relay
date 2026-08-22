@@ -58,6 +58,12 @@ async fn stub_streams(
         q.username.clone(),
     ));
 
+    // The field set here is not invented: it is what
+    // `manager-core`'s `dump_portal_contract` test prints, which is the
+    // manager's own serialiser rather than a transcription of it. The portal
+    // lives in a different repo and cannot import that type, so this is the
+    // seam where a fixture would otherwise drift in silence.
+    //
     // Only `a.smith` has anything; anyone else gets an empty list, which is
     // what the real manager does for an unknown username.
     let streams = if q.username == "a.smith" {
