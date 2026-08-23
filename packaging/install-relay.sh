@@ -61,6 +61,8 @@ QUIC_ADDR="0.0.0.0:4433"
 API_ADDR="0.0.0.0:4480"
 REQUIRE_BIND_AUTH=0
 UPGRADE_INSTALLER=0
+WITH_PORTAL=0
+PORTAL_MANAGER_URL=""
 
 # ── Argument parsing ──────────────────────────────────────────────────
 usage() {
@@ -85,6 +87,14 @@ Options:
                                default stable
   --upgrade-installer          Refresh service unit + install script,
                                leave config untouched
+  --with-portal <manager-url>  Also install the viewer portal
+                               (bilbycast-portal), pointed at this
+                               manager's https:// base URL. Only in the
+                               distribution tarball. Installed but NOT
+                               started: it needs a service token you
+                               generate in the manager first, so
+                               starting it would only fail every viewer.
+                               See docs/portal.md.
   -h, --help                   Show this message
 EOF
 }
@@ -99,10 +109,22 @@ while [[ $# -gt 0 ]]; do
         --api-addr) API_ADDR="$2"; shift 2;;
         --channel) CHANNEL="$2"; shift 2;;
         --upgrade-installer) UPGRADE_INSTALLER=1; shift;;
+        --with-portal) WITH_PORTAL=1; PORTAL_MANAGER_URL="$2"; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 1;;
     esac
 done
+
+if [[ "${WITH_PORTAL}" -eq 1 ]]; then
+    if [[ -z "${PORTAL_MANAGER_URL}" ]]; then
+        echo "--with-portal needs the manager's base URL, e.g. https://manager.example.com" >&2
+        exit 1
+    fi
+    case "${PORTAL_MANAGER_URL}" in
+        http://*|https://*) ;;
+        *) echo "--with-portal URL must start with http:// or https://" >&2; exit 1;;
+    esac
+fi
 
 # ── Pre-flight checks ─────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -366,6 +388,78 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 RUST_LOG=bilbycast_relay=info
 EOF
     chmod 0640 "${ENV_FILE}"
+fi
+
+# ── Viewer portal (optional, distribution tarball only) ───────────────
+#
+# A second binary under its own user, not a mode of the relay: it is
+# public-facing and the relay terminates media for every viewer on this box.
+# See docs/portal.md.
+#
+# Installed but deliberately NOT started. It needs a service token generated
+# in the manager (DVR Sessions -> Portal logins -> Generate a token), and a
+# portal running without one refuses every viewer with a message that reads
+# like their account being wrong.
+if [[ "${WITH_PORTAL}" -eq 1 ]]; then
+    PORTAL_BIN="$(find staging -maxdepth 3 -name bilbycast-portal -type f | head -1)"
+    if [[ -z "${PORTAL_BIN}" || ! -x "${PORTAL_BIN}" ]]; then
+        echo "This tarball carries no bilbycast-portal — the portal ships in the" >&2
+        echo "distribution variant (bilbycast-relay-<arch>-linux-distribution)." >&2
+        exit 1
+    fi
+
+    if ! id -u bilbycast-portal > /dev/null 2>&1; then
+        if command -v systemd-sysusers > /dev/null 2>&1; then
+            mkdir -p /etc/sysusers.d
+            cat > /etc/sysusers.d/bilbycast-portal.conf <<'EOF'
+u bilbycast-portal - "bilbycast portal service account" /var/lib/bilbycast/portal /usr/sbin/nologin
+EOF
+            systemd-sysusers
+        else
+            useradd --system --home /var/lib/bilbycast/portal \
+                --shell /usr/sbin/nologin bilbycast-portal
+        fi
+    fi
+
+    PORTAL_ROOT="${PORTAL_ROOT:-/opt/bilbycast/portal}"
+    mkdir -p "${PORTAL_ROOT}" /var/lib/bilbycast/portal
+    chown bilbycast-portal:bilbycast-portal /var/lib/bilbycast/portal
+    install -m 0755 "${PORTAL_BIN}" "${PORTAL_ROOT}/bilbycast-portal.new"
+    mv -Tf "${PORTAL_ROOT}/bilbycast-portal.new" "${PORTAL_ROOT}/bilbycast-portal"
+
+    PORTAL_UNIT="$(find staging -maxdepth 4 -name bilbycast-portal.service -type f | head -1)"
+    if [[ -n "${PORTAL_UNIT}" ]]; then
+        install -m 0644 "${PORTAL_UNIT}" "${SYSTEMD_UNIT_DIR}/bilbycast-portal.service"
+    else
+        echo "Tarball carried the portal binary but no unit file; not installing a unit." >&2
+    fi
+
+    # Config only if absent — an upgrade must not overwrite a working portal.
+    PORTAL_CONFIG="${CONFIG_DIR}/portal.json"
+    if [[ ! -f "${PORTAL_CONFIG}" ]]; then
+        cat > "${PORTAL_CONFIG}" <<EOF
+{
+  "listen_addr": "127.0.0.1:8088",
+  "manager_url": "${PORTAL_MANAGER_URL}",
+  "username_header": "Remote-User",
+  "trusted_proxies": ["127.0.0.1", "::1"]
+}
+EOF
+        chmod 0644 "${PORTAL_CONFIG}"
+    fi
+
+    # The service token lives here rather than in portal.json, so it can have
+    # its own permissions and stay out of a file that gets copied around.
+    PORTAL_ENV="${CONFIG_DIR}/portal.env"
+    if [[ ! -f "${PORTAL_ENV}" ]]; then
+        cat > "${PORTAL_ENV}" <<'EOF'
+# Generate this in the manager: DVR Sessions -> Portal logins -> Generate a
+# token (super admin only). Shown once. Then: systemctl start bilbycast-portal
+BILBYCAST_PORTAL_TOKEN=
+EOF
+        chmod 0600 "${PORTAL_ENV}"
+        chgrp bilbycast-portal "${PORTAL_ENV}" 2>/dev/null || true
+    fi
 fi
 
 systemctl daemon-reload

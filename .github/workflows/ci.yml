@@ -141,3 +141,20 @@ jobs:
 
       - name: cargo test (portal)
         run: cargo test --features portal
+
+      # `install-relay.sh` and `upgrade-relay.sh` are 400 lines of
+      # download-and-verify that only ever run for real, against a signed
+      # release, on somebody's server. Nothing here could execute them — so the
+      # portal blocks added to both are exercised on staged tarballs instead:
+      # does the installer find the binary, refuse the lean tarball, decline to
+      # clobber an existing config, and does the upgrader recognise an
+      # installed portal from its unit. Shell that is only ever run for real is
+      # shell nobody has tested.
+      - name: Packaging scripts parse
+        run: |
+          bash -n packaging/install-relay.sh
+          bash -n packaging/upgrade-relay.sh
+          bash -n packaging/uninstall-relay.sh
+
+      - name: Portal install/upgrade logic
+        run: bash packaging/test-portal-install.sh

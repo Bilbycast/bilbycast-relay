@@ -67,36 +67,47 @@ beside, so they travel together; they still run as two processes under two
 users.
 
 ```bash
-tar xzf bilbycast-relay-x86_64-linux-distribution.tar.gz
-cd bilbycast-relay-*-x86_64-linux-distribution
-
-sudo install -D -m0644 packaging/bilbycast-portal.sysusers /etc/sysusers.d/bilbycast-portal.conf
-sudo systemd-sysusers
-
-sudo install -D -m0755 bilbycast-portal /opt/bilbycast/portal/bilbycast-portal
-sudo install -d -o bilbycast-portal -g bilbycast-portal /var/lib/bilbycast/portal
-sudo install -D -m0644 portal-config.example.json /etc/bilbycast/portal.json
-sudo install -D -m0644 packaging/bilbycast-portal.service /etc/systemd/system/bilbycast-portal.service
-
-# The service token, from the manager (see below). Kept out of portal.json so
-# it can have its own permissions.
-sudo install -D -m0600 /dev/null /etc/bilbycast/portal.env
-sudo chgrp bilbycast-portal /etc/bilbycast/portal.env
-echo 'BILBYCAST_PORTAL_TOKEN=...' | sudo tee /etc/bilbycast/portal.env >/dev/null
-
-sudo systemctl daemon-reload && sudo systemctl enable --now bilbycast-portal
+curl -fsSL https://github.com/Bilbycast/bilbycast-relay/releases/latest/download/install-relay.sh \
+  | sudo bash -s -- \
+      --manager wss://manager.example.com/ws/node \
+      --registration-token <token-from-the-manager-UI> \
+      --with-portal https://manager.example.com
 ```
 
-Point `/etc/bilbycast/portal.json` at the manager before starting. The service
-refuses to start without a `manager_url` and a token, which is deliberate: a
-portal that came up misconfigured would fail every viewer with a message that
-reads like their account being wrong.
+`--with-portal` takes the manager's **base URL** (not the WebSocket one) — the
+portal talks to its REST API. It creates the `bilbycast-portal` user, installs
+the binary at `/opt/bilbycast/portal/`, writes `/etc/bilbycast/portal.json` and
+an empty `/etc/bilbycast/portal.env`, and installs the unit.
 
-`install-relay.sh` does **not** install the portal, and neither does
-`upgrade-relay.sh` — both are single-binary by design, discovering the relay's
-path from `systemctl cat` and swapping one file. Teaching them a second unit is
-worth doing once more than one site runs a portal; until then an upgrade is the
-four lines above against the new tarball.
+It does **not start the portal.** It cannot: the portal needs a service token
+that only exists once you generate it in the manager, and one started without a
+token refuses every viewer with a message that reads like their account being
+wrong. Generate the token (below), put it in `portal.env`, then:
+
+```bash
+sudo systemctl enable --now bilbycast-portal
+```
+
+Passing `--with-portal` against the lean forwarder tarball is refused with a
+message saying so, rather than installing a relay and quietly skipping the half
+you asked for.
+
+### Upgrading
+
+`upgrade-relay.sh` carries the portal along automatically when the host has one
+— no flag. An operator upgrading a relay is not choosing to leave its portal on
+an older binary, and skew between the two is the kind nobody goes looking for.
+
+The portal is swapped while the relay is down, then started again **only after
+the relay's health probe passes**, so it never comes up beside a relay that is
+about to be rolled back. If the relay fails its probe both roll back together.
+If the relay is fine but the portal will not start, the portal is left stopped
+and the failure is printed: it is not the data plane, and viewers unable to
+sign in is a smaller failure than putting the relay back a version to rescue
+them.
+
+Upgrading a relay with a *lean* tarball on a host that runs a portal warns and
+leaves the portal alone rather than deleting it.
 
 ## Configuring
 

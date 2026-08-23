@@ -315,10 +315,48 @@ fi
 cp "${BINARY_PATH}" "${PREV_BACKUP}"
 mv -Tf "${NEW_STAGED}" "${BINARY_PATH}"
 
+# ── The viewer portal, when this host runs one ────────────────────────
+#
+# Detected rather than flagged: an operator upgrading a relay is not choosing
+# to leave its portal on an older binary, and version skew between the two is
+# the kind nobody goes looking for. Silent when no portal is installed.
+#
+# Best-effort on purpose. The portal is not the data plane, so a portal that
+# fails to swap must not roll the relay back — it is reported and left stopped,
+# which is visible, rather than half-upgraded, which is not.
+PORTAL_UNIT_NAME="bilbycast-portal"
+PORTAL_BINARY=""
+PORTAL_PREV=""
+if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
+   && systemctl cat "${PORTAL_UNIT_NAME}" >/dev/null 2>&1; then
+    PORTAL_EXEC="$(systemctl cat "${PORTAL_UNIT_NAME}" 2>/dev/null \
+        | awk -F= '/^ExecStart=/ { sub(/^ExecStart=/, "", $0); print $0; exit }')"
+    PORTAL_BINARY="$(awk '{ print $1 }' <<< "${PORTAL_EXEC}")"
+    NEW_PORTAL="$(find staging -maxdepth 3 -name bilbycast-portal -type f | head -1)"
+
+    if [[ -n "${PORTAL_BINARY}" && -x "${PORTAL_BINARY}" && -n "${NEW_PORTAL}" ]]; then
+        echo "Upgrading ${PORTAL_UNIT_NAME} alongside the relay…"
+        PORTAL_PREV="${PORTAL_BINARY}.previous"
+        systemctl stop "${PORTAL_UNIT_NAME}" || true
+        cp "${PORTAL_BINARY}" "${PORTAL_PREV}"
+        cp "${NEW_PORTAL}" "${PORTAL_BINARY}.new"
+        chown "$(stat -c '%u:%g' "${PORTAL_BINARY}")" "${PORTAL_BINARY}.new"
+        chmod "$(stat -c '%a' "${PORTAL_BINARY}")" "${PORTAL_BINARY}.new"
+        mv -Tf "${PORTAL_BINARY}.new" "${PORTAL_BINARY}"
+    elif [[ -n "${PORTAL_BINARY}" && -z "${NEW_PORTAL}" ]]; then
+        echo "WARNING: ${PORTAL_UNIT_NAME} is installed but this tarball carries no" >&2
+        echo "         portal binary — it ships in the distribution variant. The" >&2
+        echo "         portal is left on its current version." >&2
+    fi
+fi
+
 echo "Starting ${SERVICE_NAME}…"
 systemctl start "${SERVICE_NAME}"
 
 # ── Health check + auto-rollback ──────────────────────────────────────
+# The portal comes back after the relay, and only if the relay stays up: it
+# reads nothing from the relay, but bringing it up beside a relay that is about
+# to be rolled back would leave the pair mismatched for the rollback window.
 echo "Waiting up to ${HEALTH_TIMEOUT}s for ${HEALTH_URL}…"
 HEALTHY=0
 for _ in $(seq 1 "${HEALTH_TIMEOUT}"); do
@@ -332,6 +370,21 @@ for _ in $(seq 1 "${HEALTH_TIMEOUT}"); do
 done
 
 if [[ "${HEALTHY}" -eq 1 ]]; then
+    # The relay held. Bring the portal back on the new binary.
+    if [[ -n "${PORTAL_PREV}" ]]; then
+        systemctl start "${PORTAL_UNIT_NAME}" || true
+        if systemctl is-active --quiet "${PORTAL_UNIT_NAME}"; then
+            echo "  ${PORTAL_UNIT_NAME}: upgraded and running"
+        else
+            # Said loudly and left stopped rather than rolled back: the portal
+            # is not the data plane, and a viewer seeing nothing is a smaller
+            # failure than putting the relay back a version to rescue it.
+            echo "WARNING: ${PORTAL_UNIT_NAME} did not come back. Previous binary is at" >&2
+            echo "         ${PORTAL_PREV}. The relay is fine; viewers cannot sign in." >&2
+            echo "         journalctl -u ${PORTAL_UNIT_NAME} -e" >&2
+        fi
+    fi
+
     NEW_RUNNING="$("${BINARY_PATH}" --version 2>/dev/null | awk '{ print $NF }' || echo unknown)"
     echo
     echo "── Upgrade complete ──"
@@ -354,6 +407,12 @@ echo "Rolling back to previous binary…" >&2
 systemctl stop "${SERVICE_NAME}" || true
 mv -Tf "${PREV_BACKUP}" "${BINARY_PATH}"
 systemctl start "${SERVICE_NAME}"
+# Roll the portal back with it, so the pair never straddles a version.
+if [[ -n "${PORTAL_PREV}" && -e "${PORTAL_PREV}" ]]; then
+    echo "Rolling the portal back too…"
+    mv -Tf "${PORTAL_PREV}" "${PORTAL_BINARY}"
+    systemctl start "${PORTAL_UNIT_NAME}" || true
+fi
 
 echo "Waiting up to ${HEALTH_TIMEOUT}s for rollback to come up…" >&2
 for _ in $(seq 1 "${HEALTH_TIMEOUT}"); do
