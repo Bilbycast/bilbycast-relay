@@ -23,10 +23,10 @@ mk_tarball() {  # $1 = dir name, $2 = with-portal (1/0)
   local stage="$WORK/$1/bilbycast-relay-0.10.6-x86_64-linux"
   mkdir -p "$stage/packaging"
   printf '#!/bin/sh\necho relay\n' > "$stage/bilbycast-relay"; chmod +x "$stage/bilbycast-relay"
-  cp ../bilbycast-relay.service "$stage/packaging/" 2>/dev/null || touch "$stage/packaging/bilbycast-relay.service"
+  cp ./bilbycast-relay.service "$stage/packaging/"
   if [ "$2" = "1" ]; then
     printf '#!/bin/sh\necho portal\n' > "$stage/bilbycast-portal"; chmod +x "$stage/bilbycast-portal"
-    cp ../bilbycast-portal.service "$stage/packaging/" 2>/dev/null || touch "$stage/packaging/bilbycast-portal.service"
+    cp ./bilbycast-portal.service "$stage/packaging/"
     touch "$stage/portal-config.example.json"
   fi
   (cd "$WORK/$1" && tar czf ../"$1".tar.gz .)
@@ -50,15 +50,18 @@ check "lean: relay binary still found (the default path is untouched)" \
 
 echo
 echo "== --with-portal argument validation =="
-probe() {  # run just the flag parsing + validation out of the installer
-  WITH_PORTAL=1 PORTAL_MANAGER_URL="$1" bash -c '
-    if [[ "${WITH_PORTAL}" -eq 1 ]]; then
-        if [[ -z "${PORTAL_MANAGER_URL}" ]]; then echo reject-empty; exit 1; fi
-        case "${PORTAL_MANAGER_URL}" in
-            http://*|https://*) echo accept;;
-            *) echo reject-scheme; exit 1;;
-        esac
-    fi' 2>/dev/null
+# The validation block is lifted OUT OF install-relay.sh at run time, not
+# transcribed here. A copy would keep passing after the installer changed,
+# which is the failure mode a packaging test exists to prevent.
+VALIDATION="$(awk '/^# >>> portal-url-validation/,/^# <<< portal-url-validation/' install-relay.sh)"
+[ -n "$VALIDATION" ] || { bad "install-relay.sh has no portal-url-validation block to lift"; }
+
+probe() {  # run the installer's OWN validation, extracted above
+  # The block prints its verdict on stderr and exits non-zero on a refusal, so
+  # the trailing `echo accept` is reached only when it lets the URL through.
+  WITH_PORTAL=1 PORTAL_MANAGER_URL="$1" bash -c "
+    ${VALIDATION}
+    echo accept" 2>&1 | head -1
 }
 check "https accepted"            "$(probe https://m.example)" "accept"
 check "http accepted"             "$(probe http://m.example)"  "accept"

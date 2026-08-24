@@ -695,7 +695,11 @@ fn apply_configure_distribution(
             .ok_or_else(|| "origin_stream_policies must be an object keyed by stream id".to_string())?;
         let mut per_stream = Vec::with_capacity(obj.len());
         for (stream, pv) in obj {
-            if stream.is_empty() || stream.len() > 128 {
+            // Same sanitiser the request path uses. A length check alone
+            // accepts a name no request can ever present — the override is
+            // then stored, acked as applied, reported on the health tick and
+            // matches nothing, so the session's window silently never applies.
+            if crate::distribution_control::sanitize_stream_id(stream).as_deref() != Some(stream.as_str()) {
                 return Err(format!("invalid stream id '{stream}'"));
             }
             let patch = parse_origin_policy_patch(pv)
@@ -784,6 +788,7 @@ fn persist_distribution_config(
     }
     let rt = control.load();
     let cascade = control.cascade_now();
+    let origin_policy = control.origin_policy_now();
     if let Err(e) = update_config_file(config_path, relay_config, |config| {
         let dcfg = config
             .distribution
@@ -791,11 +796,37 @@ fn persist_distribution_config(
         dcfg.enabled = true;
         dcfg.token_secret = rt.token_secret.clone();
         dcfg.require_viewer_token = rt.require_viewer_token;
+        // The origin gate persists alongside its two siblings. Omitting it
+        // made it the only gate that did not survive a restart — and because
+        // `require_viewer_token` did, an operator inspecting the file after a
+        // restart saw a gated session and concluded correctly for WHEP and
+        // wrongly for the CMAF tier, which is the exact bypass the gate exists
+        // to close. It fails OPEN, so the omission was silent.
+        dcfg.require_origin_token = rt.require_origin_token;
         dcfg.require_ingest_token = rt.require_ingest_token;
         dcfg.public_ip = rt.public_ip.map(|ip| ip.to_string());
         dcfg.public_base_url = rt.public_base_url.clone();
         dcfg.portal_url = rt.portal_url.clone();
         dcfg.cascade_sources = cascade;
+        // The node-wide storage policy persists too: it is the floor every
+        // stream falls back to, and losing it silently narrows the window on
+        // the next restart.
+        //
+        // Per-stream overrides deliberately do NOT persist. They belong to a
+        // session, and a session that ended while the relay was down must not
+        // come back holding that stream's disk at the widened window with
+        // nothing left referencing it.
+        if let Some(d) = &origin_policy.default {
+            if let Some(v) = d.retention_secs {
+                dcfg.origin_retention_secs = v;
+            }
+            if let Some(v) = d.max_bytes_per_stream {
+                dcfg.origin_max_bytes_per_stream = v;
+            }
+            if let Some(v) = d.min_segments {
+                dcfg.origin_window_segments = v;
+            }
+        }
     }) {
         tracing::warn!("failed to persist distribution config to {config_path:?}: {e}");
     }

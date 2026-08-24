@@ -119,6 +119,21 @@ impl PortalConfig {
         if !self.manager_url.starts_with("https://") && !self.manager_url.starts_with("http://") {
             return Err("manager_url must start with https:// or http://".into());
         }
+        // `manager_token` rides on every request to this URL as a bearer
+        // credential, so plaintext hands the portal's service identity to
+        // anyone on the path. Gated the way every other credential-bearing
+        // escape hatch in the fleet is: an explicit env var, so it cannot be
+        // reached by editing a config file alone.
+        if self.manager_url.starts_with("http://")
+            && std::env::var("BILBYCAST_ALLOW_INSECURE").unwrap_or_default() != "1"
+        {
+            return Err(format!(
+                "manager_url {} is plaintext, and the portal sends its manager token on \
+                 every request to it. Use https://, or set BILBYCAST_ALLOW_INSECURE=1 if \
+                 this is a development host.",
+                self.manager_url
+            ));
+        }
         // The token authenticates the portal to the manager. Without it every
         // request is refused, so failing here is the difference between one
         // clear startup error and a portal that loads and lists nothing.
@@ -180,6 +195,32 @@ impl PortalConfig {
 
 #[cfg(test)]
 mod tests {
+
+    /// The portal sends its manager token on every request, so a plaintext
+    /// manager URL must not be reachable by editing a config file alone.
+    #[test]
+    fn a_plaintext_manager_url_needs_the_explicit_env_opt_in() {
+        // SAFETY: single-threaded test, and the variable is read only here.
+        unsafe { std::env::remove_var("BILBYCAST_ALLOW_INSECURE") };
+        let mut cfg = PortalConfig {
+            listen_addr: default_listen(),
+            manager_url: "http://manager.internal".into(),
+            manager_token: "t".repeat(32),
+            username_header: default_header(),
+            logout_url: None,
+            trusted_proxies: default_proxies(),
+        };
+        let err = cfg.validate().expect_err("plaintext must be refused by default");
+        assert!(err.contains("BILBYCAST_ALLOW_INSECURE"), "{err}");
+
+        unsafe { std::env::set_var("BILBYCAST_ALLOW_INSECURE", "1") };
+        assert!(cfg.validate().is_ok(), "the opt-in must actually allow it");
+        unsafe { std::env::remove_var("BILBYCAST_ALLOW_INSECURE") };
+
+        // https needs no opt-in.
+        cfg.manager_url = "https://manager.internal".into();
+        assert!(cfg.validate().is_ok());
+    }
     use super::*;
 
     fn ok() -> PortalConfig {

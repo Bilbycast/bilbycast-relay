@@ -312,6 +312,9 @@ The accepted-lint set lives in `[lints.clippy]` in `Cargo.toml`, one documented
 reason per entry, so CI runs `-D warnings` with no inline `-A` flags to drift out
 of sync with the manifest.
 
-Triggers are branch-scoped (`branches: [main]` on both `push` and
-`pull_request`) — an unfiltered `push` also fires on tag refs, which would race
-`release-all.sh` for the same runner pool and cache.
+The `push` trigger is branch-scoped (`branches: [main]`) — an unfiltered `push`
+also fires on tag refs, which would race `release-all.sh` for the same runner
+pool and cache. **`pull_request` is deliberately not scoped**: scoping it to
+`main` meant a *stacked* PR — one whose base is another PR's branch — ran no CI
+at all, so the second half of a two-part change was never built until its base
+merged.

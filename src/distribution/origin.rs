@@ -156,6 +156,65 @@ pub struct ObjectResponse {
     pub etag: String,
 }
 
+/// Is this object an HLS playlist, whose URIs a viewer will fetch next?
+fn is_hls_playlist(file: &str) -> bool {
+    file.ends_with(".m3u8")
+}
+
+/// Re-emit a playlist with `?token=` appended to every URI it names.
+///
+/// Two kinds of URI appear: a bare line (a media segment) and a quoted
+/// `URI="..."` attribute (`EXT-X-MAP`, `EXT-X-PART`, `EXT-X-PRELOAD-HINT`,
+/// `EXT-X-RENDITION-REPORT`). Both are relative, and both are fetched without
+/// the query the playlist itself arrived with.
+fn playlist_with_token(body: &[u8], token: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return body.to_vec(); // not a playlist after all; leave it alone
+    };
+    let enc = percent_encode_token(token);
+    let add = |uri: &str| -> String {
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        format!("{uri}{sep}token={enc}")
+    };
+
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let eol = &line[trimmed.len()..];
+        if trimmed.is_empty() {
+            out.push_str(line);
+        } else if let Some(rest) = trimmed.strip_prefix('#') {
+            // Rewrite each quoted URI attribute in place.
+            match rest.find("URI=\"") {
+                Some(i) => {
+                    let start = 1 + i + 5; // '#' + prefix + `URI="`
+                    match trimmed[start..].find('"') {
+                        Some(len) => {
+                            out.push_str(&trimmed[..start]);
+                            out.push_str(&add(&trimmed[start..start + len]));
+                            out.push_str(&trimmed[start + len..]);
+                        }
+                        None => out.push_str(trimmed),
+                    }
+                }
+                None => out.push_str(trimmed),
+            }
+            out.push_str(eol);
+        } else {
+            out.push_str(&add(trimmed));
+            out.push_str(eol);
+        }
+    }
+    out.into_bytes()
+}
+
+/// Percent-encode the characters a token can carry that are not safe to drop
+/// unescaped into a query. A multi-stream token carries `,`; nothing else in
+/// the alphabet (`0-9 a-z A-Z . - _ ,`) needs escaping.
+fn percent_encode_token(token: &str) -> String {
+    token.replace(',', "%2C")
+}
+
 /// RFC 9110 8.8.3.2: `If-None-Match` is `*` or a comma-separated list, and the
 /// comparison is weak — a `W/` prefix on either side still matches.
 fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
@@ -805,7 +864,28 @@ async fn origin_get(
         return resp;
     }
     match st.origin.get(&stream, &file).await {
-        Some(obj) => {
+        Some(mut obj) => {
+            // Carry a query-borne credential into the playlist's own URIs.
+            //
+            // Native HLS (Safari, iOS) cannot set a request header, which is
+            // why `?token=` exists — but HLS resolves a playlist's URIs
+            // against the playlist's URL *without* its query, so every segment
+            // fetch that follows an authenticated manifest fetch arrives with
+            // no credential and is refused. Gated playback was therefore
+            // impossible on native HLS: the manifest loaded and nothing after
+            // it did.
+            //
+            // Only for the query form. hls.js sets `Authorization` on every
+            // request of its own, and rewriting for it would put a credential
+            // into URLs it did not need there.
+            if st.control.load().require_origin_token
+                && is_hls_playlist(&file)
+                && let Some(tok) = super::token_from_query(query.as_deref())
+            {
+                let rewritten = playlist_with_token(&obj.bytes, &tok);
+                obj.etag = etag_for(&rewritten);
+                obj.bytes = Bytes::from(rewritten);
+            }
             // Nothing here may be cached immutably, because no filename in a
             // live stream is stable across restarts.
             //
@@ -1025,6 +1105,40 @@ mod tests {
         assert_eq!((small.segments, small.bytes), (1, 100));
         assert!(big.policy_overridden, "an override must be visible to the operator");
         assert!(!small.policy_overridden);
+    }
+
+    /// A gated playlist must carry its credential into its own URIs.
+    ///
+    /// Native HLS cannot set a header, so `?token=` is how it authenticates —
+    /// but HLS resolves a playlist's URIs against the playlist URL *without*
+    /// its query, so without this every segment fetch after an authenticated
+    /// manifest fetch arrives bare and is refused.
+    #[test]
+    fn a_gated_playlist_carries_its_token_into_every_uri() {
+        let body = b"#EXTM3U\n\
+                     #EXT-X-VERSION:9\n\
+                     #EXT-X-MAP:URI=\"init.mp4\"\n\
+                     #EXTINF:2.000,\n\
+                     seg-00001.m4s\n\
+                     #EXT-X-PART:DURATION=0.5,URI=\"seg-00002.m4s?part=0\"\n\
+                     seg-00002.m4s\n";
+        let out = String::from_utf8(playlist_with_token(body, "1770000000.abc")).unwrap();
+
+        assert!(out.contains("#EXT-X-MAP:URI=\"init.mp4?token=1770000000.abc\""));
+        assert!(out.contains("\nseg-00001.m4s?token=1770000000.abc\n"));
+        // An existing query keeps it, and gets `&`.
+        assert!(out.contains("seg-00002.m4s?part=0&token=1770000000.abc"));
+        // Tags that name no URI are untouched.
+        assert!(out.contains("#EXT-X-VERSION:9\n"));
+        assert!(out.starts_with("#EXTM3U\n"));
+        // A comma in a multi-stream token has to survive the round trip.
+        let multi = String::from_utf8(playlist_with_token(body, "1770000000.a,b.abc")).unwrap();
+        assert!(multi.contains("seg-00001.m4s?token=1770000000.a%2Cb.abc"));
+        assert_eq!(
+            crate::distribution::token_from_query(Some("token=1770000000.a%2Cb.abc")).as_deref(),
+            Some("1770000000.a,b.abc"),
+            "the encoded form must decode back to the signed bytes"
+        );
     }
 
     /// A stream id names a directory under the origin root, so a name that is

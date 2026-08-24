@@ -144,7 +144,16 @@ pub async fn run_distribution(
         let origin = origin.clone();
         let cancel = cancel.clone();
         let mut rx = control.subscribe_origin();
+        let retained = control.origin_policy_now();
         tokio::spawn(async move {
+            // `subscribe` marks the current value as seen, so a push that
+            // landed while the store was being built — plausible, since
+            // `OriginStore::new` wipes the root, which on a deep DVR window is
+            // thousands of files — would never be delivered. Apply what is
+            // retained before waiting for the next change.
+            if retained.default.is_some() || retained.per_stream.is_some() {
+                origin.apply_policy_update(&retained);
+            }
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -339,28 +348,14 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Validate + normalize a stream id from the URL path. Streams are named by
-/// the manager; keep the character set tight to avoid path/URL abuse.
+/// Validate + normalize a stream id from the URL path.
 ///
-/// The character set alone is not enough now that a stream id names a
-/// **directory** under the origin root: `.` and `..` are built entirely from
-/// allowed characters, and `root.join("..")` is the origin's parent. Require at
-/// least one alphanumeric, which rejects every all-dot name without having to
-/// enumerate them.
-pub fn sanitize_stream_id(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    if s.is_empty() || s.len() > 128 {
-        return None;
-    }
-    if !s.chars().any(|c| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
-        Some(s.to_string())
-    } else {
-        None
-    }
-}
+/// Lives in `distribution_control` because the manager client — which is not
+/// feature-gated — validates the stream ids in a storage-policy push against
+/// the very same rule the request path applies. Two copies would drift, and a
+/// key that passes the push but fails the request is an override that is
+/// stored, acked and matches nothing.
+pub use crate::distribution_control::sanitize_stream_id;
 
 /// `POST /whep/{stream_id}` — accept a viewer's SDP offer, return the answer.
 async fn whep_offer(
@@ -589,15 +584,51 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 /// The `?` is already stripped by axum's `RawQuery` extractor, so this takes
 /// the query body only.
 ///
-/// No percent-decoding: a viewer token is `"{exp}.{hmac}"` — decimal digits, a
-/// dot, and lowercase hex — and nothing in that set is percent-encoded by a
-/// conforming client. Decoding would only widen what we accept.
-fn token_from_query(raw: Option<&str>) -> Option<String> {
-    raw?.split('&')
+/// Percent-decoded, and `+` is treated as a space is NOT — a token contains
+/// neither.
+///
+/// This used to decode nothing, on the reasoning that a viewer token is
+/// `"{exp}.{hmac}"` — decimal digits, a dot and lowercase hex — none of which a
+/// conforming client encodes. That set has since widened: a multi-stream token
+/// is `"{exp}.{a,b}.{hmac}"` and carries commas and stream names, and
+/// `encodeURIComponent` turns a comma into `%2C`. Undecoded, the HMAC then
+/// covers a different string and a valid credential is refused as a forgery.
+///
+/// Decoding cannot widen what is accepted: whatever comes out still has to
+/// carry a signature over the exact bytes.
+pub(super) fn token_from_query(raw: Option<&str>) -> Option<String> {
+    let raw_value = raw?
+        .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(k, _)| *k == "token")
-        .map(|(_, v)| v.to_string())
-        .filter(|v| !v.is_empty())
+        .map(|(_, v)| v)?;
+    let decoded = percent_decode(raw_value);
+    Some(decoded).filter(|v| !v.is_empty())
+}
+
+/// Minimal `%XX` decoder. Anything that is not a well-formed escape is passed
+/// through unchanged, so a token that needed no decoding is untouched.
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Validate a viewer token supplied via `Authorization: Bearer` **or** the

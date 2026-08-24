@@ -327,6 +327,7 @@ mv -Tf "${NEW_STAGED}" "${BINARY_PATH}"
 PORTAL_UNIT_NAME="bilbycast-portal"
 PORTAL_BINARY=""
 PORTAL_PREV=""
+PORTAL_WAS_ACTIVE=0
 if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
    && systemctl cat "${PORTAL_UNIT_NAME}" >/dev/null 2>&1; then
     PORTAL_EXEC="$(systemctl cat "${PORTAL_UNIT_NAME}" 2>/dev/null \
@@ -337,6 +338,14 @@ if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
     if [[ -n "${PORTAL_BINARY}" && -x "${PORTAL_BINARY}" && -n "${NEW_PORTAL}" ]]; then
         echo "Upgrading ${PORTAL_UNIT_NAME} alongside the relay…"
         PORTAL_PREV="${PORTAL_BINARY}.previous"
+        # Remember whether it was running, so the upgrade puts it back the way
+        # it found it. An operator who stopped the portal deliberately — or who
+        # installed it and has not finished configuring it — must not have it
+        # started by a relay upgrade.
+        PORTAL_WAS_ACTIVE=0
+        if systemctl is-active --quiet "${PORTAL_UNIT_NAME}"; then
+            PORTAL_WAS_ACTIVE=1
+        fi
         systemctl stop "${PORTAL_UNIT_NAME}" || true
         cp "${PORTAL_BINARY}" "${PORTAL_PREV}"
         cp "${NEW_PORTAL}" "${PORTAL_BINARY}.new"
@@ -371,7 +380,9 @@ done
 
 if [[ "${HEALTHY}" -eq 1 ]]; then
     # The relay held. Bring the portal back on the new binary.
-    if [[ -n "${PORTAL_PREV}" ]]; then
+    if [[ -n "${PORTAL_PREV}" && "${PORTAL_WAS_ACTIVE}" -eq 0 ]]; then
+        echo "  ${PORTAL_UNIT_NAME}: binary upgraded, left stopped (it was not running)"
+    elif [[ -n "${PORTAL_PREV}" ]]; then
         systemctl start "${PORTAL_UNIT_NAME}" || true
         if systemctl is-active --quiet "${PORTAL_UNIT_NAME}"; then
             echo "  ${PORTAL_UNIT_NAME}: upgraded and running"

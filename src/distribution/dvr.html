@@ -532,7 +532,17 @@
       return hls;
     }
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src; // Safari native HLS
+      // Safari native HLS. hls.js reports its failures through an event we
+      // subscribe to above; native playback has only the element's own
+      // `error`, and without this a refused credential or a missing manifest
+      // renders as a black rectangle with nothing said anywhere.
+      video.addEventListener("error", function () {
+        var code = video.error ? video.error.code : 0;
+        if (TOKEN) { failExpired(); }
+        else if (code === 4) { failNoToken(); }
+        else { fail("This feed could not be played."); }
+      });
+      video.src = src;
       return null;
     }
     fail("This browser cannot play HLS (no MSE and no native support).");

@@ -143,11 +143,16 @@ fn rendition_source(stream: &str) -> Option<&str> {
 /// waiting to happen -- but it is why the suffix list is closed and why the
 /// widening is here, in one place, rather than spread across the callers.
 pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
-    // Three-part token: it carries the list of streams it admits.
-    if let Some(rest) = token.split('.').nth(1)
-        && token.split('.').count() == 3
-    {
-        return verify_multi(secret_hex, stream, token, rest);
+    // Multi-stream token: it carries the list of streams it admits, between
+    // the expiry and the signature.
+    //
+    // Split on the OUTER dots rather than counting them. A stream name may
+    // legally contain `.` (`sanitize_stream_id` admits it), so a list like
+    // `a.b,c` makes a four-field token — and a count-based test would then hand
+    // it to the single-stream path, which parses everything after the first dot
+    // as hex and rejects a perfectly valid credential with "bad hex".
+    if token.matches('.').count() >= 2 {
+        return verify_multi(secret_hex, stream, token);
     }
     match verify(secret_hex, SCOPE_VIEWER, stream, token) {
         Ok(()) => Ok(()),
@@ -166,11 +171,15 @@ pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Resul
 /// list is attacker-supplied text until the HMAC over it verifies, so reading
 /// membership first would let anyone append a stream name to someone else's
 /// token and be believed.
-fn verify_multi(secret_hex: &str, stream: &str, token: &str, joined: &str) -> Result<()> {
-    let mut parts = token.split('.');
-    let exp_str = parts.next().ok_or_else(|| anyhow!("malformed token"))?;
-    let _ = parts.next();
-    let hmac_hex = parts.next().ok_or_else(|| anyhow!("malformed token"))?;
+fn verify_multi(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
+    // `exp` is the first field and the signature the last; everything between
+    // is the list, dots and all.
+    let (exp_str, rest) = token
+        .split_once('.')
+        .ok_or_else(|| anyhow!("malformed token"))?;
+    let (joined, hmac_hex) = rest
+        .rsplit_once('.')
+        .ok_or_else(|| anyhow!("malformed token"))?;
 
     let exp: u64 = exp_str.parse().map_err(|_| anyhow!("bad exp"))?;
     if exp < now_unix() {
@@ -258,6 +267,24 @@ pub fn mint_ingest_token(secret_hex: &str, stream: &str, exp: u64) -> Result<Str
 
 #[cfg(test)]
 mod tests {
+    /// A stream name may contain a dot, so a multi-stream token has more
+    /// fields than a dot count can tell apart. Parsing outside-in is what
+    /// keeps a valid credential from being read as the single-stream form and
+    /// refused as "bad hex".
+    #[test]
+    fn a_multi_stream_token_survives_dots_in_stream_names() {
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let exp = now_unix() + 3600;
+        let token = mint_viewer_token_multi(secret, &["studio.a", "studio.b"], exp).unwrap();
+
+        assert!(verify_viewer_token(secret, "studio.a", &token).is_ok());
+        assert!(verify_viewer_token(secret, "studio.b", &token).is_ok());
+        // ...and still admits each one's derived rendition.
+        assert!(verify_viewer_token(secret, "studio.a-proxy", &token).is_ok());
+        // ...but nothing it does not name.
+        assert!(verify_viewer_token(secret, "studio.c", &token).is_err());
+    }
+
     use super::*;
 
     const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
