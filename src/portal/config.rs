@@ -43,6 +43,17 @@ pub struct PortalConfig {
     #[serde(default = "default_header")]
     pub username_header: String,
 
+    /// Where "sign out" sends someone — normally the identity provider's own
+    /// logout, e.g. `https://auth.example.com/logout`.
+    ///
+    /// The portal cannot end the session itself: it never authenticated
+    /// anyone. Authelia holds the cookie and only Authelia can clear it, so
+    /// the most this can do is send the viewer to the right place. Unset means
+    /// no button is offered, which is better than one that appears to work and
+    /// leaves them signed in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logout_url: Option<String>,
+
     /// Peers whose `username_header` is believed. **Empty means nobody**, which
     /// is why the default is populated rather than left to mean "any": an empty
     /// list that meant "trust all" would turn a typo into an open portal.
@@ -122,6 +133,10 @@ impl PortalConfig {
         if axum::http::HeaderName::try_from(self.username_header.as_str()).is_err() {
             return Err(format!("username_header `{}` is not a header name", self.username_header));
         }
+        if let Some(ref url) = self.logout_url
+            && !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err("logout_url must start with http:// or https://".into());
+            }
         if self.trusted_proxies.is_empty() {
             return Err(
                 "trusted_proxies is empty, so no request could ever be trusted to carry a \
@@ -174,6 +189,7 @@ mod tests {
             manager_token: "tok".into(),
             username_header: default_header().to_ascii_lowercase(),
             trusted_proxies: default_proxies(),
+            logout_url: None,
         }
     }
 
@@ -259,6 +275,21 @@ mod tests {
         c.normalise();
         assert_eq!(c.manager_url, "https://m.example");
         assert_eq!(c.username_header, "remote-user");
+    }
+
+    /// A logout URL that is not a URL would be rendered as a link the viewer
+    /// is invited to click, so it is checked like the others.
+    #[test]
+    fn a_logout_url_must_be_a_url() {
+        let mut c = ok();
+        c.logout_url = Some("javascript:alert(1)".into());
+        assert!(c.validate().is_err());
+        c.logout_url = Some("auth.example.com".into());
+        assert!(c.validate().is_err());
+        c.logout_url = Some("https://auth.example.com/logout".into());
+        assert_eq!(c.validate(), Ok(()));
+        c.logout_url = None;
+        assert_eq!(c.validate(), Ok(()), "no button is a valid choice");
     }
 
     #[test]

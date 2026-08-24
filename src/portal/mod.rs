@@ -42,9 +42,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -76,6 +76,11 @@ struct StreamsResponse {
 struct ManagerStream {
     session_id: String,
     name: String,
+    /// Not forwarded to the browser — a viewer has no business knowing which
+    /// relay stream backs a feed — but the portal matches the player's
+    /// `?stream=` against it.
+    #[serde(default)]
+    stream_id: String,
 }
 
 /// The manager's answer to "mint a token for this feed".
@@ -99,6 +104,10 @@ pub fn router(state: PortalState) -> Router {
         .route("/healthz", get(healthz))
         .route("/", get(page))
         .route("/portal.js", get(portal_js))
+        // One tap back to a feed whose credential ran out. The player links
+        // here rather than to the front page: the portal already knows who
+        // they are, so "find your feed again" is a step nobody needs.
+        .route("/watch", get(watch_redirect))
         .route("/api/feeds", get(feeds))
         .route("/api/watch", post(watch))
         .with_state(state)
@@ -192,6 +201,76 @@ fn upstream_unavailable() -> Response {
         .into_response()
 }
 
+/// Ask the manager what this username may watch.
+///
+/// Shared by the JSON route the page calls and the redirect the player links
+/// to, so the two cannot drift about which streams a viewer has.
+async fn fetch_streams(st: &PortalState, username: &str) -> Result<Vec<ManagerStream>, Response> {
+    let url = format!("{}/api/v1/dvr/portal/streams", st.cfg.manager_url);
+    let resp = st
+        .http
+        .get(&url)
+        .query(&[("username", username)])
+        .bearer_auth(&st.cfg.manager_token)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "portal: manager stream list failed");
+            upstream_unavailable()
+        })?;
+    if !resp.status().is_success() {
+        // A 401 here is the PORTAL's credential being wrong, not the viewer's.
+        // Saying "not signed in" would send them to log in again forever.
+        tracing::warn!(status = %resp.status(), "portal: manager refused the stream list");
+        return Err(upstream_unavailable());
+    }
+    let body: StreamsResponse = resp.json().await.map_err(|e| {
+        tracing::warn!(error = %e, "portal: unreadable stream list");
+        upstream_unavailable()
+    })?;
+    Ok(body.streams)
+}
+
+/// Ask the manager to mint, returning the URL to send the viewer to.
+async fn mint(st: &PortalState, username: &str, session_id: &str) -> Result<String, Response> {
+    let url = format!("{}/api/v1/dvr/portal/token", st.cfg.manager_url);
+    let resp = st
+        .http
+        .post(&url)
+        .bearer_auth(&st.cfg.manager_token)
+        .json(&serde_json::json!({ "username": username, "session_id": session_id }))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "portal: manager token mint failed");
+            upstream_unavailable()
+        })?;
+
+    // The manager answers one uniform refusal whether the user is not
+    // entitled, the session does not exist, or it is not running — so this
+    // endpoint cannot be used to discover which feeds exist. Passing it
+    // through as one message keeps that property.
+    if resp.status() == StatusCode::FORBIDDEN {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "That feed is not available to you. It may have finished, \
+                          or your access may have been changed."
+            })),
+        )
+            .into_response());
+    }
+    if !resp.status().is_success() {
+        tracing::warn!(status = %resp.status(), "portal: manager refused to mint");
+        return Err(upstream_unavailable());
+    }
+    let body: TokenResponse = resp.json().await.map_err(|e| {
+        tracing::warn!(error = %e, "portal: unreadable mint response");
+        upstream_unavailable()
+    })?;
+    Ok(body.watch_url)
+}
+
 /// `GET /api/feeds` — what the signed-in user may watch.
 async fn feeds(
     State(st): State<PortalState>,
@@ -201,46 +280,63 @@ async fn feeds(
     let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
         return unauthenticated();
     };
-
-    let url = format!("{}/api/v1/dvr/portal/streams", st.cfg.manager_url);
-    let resp = st
-        .http
-        .get(&url)
-        .query(&[("username", username.as_str())])
-        .bearer_auth(&st.cfg.manager_token)
-        .send()
-        .await;
-
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "portal: manager stream list failed");
-            return upstream_unavailable();
-        }
+    let streams = match fetch_streams(&st, &username).await {
+        Ok(s) => s,
+        Err(r) => return r,
     };
-    if !resp.status().is_success() {
-        // A 401 here is the PORTAL's credential being wrong, not the viewer's.
-        // Saying "not signed in" would send them to log in again forever.
-        tracing::warn!(status = %resp.status(), "portal: manager refused the stream list");
-        return upstream_unavailable();
-    }
-    let body: StreamsResponse = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(error = %e, "portal: unreadable stream list");
-            return upstream_unavailable();
-        }
-    };
-
-    let feeds: Vec<Feed> = body
-        .streams
+    let feeds: Vec<Feed> = streams
         .into_iter()
-        .map(|s| Feed {
-            session_id: s.session_id,
-            name: s.name,
-        })
+        .map(|s| Feed { session_id: s.session_id, name: s.name })
         .collect();
-    Json(serde_json::json!({ "username": username, "feeds": feeds })).into_response()
+    Json(serde_json::json!({
+        "username": username,
+        "feeds": feeds,
+        // Rendered as a "Sign out" link when configured. The portal cannot end
+        // the session itself — Authelia holds the cookie — so an absent value
+        // means no button, rather than one that appears to work.
+        "logout_url": st.cfg.logout_url,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WatchQuery {
+    /// The relay's stream id, not the session id — the player knows which
+    /// stream it is showing and nothing else about the session behind it.
+    pub stream: String,
+}
+
+/// `GET /watch?stream=…` — mint for the signed-in viewer and send them back.
+///
+/// The player's "sign in again" link. It resolves the stream against what this
+/// user may watch, so an unentitled stream is indistinguishable from one that
+/// does not exist: both land back on the portal with no explanation of which,
+/// exactly as the mint endpoint refuses.
+async fn watch_redirect(
+    State(st): State<PortalState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<WatchQuery>,
+) -> Response {
+    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
+        // Not signed in, or not through the proxy. Send them to the front
+        // page, which is behind the same forward-auth and will bounce them
+        // into a login.
+        return Redirect::to("/").into_response();
+    };
+
+    let streams = match fetch_streams(&st, &username).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Some(hit) = streams.iter().find(|s| s.stream_id == q.stream) else {
+        return Redirect::to("/").into_response();
+    };
+
+    match mint(&st, &username, &hit.session_id).await {
+        Ok(url) => Redirect::to(&url).into_response(),
+        Err(_) => Redirect::to("/").into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +425,7 @@ mod tests {
             manager_token: "t".into(),
             username_header: "remote-user".into(),
             trusted_proxies: trusted.iter().map(|s| s.parse().unwrap()).collect::<HashSet<_>>(),
+            logout_url: None,
         }
     }
 

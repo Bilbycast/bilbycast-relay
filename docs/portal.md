@@ -184,12 +184,34 @@ manager's own UI:
 * Only sessions that are **on air** appear in the portal. A feed that is not
   running is simply absent, rather than offering a link to a black screen.
 
+## Signing out
+
+The portal cannot end a session — it never authenticated anyone. Authelia holds
+the cookie and only Authelia can clear it, so `logout_url` in `portal.json`
+points at the identity provider's own logout (`https://auth.example.com/logout`
+for Authelia). Leave it unset and no button is shown, which is better than one
+that appears to work and leaves the viewer signed in.
+
 ## Access lasts three hours
 
 A token minted through the portal is good for three hours, after which the
 player stops with "your viewing access has expired". The viewer returns to the
 portal and opens the feed again; if their entitlement has been withdrawn in the
 meantime, it is not there to open.
+
+A viewer whose token runs out is offered a link straight back to **that
+feed** — `{portal}/watch?stream={id}` — not to the portal's front page. The
+portal already knows who they are, so recovering is one tap. A stream they are
+not entitled to and one that does not exist both land back on the front page
+with no hint of which, exactly as the mint endpoint refuses.
+
+The player keeps its token in `sessionStorage` for the life of the tab, because
+it strips it from the URL on load. Stripping is right — a viewer copying the
+address bar should not hand out their credential — but without somewhere to
+keep it the page became a one-shot: a reload, a back-navigation or a restored
+tab lost the token and reported "your viewing access has expired", which was
+false. A refused token is forgotten, so one refusal cannot become a loop that
+survives every reload.
 
 Removing a portal login stops them getting *new* tokens immediately. A token
 already in a browser keeps working until it expires — the relay verifies a

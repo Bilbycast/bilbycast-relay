@@ -31,6 +31,17 @@
     var who = document.getElementById('who');
     who.textContent = 'Signed in as ' + data.username;
 
+    /* Sign out belongs to whoever holds the session, which is not us: the
+     * portal never authenticated anyone and cannot clear Authelia's cookie.
+     * All it can do is point at the right place, so with no `logout_url`
+     * configured there is no button — better than one that appears to work
+     * and leaves the viewer signed in. */
+    var out = document.getElementById('signout');
+    if (out && data.logout_url) {
+      out.href = data.logout_url;
+      out.hidden = false;
+    }
+
     if (!data.feeds || !data.feeds.length) {
       /* Distinguishing "you have none" from "none are on air" would need the
        * manager to report entitlements for feeds it has decided not to show,

@@ -130,16 +130,48 @@
   //
   // Only needed when the origin is gated (`require_origin_token`), which is
   // off by default.
+  // Remembered for the life of the TAB, because the line below deletes it
+  // from the URL.
+  //
+  // Stripping it is right — a viewer copying the address bar should not hand
+  // out their credential with it — but on its own it made the page a one-shot:
+  // reload, press back, or let the browser restore the tab, and the URL that
+  // comes back is the stripped one. The page then had no credential at all and
+  // said "your viewing access has expired", which was not true and told the
+  // viewer to fix the wrong thing. Confirmed in Chrome: first load 200s
+  // throughout, reload 401s on the first manifest.
+  //
+  // `sessionStorage` is the right lifetime: per tab, gone when the tab closes,
+  // never sent anywhere. It is wrapped because a browser with site data
+  // blocked throws on access rather than returning null, and a viewer with
+  // strict privacy settings should still be able to watch — they just lose the
+  // reload.
+  var TOKEN_KEY = "bilbycast.dvr.token." + STREAM;
+  function rememberToken(t) {
+    try { window.sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* blocked */ }
+  }
+  function recallToken() {
+    try { return window.sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+  }
+  function forgetToken() {
+    try { window.sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* blocked */ }
+  }
+
   var TOKEN = qs.get("token") || "";
+  if (TOKEN) {
+    rememberToken(TOKEN);
+  } else {
+    // A reload, a back-navigation, or a restored tab. The URL lost the token;
+    // the tab did not.
+    TOKEN = recallToken();
+  }
 
   // With MSE we can send the token as a request header, so it never has to
   // sit in a URL -- out of the address bar, the history, and any Referer.
   // Native HLS (iOS Safari) hands the URL straight to the media stack and
   // cannot set headers, so there the query form is the only option.
   var TOKEN_IN_HEADER = !!(window.Hls && window.Hls.isSupported());
-  if (TOKEN && window.history && history.replaceState) {
-    // Drop it from the visible URL either way: a viewer copying the address
-    // out of the bar should not be handing out their credential with it.
+  if (qs.get("token") && window.history && history.replaceState) {
     qs.delete("token");
     var q = qs.toString();
     history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
@@ -242,24 +274,55 @@
    *
    * So: when a portal is configured, offer it. When one is not, say what
    * happened and where to go, without promising a reload that may not help. */
-  function failExpired() {
+  /* Where to send someone who needs a fresh credential.
+   *
+   * Straight back to THIS feed, not the portal's front page: the portal knows
+   * who they are, so recovering should be one tap rather than "find your feed
+   * again". Falls back to the front page if the stream name would not survive
+   * a URL, which it always should — the relay validates it — but a link built
+   * by string concatenation gets checked. */
+  function portalReturn() {
+    if (!PORTAL_URL) return "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(STREAM)) return PORTAL_URL;
+    return PORTAL_URL.replace(/\/+$/, "") + "/watch?stream=" + encodeURIComponent(STREAM);
+  }
+
+  function failWith(lead, linkText, tailText) {
     accessExpired = true;
     errEl.textContent = "";
-    var span = document.createElement("span");
-    span.textContent = "Your viewing access has expired. ";
-    errEl.appendChild(span);
-    if (PORTAL_URL) {
+    errEl.appendChild(document.createTextNode(lead));
+    var href = portalReturn();
+    if (href) {
       var a = document.createElement("a");
-      a.href = PORTAL_URL;
-      a.textContent = "Sign in again to keep watching";
+      a.href = href;
+      a.textContent = linkText;
       a.rel = "noopener";
       a.style.color = "inherit";
       errEl.appendChild(a);
       errEl.appendChild(document.createTextNode("."));
     } else {
-      errEl.appendChild(document.createTextNode(
-        "Open the feed again from wherever you got the link."));
+      errEl.appendChild(document.createTextNode(tailText));
     }
+  }
+
+  /* The credential was REFUSED. It may have run out, or been withdrawn — the
+   * relay answers both the same way on purpose, so this cannot say which.
+   * Forget it either way: keeping a token the relay has just rejected is what
+   * turns one refusal into a loop. */
+  function failExpired() {
+    forgetToken();
+    failWith("Your viewing access has expired. ",
+             "Sign in again to keep watching",
+             "Open the feed again from wherever you got the link.");
+  }
+
+  /* There was no credential at all — this page was opened directly, or its
+   * tab was restored after the stored one was cleared. Nothing expired, and
+   * saying so would send the viewer to fix the wrong thing. */
+  function failNoToken() {
+    failWith("This page needs a viewing link. ",
+             "Open the feed from the portal",
+             "Open the feed from wherever you got the link.");
   }
   function fmt(t) {
     if (!isFinite(t) || t < 0) return "--:--:--";
@@ -446,7 +509,11 @@
         // rather than this branch asserting one of the two answers.
         var status = (data.response && data.response.code) || 0;
         if (status === 401 || status === 403) {
-          failExpired();
+          // Having no credential and having one refused are different
+          // problems with different fixes, and telling a viewer their access
+          // "expired" when the page simply never had a token sends them to
+          // fix the wrong thing.
+          if (TOKEN) { failExpired(); } else { failNoToken(); }
           return;
         }
 

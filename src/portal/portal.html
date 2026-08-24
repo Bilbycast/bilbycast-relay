@@ -24,6 +24,15 @@
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .01em; }
   header .who { color: var(--dim); font-size: 13px; }
+  /* Pushed to the far end so it is never next to a Watch button — signing out
+     by accident when you meant to watch is a bad five seconds. */
+  header .spacer { flex: 1; }
+  header a.signout {
+    color: var(--dim); font-size: 13px; text-decoration: none;
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 14px; min-height: 40px; display: inline-flex; align-items: center;
+  }
+  header a.signout:active { background: var(--panel); }
   main { max-width: 720px; margin: 0 auto; padding: 18px 16px 40px; }
 
   .feeds { display: flex; flex-direction: column; gap: 10px; }
@@ -55,6 +64,8 @@
 <header>
   <h1>Your feeds</h1>
   <span class="who" id="who"></span>
+  <span class="spacer"></span>
+  <a class="signout" id="signout" href="#" hidden>Sign out</a>
 </header>
 <main>
   <p class="note" id="note" hidden>

@@ -802,6 +802,57 @@ mod tests {
         );
     }
 
+    /// The player must survive a reload.
+    ///
+    /// It strips the token from the URL on load, which is right — a viewer
+    /// copying the address bar should not hand out their credential. On its
+    /// own that made the page a one-shot: reload, press back, or let the
+    /// browser restore the tab, and the URL that came back was the stripped
+    /// one. The page then had no credential and told the viewer their access
+    /// had EXPIRED, which was false and pointed them at the wrong fix.
+    /// Measured in Chrome: first load 200 throughout, reload 401 on the first
+    /// manifest.
+    #[test]
+    fn the_token_outlives_the_url_it_arrived_in() {
+        let html = include_str!("dvr.html");
+        assert!(
+            html.contains("sessionStorage"),
+            "the token is dropped from the URL and kept nowhere — a reload loses it"
+        );
+        // Per tab, not per browser: a viewing credential has no business
+        // outliving the tab it was opened in.
+        assert!(!html.contains("localStorage"), "a viewer token must not persist beyond the tab");
+        // Every access wrapped: a browser with site data blocked throws on
+        // read rather than returning null, and that must not take the player
+        // down with it.
+        let uses = html.matches("sessionStorage").count();
+        let guarded = html.matches("try {").count();
+        assert!(guarded >= uses, "an unguarded storage access will throw where site data is blocked");
+    }
+
+    /// Having no credential and having one refused need different words.
+    ///
+    /// Both used to produce "your viewing access has expired". For a page that
+    /// was simply opened without a token nothing had expired, and the message
+    /// sent the viewer to renew something they never had.
+    #[test]
+    fn a_missing_token_is_not_reported_as_an_expired_one() {
+        let html = include_str!("dvr.html");
+        assert!(html.contains("failNoToken"), "no distinct path for a missing credential");
+        assert!(html.contains("failExpired"), "no path for a refused credential");
+        assert!(
+            html.contains("if (TOKEN) { failExpired(); } else { failNoToken(); }"),
+            "the two failures are not actually told apart at the branch"
+        );
+        // A refused token must be forgotten, or the stored copy turns one
+        // refusal into a loop that survives every reload.
+        let expired = html.split("function failExpired()").nth(1).unwrap_or("");
+        assert!(
+            expired[..expired.len().min(300)].contains("forgetToken"),
+            "a refused token is kept, so the failure repeats on every reload"
+        );
+    }
+
     /// hls.js is vendored, not fetched. Android Chrome has no native HLS, so a
     /// CDN reference would make the player fail exactly on the primary target
     /// whenever the relay is deployed without public internet.
