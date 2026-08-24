@@ -125,7 +125,7 @@ pub async fn run_distribution(
         retention: std::time::Duration::from_secs(config.origin_retention_secs),
         max_bytes_per_stream: config.origin_max_bytes_per_stream,
         min_segments: config.origin_window_segments,
-        idle_grace: std::time::Duration::from_secs(60),
+        idle_grace: std::time::Duration::from_secs(config.origin_idle_grace_secs),
     };
     tracing::info!(
         root = %origin_cfg.root.display(),

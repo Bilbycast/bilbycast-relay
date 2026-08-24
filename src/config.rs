@@ -308,6 +308,19 @@ pub struct DistributionConfig {
     #[serde(default = "default_origin_max_bytes_per_stream")]
     pub origin_max_bytes_per_stream: u64,
 
+    /// How long past `origin_retention_secs` a stream may sit without a PUT
+    /// before it is reclaimed outright — segments, manifest, init and
+    /// directory. Default 60.
+    ///
+    /// Here as well as on the pushed policy because it is one of the four
+    /// node-wide storage knobs, and the only one that used to have nowhere to
+    /// land: the manager could push it and the relay applied it, but
+    /// `persist_distribution_config` had no field to write it back to, so it
+    /// silently returned to 60 s on the next restart while its three siblings
+    /// survived.
+    #[serde(default = "default_origin_idle_grace_secs")]
+    pub origin_idle_grace_secs: u64,
+
     /// Directory the origin writes media segments under. Defaults to
     /// `/var/lib/bilbycast/relay/origin` (inside the packaged unit's
     /// `ReadWritePaths`). Wiped on startup — segments from a previous run are
@@ -351,6 +364,7 @@ impl Default for DistributionConfig {
             require_origin_token: false,
             require_ingest_token: true,
             max_viewers_per_ip: default_max_viewers_per_ip(),
+            origin_idle_grace_secs: default_origin_idle_grace_secs(),
             origin_window_segments: default_origin_window_segments(),
             origin_retention_secs: default_origin_retention_secs(),
             origin_max_bytes_per_stream: default_origin_max_bytes_per_stream(),
@@ -374,6 +388,10 @@ fn default_origin_retention_secs() -> u64 {
 
 fn default_origin_max_bytes_per_stream() -> u64 {
     8 * 1024 * 1024 * 1024
+}
+
+fn default_origin_idle_grace_secs() -> u64 {
+    60
 }
 
 /// Default origin storage root. Under the packaged unit's data root, which is
@@ -455,6 +473,9 @@ impl DistributionConfig {
         // archive, not a live origin's sliding window.
         if self.origin_retention_secs == 0 || self.origin_retention_secs > 86_400 {
             anyhow::bail!("distribution.origin_retention_secs must be in 1..=86400");
+        }
+        if self.origin_idle_grace_secs > 86_400 {
+            anyhow::bail!("distribution.origin_idle_grace_secs must be <= 86400");
         }
         if self.origin_max_bytes_per_stream < 16 * 1024 * 1024 {
             anyhow::bail!(

@@ -842,6 +842,9 @@ fn persist_distribution_config(
             if let Some(v) = d.min_segments {
                 dcfg.origin_window_segments = v;
             }
+            if let Some(v) = d.idle_grace_secs {
+                dcfg.origin_idle_grace_secs = v;
+            }
         }
     }) {
         tracing::warn!("failed to persist distribution config to {config_path:?}: {e}");
@@ -1433,11 +1436,20 @@ mod manager_contract_tests {
                 "e2e":       { "retention_secs": 300 },
                 "e2e-proxy": { "retention_secs": 300 }
             },
-            "require_origin_token": false
+            // `true`, because that is what the manager sends. `relay_push_body`
+            // carries it unconditionally (migration 0063 — every DVR feed is
+            // gated), so a fixture pinning `false` pins a body the manager has
+            // never produced, and the one field whose value actually matters
+            // here would go unchecked.
+            "require_origin_token": true
         });
 
         apply_configure_distribution(Some(&control), &from_manager)
             .expect("the relay must accept the manager's push");
+        assert!(
+            control.load().require_origin_token,
+            "the gate the manager always sends must actually engage"
+        );
 
         // Applied, not merely parsed.
         let mut rx = control.subscribe_origin();

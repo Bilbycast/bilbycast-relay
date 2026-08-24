@@ -195,8 +195,15 @@ It expects **two renditions** of the same source:
 
 | Rendition | Origin path | Encoding | Used for |
 |---|---|---|---|
-| main | `{stream}` | long-GOP | live, 1x, 0.25–4x forward, coarse scrub |
-| proxy | `{stream}-proxy` | low-res **all-intra** | frame jog, shuttle, reverse |
+| main | `{stream}` | long-GOP | live, the 33 / 50 / 100 % speed presets, coarse scrub, **frame jog** |
+| proxy | `{stream}-proxy` | low-res **all-intra** | shuttle 2/4/8/16x, both directions |
+
+The main rendition plays at 1x and below, not above: the presets are 33 %,
+50 % and 100 %, and anything faster is a *seek* rate, which is what the
+shuttle is for. Frame jog runs on the main rendition at full resolution —
+measured against burnt-in timecode, long-GOP stepping is frame-exact as long
+as the seek names a frame **centre**; what broke stepping was landing on frame
+boundaries, not the GoP.
 
 Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`
 (one token covers both renditions — see above; required only when

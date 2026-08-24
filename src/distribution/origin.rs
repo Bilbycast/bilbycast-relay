@@ -1,7 +1,14 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Tier 1 — LL-HLS / CMAF HTTP origin + in-memory sliding-window cache.
+//! Tier 1 — LL-HLS / CMAF HTTP origin, disk-backed.
+//!
+//! Media segments are written to disk and retained by age, bounded by a
+//! per-stream byte cap and floored at a segment count. Manifests and init
+//! segments stay in memory: they are rewritten every segment and never
+//! evicted, so persisting them would be churn on the hottest objects here
+//! for no durability benefit — nothing reads them back after a restart,
+//! because the segments they reference are gone too.
 //!
 //! The edge's existing CMAF output PUTs browser-playable fMP4 segments +
 //! HLS/DASH manifests to `{ingest_url}/{file}`. Point that `ingest_url` at
