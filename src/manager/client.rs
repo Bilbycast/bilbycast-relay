@@ -659,23 +659,39 @@ fn apply_configure_distribution(
     if let Some(b) = action.get("require_ingest_token").and_then(|v| v.as_bool()) {
         update.require_ingest_token = Some(b);
     }
-    if let Some(s) = action.get("public_ip").and_then(|v| v.as_str()) {
+    // An empty string is "the operator left the box blank", not a value.
+    //
+    // The manager's own validators admit `""` for these three (each is guarded
+    // by `!v.is_empty() &&`) and its Distribution tab sends all three keys on
+    // every save, so a blank Public IP arrived here as `""` — and rejecting it
+    // aborts the WHOLE command, so the token secret, the gates and the cascade
+    // sources in the same push were not applied either. The ordinary case of
+    // saving that form with one box empty silently applied nothing.
+    let non_empty = |k: &str| -> Option<String> {
+        action
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(s) = non_empty("public_ip") {
         match s.parse() {
             Ok(ip) => update.public_ip = Some(ip),
             Err(_) => return Err(format!("invalid public_ip '{s}'")),
         }
     }
-    if let Some(s) = action.get("portal_url").and_then(|v| v.as_str()) {
+    if let Some(s) = non_empty("portal_url") {
         if !s.starts_with("http://") && !s.starts_with("https://") {
             return Err("portal_url must start with http:// or https://".to_string());
         }
-        update.portal_url = Some(s.to_string());
+        update.portal_url = Some(s);
     }
-    if let Some(s) = action.get("public_base_url").and_then(|v| v.as_str()) {
+    if let Some(s) = non_empty("public_base_url") {
         if !(s.starts_with("http://") || s.starts_with("https://")) {
             return Err("public_base_url must start with http:// or https://".to_string());
         }
-        update.public_base_url = Some(s.to_string());
+        update.public_base_url = Some(s);
     }
     control.apply(update);
 
@@ -1434,6 +1450,52 @@ mod manager_contract_tests {
             per[0].1.retention_secs,
             Some(300),
             "the window must survive the wire"
+        );
+    }
+
+    /// A blank box on the Distribution tab must not abort the whole push.
+    ///
+    /// The manager admits `""` for `public_ip`, `public_base_url` and
+    /// `portal_url` and its form sends all three keys on every save, so the
+    /// ordinary case of leaving one empty used to return `Err` — which aborts
+    /// `apply_configure_distribution` entirely, so the token secret and the
+    /// gates in the same command were not applied either. Silently: the
+    /// manager reports `success: true, pushed: false` at most.
+    #[test]
+    fn a_blank_field_does_not_abort_the_rest_of_the_push() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "public_ip": "",
+                "portal_url": "",
+                "public_base_url": "https://relay.example.com",
+                "require_viewer_token": true,
+                "token_secret": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            }),
+        )
+        .expect("a blank field must not abort the push");
+
+        let rt = control.load();
+        assert_eq!(
+            rt.public_base_url.as_deref(),
+            Some("https://relay.example.com"),
+            "the field that WAS filled in must land"
+        );
+        assert!(rt.require_viewer_token, "the gate in the same push must land");
+        assert!(rt.token_secret.is_some(), "the secret in the same push must land");
+        assert!(rt.public_ip.is_none(), "a blank field stays unset");
+
+        // A non-empty but malformed value is still refused.
+        assert!(
+            apply_configure_distribution(
+                Some(&control),
+                &serde_json::json!({ "type": "configure_distribution", "public_ip": "not-an-ip" }),
+            )
+            .is_err()
         );
     }
 

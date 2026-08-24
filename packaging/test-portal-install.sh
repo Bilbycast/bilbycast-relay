@@ -15,12 +15,15 @@ ok()   { printf "  ok    %s\n" "$1"; PASS=$((PASS+1)); }
 bad()  { printf "  FAIL  %s\n" "$1"; FAIL=$((FAIL+1)); }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', wanted '$3')"; fi; }
 
+# Version read from the manifest rather than pinned, so a release bump does
+# not leave this fixture naming a tarball that no longer ships.
+REL_VER=$(grep -m1 "^version" ../Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 # ── build two tarballs the way the release workflow stages them ───────────
 mk_tarball() {  # $1 = dir name, $2 = with-portal (1/0)
-  local stage="$WORK/$1/bilbycast-relay-0.10.6-x86_64-linux"
+  local stage="$WORK/$1/bilbycast-relay-${REL_VER}-x86_64-linux"
   mkdir -p "$stage/packaging"
   printf '#!/bin/sh\necho relay\n' > "$stage/bilbycast-relay"; chmod +x "$stage/bilbycast-relay"
   cp ./bilbycast-relay.service "$stage/packaging/"
