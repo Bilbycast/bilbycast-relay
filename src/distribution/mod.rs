@@ -341,9 +341,18 @@ async fn health() -> impl IntoResponse {
 
 /// Validate + normalize a stream id from the URL path. Streams are named by
 /// the manager; keep the character set tight to avoid path/URL abuse.
+///
+/// The character set alone is not enough now that a stream id names a
+/// **directory** under the origin root: `.` and `..` are built entirely from
+/// allowed characters, and `root.join("..")` is the origin's parent. Require at
+/// least one alphanumeric, which rejects every all-dot name without having to
+/// enumerate them.
 pub fn sanitize_stream_id(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() || s.len() > 128 {
+        return None;
+    }
+    if !s.chars().any(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
     if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
@@ -701,10 +710,17 @@ async fn dvr_page(
         .unwrap_or_default();
     let html = include_str!("dvr.html")
         .replace("__STREAM_ID__", &stream_id)
-        .replace("__PORTAL_URL__", &portal);
+        .replace("__PORTAL_URL__", &portal)
+        .replace("__HLS_JS_VERSION__", HLS_JS_VERSION);
     // The page is an app shell that changes with the build. Without this a
     // browser will happily serve a cached copy after an upgrade, so a fixed
-    // player looks unfixed. (`/dvr/hls.js` stays immutable — it is versioned.)
+    // player looks unfixed.
+    //
+    // The page is also what versions `/dvr/hls.js`: it is served `immutable`,
+    // which is a promise about a URL, and `/dvr/hls.js` on its own is a URL
+    // whose bytes change on every hls.js bump. The `?v=` the page appends is
+    // what makes the promise true — a viewer who cached the old bundle for a
+    // year is asked for a different URL after an upgrade.
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -721,6 +737,12 @@ async fn dvr_page(
 /// deployed where viewers have no route to the public internet, and because a
 /// player that silently stops working when a CDN changes is not a broadcast
 /// tool. Android Chrome has no native HLS, so this is not optional there.
+/// The vendored bundle's version, appended to its URL by the page above.
+///
+/// Keep in step with `vendor/README.md`; the pair is what lets the response be
+/// `immutable` without pinning viewers to a superseded bundle.
+pub const HLS_JS_VERSION: &str = "1.6.16";
+
 async fn dvr_hls_js() -> Response {
     (
         [
@@ -850,6 +872,22 @@ mod tests {
         assert!(
             expired[..expired.len().min(300)].contains("forgetToken"),
             "a refused token is kept, so the failure repeats on every reload"
+        );
+    }
+
+    /// `/dvr/hls.js` is served `immutable` for a year, which is a promise
+    /// about a URL. The page must therefore version the URL, or a viewer who
+    /// cached one bundle keeps it across every future upgrade — the same
+    /// same-URL-different-bytes trap the origin's own cache headers avoid.
+    #[test]
+    fn dvr_page_versions_the_immutable_hls_js_url() {
+        let html = include_str!("dvr.html")
+            .replace("__STREAM_ID__", "s")
+            .replace("__HLS_JS_VERSION__", HLS_JS_VERSION);
+        assert!(!html.contains("__HLS_JS_VERSION__"), "placeholder left in page");
+        assert!(
+            html.contains(&format!("/dvr/hls.js?v={HLS_JS_VERSION}")),
+            "hls.js is loaded from an unversioned URL while served immutable"
         );
     }
 
