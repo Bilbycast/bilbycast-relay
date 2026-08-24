@@ -20,15 +20,25 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
-# Both triggers are branch-scoped on purpose.
+# The `push` trigger stays scoped to main; the `pull_request` one is not
+# scoped at all, and that difference is the point.
 #
 # An unfiltered `push` also fires on tag refs, so every `release-all.sh` run
-# would spin this whole job up on the tag ref, racing the Release build for the
-# same runner pool and the same repo cache. Scoping to `main` also removes the
-# push/PR double-run for free: a PR branch push no longer matches `push`, so
-# only `pull_request` runs.
+# would spin this whole job up on the tag ref, racing the Release build for the same
+# runner pool and the same repo cache. That reasoning is about `push` and only
+# `push`.
+#
+# `pull_request` was scoped to main as well, which meant a **stacked** PR — one
+# whose base is another feature branch — got no CI at all. The DVR work sat in
+# two such stacks for days: the bottom of each was green, the top had never been
+# built, and nothing said so. The checks tab was simply empty, which reads like
+# "nothing to report" rather than "nothing ran". Whatever a PR is based on, it
+# is a change somebody is asking to merge, so it gets checked.
+#
+# Scoping `push` to main still removes the push/PR double-run: a PR branch push
+# no longer matches `push`, so only `pull_request` runs.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
