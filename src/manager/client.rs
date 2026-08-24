@@ -852,6 +852,15 @@ fn build_health_message(
     let dist_snapshot = relay_stats.distribution_snapshot();
     if dist_snapshot.is_some() {
         capabilities.push("viewer-distribution");
+        // "origin-policy" => this build understands `require_origin_token`,
+        // `origin_policy` and `origin_stream_policies` on
+        // `configure_distribution`. A relay that predates them advertises
+        // `viewer-distribution` just the same and **acks the push anyway** —
+        // unknown keys are ignored, so the manager records a gate or a
+        // retention window as applied when nothing was. The bit is what lets
+        // the manager refuse instead of reporting a success it cannot see is
+        // false.
+        capabilities.push("origin-policy");
     }
 
     let mut payload = serde_json::json!({
