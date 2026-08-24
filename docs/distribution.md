@@ -63,7 +63,7 @@ they are not either/or.
 | `POST` | `/whip/{stream}` | Edge pushes a stream in (SDP offer → answer) |
 | `DELETE` | `/whip/{stream}/{session}` | Stop an ingest |
 | `GET` | `/watch/{stream}` | Built-in minimal `<video>` + WHEP player page (live only) |
-| `GET` | `/dvr/{stream}` | Browser DVR player: live, 60-min scrub-back, frame jog, shuttle |
+| `GET` | `/dvr/{stream}` | Browser DVR player: live, scrub-back, frame jog, shuttle. How far back is whatever `origin_retention_secs` holds — **60 s by default**; a DVR surface needs it raised, per stream or node-wide |
 | `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |

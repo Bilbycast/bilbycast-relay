@@ -430,6 +430,34 @@ impl DistributionConfig {
                 self.origin_max_bytes_per_stream
             );
         }
+        // `origin_storage_dir` is recursively deleted at every startup, so a
+        // typo here is destructive rather than merely wrong. These bounds
+        // reject the shapes a slip actually produces — a relative path, a
+        // filesystem root, a top-level directory — and `OriginStore::new`
+        // refuses to wipe a directory it cannot identify as its own.
+        if let Some(dir) = &self.origin_storage_dir {
+            let p = std::path::Path::new(dir);
+            if dir.trim().is_empty() || !p.is_absolute() {
+                anyhow::bail!(
+                    "distribution.origin_storage_dir must be an absolute path (got {dir:?})"
+                );
+            }
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                anyhow::bail!("distribution.origin_storage_dir must not contain '..' ({dir:?})");
+            }
+            let depth = p
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
+            if depth < 2 {
+                anyhow::bail!(
+                    "distribution.origin_storage_dir must be at least two levels deep — \
+                     it is wiped on startup, and {dir:?} is a system directory"
+                );
+            }
+        }
         if self.cascade_sources.len() > 64 {
             anyhow::bail!("distribution.cascade_sources: at most 64 entries");
         }
