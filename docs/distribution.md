@@ -195,8 +195,12 @@ It expects **two renditions** of the same source:
 
 | Rendition | Origin path | Encoding | Used for |
 |---|---|---|---|
-| main | `{stream}` | long-GOP | live, 1x, 0.25–4x forward, coarse scrub |
-| proxy | `{stream}-proxy` | low-res **all-intra** | frame jog, shuttle, reverse |
+| main | `{stream}` | long-GOP | live, 1x, 0.25–4x forward, frame jog, and the still after a scrub |
+| proxy | `{stream}-proxy` | low-res **all-intra** | shuttle, reverse, and the picture *while* a scrub thumb is held |
+| thumbnails | `thumbs-*.jpg` + `thumbs.vtt` | sprite sheets | the preview under the thumb while dragging |
+
+That split has moved twice on measurement and is worth reading as measured
+rather than as designed — see **Which rendition does what, and why** below.
 
 Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`
 (one token covers both renditions — see above; required only when
@@ -209,12 +213,38 @@ is not handing out their credential with it. Native HLS (iOS Safari) hands
 the URL straight to the media stack and cannot set headers, so there the query
 form is kept.
 
-**Why a proxy rendition.** Frame-exact seeking works in a plain `<video>` only
-when every frame is a random-access point. On long-GOP video `currentTime`
-lands on the nearest keyframe instead, and every backward step re-decodes from
-the preceding IDR. Encode the proxy with `gop_size: 1` on the edge's CMAF
-output. Note that **NVENC cannot do this** — it refuses `gop_size: 1` outright
-— so use `x264` for the proxy on NVENC hosts rather than `h264_auto`
+### Which rendition does what, and why
+
+**Frame jog runs on main, not the proxy.** The original design assumed long-GOP
+video could not be stepped exactly. Measured against burnt-in timecode, that is
+wrong — what broke stepping was seeking to frame *boundaries*, where the browser
+may present either side. Seek to the midpoint of the target frame, `(i+0.5)/fps`,
+and stepping is exact at full resolution.
+
+**A held scrub runs on the proxy.** Measured on the target Android tablet with
+`?selftest=1`, 50 seeks over 2 s inside the buffer:
+
+| element | presented | rate |
+|---|---|---|
+| main 1920p | 13/50, 16/50, 18/50 | 6.1–8.5 fps |
+| proxy 360p | 39/50, 40/50, 41/50 | 18.4–19.3 fps |
+
+A drag on the main rendition there presents about one frame in four. **The same
+test on a desktop shows no difference whatsoever (23.5 vs 23.5 fps)** — so this
+is a property of the device, and a workstation measurement will tell you the
+opposite of the truth. Releasing hands the still back to main, because a stopped
+scrub is someone examining the frame they landed on.
+
+**Neither rendition helps outside the buffer.** 40 seeks over 2 s on spans
+neither element had visited: 0–1 frames presented, for *both*, at LAN speed, at
+25 Mbit/s and at 8 Mbit/s alike. The cost there is the segment fetch, not the
+decode — 2.0 MB per 2 s main segment against 656 KB for the proxy. That is what
+the thumbnail track is for.
+
+**Why the proxy is all-intra.** Frame-exact seeking works in a plain `<video>`
+only when every frame is a random-access point. Encode it with `gop_size: 1` on
+the edge's CMAF output. **NVENC cannot do this** — it refuses `gop_size: 1`
+outright — so use `x264` for the proxy on NVENC hosts rather than `h264_auto`
 (bilbycast-edge#125).
 
 **Reverse playback** is a `requestAnimationFrame` loop stepping `currentTime`,
@@ -223,10 +253,81 @@ rate stays at roughly the frame rate regardless of shuttle speed — at 8x the
 player presents every 8th frame — which is what keeps it affordable on a
 tablet.
 
+### The scrub bar
+
+**The bar spans the playlist window, not `video.seekable`.** They are different
+and the gap grows: measured against a live 300 s window, the playlist summed to
+exactly 300 s of `EXTINF` while `main.seekable` read `0.0–504.0`. MSE keeps
+extending its seekable range as segments are appended while the server-side
+window slides. Calibrated on `seekable`, the bar offered positions before the
+oldest segment and after the live edge — around 40 % of it was footage the
+origin had evicted and 30 % footage that had not happened, both showing nothing.
+The window comes from hls.js (`fragments[0].start` + `totalduration`), falling
+back to `seekable` for native HLS, which exposes no playlist.
+
+**The lit part of the bar is `main.buffered`** — where a drag moves the real
+picture with no fetch. It is capped by `backBufferLength`, so on a long window
+it is a small fraction of the bar and *shrinks* as a proportion the longer a
+session runs. Everything outside it is served by the thumbnail preview.
+
+### Scrub preview (thumbnail track)
+
+Sprite sheets plus a WebVTT index, published by the edge beside the media
+(bilbycast-edge#124). One sheet is about the size of one media segment and
+covers a hundred positions, where seeking for a real frame costs a segment fetch
+each time.
+
+**Cue times are offsets from a UTC epoch declared in the index's own header**,
+because the player and the generator share no other clock — hls.js zeroes its
+timeline at whichever fragment it happened to load first, so a cue looked up by
+`currentTime` would show a plausible frame from the wrong moment, differently
+for every viewer. The player maps position → wall clock via
+`#EXT-X-PROGRAM-DATE-TIME` on the playlist → offset from that epoch.
+
+Two things the player must do, both of which were silently wrong first:
+
+* **Fetch sheets with the credential.** A CSS `background-image` cannot carry an
+  `Authorization` header, so a style pointed at the sheet URL 401s and paints
+  the box's own background colour — every DOM assertion passing while the
+  operator sees a black rectangle. Sheets go through `fetch` and the style gets
+  a blob URL.
+* **Refetch the index.** It is a rolling window like the playlist; fetched once
+  and kept, it drifts out from under the bar and every position resolves outside
+  its span.
+
+### Self-test (`?selftest=1`)
+
+The player carries its own measurement, because the question "what can this
+device present?" cannot be answered from a workstation — and on this project the
+workstation's answer was the opposite of the tablet's. It runs on a tap and
+prints plainly enough to photograph: shuttle rate main vs proxy, scrub preview
+coverage across the bar, the real drag path (including which element the picture
+ended up on), and a token renewal.
+
+The instrument is `requestVideoFrameCallback` — frames actually put on screen —
+not `droppedVideoFrames`, which counts only what was discarded and reads clean
+while the picture is frozen.
+
 **Retention must exceed the window the edge advertises.** The playlist is a
 sliding window; if `origin_retention_secs` is shorter than the edge's
 `dvr_window_secs`, the manifest lists segments the origin has already evicted
 and a viewer seeking to the back of the window gets 404s.
+
+**Restart the edge whenever you restart the relay.** The origin is wiped on
+relay startup, but the manifest addressing it is produced by the *edge* and
+survives — so the playlist and the thumbnail index go on naming objects that
+have been deleted, until the window rolls over. At a 5-minute window that heals
+in 5 minutes; at the 2h30m window a whole-event DVR wants, it takes 2h30m, and
+the scrub bar looks broken throughout with nothing to say why. Tracked as #6.
+
+**Sizing a whole-event window.** The window costs relay disk, not device
+memory — a viewer holds only `backBufferLength`, whatever the window. Measured
+on live 1080p: main ~8 Mbit/s (2.0 MB per 2 s segment), proxy ~2.6 Mbit/s
+(656 KB), sprite sheets negligible. A 2h30m event is therefore roughly **12 GB
+per session**, and `origin_max_bytes_per_stream` must be raised to match or the
+window silently truncates into the 404 case above. At 2 s segments that window
+is also a ~4500-entry playlist, around 200 KB, refetched and reparsed by every
+viewer on each reload.
 
 hls.js is **vendored** and served from `/dvr/hls.js` rather than a CDN: relays
 are often deployed where viewers have no route to the public internet, and
