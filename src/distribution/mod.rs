@@ -851,6 +851,31 @@ mod tests {
         );
     }
 
+    /// The self-test must be inert unless asked for.
+    ///
+    /// It seeks both elements dozens of times and drives the preview by hand.
+    /// Running any of that for an ordinary viewer would be a player that
+    /// jumps around on load, so the whole thing hangs off one query flag and
+    /// a deliberate tap.
+    #[test]
+    fn the_self_test_runs_only_when_asked_for() {
+        let html = include_str!("dvr.html");
+        assert!(
+            html.contains(r#"qs.get("selftest") === "1""#),
+            "the self-test is not behind a flag"
+        );
+        // The only thing that starts it is the button, inside that guard.
+        assert_eq!(
+            html.matches("stRunAll").count(),
+            2,
+            "stRunAll is referenced somewhere other than its definition and its one listener"
+        );
+        // And it must not be wired to anything that fires on load.
+        for on_load in ["loadedmetadata\", stRunAll", "DOMContentLoaded\", stRunAll"] {
+            assert!(!html.contains(on_load), "self-test runs on load: {on_load}");
+        }
+    }
+
     /// What the page tells the operator about the bar must match what the
     /// bar now does.
     ///

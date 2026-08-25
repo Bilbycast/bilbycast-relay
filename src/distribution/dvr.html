@@ -40,6 +40,19 @@
            background: rgba(0,0,0,.75); padding: 8px 10px; border-radius: 6px;
            white-space: pre; pointer-events: none; }
   body[data-debug="1"] #debug { display: block; }
+  #selftest {
+    display: none; position: absolute; inset: 8px; overflow: auto; z-index: 5;
+    background: rgba(8,11,14,.97); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  body[data-selftest="1"] #selftest { display: block; }
+  #selftest h2 { margin: 0 0 6px; font-size: 16px; }
+  #selftest p { margin: 0 0 12px; color: var(--dim); font-size: 13px; max-width: 60ch; }
+  #selftest button { background: var(--accent); color: #05231b; border-color: var(--accent); }
+  #selftest pre {
+    margin: 14px 0 0; white-space: pre-wrap; word-break: break-word;
+    font: 13px/1.5 ui-monospace, Menlo, monospace; color: var(--fg);
+  }
   footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 14px 14px; }
   .timeline { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .timeline .track { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; }
@@ -121,6 +134,13 @@
   <video id="main" playsinline muted></video>
   <video id="proxy" playsinline muted></video>
   <div id="badge">live</div>
+  <div id="selftest">
+    <h2>Player self-test</h2>
+    <p id="stExplain">Measures what this device can actually present. Takes about a minute.
+      Leave the tab in front while it runs.</p>
+    <button id="stRun" type="button">Run the test</button>
+    <pre id="stOut"></pre>
+  </div>
   <div id="status">—</div>
   <pre id="debug"></pre>
 </div>
@@ -1239,10 +1259,167 @@
     }
   });
 
+  // ── self-test (?selftest=1) ────────────────────────────────────────────
+  // The one question this player cannot answer from a desk: what can the
+  // *device in the operator's hands* actually present?
+  //
+  // Counters do not answer it. Measured repeatedly on this project, a decoder
+  // reports healthy while presenting nothing, and `droppedVideoFrames` counts
+  // only what was discarded — never what was never presented at all. So the
+  // instrument here is `requestVideoFrameCallback`, which fires once per frame
+  // actually put on the screen, and the measure is frames presented against
+  // seeks asked for.
+  //
+  // Runs on a tap because autoplay and decoding both want a gesture, and
+  // prints plainly so the result can be read or photographed off the screen.
+  var stOut = document.getElementById("stOut");
+
+  function stSay(line) {
+    stOut.textContent += line + "\n";
+  }
+
+  /// Count frames `v` actually presents while `steps` seeks are issued across
+  /// `[from, to]` on its own clock.
+  function stBurst(v, from, to, steps, gapMs) {
+    return new Promise(function (done) {
+      var seen = [], stop = false;
+      if (!v.requestVideoFrameCallback) { done(null); return; }
+      (function loop(now, meta) {
+        if (meta) seen.push(+meta.mediaTime.toFixed(3));
+        if (!stop) v.requestVideoFrameCallback(loop);
+      })();
+      v.pause();
+      var i = 0, t0 = performance.now();
+      var tick = setInterval(function () {
+        i++;
+        try { v.currentTime = from + (to - from) * i / steps; } catch (e) {}
+        if (i >= steps) {
+          clearInterval(tick);
+          setTimeout(function () {
+            stop = true;
+            var ms = performance.now() - t0;
+            var distinct = {};
+            for (var k = 0; k < seen.length; k++) distinct[seen[k]] = 1;
+            done({
+              presented: seen.length,
+              distinct: Object.keys(distinct).length,
+              steps: steps,
+              fps: seen.length / (ms / 1000)
+            });
+          }, 120);
+        }
+      }, gapMs);
+    });
+  }
+
+  /// The largest buffered interval of `v`, or null.
+  function stWidestBuffered(v) {
+    var best = null;
+    for (var i = 0; i < v.buffered.length; i++) {
+      var a = v.buffered.start(i), b = v.buffered.end(i);
+      if (!best || b - a > best[1] - best[0]) best = [a, b];
+    }
+    return best;
+  }
+
+  function stPad(x, n) {
+    x = String(x);
+    while (x.length < n) x += " ";
+    return x;
+  }
+
+  function stReport(label, r) {
+    if (!r) { stSay(stPad(label, 22) + "not measurable on this browser"); return; }
+    stSay(stPad(label, 22) + stPad(r.distinct + "/" + r.steps + " frames", 16) +
+          r.fps.toFixed(1) + " fps");
+  }
+
+  function stWait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  async function stRunAll() {
+    var btn = document.getElementById("stRun");
+    btn.disabled = true;
+    stOut.textContent = "";
+    stSay("device   " + (navigator.userAgent || "?"));
+    stSay("screen   " + screen.width + "x" + screen.height +
+          " dpr=" + (window.devicePixelRatio || 1) +
+          "  cores=" + (navigator.hardwareConcurrency || "?"));
+    stSay("");
+
+    // Let the main rendition settle and build a buffer to work inside.
+    stSay("warming up the main rendition...");
+    main.play().catch(function () {});
+    await stWait(20000);
+    stSay("main     " + main.videoWidth + "x" + main.videoHeight +
+          "  readyState=" + main.readyState);
+
+    // The proxy is attached lazily, exactly as a shuttle would.
+    stSay("attaching the proxy...");
+    ensureProxy();
+    await stWait(20000);
+    stSay("proxy    " + proxy.videoWidth + "x" + proxy.videoHeight +
+          "  readyState=" + proxy.readyState);
+    stSay("");
+
+    var mb = stWidestBuffered(main), pb = stWidestBuffered(proxy);
+    if (!mb || !pb || mb[1] - mb[0] < 8 || pb[1] - pb[0] < 8) {
+      stSay("Not enough buffered on both renditions to compare — try again in a minute.");
+      btn.disabled = false;
+      return;
+    }
+    var span = Math.min(mb[1] - mb[0], pb[1] - pb[0]) - 2;
+
+    // 1. SHUTTLE, inside the buffer. This is the only job the proxy still has,
+    //    and the question is whether this device needs it.
+    stSay("1. shuttle rate, inside the buffer (50 seeks in 2 s)");
+    stSay("   " + stPad("", 19) + stPad("presented", 16) + "rate");
+    stReport("   main " + main.videoWidth + "p", await stBurst(main, mb[0] + 1, mb[0] + 1 + span, 50, 40));
+    await stWait(1500);
+    stReport("   proxy 360p", await stBurst(proxy, pb[0] + 1, pb[0] + 1 + span, 50, 40));
+    await stWait(1500);
+    // Reversed, so warming cannot favour whichever went first.
+    stReport("   proxy 360p (again)", await stBurst(proxy, pb[0] + 1 + span, pb[0] + 1, 50, 40));
+    await stWait(1500);
+    stReport("   main " + main.videoWidth + "p (again)", await stBurst(main, mb[0] + 1 + span, mb[0] + 1, 50, 40));
+    stSay("");
+
+    // 2. SCRUB PREVIEW across the whole bar, which is what an operator drags.
+    stSay("2. scrub preview across the bar (20 positions)");
+    loadThumbs();
+    await stWait(2500);
+    var r = range(main), shown = 0, outside = 0, blank = 0;
+    if (!r) {
+      stSay("   no window yet");
+    } else {
+      scrubbing = true;
+      for (var i = 0; i < 20; i++) {
+        var frac = 0.04 + (0.94 - 0.04) * i / 19;
+        var t = r.start + (r.end - r.start) * frac;
+        showPreview(t, frac);
+        await stWait(350);
+        if (document.body.dataset.preview === "1") shown++;
+        else if (thumbs && !cueAt(t)) outside++;
+        else blank++;
+      }
+      scrubbing = false;
+      hidePreview();
+      stSay("   preview shown        " + shown + "/20");
+      stSay("   past the newest sheet " + outside + "/20   (expected at the live edge)");
+      stSay("   covered but blank    " + blank + "/20   (should be 0)");
+    }
+    stSay("");
+    stSay("Done. Photograph or read this back.");
+    btn.disabled = false;
+  }
+
   // ── start ──────────────────────────────────────────────────────────────
   if (qs.get("debug") === "1") {
     dbg = document.getElementById("debug");
     document.body.dataset.debug = "1";
+  }
+  if (qs.get("selftest") === "1") {
+    document.body.dataset.selftest = "1";
+    document.getElementById("stRun").addEventListener("click", stRunAll);
   }
   mainHls = attach(main, MAIN, "main");
   // The proxy is NOT attached up front. Two live MSE elements hold two
