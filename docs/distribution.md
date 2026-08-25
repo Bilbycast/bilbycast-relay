@@ -294,6 +294,29 @@ Two properties that decide whether it feels right:
 A preset wider than the window collapses to the window, so `30m` on a
 five-minute window is simply `ALL`.
 
+**Reaching past the visible span.** Held in the outer eighth of the bar, the
+view scrolls that way — the thumb stays put and the window moves under it. Its
+own frame loop drives this rather than the `input` event, because a thumb held
+still at the edge fires no further events and an implementation driven by
+movement scrolls one step and stalls. The pan is clamped to the window so the
+far ends stay reachable.
+
+**The ruler.** Marks along the bar sit at round clock times, which does two
+jobs: their spacing says how far the bar is zoomed without reading the buttons,
+and because each is pinned to an absolute moment they drift left on their own as
+the view follows the playhead. That motion is the passage of time, not an
+animation over it — and it stops when the transport stops, which is also true.
+
+At least three labelled marks are guaranteed at every zoom; a ruler showing one
+time is a caption. The label interval is the largest round step that still gives
+three, and minor marks subdivide it by a factor that always divides cleanly, so
+a minor never lands beside a labelled one. Measured: 5 labels at `ALL` on a
+five-minute window, 4 at `2m`, 3 at `30s`.
+
+It runs on its own frame loop — `render` is 5 Hz, fine for a readout and visibly
+steppy for something in motion — and skips the DOM entirely when nothing has
+moved.
+
 Zooming in near the playhead also tends to fill the bar with buffered media, so
 at the narrow presets the whole visible span is usually instant *and*
 frame-exact. That is a consequence of the back buffer's size rather than a

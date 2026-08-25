@@ -63,8 +63,26 @@
      stays large enough for a thumb. */
   .timeline .track input[type=range] {
     -webkit-appearance: none; appearance: none;
-    display: block; width: 100%; height: 32px; margin: 0;
-    position: relative; background: transparent;
+    display: block; width: 100%; height: 46px; margin: 0;
+    position: relative; background: transparent; z-index: 2;
+  }
+  /* A ruler under the bar. The marks sit at round clock times, so as the view
+     follows the playhead they drift left on their own — the motion is the
+     passage of time itself, not an animation put on top of it. Their spacing
+     is also the readable signal for how far the bar is zoomed. */
+  #ticks {
+    position: absolute; left: 0; right: 0; top: 50%; height: 22px;
+    margin-top: 3px; pointer-events: none; overflow: hidden; z-index: 1;
+  }
+  /* Bright enough to read at arm's length on a tablet. `--line` is a border
+     colour and disappears against the panel — the first build was correct and
+     invisible. */
+  #ticks i { position: absolute; top: 0; width: 1px; height: 5px; background: #4d5a68; }
+  #ticks i.major { height: 10px; width: 1px; background: #8494a4; }
+  #ticks b {
+    position: absolute; top: 10px; transform: translateX(-50%);
+    font: 10px/1 ui-monospace, Menlo, monospace; color: var(--dim);
+    white-space: nowrap; font-weight: 500;
   }
   .timeline .track input[type=range]::-webkit-slider-runnable-track { height: 5px; background: transparent; }
   .timeline .track input[type=range]::-moz-range-track { height: 5px; background: transparent; }
@@ -156,6 +174,7 @@
     <span class="t" id="tPos" title="Time of day this frame was ingested">--:--:--:--</span>
     <div class="track">
       <div id="cached" aria-hidden="true"></div>
+      <div id="ticks" aria-hidden="true"></div>
       <div id="preview" aria-hidden="true"><i></i><b></b></div>
       <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
     </div>
@@ -276,6 +295,7 @@
   var proxy = document.getElementById("proxy");
   var scrub = document.getElementById("scrub");
   var cached = document.getElementById("cached");
+  var ticks = document.getElementById("ticks");
   var preview = document.getElementById("preview");
   var previewImg = preview.querySelector("i");
   var previewLabel = preview.querySelector("b");
@@ -943,6 +963,8 @@
     // Pin the view where it is: see `viewAnchor`.
     var pinned = viewRange();
     if (pinned) viewAnchor = (pinned.start + pinned.end) / 2;
+    panLast = 0;
+    if (panRAF === null) panRAF = requestAnimationFrame(panStep);
     handPictureToProxy();
     syncRateButtons();
   }
@@ -971,6 +993,7 @@
   function endScrub() {
     if (!scrubbing) return;
     scrubbing = false;
+    if (panRAF !== null) { cancelAnimationFrame(panRAF); panRAF = null; }
     viewAnchor = null;      // let the view follow the playhead again
     hidePreview();
     if (scrubOnProxy) {
@@ -992,22 +1015,181 @@
   }
 
   scrub.addEventListener("pointerdown", beginScrub);
-  scrub.addEventListener("input", function () {
-    // The proxy may have become ready since the thumb went down.
-    handPictureToProxy();
+  /// Move the transport to wherever the thumb currently is.
+  ///
+  /// Shared by the drag itself and by the edge-pan loop below, because the two
+  /// must agree: panning changes which moment sits under a stationary thumb,
+  /// and that moment is what has to be shown.
+  function applyScrubPosition() {
+    handPictureToProxy();   // the proxy may have become ready since pointerdown
     var v = activeVideo();
     // The bar is calibrated on main's clock (see `render`), so pick the
     // position there and convert for whichever element is showing.
     var r = viewRange();
     if (!r) return;
     if (mode === "live") setMode("scrub");
-    var t = r.start + (r.end - r.start) * (scrub.value / 1000);
+    var frac = scrub.value / 1000;
+    var t = r.start + (r.end - r.start) * frac;
     pendingSeek = null;   // the operator is choosing a position explicitly
     try { v.currentTime = fromMainTime(t, v); } catch (e) {}
     var wallAt = wallClockAt(t);
     tPos.textContent = wallAt === null ? fmt(t - r.start) : fmtTimeOfDay(wallAt);
-    showPreview(t, scrub.value / 1000);
-  });
+    showPreview(t, frac);
+    renderCached(r);
+  }
+
+  // ── the ruler ──────────────────────────────────────────────────────────
+  // Marks along the bar, at round clock times. Two jobs:
+  //
+  //  * **Show the zoom.** Their spacing is what tells an operator whether the
+  //    bar covers thirty seconds or three hours, at a glance and without
+  //    reading the VIEW buttons.
+  //  * **Show time flowing.** Because each mark is pinned to an absolute
+  //    moment, they drift left on their own as the view follows the playhead.
+  //    That motion is the passage of time, not an animation laid over it — and
+  //    when the transport is stopped they stop, which is the truth as well.
+  //
+  // Driven by its own frame loop: `render` runs at 5 Hz, which is fine for a
+  // readout and visibly steppy for something that moves.
+
+  /// Candidate spacings, in seconds. Chosen so the labels land on times an
+  /// operator would say out loud — :15, :30, the minute — rather than on
+  /// arbitrary divisions of whatever the span happens to be.
+  var TICK_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+
+  /// Spacing for labelled marks and for the minor ones between them.
+  ///
+  /// The labels are chosen first, and chosen to guarantee **at least three
+  /// across the bar at every zoom** — a ruler showing one time is not a ruler,
+  /// it is a caption. Picking the *largest* step that still gives three keeps
+  /// them on round times rather than dividing the span arbitrarily.
+  ///
+  /// Minor marks then subdivide the label interval. Every pairing this can
+  /// produce divides cleanly (10/2, 30/10, 120/30, 300/60, 1800/600, 3600/900),
+  /// so a minor mark never lands just beside a labelled one.
+  function rulerSteps(span) {
+    var label = TICK_STEPS[0];
+    for (var i = 0; i < TICK_STEPS.length; i++) {
+      if (span / TICK_STEPS[i] >= 3) label = TICK_STEPS[i];
+    }
+    var minor = TICK_STEPS[0];
+    for (var j = 0; j < TICK_STEPS.length; j++) {
+      if (TICK_STEPS[j] <= label / 3) minor = TICK_STEPS[j];
+    }
+    return { label: label, minor: minor };
+  }
+
+  /// `HH:MM:SS`, or `MM:SS` when the step is fine enough that hours are noise.
+  function tickLabel(secs, step) {
+    var d = new Date(secs * 1000);
+    var hh = String(d.getHours()).padStart(2, "0");
+    var mm = String(d.getMinutes()).padStart(2, "0");
+    var ss = String(d.getSeconds()).padStart(2, "0");
+    return step >= 60 ? hh + ":" + mm : hh + ":" + mm + ":" + ss;
+  }
+
+  var tickPool = [], labelPool = [];
+  var lastTickKey = "";
+
+  function renderTicks() {
+    var view = viewRange();
+    if (!view) return;
+    var span = view.end - view.start;
+    if (!(span > 0)) return;
+
+    // Anchor to wall clock so marks land on round times. Without a playlist
+    // clock there is nothing to be round about, so fall back to the media
+    // timeline and the marks are merely evenly spaced.
+    var w0 = wallClockAt(view.start);
+    var base = w0 === null ? view.start : w0 / 1000;
+    var steps = rulerSteps(span);
+    var step = steps.minor, major = steps.label;
+
+    // Redraw only when something has actually moved by a visible amount.
+    var key = base.toFixed(2) + "/" + span.toFixed(2);
+    if (key === lastTickKey) return;
+    lastTickKey = key;
+
+    var first = Math.ceil(base / step) * step;
+    var ti = 0, li = 0;
+    for (var t = first; t < base + span; t += step) {
+      var frac = (t - base) / span;
+      if (frac < 0 || frac > 1) continue;
+      var el = tickPool[ti];
+      if (!el) { el = document.createElement("i"); ticks.appendChild(el); tickPool.push(el); }
+      var isMajor = Math.abs(t / major - Math.round(t / major)) < 1e-6;
+      el.className = isMajor ? "major" : "";
+      el.style.left = (frac * 100).toFixed(3) + "%";
+      el.style.display = "block";
+      ti++;
+      if (isMajor && w0 !== null) {
+        var lb = labelPool[li];
+        if (!lb) { lb = document.createElement("b"); ticks.appendChild(lb); labelPool.push(lb); }
+        lb.textContent = tickLabel(t, step);
+        lb.style.left = (frac * 100).toFixed(3) + "%";
+        lb.style.display = "block";
+        li++;
+      }
+    }
+    for (; ti < tickPool.length; ti++) tickPool[ti].style.display = "none";
+    for (; li < labelPool.length; li++) labelPool[li].style.display = "none";
+  }
+
+  function tickLoop() {
+    renderTicks();
+    requestAnimationFrame(tickLoop);
+  }
+
+  // ── panning a zoomed view ──────────────────────────────────────────────
+  // Zoomed in, the bar reaches only as far as the visible span, and holding
+  // the thumb at the end simply stops. Releasing and dragging again works but
+  // is clumsy with a thumb on a tablet, and it is exactly the moment an
+  // operator is hunting for a cue point.
+  //
+  // So while the thumb is held in the outer eighth of the bar, the view scrolls
+  // that way. The thumb stays put and the window moves under it — the opposite
+  // of the mid-drag re-centring `viewAnchor` exists to prevent, and safe for
+  // the same reason: it is the operator asking, not the playhead pulling.
+
+  /// How near an end counts as asking to scroll, in bar steps of 1000.
+  var PAN_EDGE = 125;
+  /// View spans per second at the very end of the bar. Ramps from zero at the
+  /// edge of the zone, so easing into it creeps and pushing to the end runs.
+  var PAN_SPANS_PER_SEC = 0.9;
+  var panRAF = null;
+  var panLast = 0;
+
+  function panStep(now) {
+    if (!scrubbing) { panRAF = null; return; }
+    panRAF = requestAnimationFrame(panStep);
+    var dt = panLast ? Math.min((now - panLast) / 1000, 0.1) : 0;
+    panLast = now;
+    if (!dt) return;
+
+    var value = parseInt(scrub.value, 10);
+    var depth = value <= PAN_EDGE ? -(PAN_EDGE - value) / PAN_EDGE
+              : value >= 1000 - PAN_EDGE ? (value - (1000 - PAN_EDGE)) / PAN_EDGE
+              : 0;
+    if (!depth) return;
+
+    var full = range(main);
+    var view = viewRange();
+    if (!full || !view) return;
+    var span = view.end - view.start;
+    if (span >= full.end - full.start) return;   // nothing to scroll
+
+    var centre = viewAnchor === null ? (view.start + view.end) / 2 : viewAnchor;
+    centre += depth * span * PAN_SPANS_PER_SEC * dt;
+    // Clamp to the window, so the far ends stay reachable and the pan simply
+    // stops rather than running off.
+    var half = span / 2;
+    if (centre - half < full.start) centre = full.start + half;
+    if (centre + half > full.end) centre = full.end - half;
+    viewAnchor = centre;
+    applyScrubPosition();
+  }
+
+  scrub.addEventListener("input", applyScrubPosition);
   // Release is caught on the window, not the input: dragging off the track
   // (easy with a thumb on a tablet) still ends the scrub.
   window.addEventListener("pointerup", endScrub);
@@ -1352,6 +1534,7 @@
     ].join("\n");
   }
   setInterval(render, 200);
+  requestAnimationFrame(tickLoop);
 
   // ── controls ───────────────────────────────────────────────────────────
   btnLive.addEventListener("click", goLive);

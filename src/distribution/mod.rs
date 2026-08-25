@@ -878,20 +878,15 @@ mod tests {
             "the live badge is being decided from the visible span"
         );
 
-        // The drag maps the bar onto the view. Bound the handler body: taking
-        // everything after the listener would find `viewRange` further down
-        // the file and pass regardless.
-        let input = html
-            .split(r#"scrub.addEventListener("input", function () {"#)
-            .nth(1)
-            .expect("no scrub input handler")
-            .split("
-  });")
-            .next()
-            .expect("unterminated scrub input handler");
+        // The drag maps the bar onto the view.
+        let apply = js_fn(html, "applyScrubPosition");
         assert!(
-            input.contains("var r = viewRange();"),
-            "a drag still maps onto the whole window while the bar shows a slice: {input}"
+            apply.contains("var r = viewRange();"),
+            "a drag still maps onto the whole window while the bar shows a slice: {apply}"
+        );
+        assert!(
+            html.contains(r#"scrub.addEventListener("input", applyScrubPosition)"#),
+            "the bar is no longer wired to the shared position handler"
         );
     }
 
@@ -911,6 +906,116 @@ mod tests {
         assert!(
             js_fn(html, "endScrub").contains("viewAnchor = null"),
             "the view stays pinned after the drag, so it stops following the playhead"
+        );
+    }
+
+    /// The ruler is pinned to absolute time, which is what makes it move.
+    ///
+    /// Marks at round clock times drift left on their own as the view follows
+    /// the playhead — the motion *is* the passage of time, and it stops when
+    /// the transport does. Spacing them evenly across the visible span
+    /// instead would produce marks that never move, which is decoration
+    /// pretending to be information.
+    ///
+    /// It needs its own frame loop: `render` runs at 5 Hz, fine for a readout
+    /// and visibly steppy for something in motion.
+    #[test]
+    fn the_ruler_is_pinned_to_absolute_time_and_runs_at_frame_rate() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "renderTicks");
+        // Assert the value is *derived* from the clock, not merely that the
+        // call appears: the first version of this test passed with `base`
+        // hard-wired to 0, because the line above it still read the clock.
+        assert!(
+            f.contains("w0 === null ? view.start : w0 / 1000"),
+            "marks are not anchored to the clock, so they would never move: {f}"
+        );
+        assert!(
+            f.contains("Math.ceil(base / step) * step"),
+            "marks do not land on round times: {f}"
+        );
+
+        // At least three labelled marks at every zoom: a ruler showing one
+        // time is a caption, not a ruler. Check the rule that guarantees it,
+        // and that every label/minor pairing it can pick divides cleanly so a
+        // minor mark never lands just beside a labelled one.
+        let steps = js_fn(html, "rulerSteps");
+        assert!(
+            steps.contains("span / TICK_STEPS[i] >= 3"),
+            "nothing guarantees three labels across the bar: {steps}"
+        );
+        for (span, want_min_labels) in [(30.0, 3), (120.0, 3), (600.0, 3), (9000.0, 3)] {
+            // Mirror the rule the page applies.
+            let ladder = [
+                1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
+            ];
+            let label = ladder
+                .iter()
+                .filter(|s| span / **s >= 3.0)
+                .cloned()
+                .fold(ladder[0], f64::max);
+            let minor = ladder
+                .iter()
+                .filter(|s| **s <= label / 3.0)
+                .cloned()
+                .fold(ladder[0], f64::max);
+            assert!(
+                (span / label) as i32 >= want_min_labels,
+                "a {span}s span yields only {} labels", (span / label) as i32
+            );
+            assert!(
+                (label / minor).fract().abs() < 1e-9,
+                "a {span}s span divides {label} by {minor}, which does not go evenly"
+            );
+        }
+        // And that the loop is *started*. `tickLoop` re-arms itself, so the
+        // call appears inside its own body and proves nothing on its own.
+        assert!(
+            html.contains("setInterval(render, 200);
+  requestAnimationFrame(tickLoop);"),
+            "the ruler loop is never started, so it only moves at render's 5 Hz"
+        );
+        // Redrawing every frame regardless would write to the DOM 60 times a
+        // second for a picture that has not changed.
+        assert!(
+            f.contains("lastTickKey"),
+            "the ruler redraws even when nothing has moved: {f}"
+        );
+    }
+
+    /// A zoomed view scrolls when the thumb is held near an end.
+    ///
+    /// Zoomed in, the bar reaches only as far as the visible span. Without
+    /// this, holding the thumb at the end simply stops, and the operator has
+    /// to release and drag again — clumsy with a thumb, and exactly the moment
+    /// they are hunting for a cue point. Reported by AJ against the first
+    /// version, which had this limitation.
+    ///
+    /// It must be driven by its own loop, not by `input`: a thumb held still
+    /// at the edge fires no further events, so an implementation that panned
+    /// only on movement would scroll one step and stall.
+    #[test]
+    fn a_zoomed_view_scrolls_when_the_thumb_is_held_near_an_end() {
+        let html = include_str!("dvr.html");
+        let pan = js_fn(html, "panStep");
+        assert!(pan.contains("PAN_EDGE"), "nothing defines an edge zone: {pan}");
+        assert!(
+            pan.contains("requestAnimationFrame(panStep)"),
+            "panning is not self-driving, so a stationary thumb stalls it: {pan}"
+        );
+        assert!(
+            pan.contains("applyScrubPosition()"),
+            "the view scrolls without moving the transport under the thumb: {pan}"
+        );
+        // Clamped, or the far ends stop being reachable.
+        assert!(
+            pan.contains("full.start + half") && pan.contains("full.end - half"),
+            "the pan is not clamped to the window: {pan}"
+        );
+        // And it must stop when the drag does.
+        assert!(
+            js_fn(html, "endScrub").contains("cancelAnimationFrame(panRAF)"),
+            "the pan loop outlives the drag"
         );
     }
 
