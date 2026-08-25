@@ -851,6 +851,28 @@ mod tests {
         );
     }
 
+    /// What the page tells the operator about the bar must match what the
+    /// bar now does.
+    ///
+    /// The shading was added when dragging outside the buffer showed nothing
+    /// until you stopped, and the hint said so. The thumbnail track changed
+    /// that and the sentence outlived it — which is worse than no hint,
+    /// because an operator who reads "the picture waits until you stop" will
+    /// stop, and never discover the preview. Caught by AJ asking what the
+    /// green section meant.
+    #[test]
+    fn the_hint_describes_the_bar_as_it_behaves_now() {
+        let html = include_str!("dvr.html");
+        assert!(
+            !html.contains("the picture waits until you stop"),
+            "the hint still describes the player as it was before the preview"
+        );
+        assert!(
+            html.contains("preview thumbnail while you drag"),
+            "nothing tells the operator a preview exists outside the lit part"
+        );
+    }
+
     /// The scrub bar must span the playlist window, not `video.seekable`.
     ///
     /// They are different and the gap grows: measured against a live 300 s
