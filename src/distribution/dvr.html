@@ -518,20 +518,65 @@
   /// Distinct from `range(main)`, which stays the *whole* window: everything
   /// about live — how far behind, whether to snap, when to hand back — is
   /// measured against the real edge, not against whatever is on screen.
+  /// A live edge that advances continuously rather than in segment steps.
+  ///
+  /// The playlist end only moves when a segment lands. Clamping the view to it
+  /// meant the ruler stood still and then leapt: measured while following one
+  /// label, still for 77 of 79 frames and then a 6.649 % jump — exactly the
+  /// 2 s segment duration on a 30 s span.
+  ///
+  /// So carry a value that advances at real time and is capped by the playlist
+  /// end. It settles about one segment behind, which is the price of moving
+  /// smoothly: the last couple of seconds of the window are not reachable by
+  /// dragging at a narrow zoom. LIVE still goes to the edge, and the playhead
+  /// sits further back than that anyway.
+  ///
+  /// Only ever used to clamp the *view*. Everything about how far behind live
+  /// the viewer is still reads the real end.
+  var liveSmooth = null, liveSmoothAt = 0;
+
+  function smoothWindowEnd(full) {
+    var now = performance.now() / 1000;
+    var lag = full.end - (liveSmooth === null ? full.end : liveSmooth);
+    // A seek, a reload or a stream restart moves the window a long way; do not
+    // crawl across the gap at 1x.
+    if (liveSmooth === null || liveSmooth > full.end || lag > 10) {
+      var d = hlsFor(main);
+      var lvl = d && d.levels && d.levels[d.currentLevel >= 0 ? d.currentLevel : 0];
+      var target = (lvl && lvl.details && lvl.details.targetduration) || 2;
+      liveSmooth = full.end - target;   // seed with headroom, or it sits still
+      liveSmoothAt = now;               // until the next segment arrives
+      return liveSmooth;
+    }
+    liveSmooth += Math.max(0, now - liveSmoothAt);
+    liveSmoothAt = now;
+    if (liveSmooth > full.end) liveSmooth = full.end;
+    return liveSmooth;
+  }
+
   function viewRange() {
     var full = range(main);
     if (!full) return null;
     var whole = full.end - full.start;
-    if (!zoomSecs || zoomSecs >= whole) return full;
+    if (!zoomSecs || zoomSecs >= whole) {
+      // Whole-window view. It still wants the smoothed edge, or the marks
+      // stand still and leap here exactly as they did when zoomed — this
+      // early return was how ALL, 30m and 10m kept jumping after the zoomed
+      // cases were fixed.
+      var wide = smoothWindowEnd(full);
+      return { start: full.start, end: Math.max(full.start + 1, wide) };
+    }
     var centre = viewAnchor;
     if (centre === null) {
       var v = activeVideo();
       centre = toMainTime(playhead(v), v);
     }
     if (!isFinite(centre)) centre = full.end;
+    var end = smoothWindowEnd(full);
     var start = centre - zoomSecs / 2;
     if (start < full.start) start = full.start;
-    if (start + zoomSecs > full.end) start = full.end - zoomSecs;
+    if (start + zoomSecs > end) start = end - zoomSecs;
+    if (start < full.start) start = full.start;
     return { start: start, end: start + zoomSecs };
   }
 

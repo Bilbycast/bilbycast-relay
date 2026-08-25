@@ -317,6 +317,27 @@ It runs on its own frame loop — `render` is 5 Hz, fine for a readout and visib
 steppy for something in motion — and skips the DOM entirely when nothing has
 moved.
 
+**The view is clamped to a live edge that advances continuously**, not to the
+playlist end. The playlist end only moves when a segment lands, so clamping to
+it made the marks stand still and then leap: measured while following one label,
+still for 77 of 79 frames and then a 6.649 % jump — the 2 s segment duration on
+a 30 s span, exactly. The smoothed value advances at real time and is capped by
+the real end, settling about one segment behind. After the fix: zero still
+frames at every zoom.
+
+Two consequences worth knowing:
+
+* The last second or two of the window is not reachable by dragging at a narrow
+  zoom. `LIVE` still goes to the edge, and the playhead sits further back than
+  that anyway.
+* It is used for the **view only**. "How far behind live" still reads the real
+  playlist end, or the figure would lag by a segment.
+
+At `ALL` on a window that is still *growing*, the span itself changes and the
+marks compress slightly as well as drift; once the window is full and rolling
+its left edge also steps by a segment, which is invisible on a whole-event
+window (0.02 % of the bar) and noticeable on a very short one.
+
 Zooming in near the playhead also tends to fill the bar with buffered media, so
 at the narrow presets the whole visible span is usually instant *and*
 frame-exact. That is a consequence of the back buffer's size rather than a

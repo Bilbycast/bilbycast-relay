@@ -983,6 +983,48 @@ mod tests {
         );
     }
 
+    /// The view is clamped to a live edge that moves continuously.
+    ///
+    /// The playlist end only advances when a segment lands, so clamping the
+    /// view to it made the ruler stand still and then leap. Measured while
+    /// following a single label: still for 77 of 79 frames, then a 6.649 %
+    /// jump — the 2 s segment duration on a 30 s span, exactly.
+    ///
+    /// The smoothed value is for the *view* only. "How far behind live" must
+    /// keep reading the real end, or the figure would lag by a segment.
+    #[test]
+    fn the_view_is_clamped_to_a_live_edge_that_moves_continuously() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "smoothWindowEnd");
+        assert!(
+            f.contains("liveSmooth += Math.max(0, now - liveSmoothAt)"),
+            "the edge does not advance with real time: {f}"
+        );
+        assert!(
+            f.contains("if (liveSmooth > full.end) liveSmooth = full.end"),
+            "the smoothed edge can run past media that does not exist: {f}"
+        );
+        assert!(
+            f.contains("lag > 10"),
+            "a seek or restart would be crawled across at 1x: {f}"
+        );
+
+        // The view uses it — on *both* paths. The whole-window branch returns
+        // early, and that early return is how ALL/30m/10m went on jumping
+        // after the zoomed cases were smoothed.
+        let vr = js_fn(html, "viewRange");
+        assert_eq!(
+            vr.matches("smoothWindowEnd(full)").count(),
+            2,
+            "only one of the two view paths uses the smoothed edge: {vr}"
+        );
+        let render = js_fn(html, "render()");
+        assert!(
+            render.contains(r#"tDur.textContent = "-" + fmt(Math.max(0, r.end - pos))"#),
+            "`behind live` is reading the smoothed edge and would lag a segment"
+        );
+    }
+
     /// A zoomed view scrolls when the thumb is held near an end.
     ///
     /// Zoomed in, the bar reaches only as far as the visible span. Without
