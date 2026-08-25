@@ -105,7 +105,9 @@
     font-family: ui-monospace, Menlo, monospace; font-size: 11px;
     color: var(--dim); padding-top: 3px;
   }
-  .t { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--dim); min-width: 5.5em; }
+  .t { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--dim); min-width: 8.5em; }
+  /* The time of day is the one an operator reads off and says out loud. */
+  #tPos { color: var(--fg); font-weight: 600; }
   .t.right { text-align: right; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   button {
@@ -147,13 +149,13 @@
 
 <footer>
   <div class="timeline">
-    <span class="t" id="tPos">--:--:--</span>
+    <span class="t" id="tPos" title="Time of day this frame was ingested">--:--:--:--</span>
     <div class="track">
       <div id="cached" aria-hidden="true"></div>
       <div id="preview" aria-hidden="true"><i></i><b></b></div>
       <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
     </div>
-    <span class="t right" id="tDur">--:--</span>
+    <span class="t right" id="tDur" title="How far behind live">--:--</span>
   </div>
 
   <div class="row">
@@ -410,6 +412,23 @@
     var f = Math.floor((t % 1) * FPS);
     return (h ? String(h).padStart(2, "0") + ":" : "") +
            String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + "." + String(f).padStart(2, "0");
+  }
+
+  /// Time of day, as `HH:MM:SS:FF`, from a wall clock in milliseconds.
+  ///
+  /// In the **viewer's** timezone, because that is what "what time was that?"
+  /// means to the person holding the tablet. An operator working a venue in
+  /// another timezone wants the venue's clock instead; that needs a
+  /// configured zone and is not guessed here.
+  function fmtTimeOfDay(wallMs) {
+    if (wallMs === null || !isFinite(wallMs)) return "--:--:--:--";
+    var d = new Date(wallMs);
+    var ff = Math.floor((wallMs % 1000) / (1000 / FPS));
+    if (ff >= FPS) ff = FPS - 1;   // a rounding artefact must not print :25
+    return String(d.getHours()).padStart(2, "0") + ":" +
+           String(d.getMinutes()).padStart(2, "0") + ":" +
+           String(d.getSeconds()).padStart(2, "0") + ":" +
+           String(ff).padStart(2, "0");
   }
 
   // ── seekable window ────────────────────────────────────────────────────
@@ -914,7 +933,8 @@
     var t = r.start + (r.end - r.start) * (scrub.value / 1000);
     pendingSeek = null;   // the operator is choosing a position explicitly
     try { v.currentTime = fromMainTime(t, v); } catch (e) {}
-    tPos.textContent = fmt(t - r.start);
+    var wallAt = wallClockAt(t);
+    tPos.textContent = wallAt === null ? fmt(t - r.start) : fmtTimeOfDay(wallAt);
     showPreview(t, scrub.value / 1000);
   });
   // Release is caught on the window, not the input: dragging off the track
@@ -1113,8 +1133,9 @@
     previewImg.style.height = cue.h + "px";
     previewImg.style.backgroundImage = "url(" + sheet + ")";
     previewImg.style.backgroundPosition = "-" + cue.x + "px -" + cue.y + "px";
+    var pw = wallClockAt(mainT);
     var r = range(main);
-    previewLabel.textContent = r ? fmt(mainT - r.start) : "";
+    previewLabel.textContent = pw === null ? (r ? fmt(mainT - r.start) : "") : fmtTimeOfDay(pw);
     // Keep the box on screen when the thumb is near either end.
     var trackW = cached.getBoundingClientRect().width || 1;
     var halfPct = (cue.w / 2 + 5) / trackW * 100;
@@ -1179,7 +1200,11 @@
     if (r) {
       var dur = r.end - r.start;
       var pos = toMainTime(playhead(v), v);
-      tPos.textContent = fmt(pos - r.start);
+      // Left: the time of day this frame was ingested. Right: how far behind
+      // live it is. Between them they answer the two questions an operator
+      // actually asks of a DVR — "when was that?" and "how far back am I?".
+      var wall = wallClockAt(pos);
+      tPos.textContent = wall === null ? fmt(pos - r.start) : fmtTimeOfDay(wall);
       tDur.textContent = "-" + fmt(Math.max(0, r.end - pos)).replace(/\.\d+$/, "");
       if (!scrubbing && dur > 0) {
         scrub.value = String(Math.round(((pos - r.start) / dur) * 1000));

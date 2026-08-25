@@ -270,6 +270,41 @@ picture with no fetch. It is capped by `backBufferLength`, so on a long window
 it is a small fraction of the bar and *shrinks* as a proportion the longer a
 session runs. Everything outside it is served by the thumbnail preview.
 
+### The two readouts
+
+**Left: the time of day the frame was ingested**, as `HH:MM:SS:FF` in the
+viewer's own timezone. **Right: how far behind live.** Between them they answer
+the two questions an operator asks of a DVR — "when was that?" and "how far back
+am I?"
+
+The time of day comes from `#EXT-X-PROGRAM-DATE-TIME`; there is no other clock
+to use, since hls.js zeroes its timeline at whichever fragment it loaded first.
+A stream published without the tag, or played through native HLS which exposes
+no playlist, falls back to elapsed-since-the-window-started rather than
+inventing a time.
+
+**What it is, precisely:** the wall clock the *edge* stamped when it closed that
+segment. Two consequences worth knowing before trusting it as a house clock:
+
+* **It lags true capture** by the ingest path — SRT latency, decode, encode,
+  segmentation. Fixed for a given deployment, but not zero.
+* **It is not frame-exact.** Measured on the live feed, consecutive segments
+  arrive 2000.1 ms apart with a 6.6 ms standard deviation and an 18 ms worst
+  case, against a 40 ms frame; and the displayed clock tracked real time to
+  13 ms over a 20 s interval. So the frame field is right or one out, not
+  arbitrary — but it is derived, not carried.
+
+**A source carrying SMPTE 12M timecode would be authoritative** and frame-exact,
+and the edge already decodes `pic_timing` SEI
+(`engine::content_analysis::timecode`). The feed tested here emits `pic_timing`
+on every frame but with 4-byte payloads and no clock timestamp, so there was
+nothing to read. Worth revisiting for a plant that does embed it.
+
+Note the right-hand figure is distance from the **playlist's** live edge, which
+is itself behind real time by roughly a segment plus upload. So the time of day
+at the live edge reads further back than the "behind live" figure suggests, and
+both are correct.
+
 ### Scrub preview (thumbnail track)
 
 Sprite sheets plus a WebVTT index, published by the edge beside the media

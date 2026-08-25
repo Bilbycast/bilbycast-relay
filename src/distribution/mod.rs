@@ -846,6 +846,49 @@ mod tests {
         );
     }
 
+    /// The left readout is a time of day, and it comes from the playlist.
+    ///
+    /// "What time was that?" is the question an operator asks of a DVR, and
+    /// elapsed-since-the-window-started does not answer it. The only clock
+    /// available is `#EXT-X-PROGRAM-DATE-TIME`; hls.js zeroes its own timeline
+    /// at whichever fragment it loaded first, so `currentTime` means a
+    /// different moment to two viewers who joined minutes apart.
+    ///
+    /// It must fall back rather than invent one. Native HLS exposes no
+    /// playlist, and a stream published without the tag has no wall clock at
+    /// all — showing a confident but wrong time of day would be worse than
+    /// showing elapsed.
+    #[test]
+    fn the_left_readout_is_a_time_of_day_taken_from_the_playlist_clock() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "fmtTimeOfDay");
+        assert!(
+            f.contains("getHours") && f.contains("getMinutes"),
+            "the readout is not a time of day: {f}"
+        );
+        // Frames, not milliseconds: this is a timecode an operator reads out.
+        assert!(f.contains("FPS"), "no frame field on the timecode: {f}");
+        // A rounding artefact must never print frame == FPS.
+        assert!(
+            f.contains("ff >= FPS"),
+            "the frame field can overflow to :{{FPS}}: {f}"
+        );
+
+        // Every place the position is shown must go through the same clock,
+        // and every one must fall back rather than invent a time.
+        let render = js_fn(html, "render()");
+        assert!(
+            render.contains("wallClockAt(pos)") && render.contains("fmtTimeOfDay"),
+            "the main readout does not show a time of day: {render}"
+        );
+        assert_eq!(
+            html.matches("=== null ? fmt").count()
+                + html.matches("=== null ? (r ? fmt").count(),
+            3,
+            "not every time-of-day readout falls back when there is no playlist clock"
+        );
+    }
+
     /// The player renews its own token before it runs out.
     ///
     /// Three hours does not cover a match plus its build-up, and the failure
