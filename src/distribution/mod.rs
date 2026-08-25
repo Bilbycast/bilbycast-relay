@@ -846,6 +846,74 @@ mod tests {
         );
     }
 
+    /// The bar spans the view; live is still measured against the whole window.
+    ///
+    /// Zooming trades reach for granularity — at 30 s across a 1000-step bar a
+    /// step is ~30 ms, under a frame, where a 2h30m window is 9 s a step and a
+    /// cue point cannot be found by dragging at all.
+    ///
+    /// The distinction that must not blur: `viewRange()` is what the bar
+    /// covers, `range(main)` is what exists. Everything about live — how far
+    /// behind, whether to snap, the badge — reads the whole window. Measure
+    /// "behind live" against the view instead and zooming in would report the
+    /// viewer as closer to live than they are, which is exactly the number an
+    /// operator would act on.
+    #[test]
+    fn the_bar_spans_the_view_but_live_is_measured_against_the_whole_window() {
+        let html = include_str!("dvr.html");
+        let render = js_fn(html, "render()");
+        assert!(
+            render.contains("viewRange()"),
+            "the bar does not follow the view: {render}"
+        );
+        // Assert on the specific readouts, not merely that the phrase occurs
+        // somewhere in `render` — the first version of this test passed with
+        // `tDur` broken because `updateLiveState` on another line satisfied it.
+        assert!(
+            render.contains(r#"tDur.textContent = "-" + fmt(Math.max(0, r.end - pos))"#),
+            "`behind live` no longer measures against the whole window: {render}"
+        );
+        assert!(
+            render.contains("updateLiveState(r.end - pos)"),
+            "the live badge is being decided from the visible span"
+        );
+
+        // The drag maps the bar onto the view. Bound the handler body: taking
+        // everything after the listener would find `viewRange` further down
+        // the file and pass regardless.
+        let input = html
+            .split(r#"scrub.addEventListener("input", function () {"#)
+            .nth(1)
+            .expect("no scrub input handler")
+            .split("
+  });")
+            .next()
+            .expect("unterminated scrub input handler");
+        assert!(
+            input.contains("var r = viewRange();"),
+            "a drag still maps onto the whole window while the bar shows a slice: {input}"
+        );
+    }
+
+    /// The view must hold still while the thumb is held.
+    ///
+    /// A view that re-centres on the playhead mid-drag slides the bar under
+    /// the finger: the operator drags right, the window follows, and the thumb
+    /// snaps back to the middle having apparently moved nowhere. Pin it on
+    /// pointerdown, release it on pointerup.
+    #[test]
+    fn the_view_is_pinned_for_the_duration_of_a_drag() {
+        let html = include_str!("dvr.html");
+        assert!(
+            js_fn(html, "beginScrub").contains("viewAnchor ="),
+            "the view is not pinned when the drag starts"
+        );
+        assert!(
+            js_fn(html, "endScrub").contains("viewAnchor = null"),
+            "the view stays pinned after the drag, so it stops following the playhead"
+        );
+    }
+
     /// The left readout is a time of day, and it comes from the playlist.
     ///
     /// "What time was that?" is the question an operator asks of a DVR, and

@@ -270,6 +270,35 @@ picture with no fetch. It is capped by `backBufferLength`, so on a long window
 it is a small fraction of the bar and *shrinks* as a proportion the longer a
 session runs. Everything outside it is served by the thumbnail preview.
 
+### How much of the window the bar shows (`VIEW`)
+
+A whole-event window is hours long, so a 1000-step bar is seconds per step and a
+cue point cannot be found by dragging at all. `VIEW` sets the span the bar
+covers — `ALL`, 30m, 10m, 2m, 30s — trading reach for granularity. Measured on
+the live feed: **30 s across the bar is 0.028 s per step**, comfortably under a
+frame, against 0.33 s per step on a 5-minute window and ~9 s on a 2h30m one.
+
+Two properties that decide whether it feels right:
+
+* **The view is pinned while the thumb is held.** A view that re-centres on the
+  playhead mid-drag slides the bar under the finger and snaps the thumb back to
+  the middle — the operator drags, the picture moves, and the thumb ends up
+  where it started. It is pinned on pointerdown and released on pointerup, after
+  which it follows the playhead again. Verified: dragging to steps 200/400/600/
+  800 reads back exactly those, with the clock advancing 6.00 s per 200 steps.
+* **`viewRange()` is what the bar covers; `range(main)` is what exists.**
+  Everything about live — how far behind, the badge, whether to snap — reads the
+  whole window. Measured against the view instead, zooming in would report the
+  viewer as closer to live than they are, which is a number an operator acts on.
+
+A preset wider than the window collapses to the window, so `30m` on a
+five-minute window is simply `ALL`.
+
+Zooming in near the playhead also tends to fill the bar with buffered media, so
+at the narrow presets the whole visible span is usually instant *and*
+frame-exact. That is a consequence of the back buffer's size rather than a
+designed property, and it does not hold for a viewer who has just joined.
+
 ### The two readouts
 
 **Left: the time of day the frame was ingested**, as `HH:MM:SS:FF` in the
