@@ -787,19 +787,14 @@ mod tests {
             "shading follows an element a scrub does not seek: {shade}"
         );
 
-        // And the premise: a scrub drives `main`. If that ever moves to the
-        // proxy, this shading becomes the wrong answer and must move with it.
-        let input = html
-            .split(r#"scrub.addEventListener("input""#)
-            .nth(1)
-            .expect("no scrub input handler");
+        // The shading describes `main.buffered` even while a held scrub is
+        // showing the proxy, and that is correct: the bar is calibrated on
+        // main's clock, and the lit part is where *the video* is instant when
+        // the thumb is released. It must not follow the picture.
         assert!(
-            input.contains("activeVideo()"),
-            "the scrub handler no longer picks its element the way this assumes"
-        );
-        assert!(
-            js_fn(html, "activeVideo").contains(r#"mode === "shuttle" ? proxy : main"#),
-            "`activeVideo` changed; re-check what a held scrub seeks before              trusting the shading"
+            js_fn(html, "renderCached").contains("range(main)")
+                || html.contains("renderCached(r)"),
+            "the shading no longer describes main's window"
         );
     }
 
@@ -1023,6 +1018,73 @@ mod tests {
         assert!(
             js_fn(include_str!("dvr.html"), "endScrub").contains("hidePreview()"),
             "the preview outlives the drag that opened it"
+        );
+    }
+
+    /// A held scrub shows the proxy; releasing hands the still back.
+    ///
+    /// Measured on the target tablet, 50 seeks over 2 s inside the buffer:
+    /// main 1920p presented **13/50** at 6.1 fps, the proxy **39-41/50** at
+    /// 18-19 fps. A drag on the main rendition there shows about one frame in
+    /// four. The same test on a desktop showed no difference whatsoever
+    /// (23.5 vs 23.5), which is exactly why this was nearly deleted as a
+    /// no-op — the hardware was the hidden variable.
+    ///
+    /// It hands back on release because a stopped scrub is someone examining
+    /// the frame they landed on, and 640x360 is not what they stopped to look
+    /// at.
+    #[test]
+    fn a_held_scrub_shows_the_proxy_and_releases_back_to_main() {
+        let html = include_str!("dvr.html");
+        assert!(
+            js_fn(html, "activeVideo").contains("scrubOnProxy"),
+            "a held scrub still drives the main rendition"
+        );
+        let begin = js_fn(html, "beginScrub");
+        assert!(begin.contains("ensureProxy()"), "the drag never asks for the rendition it needs");
+        assert!(begin.contains("handPictureToProxy()"), "nothing hands the picture over");
+        assert!(
+            js_fn(html, "endScrub").contains("seekWhenReady(main"),
+            "the picture is left on the proxy after the drag ends"
+        );
+    }
+
+    /// The handover refuses until the proxy can show that position.
+    ///
+    /// Two ways to turn a choppy scrub into a broken one: promote to an
+    /// element with no frames yet (black), or promote before the two
+    /// timelines have been related — `timelineOffset` starts at 0, which is
+    /// not a measurement, and the drag would land seconds from the thumb.
+    #[test]
+    fn the_scrub_handover_waits_for_a_picture_and_a_measured_offset() {
+        let f = js_fn(include_str!("dvr.html"), "handPictureToProxy");
+        assert!(f.contains("proxy.readyState"), "hands over to an element that may show nothing: {f}");
+        assert!(f.contains("offsetSamples.length"), "hands over on an unmeasured offset: {f}");
+    }
+
+    /// The stylesheet and `activeVideo` must not decide the picture separately.
+    ///
+    /// They used to: the CSS showed the proxy for `data-mode="shuttle"` and
+    /// `activeVideo` returned it for the same test, so a second reason to show
+    /// the proxy meant remembering to edit both. When they disagree the
+    /// operator watches one element while the transport drives the other, and
+    /// nothing reports it — the picture simply stops responding.
+    #[test]
+    fn the_stylesheet_shows_whatever_active_video_returns() {
+        let html = include_str!("dvr.html");
+        assert!(
+            !html.contains(r#"body[data-mode="shuttle"] #proxy"#),
+            "the stylesheet is picking the picture from the mode again"
+        );
+        assert!(html.contains(r#"body[data-picture="proxy"] #proxy"#), "no rule shows the proxy");
+        assert_eq!(
+            html.matches("dataset.picture =").count(),
+            1,
+            "`data-picture` has more than one writer, so they can disagree"
+        );
+        assert!(
+            js_fn(html, "syncPicture").contains("onProxy()"),
+            "the one writer does not ask `activeVideo` what is on screen"
         );
     }
 

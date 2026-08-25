@@ -25,8 +25,8 @@
   #stage { position: relative; flex: 1; min-height: 0; background: #000; }
   #stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
   #proxy { display: none; }
-  body[data-mode="shuttle"] #proxy { display: block; }
-  body[data-mode="shuttle"] #main  { display: none; }
+  body[data-picture="proxy"] #proxy { display: block; }
+  body[data-picture="proxy"] #main  { display: none; }
   #badge {
     position: absolute; top: 10px; left: 10px; padding: 3px 9px; border-radius: 999px;
     font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
@@ -125,7 +125,7 @@
   @media (max-width: 560px) { .label-long { display: none; } }
 </style>
 </head>
-<body data-mode="live" data-live="1">
+<body data-mode="live" data-live="1" data-picture="main">
 <header>
   <h1>DVR</h1><span class="id">__STREAM_ID__</span>
 </header>
@@ -466,7 +466,7 @@
     // Audible only when the operator asked for it AND main is the element on
     // screen. Shuttle hands over to the proxy, so audio drops out for the
     // duration and comes back on its own -- no second control to remember.
-    main.muted = !(wantAudio && mode !== "shuttle");
+    main.muted = !(wantAudio && !onProxy());
     proxy.muted = true;
     btnMute.setAttribute("aria-pressed", wantAudio ? "false" : "true");
     btnMute.textContent = wantAudio ? "🔊" : "🔇";
@@ -486,7 +486,22 @@
   // Only shuttle runs on the proxy. Jog stays on the main rendition: an
   // operator stepping frames is examining them, and stepping is one seek, not
   // the ~fps/s a shuttle needs.
-  function activeVideo() { return mode === "shuttle" ? proxy : main; }
+  /// True while a held scrub has handed the picture to the proxy.
+  ///
+  /// Measured on the target tablet, 50 seeks over 2 s inside the buffer:
+  /// **main 1920p presented 13/50 at 6.1 fps, the proxy 39-41/50 at 18-19.**
+  /// A drag on the main rendition there shows about one frame in four. The
+  /// same test on a desktop showed no difference at all (23.5 vs 23.5), which
+  /// is why this needs the number from the device and not from a workstation.
+  ///
+  /// Only while the thumb is *held*: a stopped scrub is someone examining the
+  /// frame they landed on, and 640x360 is not what they stopped to look at.
+  var scrubOnProxy = false;
+
+  function activeVideo() { return (mode === "shuttle" || scrubOnProxy) ? proxy : main; }
+  function onProxy() { return activeVideo() === proxy; }
+  /// Make the stylesheet agree with `activeVideo`.
+  function syncPicture() { document.body.dataset.picture = onProxy() ? "proxy" : "main"; }
 
   /// Index of the frame containing `t`.
   function frameIndexAt(t) { return Math.floor(t * FPS + 1e-6); }
@@ -666,6 +681,7 @@
     if (next === "jog" || next === "shuttle") { main.pause(); }
     else { proxy.pause(); stopShuttle(); }
     document.body.dataset.live = (next === "live") ? "1" : "0";
+    syncPicture();
     btnLive.setAttribute("aria-pressed", next === "live" ? "true" : "false");
     // Mode decides which element is on screen, so it also decides what may be
     // heard -- shuttle mutes, and returning restores without asking again.
@@ -830,6 +846,7 @@
     if (scrubbing) return;
     loadThumbs();
     scrubbing = true;
+    ensureProxy();
     var v = activeVideo();
     // `rate < 0` counts as playing: a reverse shuttle drives currentTime
     // itself, so the element is paused even though the transport is running.
@@ -837,13 +854,44 @@
     stopShuttle();
     v.pause();
     if (mode === "live") setMode("scrub");
+    handPictureToProxy();
     syncRateButtons();
+  }
+
+  /// Put the full-screen picture on the proxy for the rest of the drag.
+  ///
+  /// Refused until the proxy can actually show that position. On the first
+  /// scrub of a session the proxy is still attaching, so the drag starts on
+  /// main exactly as it used to and takes over the moment it can — promoting
+  /// to an element with no picture would trade a choppy scrub for a black one.
+  function handPictureToProxy() {
+    if (!scrubbing || scrubOnProxy || mode === "shuttle") return;
+    if (proxy.readyState < 2 || !proxy.seekable.length) return;
+    // And only once the two clocks have been related. `timelineOffset` starts
+    // at 0, which is not a measurement — handing over on it would put the drag
+    // seconds away from where the thumb says it is.
+    if (!offsetSamples.length) return;
+    var t = toMainTime(playhead(main), main);
+    scrubOnProxy = true;
+    main.pause();
+    syncPicture();
+    applyAudio();
+    seekWhenReady(proxy, t);
   }
 
   function endScrub() {
     if (!scrubbing) return;
     scrubbing = false;
     hidePreview();
+    if (scrubOnProxy) {
+      // Hand over by *content*, not by number: the two elements do not share
+      // a clock.
+      var back = toMainTime(playhead(proxy), proxy);
+      scrubOnProxy = false;
+      syncPicture();
+      applyAudio();
+      seekWhenReady(main, back);
+    }
     var st = resumeAfterScrub;
     resumeAfterScrub = null;
     if (st && st.playing) {
@@ -855,6 +903,8 @@
 
   scrub.addEventListener("pointerdown", beginScrub);
   scrub.addEventListener("input", function () {
+    // The proxy may have become ready since the thumb went down.
+    handPictureToProxy();
     var v = activeVideo();
     // The bar is calibrated on main's clock (see `render`), so pick the
     // position there and convert for whichever element is showing.
@@ -1142,7 +1192,7 @@
         mode === "shuttle" ? (rate > 0 ? rate + "x" : rate + "x") :
         atLive ? "live" : "delayed";
     }
-    status.textContent = mode + " | " + (mode === "shuttle" ? "proxy" : "main") +
+    status.textContent = mode + " | " + (onProxy() ? "proxy" : "main") +
                          " | " + (rate > 0 ? rate + "x" : rate + "x");
     if (dbg) renderDebug();
   }
@@ -1406,6 +1456,54 @@
       stSay("   preview shown        " + shown + "/20");
       stSay("   past the newest sheet " + outside + "/20   (expected at the live edge)");
       stSay("   covered but blank    " + blank + "/20   (should be 0)");
+    }
+    stSay("");
+
+    // 3. THE SCRUB PATH ITSELF. Sections 1 and 2 measure the parts; this
+    //    measures what a thumb actually does, through the same handlers the
+    //    bar fires — which is the only way to see whether the handover to the
+    //    proxy fires at all.
+    stSay("3. dragging the bar, through the real handlers (40 moves)");
+    var r3 = range(main);
+    if (!r3) {
+      stSay("   no window yet");
+    } else {
+      var seen3 = [], stop3 = false;
+      ['main', 'proxy'].forEach(function (n) {
+        var v = document.getElementById(n);
+        if (!v.requestVideoFrameCallback) return;
+        (function loop(now, meta) {
+          if (meta) seen3.push(n + ":" + meta.mediaTime.toFixed(3));
+          if (!stop3) v.requestVideoFrameCallback(loop);
+        })();
+      });
+      // Start inside the buffered part of the bar, which is where a drag can
+      // present real frames at all.
+      var wb = stWidestBuffered(main) || [r3.start, r3.end];
+      var f0 = (wb[0] - r3.start) / (r3.end - r3.start);
+      var f1 = (wb[1] - r3.start) / (r3.end - r3.start);
+      scrub.value = String(Math.round(f0 * 1000));
+      beginScrub();
+      var t3 = performance.now();
+      for (var i = 1; i <= 40; i++) {
+        scrub.value = String(Math.round((f0 + (f1 - f0) * i / 40) * 1000));
+        scrub.dispatchEvent(new Event("input", { bubbles: true }));
+        await stWait(50);
+      }
+      var ms3 = performance.now() - t3;
+      var showing = onProxy() ? "proxy" : "main";
+      endScrub();
+      await stWait(200);
+      stop3 = true;
+      var d3 = {};
+      for (var k = 0; k < seen3.length; k++) d3[seen3[k]] = 1;
+      // Not "n/40": the numerator is distinct frames presented and the
+      // denominator would be moves — different units, and a reader seeing
+      // "41/40" reasonably assumes something is broken.
+      stSay("   frames presented    " + Object.keys(d3).length + " over 40 moves   " +
+            (seen3.length / (ms3 / 1000)).toFixed(1) + " fps");
+      stSay("   picture was on      " + showing +
+            (showing === "proxy" ? "   (handover fired)" : "   (NO handover)"));
     }
     stSay("");
     stSay("Done. Photograph or read this back.");
