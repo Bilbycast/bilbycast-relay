@@ -1506,8 +1506,122 @@
             (showing === "proxy" ? "   (handover fired)" : "   (NO handover)"));
     }
     stSay("");
+
+    // 4. TOKEN RENEWAL. Three hours is longer than anyone will sit here
+    //    waiting, so exercise the path rather than the clock.
+    stSay("4. token renewal");
+    var expBefore = tokenExpiry(TOKEN);
+    if (!PORTAL_URL) {
+      stSay("   no portal configured — a link viewer cannot renew (correct)");
+    } else if (expBefore === null) {
+      stSay("   token carries no expiry — cannot schedule a renewal");
+    } else {
+      var mins = Math.round((expBefore - Date.now() / 1000) / 60);
+      stSay("   this token expires in " + mins + " min");
+      await new Promise(function (resolve) {
+        var done = false;
+        var timer = setTimeout(function () {
+          if (!done) { done = true; stSay("   renewal timed out"); resolve(); }
+        }, 15000);
+        var before = TOKEN;
+        renewNow();
+        // `renewNow` swaps TOKEN in place; watch for it rather than
+        // duplicating the request and asking a different question.
+        var poll = setInterval(function () {
+          if (TOKEN === before || done) return;
+          done = true;
+          clearInterval(poll); clearTimeout(timer);
+          var expAfter = tokenExpiry(TOKEN);
+          stSay("   renewed OK — expiry moved " +
+                Math.round(((expAfter || 0) - expBefore) / 60) + " min later");
+          resolve();
+        }, 250);
+        setTimeout(function () {
+          if (done) return;
+          clearInterval(poll); clearTimeout(timer); done = true;
+          stSay("   NO renewal — signed in via a link rather than the portal,");
+          stSay("   or this player's origin is not in the portal's player_origins");
+          resolve();
+        }, 12000);
+      });
+    }
+    stSay("");
     stSay("Done. Photograph or read this back.");
     btn.disabled = false;
+  }
+
+  // ── keeping the token alive ────────────────────────────────────────────
+  // A viewing token lasts three hours. A match plus its build-up does not fit
+  // in three hours, and the failure arrives mid-second-half as "your viewing
+  // access has expired" — which is true, and useless.
+  //
+  // So renew before it runs out. The renewal goes back through the portal to
+  // the manager, which re-checks the entitlement before signing: that is what
+  // keeps a short expiry meaningful. It is revocation latency, not a
+  // countdown, and a renewal that skipped the check would quietly turn it into
+  // "access lasts as long as the tab is open".
+  //
+  // Only a viewer who came through the portal can renew — they have the
+  // session cookie the portal authenticates with. A guest holding a one-off
+  // link cannot, and should not: their three hours are the point of the link.
+
+  /// Seconds of headroom to renew with. Long enough to survive a few failed
+  /// attempts and a slow manager, short enough that a withdrawn entitlement
+  /// still bites inside the hour.
+  var RENEW_LEAD_SECS = 600;
+  var renewTimer = null;
+  var renewFailures = 0;
+
+  /// Unix seconds this token expires, or null.
+  ///
+  /// The token is `{exp}.{streams}.{hmac}`, so the player can read its own
+  /// deadline. Asking the server when it expires would be a second thing that
+  /// can disagree with the first.
+  function tokenExpiry(t) {
+    var dot = (t || "").indexOf(".");
+    if (dot <= 0) return null;
+    var exp = parseInt(t.slice(0, dot), 10);
+    return isFinite(exp) && exp > 0 ? exp : null;
+  }
+
+  function scheduleRenewal() {
+    if (renewTimer !== null) { clearTimeout(renewTimer); renewTimer = null; }
+    if (!PORTAL_URL || !TOKEN) return;      // no portal, or nothing to renew
+    var exp = tokenExpiry(TOKEN);
+    if (exp === null) return;
+    var secs = exp - Math.floor(Date.now() / 1000) - RENEW_LEAD_SECS;
+    // Already inside the lead time (a restored tab, a slow start): try now.
+    if (secs < 0) secs = 0;
+    // setTimeout takes a 32-bit delay; anything longer silently fires at once.
+    var ms = Math.min(secs * 1000, 0x7fffffff);
+    renewTimer = setTimeout(renewNow, ms);
+  }
+
+  function renewNow() {
+    renewTimer = null;
+    var url = PORTAL_URL.replace(/\/+$/, "") + "/api/renew?stream=" +
+              encodeURIComponent(STREAM);
+    fetch(url, { credentials: "include" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (body) {
+        if (!body || !body.token) throw new Error("no token");
+        TOKEN = body.token;
+        rememberToken(TOKEN);
+        renewFailures = 0;
+        // hls.js reads `TOKEN` inside `xhrSetup` at request time, and so does
+        // every sprite-sheet fetch, so there is nothing to re-attach.
+        scheduleRenewal();
+      })
+      .catch(function () {
+        // Retry with a widening gap, but never past the expiry itself: after
+        // that the existing expired-access path is the honest answer, and it
+        // offers a way back that actually works.
+        renewFailures++;
+        var exp = tokenExpiry(TOKEN);
+        var left = exp === null ? 0 : exp - Math.floor(Date.now() / 1000);
+        var backoff = Math.min(30 * Math.pow(2, renewFailures - 1), 300);
+        if (left > backoff + 5) renewTimer = setTimeout(renewNow, backoff * 1000);
+      });
   }
 
   // ── start ──────────────────────────────────────────────────────────────
@@ -1519,6 +1633,7 @@
     document.body.dataset.selftest = "1";
     document.getElementById("stRun").addEventListener("click", stRunAll);
   }
+  scheduleRenewal();
   mainHls = attach(main, MAIN, "main");
   // The proxy is NOT attached up front. Two live MSE elements hold two
   // decoders, and Chrome's hardware decoder budget is small and shared —

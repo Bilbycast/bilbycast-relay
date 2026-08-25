@@ -59,6 +59,21 @@ pub struct PortalConfig {
     /// list that meant "trust all" would turn a typo into an open portal.
     #[serde(default = "default_proxies")]
     pub trusted_proxies: HashSet<IpAddr>,
+
+    /// Player origins allowed to renew a token in the background, e.g.
+    /// `https://relay.example.com`.
+    ///
+    /// The player is served by the relay and the portal by this service, so a
+    /// renewal is a cross-origin request carrying the viewer's Authelia
+    /// cookie. That is exactly the shape a CSRF wants, so the list is explicit
+    /// and **empty means nobody** — a portal that has not been told which
+    /// player to trust simply does not offer renewal, and viewers fall back to
+    /// signing in again when their three hours are up.
+    ///
+    /// Wildcards are not accepted, and could not be: a response carrying
+    /// `Access-Control-Allow-Credentials` may not answer `*`.
+    #[serde(default)]
+    pub player_origins: Vec<String>,
 }
 
 fn default_listen() -> String {
@@ -105,6 +120,12 @@ impl PortalConfig {
         // Header lookup is case-insensitive in `http`, but the stored name is
         // used to build a `HeaderName`, which must be lowercase.
         self.username_header = self.username_header.trim().to_ascii_lowercase();
+        // An origin is scheme://host[:port] and nothing else. A trailing slash
+        // is the obvious thing to write and would never match the `Origin`
+        // header, so fix it here rather than failing silently at renewal time.
+        for o in &mut self.player_origins {
+            *o = o.trim().trim_end_matches('/').to_string();
+        }
     }
 
     /// Everything that must be true before the service will start.
@@ -144,10 +165,37 @@ impl PortalConfig {
                     .into(),
             );
         }
+        for o in &self.player_origins {
+            // `*` cannot be answered alongside `Allow-Credentials`, and a
+            // renewal without credentials is not a renewal. Refusing at
+            // startup beats a portal that looks configured and never renews.
+            if o == "*" {
+                return Err(
+                    "player_origins cannot contain `*`: a credentialed response may not                      answer a wildcard origin. List each player origin."
+                        .into(),
+                );
+            }
+            if !o.starts_with("http://") && !o.starts_with("https://") {
+                return Err(format!("player_origins entry `{o}` must start with http:// or https://"));
+            }
+            // An `Origin` header is scheme://host[:port] — never a path. One
+            // written with a path could not match, and would look like a
+            // configured renewal that silently never fires.
+            if o.split_once("://").is_some_and(|(_, rest)| rest.contains('/')) {
+                return Err(format!(
+                    "player_origins entry `{o}` has a path; an origin is scheme://host[:port]"
+                ));
+            }
+        }
         self.listen_addr
             .parse::<std::net::SocketAddr>()
             .map_err(|e| format!("listen_addr `{}`: {e}", self.listen_addr))?;
         Ok(())
+    }
+
+    /// Is `origin` allowed to renew? Exact match, never a prefix.
+    pub fn allows_player_origin(&self, origin: &str) -> bool {
+        self.player_origins.iter().any(|o| o == origin)
     }
 
     pub fn is_trusted_proxy(&self, peer: IpAddr) -> bool {
@@ -189,8 +237,68 @@ mod tests {
             manager_token: "tok".into(),
             username_header: default_header().to_ascii_lowercase(),
             trusted_proxies: default_proxies(),
+            player_origins: Vec::new(),
             logout_url: None,
         }
+    }
+
+    /// Renewal is off unless a player origin is named, and `*` is refused.
+    ///
+    /// A credentialed response may not answer a wildcard origin — the browser
+    /// rejects it — so `*` here would be a portal that looks configured for
+    /// renewal and silently never renews, surfacing months later as "access
+    /// expired mid-match". Refuse it at startup instead.
+    #[test]
+    fn renewal_is_off_by_default_and_refuses_a_wildcard() {
+        let mut c = ok();
+        assert!(c.player_origins.is_empty(), "renewal must not be on by default");
+        assert!(!c.allows_player_origin("https://relay.example"));
+
+        c.player_origins = vec!["*".into()];
+        let err = c.validate().expect_err("a wildcard origin was accepted");
+        // `*` is refused twice over — explicitly, and again by the scheme
+        // check — so assert on the *message*, which is the only thing the
+        // explicit check adds. Told "must start with https://", an operator
+        // reaches for `https://*`; told why a wildcard cannot work with
+        // credentials, they list the origin.
+        assert!(
+            err.contains("credential") || err.contains("wildcard"),
+            "the wildcard refusal does not explain itself: {err}"
+        );
+
+        c.player_origins = vec!["https://relay.example/watch".into()];
+        assert!(
+            c.validate().is_err(),
+            "an origin with a path was accepted; it could never match an Origin header"
+        );
+
+        c.player_origins = vec!["relay.example".into()];
+        assert!(c.validate().is_err(), "a schemeless origin was accepted");
+    }
+
+    /// An origin must match exactly — never as a prefix.
+    ///
+    /// `https://relay.example.evil.com` starts with `https://relay.example`,
+    /// and a prefix check would hand that site a viewing token belonging to
+    /// whoever was signed in.
+    #[test]
+    fn a_player_origin_matches_exactly_and_not_by_prefix() {
+        let mut c = ok();
+        c.player_origins = vec!["https://relay.example".into()];
+        assert!(c.allows_player_origin("https://relay.example"));
+        assert!(!c.allows_player_origin("https://relay.example.evil.com"));
+        assert!(!c.allows_player_origin("https://relay.example:8443"));
+        assert!(!c.allows_player_origin("http://relay.example"));
+        assert!(!c.allows_player_origin(""));
+    }
+
+    /// A trailing slash is the obvious thing to write and would never match.
+    #[test]
+    fn a_trailing_slash_on_a_player_origin_is_tidied_away() {
+        let mut c = ok();
+        c.player_origins = vec!["https://relay.example/".into()];
+        c.normalise();
+        assert!(c.allows_player_origin("https://relay.example"));
     }
 
     #[test]

@@ -140,6 +140,7 @@ async fn harness_trusting(trusted: &[&str]) -> (String, Recorder) {
         manager_token: SERVICE_TOKEN.into(),
         username_header: "remote-user".into(),
         trusted_proxies: trusted.iter().map(|s| s.parse().unwrap()).collect(),
+        player_origins: Vec::new(),
         logout_url: Some("https://auth.example/logout".into()),
     };
     cfg.normalise();
@@ -364,6 +365,7 @@ async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
         manager_token: SERVICE_TOKEN.into(),
         username_header: "remote-user".into(),
         trusted_proxies: ["127.0.0.1".parse().unwrap()].into_iter().collect(),
+        player_origins: Vec::new(),
         logout_url: None,
     };
     cfg.normalise();

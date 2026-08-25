@@ -3,5 +3,11 @@
   "manager_url": "https://manager.example.com",
   "username_header": "Remote-User",
   "logout_url": "https://auth.example.com/logout",
-  "trusted_proxies": ["127.0.0.1", "::1"]
+  "trusted_proxies": [
+    "127.0.0.1",
+    "::1"
+  ],
+  "player_origins": [
+    "https://relay.example.com"
+  ]
 }

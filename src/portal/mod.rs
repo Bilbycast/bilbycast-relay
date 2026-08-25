@@ -110,6 +110,7 @@ pub fn router(state: PortalState) -> Router {
         .route("/watch", get(watch_redirect))
         .route("/api/feeds", get(feeds))
         .route("/api/watch", post(watch))
+        .route("/api/renew", get(renew))
         .with_state(state)
 }
 
@@ -339,6 +340,91 @@ async fn watch_redirect(
     }
 }
 
+/// `GET /api/renew?stream=…` — a fresh token for a player already watching.
+///
+/// A viewing token lasts three hours; an event plus its build-up does not fit
+/// in that, and the failure lands mid-match as "your viewing access has
+/// expired". So the player renews itself before it runs out.
+///
+/// **Renewal goes through the manager, exactly as the first mint did.** The
+/// manager re-checks the entitlement before it signs, which is what keeps the
+/// short expiry meaningful: it is revocation latency, not a countdown. A
+/// renewal that skipped that check would turn "access lasts three hours" into
+/// "access lasts as long as the tab is open", and withdrawing someone's access
+/// would stop working entirely.
+///
+/// Cross-origin and credentialed, because the player is served by the relay
+/// and this is the portal. Only origins named in `player_origins` are
+/// answered, and an unlisted one gets the data without the CORS headers that
+/// would let script read it — which is what the browser enforces anyway.
+async fn renew(
+    State(st): State<PortalState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<WatchQuery>,
+) -> Response {
+    // The origin is checked before anything is done, not before the answer is
+    // returned: an un-allowed origin must not be able to cause a mint.
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !st.cfg.allows_player_origin(&origin) {
+        return (StatusCode::FORBIDDEN, "origin not permitted to renew").into_response();
+    }
+
+    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
+        return unauthenticated();
+    };
+    let streams = match fetch_streams(&st, &username).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    // Unentitled and non-existent are the same answer, as everywhere else
+    // here: a renewal must not become a way to enumerate feeds.
+    let Some(hit) = streams.iter().find(|s| s.stream_id == q.stream) else {
+        return with_cors(&origin, (StatusCode::FORBIDDEN, "no such feed").into_response());
+    };
+
+    match mint(&st, &username, &hit.session_id).await {
+        Ok(url) => {
+            let token = url
+                .split_once("token=")
+                .map(|(_, t)| t.to_string())
+                .unwrap_or_default();
+            if token.is_empty() {
+                return with_cors(&origin, upstream_unavailable());
+            }
+            with_cors(
+                &origin,
+                Json(serde_json::json!({ "token": token })).into_response(),
+            )
+        }
+        Err(r) => with_cors(&origin, r),
+    }
+}
+
+/// Let the named origin's script read the answer.
+///
+/// `Vary: Origin` because the response differs by origin and a cache that
+/// missed that would hand one player another's answer.
+fn with_cors(origin: &str, mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    if let Ok(v) = axum::http::HeaderValue::from_str(origin) {
+        h.insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    }
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        axum::http::HeaderValue::from_static("true"),
+    );
+    h.insert(
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("Origin"),
+    );
+    resp
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WatchRequest {
     pub session_id: String,
@@ -425,6 +511,7 @@ mod tests {
             manager_token: "t".into(),
             username_header: "remote-user".into(),
             trusted_proxies: trusted.iter().map(|s| s.parse().unwrap()).collect::<HashSet<_>>(),
+            player_origins: Vec::new(),
             logout_url: None,
         }
     }

@@ -846,6 +846,61 @@ mod tests {
         );
     }
 
+    /// The player renews its own token before it runs out.
+    ///
+    /// Three hours does not cover a match plus its build-up, and the failure
+    /// lands mid-second-half as "your viewing access has expired" — true, and
+    /// useless. It bit twice during testing on 2026-08-25, once invalidating a
+    /// whole measurement run before it was noticed.
+    ///
+    /// The deadline is read out of the token itself (`{exp}.{streams}.{hmac}`)
+    /// rather than asked for: a second source for the same fact is a second
+    /// thing that can disagree with the first.
+    #[test]
+    fn the_player_renews_its_token_before_it_expires() {
+        let html = include_str!("dvr.html");
+        let sched = js_fn(html, "scheduleRenewal");
+        assert!(
+            sched.contains("RENEW_LEAD_SECS"),
+            "nothing renews ahead of the expiry: {sched}"
+        );
+        assert!(
+            js_fn(html, "tokenExpiry").contains("parseInt"),
+            "the deadline is not read from the token"
+        );
+        // A 32-bit setTimeout delay silently fires immediately when overflowed,
+        // which would hammer the portal from every idle tab.
+        assert!(
+            sched.contains("0x7fffffff"),
+            "an over-long delay would overflow setTimeout and fire at once: {sched}"
+        );
+
+        let now = js_fn(html, "renewNow");
+        assert!(
+            now.contains(r#"credentials: "include""#),
+            "the renewal cannot authenticate: {now}"
+        );
+        assert!(
+            now.contains("rememberToken(TOKEN)"),
+            "a renewed token is not kept, so a reload loses it"
+        );
+    }
+
+    /// Renewal must stop at the expiry rather than retry forever.
+    ///
+    /// Past it the existing expired-access path is the honest answer and it
+    /// offers a way back that works. A tab retrying a dead credential every
+    /// few seconds is a tab hammering the portal to no purpose.
+    #[test]
+    fn renewal_gives_up_at_the_expiry_and_backs_off_before_it() {
+        let f = js_fn(include_str!("dvr.html"), "renewNow");
+        assert!(f.contains("renewFailures"), "no backoff: {f}");
+        assert!(
+            f.contains("left > backoff"),
+            "retries are not bounded by the token's own expiry: {f}"
+        );
+    }
+
     /// The self-test must be inert unless asked for.
     ///
     /// It seeks both elements dozens of times and drives the preview by hand.

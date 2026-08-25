@@ -213,6 +213,35 @@ tab lost the token and reported "your viewing access has expired", which was
 false. A refused token is forgotten, so one refusal cannot become a loop that
 survives every reload.
 
+### Renewing without signing in again
+
+Three hours does not cover a match plus its build-up, and the failure arrives
+mid-second-half. So the player renews itself about ten minutes before its token
+runs out, by calling `GET /api/renew?stream=…` here.
+
+That renewal goes back through the manager exactly as the first mint did, and
+**the manager re-checks the entitlement before it signs**. This is what keeps a
+short expiry meaningful: it is revocation latency, not a countdown. A renewal
+that skipped the check would quietly turn "access lasts three hours" into
+"access lasts as long as the tab is open", and withdrawing access would stop
+working.
+
+Renewal is **off until you name the player's origin**, because it is a
+cross-origin request carrying the viewer's session cookie — the shape a CSRF
+wants:
+
+```json
+"player_origins": ["https://relay.example.com"]
+```
+
+Exact matches only, and `*` is refused at startup: a response carrying
+`Access-Control-Allow-Credentials` may not answer a wildcard origin, so a
+portal configured that way would look right and never renew.
+
+Only a viewer who came through the portal can renew — they hold the session
+cookie. **A guest with a one-off link cannot, and should not:** their three
+hours are the point of the link.
+
 Removing a portal login stops them getting *new* tokens immediately. A token
 already in a browser keeps working until it expires — the relay verifies a
 signature and an expiry, and holds no per-viewer state to revoke. Three hours is
