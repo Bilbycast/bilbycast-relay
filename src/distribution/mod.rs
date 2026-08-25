@@ -803,6 +803,182 @@ mod tests {
         );
     }
 
+    /// The scrub preview must locate its frame through wall clock.
+    ///
+    /// The player and the thumbnail generator share no clock: hls.js zeroes
+    /// its timeline at whichever fragment it happened to load first, so the
+    /// same position means a different time to two viewers who joined
+    /// minutes apart. Looking a cue up by `currentTime` would therefore show
+    /// a plausible frame from the wrong moment — wrong by an amount nobody
+    /// can see, and different for every viewer.
+    #[test]
+    fn the_scrub_preview_locates_its_frame_by_wall_clock() {
+        let html = include_str!("dvr.html");
+        let cue_at = js_fn(html, "cueAt");
+        assert!(
+            cue_at.contains("wallClockAt("),
+            "cue lookup does not go through wall clock: {cue_at}"
+        );
+        assert!(
+            cue_at.contains("thumbs.epoch"),
+            "cue lookup ignores the epoch the index declares: {cue_at}"
+        );
+        // And the wall clock must come from the playlist's own absolute time,
+        // not from anything the player invented.
+        let wall = js_fn(html, "wallClockAt");
+        assert!(
+            wall.contains("programDateTime"),
+            "wall clock is not taken from #EXT-X-PROGRAM-DATE-TIME: {wall}"
+        );
+    }
+
+    /// A half-understood index must be refused outright.
+    ///
+    /// The failure mode of accepting one is a preview that shows confidently
+    /// wrong pictures rather than no picture, which is worse: an operator
+    /// trusts what they see on the way to a cue point.
+    #[test]
+    fn a_thumbnail_index_that_is_not_understood_yields_no_preview() {
+        let f = js_fn(include_str!("dvr.html"), "parseThumbIndex");
+        assert!(f.contains("return null"), "{f}");
+        assert!(
+            f.contains("epoch === null") || f.contains("isNaN(epoch)"),
+            "an index with no usable epoch is still accepted: {f}"
+        );
+        assert!(
+            f.contains("!cues.length"),
+            "an index with no cues is still accepted: {f}"
+        );
+    }
+
+    /// The scrub bar must span the playlist window, not `video.seekable`.
+    ///
+    /// They are different and the gap grows: measured against a live 300 s
+    /// window, the playlist summed to exactly 300 s of `EXTINF` while
+    /// `main.seekable` read `0.0-504.0`. MSE keeps extending its seekable
+    /// range as segments are appended; the server-side window slides.
+    ///
+    /// Calibrated on `seekable`, the bar offers positions before the oldest
+    /// segment and after the live edge — 40 % of the bar was footage the
+    /// origin had evicted and 30 % was footage that had not happened. Both
+    /// simply show nothing, with no error anywhere.
+    #[test]
+    fn the_scrub_bar_spans_the_playlist_window_not_the_media_source() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "range");
+        assert!(
+            f.contains("playlistWindow("),
+            "the bar is calibrated on the media source again: {f}"
+        );
+        let w = js_fn(html, "playlistWindow");
+        assert!(
+            w.contains("totalduration") && w.contains("fragments"),
+            "the window is not derived from the playlist: {w}"
+        );
+        // The fallback must stay for native HLS, which exposes no playlist.
+        assert!(
+            f.contains("v.seekable"),
+            "no fallback for a player without hls.js: {f}"
+        );
+    }
+
+    /// The thumbnail index is a rolling window and must be refetched.
+    ///
+    /// Sheets age out, new ones appear, and the declared epoch moves with the
+    /// oldest — exactly like the media playlist. Fetched once and kept, it
+    /// drifts out from under the bar: measured on a session fifteen minutes
+    /// old, every position resolved outside the index's span and the preview
+    /// was simply gone, with nothing on screen to say why.
+    ///
+    /// A refetch that fails to parse must also leave the working index alone,
+    /// or a truncated read mid-publish takes the preview away.
+    #[test]
+    fn the_thumbnail_index_is_refetched_as_it_rolls() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "loadThumbs");
+        assert!(
+            f.contains("THUMBS_MAX_AGE_MS"),
+            "the index is fetched once and kept forever: {f}"
+        );
+        assert!(
+            f.contains("if (next) thumbs = next"),
+            "a failed reparse drops the working index: {f}"
+        );
+    }
+
+    /// A sprite sheet must be fetched with the viewer's credential.
+    ///
+    /// The origin refuses an unauthenticated GET, and a CSS
+    /// `background-image` cannot carry an `Authorization` header — so a style
+    /// pointed straight at the sheet URL gets a 401 and paints the box's own
+    /// background colour. The element still has its size, its position and a
+    /// `background-image`, so every assertion about the DOM passes while the
+    /// operator sees a black rectangle where a frame should be. It shipped
+    /// that way once and was caught by looking at a screenshot, not by a test.
+    ///
+    /// So the sheet goes through `fetch`, which can carry the header, and the
+    /// style gets a blob URL.
+    #[test]
+    fn a_sprite_sheet_is_fetched_with_the_viewers_credential() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "sheetUrl");
+        assert!(
+            f.contains("Authorization") && f.contains("Bearer"),
+            "the sheet is requested without a credential: {f}"
+        );
+        assert!(
+            f.contains("createObjectURL"),
+            "the style is not given a blob URL: {f}"
+        );
+
+        // And nothing may point a style straight at the origin URL again.
+        let show = js_fn(html, "showPreview");
+        assert!(
+            !show.contains("url(STREAM, cue.uri)"),
+            "backgroundImage points at the origin URL, which will 401: {show}"
+        );
+        assert!(
+            show.contains("sheetUrl("),
+            "the preview does not go through the authenticated fetch: {show}"
+        );
+    }
+
+    /// A sheet arriving mid-drag must repaint the preview.
+    ///
+    /// `sheetUrl` answers null while its fetch is in flight, and nothing else
+    /// redraws — so the first position on every sheet stayed blank until the
+    /// thumb moved again. Measured along the bar that is a blank at perfectly
+    /// regular intervals, one per sheet, which reads as a broken preview
+    /// rather than a slow one.
+    ///
+    /// A failed fetch must also be forgotten, or one transient error means no
+    /// preview from that sheet for the life of the tab.
+    #[test]
+    fn a_sheet_arriving_mid_drag_repaints_the_preview() {
+        let f = js_fn(include_str!("dvr.html"), "sheetUrl");
+        assert!(
+            f.contains("showPreview(lastPreviewAt.t"),
+            "nothing repaints when the sheet lands: {f}"
+        );
+        assert!(
+            f.contains("delete sheetUrls[uri]"),
+            "a failed fetch is remembered for the life of the tab: {f}"
+        );
+    }
+
+    /// The preview must be taken down when the drag ends.
+    ///
+    /// It floats over the transport. Left up, it covers the controls and
+    /// shows a frame the playhead has since left — and nothing else in the
+    /// player would ever hide it.
+    #[test]
+    fn the_scrub_preview_is_taken_down_when_the_drag_ends() {
+        assert!(
+            js_fn(include_str!("dvr.html"), "endScrub").contains("hidePreview()"),
+            "the preview outlives the drag that opened it"
+        );
+    }
+
     /// The shading has to be recomputed as fragments land, or it freezes at
     /// whatever was buffered on the first frame and then quietly misleads.
     #[test]

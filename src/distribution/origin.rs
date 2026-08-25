@@ -553,16 +553,30 @@ fn content_type_for(file: &str) -> &'static str {
         "video/mp2t"
     } else if lower.ends_with(".vtt") {
         "text/vtt"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".png") {
+        "image/png"
     } else {
         "application/octet-stream"
     }
 }
 
 /// Is this a media segment/part (evictable), vs a manifest (kept)?
+///
+/// Thumbnail sprite sheets count as media. They describe a span of the DVR
+/// window and are worthless once that span has aged out — kept, they would
+/// accumulate for the life of the stream while the pictures they show no
+/// longer exist. Their `.vtt` index is a manifest: one object, rewritten in
+/// place, listing only the sheets still present.
 fn is_media_segment(file: &str) -> bool {
     let lower = file.to_ascii_lowercase();
     lower.ends_with(".m4s") || lower.ends_with(".ts") || lower.ends_with(".cmfv")
         || lower.ends_with(".cmfa") || lower.ends_with(".cmf")
+        || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp") || lower.ends_with(".png")
         || (lower.ends_with(".mp4") && !lower.contains("init"))
 }
 
@@ -751,6 +765,58 @@ mod tests {
     }
 
     use crate::distribution_control::{OriginPolicyPatch, OriginPolicyUpdate};
+
+    /// Thumbnail sprite sheets must age out with the pictures they show.
+    ///
+    /// They are classified by extension, and everything not recognised as a
+    /// segment is treated as a manifest and **kept**. A sheet kept forever is
+    /// a slow leak that also lies: it depicts a span of the window that has
+    /// long since been evicted. The `.vtt` index is genuinely a manifest —
+    /// one object, rewritten in place — and must survive.
+    #[tokio::test]
+    async fn sprite_sheets_are_evicted_with_the_media_and_their_index_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 1);
+        s.apply_policy_update(&OriginPolicyUpdate {
+            per_stream: Some(vec![("match".into(), patch_bytes(30))]),
+            ..Default::default()
+        });
+
+        s.put("match", "thumbs.vtt", Bytes::from_static(b"WEBVTT
+"))
+            .await
+            .unwrap();
+        for i in 0..6 {
+            put_seg(&s, "match", &format!("thumbs-{i}.jpg"), 10).await;
+        }
+
+        assert!(
+            s.get("match", "thumbs-0.jpg").await.is_none(),
+            "an old sprite sheet outlived the window it depicts"
+        );
+        assert!(s.get("match", "thumbs-5.jpg").await.is_some());
+        assert!(
+            s.get("match", "thumbs.vtt").await.is_some(),
+            "the index was evicted as if it were a segment"
+        );
+    }
+
+    /// A sprite sheet must be served as an image.
+    ///
+    /// `application/octet-stream` is what every unrecognised extension gets,
+    /// and an `<img>` pointed at one is at the mercy of content sniffing —
+    /// which is exactly the thing a security header turns off. The failure is
+    /// a scrub preview that silently shows nothing.
+    #[test]
+    fn thumbnail_objects_are_served_as_images_and_text() {
+        assert_eq!(content_type_for("thumbs-001.jpg"), "image/jpeg");
+        assert_eq!(content_type_for("thumbs-001.JPEG"), "image/jpeg");
+        assert_eq!(content_type_for("thumbs-001.webp"), "image/webp");
+        assert_eq!(content_type_for("thumbs.vtt"), "text/vtt");
+        // And the media path is untouched.
+        assert_eq!(content_type_for("seg-1.m4s"), "video/mp4");
+        assert_eq!(content_type_for("manifest.m3u8"), "application/vnd.apple.mpegurl");
+    }
 
     fn patch_bytes(n: u64) -> OriginPolicyPatch {
         OriginPolicyPatch {

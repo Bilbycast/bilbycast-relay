@@ -77,6 +77,21 @@
     box-shadow: inset 0 0 0 1px var(--line);
   }
   #cached i { position: absolute; top: 0; bottom: 0; background: var(--accent); border-radius: 3px; }
+  /* Scrub preview. Hidden until there is a picture *and* a position to put it
+     at, so it never flashes an empty frame. */
+  #preview {
+    position: absolute; bottom: 26px; display: none; pointer-events: none;
+    transform: translateX(-50%); z-index: 3;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 4px; box-shadow: 0 6px 18px rgba(0,0,0,.55);
+  }
+  body[data-preview="1"] #preview { display: block; }
+  #preview i { display: block; background-color: #000; background-repeat: no-repeat; border-radius: 4px; }
+  #preview b {
+    display: block; text-align: center; font-weight: 600;
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+    color: var(--dim); padding-top: 3px;
+  }
   .t { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--dim); min-width: 5.5em; }
   .t.right { text-align: right; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -115,6 +130,7 @@
     <span class="t" id="tPos">--:--:--</span>
     <div class="track">
       <div id="cached" aria-hidden="true"></div>
+      <div id="preview" aria-hidden="true"><i></i><b></b></div>
       <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
     </div>
     <span class="t right" id="tDur">--:--</span>
@@ -224,6 +240,9 @@
   var proxy = document.getElementById("proxy");
   var scrub = document.getElementById("scrub");
   var cached = document.getElementById("cached");
+  var preview = document.getElementById("preview");
+  var previewImg = preview.querySelector("i");
+  var previewLabel = preview.querySelector("b");
   var tPos = document.getElementById("tPos");
   var tDur = document.getElementById("tDur");
   var status = document.getElementById("status");
@@ -377,7 +396,38 @@
   // The DVR depth is whatever the manifest lists, which is a server-side
   // sliding window. That is why a viewer can scrub back to before they
   // joined: nothing here depends on what this client has buffered.
+  function hlsFor(v) { return v === proxy ? proxyHls : mainHls; }
+
+  /// The playlist window, which is *not* `video.seekable`.
+  ///
+  /// Measured against a live 300 s window: the playlist summed to exactly
+  /// 300 s of `EXTINF` while `main.seekable` read `0.0-504.0`. MSE derives a
+  /// seekable range from the media source, which keeps extending as segments
+  /// are appended, while the server-side window slides — so the gap grows for
+  /// as long as the session runs.
+  ///
+  /// The bar was calibrated on that, which made it offer positions before the
+  /// oldest segment and after the live edge. Both show nothing: the left of
+  /// the bar is footage the origin has evicted, the right is footage that has
+  /// not happened. It also made the buffered shading look like it was
+  /// shrinking, when what was growing was the phantom part of the bar.
+  function playlistWindow(v) {
+    var hls = hlsFor(v);
+    if (!hls || !hls.levels) return null;
+    var lvl = hls.levels[hls.currentLevel >= 0 ? hls.currentLevel : 0];
+    var det = lvl && lvl.details;
+    if (!det || !det.fragments || !det.fragments.length) return null;
+    if (!isFinite(det.totalduration) || det.totalduration <= 0) return null;
+    var start = det.fragments[0].start;
+    if (!isFinite(start)) return null;
+    return { start: start, end: start + det.totalduration };
+  }
+
   function range(v) {
+    var w = playlistWindow(v);
+    if (w) return w;
+    // Native HLS (no hls.js) exposes no playlist, so fall back — a bar that is
+    // too generous still beats no bar.
     if (!v.seekable || v.seekable.length === 0) return null;
     return { start: v.seekable.start(0), end: v.seekable.end(v.seekable.length - 1) };
   }
@@ -758,6 +808,7 @@
 
   function beginScrub() {
     if (scrubbing) return;
+    loadThumbs();
     scrubbing = true;
     var v = activeVideo();
     // `rate < 0` counts as playing: a reverse shuttle drives currentTime
@@ -772,6 +823,7 @@
   function endScrub() {
     if (!scrubbing) return;
     scrubbing = false;
+    hidePreview();
     var st = resumeAfterScrub;
     resumeAfterScrub = null;
     if (st && st.playing) {
@@ -793,6 +845,7 @@
     pendingSeek = null;   // the operator is choosing a position explicitly
     try { v.currentTime = fromMainTime(t, v); } catch (e) {}
     tPos.textContent = fmt(t - r.start);
+    showPreview(t, scrub.value / 1000);
   });
   // Release is caught on the window, not the input: dragging off the track
   // (easy with a thumb on a tablet) still ends the scrub.
@@ -814,6 +867,193 @@
       liveState = true;
     }
   }
+
+  // ── scrub preview (thumbnail track) ────────────────────────────────────
+  // Sprite sheets plus a WebVTT index, published beside the media. This is
+  // what makes the *unbuffered* part of the bar useful: one sheet is about
+  // the size of one media segment and covers a hundred positions, where
+  // seeking for a real frame costs a segment fetch each time.
+  //
+  // Absent on a stream published without the track, in which case every
+  // function here no-ops and the bar behaves exactly as it did before.
+  var thumbs = null;          // { epoch, cues: [{start, end, uri, x, y, w, h}] }
+  var thumbsAsked = false;
+  var thumbsFetchedAt = 0;
+
+  /// How stale the index may get before it is refetched.
+  ///
+  /// It is a rolling window like the playlist: sheets age out, new ones
+  /// appear, and the epoch moves with the oldest. Fetched once and kept, it
+  /// drifts out from under the bar — measured after fifteen minutes, every
+  /// position on the bar resolved outside the index's span, so the preview
+  /// was simply gone with nothing to say why.
+  var THUMBS_MAX_AGE_MS = 20000;
+
+  function loadThumbs() {
+    var now = Date.now();
+    if (thumbsAsked && now - thumbsFetchedAt < THUMBS_MAX_AGE_MS) return;
+    thumbsAsked = true;
+    thumbsFetchedAt = now;
+    var opts = {};
+    if (TOKEN_IN_HEADER && TOKEN) opts.headers = { Authorization: "Bearer " + TOKEN };
+    fetch(url(STREAM, "thumbs.vtt"), opts)
+      .then(function (r) { return r.ok ? r.text() : null; })
+      .then(function (text) {
+        // Keep the index we have unless the new one parses: a truncated read
+        // mid-publish must not take the preview away.
+        var next = text ? parseThumbIndex(text) : null;
+        if (next) thumbs = next;
+      })
+      .catch(function () { /* no preview is not an error worth showing */ });
+  }
+
+  /// Parse the index. Returns `null` rather than a half-built one: a preview
+  /// built from a partly-understood file would show confidently wrong frames.
+  function parseThumbIndex(text) {
+    var lines = text.split(/\r?\n/);
+    if (!/^WEBVTT/.test(lines[0] || "")) return null;
+    var epoch = null, cues = [], pending = null;
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      var ep = /^X-BILBYCAST-EPOCH:\s*(.+)$/.exec(line);
+      if (ep) { epoch = Date.parse(ep[1]); continue; }
+      var t = /^(\d+):(\d\d):(\d\d)\.(\d\d\d)\s+-->\s+(\d+):(\d\d):(\d\d)\.(\d\d\d)/.exec(line);
+      if (t) {
+        pending = {
+          start: (+t[1]) * 3600 + (+t[2]) * 60 + (+t[3]) + (+t[4]) / 1000,
+          end:   (+t[5]) * 3600 + (+t[6]) * 60 + (+t[7]) + (+t[8]) / 1000
+        };
+        continue;
+      }
+      if (pending && line) {
+        var m = /^([^#\s]+)#xywh=(\d+),(\d+),(\d+),(\d+)$/.exec(line);
+        if (m) {
+          pending.uri = m[1];
+          pending.x = +m[2]; pending.y = +m[3];
+          pending.w = +m[4]; pending.h = +m[5];
+          cues.push(pending);
+        }
+        pending = null;
+      }
+    }
+    if (epoch === null || isNaN(epoch) || !cues.length) return null;
+    return { epoch: epoch, cues: cues };
+  }
+
+  /// Wall clock at a position on main's timeline, in ms.
+  ///
+  /// The player and the thumbnail generator share no clock — hls.js zeroes
+  /// its timeline at whichever fragment it loaded first — so the mapping runs
+  /// through `#EXT-X-PROGRAM-DATE-TIME`. Native HLS (no hls.js) exposes no
+  /// equivalent, so there is simply no preview there.
+  function wallClockAt(mainT) {
+    if (!mainHls || !mainHls.levels) return null;
+    var lvl = mainHls.levels[mainHls.currentLevel >= 0 ? mainHls.currentLevel : 0];
+    var det = lvl && lvl.details;
+    var frags = det && det.fragments;
+    if (!frags || !frags.length) return null;
+    var f = frags[0];
+    if (typeof f.programDateTime !== "number") return null;
+    return f.programDateTime + (mainT - f.start) * 1000;
+  }
+
+  /// The cue covering a position on main's timeline, or null.
+  function cueAt(mainT) {
+    if (!thumbs) return null;
+    var wall = wallClockAt(mainT);
+    if (wall === null) return null;
+    var off = (wall - thumbs.epoch) / 1000;
+    var cues = thumbs.cues;
+    // Sorted and contiguous, so binary search rather than a scan: a drag asks
+    // this ~20 times a second against a list that is thousands long over a
+    // three-hour window.
+    var lo = 0, hi = cues.length - 1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (off < cues[mid].start) hi = mid - 1;
+      else if (off >= cues[mid].end) lo = mid + 1;
+      else return cues[mid];
+    }
+    return null;
+  }
+
+  /// Sprite sheets already fetched, `uri` -> object URL.
+  ///
+  /// A CSS `background-image` cannot carry an `Authorization` header, and the
+  /// origin refuses an unauthenticated GET — so pointing the style straight at
+  /// the sheet gets a 401 and paints the box's background colour. That is a
+  /// black rectangle where a frame should be, with nothing in the DOM to say
+  /// so: the element has its size, its position and a `background-image`, and
+  /// every assertion about it passes. Found by looking at a screenshot.
+  ///
+  /// Fetching once per sheet and handing the style a blob URL also means the
+  /// hundred tiles on a sheet cost one request between them, not one each.
+  var sheetUrls = Object.create(null);
+  var sheetOrder = [];
+  var SHEET_CACHE = 20;
+
+  function sheetUrl(uri) {
+    var hit = sheetUrls[uri];
+    if (hit) return hit.url;      // null while the fetch is still in flight
+    var entry = { url: null };
+    sheetUrls[uri] = entry;
+    sheetOrder.push(uri);
+    while (sheetOrder.length > SHEET_CACHE) {
+      var old = sheetOrder.shift();
+      if (sheetUrls[old] && sheetUrls[old].url) URL.revokeObjectURL(sheetUrls[old].url);
+      delete sheetUrls[old];
+    }
+    var opts = {};
+    if (TOKEN_IN_HEADER && TOKEN) opts.headers = { Authorization: "Bearer " + TOKEN };
+    fetch(url(STREAM, uri), opts)
+      .then(function (r) { return r.ok ? r.blob() : null; })
+      .then(function (b) {
+        if (!b || sheetUrls[uri] !== entry) return;
+        entry.url = URL.createObjectURL(b);
+        // Repaint. Without this the first position on every sheet stays blank
+        // until the thumb moves again: `sheetUrl` answers null while the
+        // fetch is in flight, and nothing else redraws. Measured as a
+        // perfectly regular blank-every-other-position along the bar, one per
+        // sheet — which reads as a broken preview rather than a slow one.
+        if (scrubbing && lastPreviewAt) showPreview(lastPreviewAt.t, lastPreviewAt.frac);
+      })
+      .catch(function () {
+        // Let a later drag try again rather than remembering the failure for
+        // the life of the tab.
+        if (sheetUrls[uri] === entry) delete sheetUrls[uri];
+      });
+    return null;
+  }
+
+  /// The position the preview was last asked for, so a sheet arriving
+  /// mid-drag can repaint it.
+  var lastPreviewAt = null;
+
+  /// Show the preview for `mainT`, anchored at `frac` across the bar.
+  function showPreview(mainT, frac) {
+    lastPreviewAt = { t: mainT, frac: frac };
+    var cue = cueAt(mainT);
+    if (!cue) { hidePreview(); return; }
+    // No sheet yet means the fetch is still in flight. Keep the box hidden
+    // rather than showing an empty one -- a black rectangle reads as a black
+    // frame, which is a picture, and a wrong one.
+    var sheet = sheetUrl(cue.uri);
+    if (!sheet) { hidePreview(); return; }
+    previewImg.style.width = cue.w + "px";
+    previewImg.style.height = cue.h + "px";
+    previewImg.style.backgroundImage = "url(" + sheet + ")";
+    previewImg.style.backgroundPosition = "-" + cue.x + "px -" + cue.y + "px";
+    var r = range(main);
+    previewLabel.textContent = r ? fmt(mainT - r.start) : "";
+    // Keep the box on screen when the thumb is near either end.
+    var trackW = cached.getBoundingClientRect().width || 1;
+    var halfPct = (cue.w / 2 + 5) / trackW * 100;
+    var pct = Math.max(halfPct, Math.min(100 - halfPct, frac * 100));
+    preview.style.left = pct + "%";
+    document.body.dataset.preview = "1";
+  }
+
+  function hidePreview() { document.body.dataset.preview = "0"; }
 
   /// Shade the part of the bar that will actually respond to a drag.
   ///
@@ -896,6 +1136,20 @@
     for (var i = 0; i < m.length; i++) a.push(m.start(i).toFixed(1) + "-" + m.end(i).toFixed(1));
     return a.join(",") || "-";
   }
+  /// One line describing why there is, or is not, a scrub preview.
+  function thumbState() {
+    if (!thumbsAsked) return "not requested (touch the scrub bar)";
+    if (!thumbs) return "no usable index at " + url(STREAM, "thumbs.vtt");
+    var wall = wallClockAt(main.currentTime);
+    if (wall === null) return thumbs.cues.length + " cues, but no PROGRAM-DATE-TIME to map through";
+    var off = (wall - thumbs.epoch) / 1000;
+    var first = thumbs.cues[0], last = thumbs.cues[thumbs.cues.length - 1];
+    return thumbs.cues.length + " cues covering " + first.start.toFixed(0) + "-" +
+           last.end.toFixed(0) + "s from " + new Date(thumbs.epoch).toISOString() +
+           "  |  here=" + off.toFixed(1) + "s -> " +
+           (cueAt(main.currentTime) ? "covered" : "OUTSIDE the covered span");
+  }
+
   function renderDebug() {
     var v = activeVideo();
     var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
@@ -915,6 +1169,11 @@
         "  proxyT=" + proxy.currentTime.toFixed(2) +
         "  (same instant when proxyT - mainT = offset)",
       "lastHlsError=" + (lastHlsError || "none"),
+      // The preview has three independent ways to be silently absent: no
+      // index published, no absolute time on the playlist to map through, or
+      // a position the index does not cover. They look identical on screen,
+      // so name which one it is.
+      "thumbs=" + thumbState(),
       "",
       "If decodedFrames is RISING but the picture is black, the stream is fine",
       "and the browser is not compositing it — try chrome://settings 'Use",
