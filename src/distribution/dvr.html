@@ -42,7 +42,41 @@
   body[data-debug="1"] #debug { display: block; }
   footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 14px 14px; }
   .timeline { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  .timeline input[type=range] { flex: 1; min-width: 0; }
+  .timeline .track { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; }
+  /* The native slider paints its own filled track, which covered the shading
+     entirely -- the DOM was correct and the screen showed a plain blue bar.
+     So the track is ours and transparent, and #cached behind it *is* the
+     track: dark where a drag would fetch, lit where it is instant. The thumb
+     stays large enough for a thumb. */
+  .timeline .track input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    display: block; width: 100%; height: 32px; margin: 0;
+    position: relative; background: transparent;
+  }
+  .timeline .track input[type=range]::-webkit-slider-runnable-track { height: 5px; background: transparent; }
+  .timeline .track input[type=range]::-moz-range-track { height: 5px; background: transparent; }
+  .timeline .track input[type=range]::-moz-range-progress { background: transparent; }
+  .timeline .track input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--fg); border: 2px solid var(--panel); margin-top: -6.5px;
+  }
+  .timeline .track input[type=range]::-moz-range-thumb {
+    width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--panel);
+    background: var(--fg);
+  }
+  .timeline .track input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  /* The part of the window that is buffered, drawn behind the slider. It sits
+     under the native track, which is centred, and spans the element's full
+     width -- the thumb's travel is inset by half its own width, so the shading
+     runs up to ~1% wide at each end. This is a "here it is instant" hint, not
+     a measurement. */
+  #cached {
+    position: absolute; left: 0; right: 0; top: 50%; height: 5px;
+    transform: translateY(-50%); pointer-events: none; border-radius: 3px;
+    background: #000914; border: 1px solid var(--line); border-width: 0;
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+  #cached i { position: absolute; top: 0; bottom: 0; background: var(--accent); border-radius: 3px; }
   .t { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--dim); min-width: 5.5em; }
   .t.right { text-align: right; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -79,7 +113,10 @@
 <footer>
   <div class="timeline">
     <span class="t" id="tPos">--:--:--</span>
-    <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
+    <div class="track">
+      <div id="cached" aria-hidden="true"></div>
+      <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
+    </div>
     <span class="t right" id="tDur">--:--</span>
   </div>
 
@@ -103,7 +140,10 @@
   <div class="hint">
     Keys: <b>J</b>/<b>L</b> rewind/forward (press again to speed up) &middot;
     <b>K</b> stop &middot; <b>,</b>/<b>.</b> frame step &middot;
-    <b>Space</b> play/pause &middot; <b>End</b> live
+    <b>Space</b> play/pause &middot; <b>End</b> live<br>
+    The <b style="color:var(--accent)">lit</b> part of the bar is held locally and
+    scrubs instantly; dragging outside it fetches, so the picture waits until you
+    stop.
   </div>
   <div class="err" id="err"></div>
 </footer>
@@ -183,6 +223,7 @@
   var main = document.getElementById("main");
   var proxy = document.getElementById("proxy");
   var scrub = document.getElementById("scrub");
+  var cached = document.getElementById("cached");
   var tPos = document.getElementById("tPos");
   var tDur = document.getElementById("tDur");
   var status = document.getElementById("status");
@@ -774,6 +815,51 @@
     }
   }
 
+  /// Shade the part of the bar that will actually respond to a drag.
+  ///
+  /// A seek into buffered media is immediate; every other position costs a
+  /// segment fetch, and a drag issues roughly twenty seeks a second. Measured
+  /// on the live 1080p feed with `requestVideoFrameCallback`, forty seeks over
+  /// two seconds presented **0-1** frames outside the buffer -- at LAN speed,
+  /// at 25 Mbit/s and at 8 Mbit/s alike, on the main rendition and on the
+  /// all-intra proxy alike. The cost is the fetch, not the decode.
+  ///
+  /// So the bar has always offered a whole window of positions of which only a
+  /// slice works, and nothing said which slice. Worse, the window grows for as
+  /// long as the session runs while the buffer is capped by
+  /// `backBufferLength`, so the working slice shrinks in proportion: ~29 % of
+  /// the bar three minutes in, around 1 % across a three-hour window. An
+  /// operator reported this as "it only scrubs on footage after 04:00", which
+  /// was the back-buffer edge named exactly.
+  ///
+  /// This does not make the rest of the bar work -- that needs a thumbnail
+  /// track (edge#124). It makes the limit visible instead of looking broken.
+  var cachedKey = "";
+  function renderCached(r) {
+    var dur = r.end - r.start;
+    if (dur <= 0) return;
+    var parts = [], key = "";
+    // `main` is what a scrub seeks, so its buffer is what decides.
+    for (var i = 0; i < main.buffered.length; i++) {
+      var a = Math.max(0, (main.buffered.start(i) - r.start) / dur);
+      var b = Math.min(1, (main.buffered.end(i) - r.start) / dur);
+      if (b <= a) continue;
+      parts.push([a, b]);
+      key += a.toFixed(4) + ">" + b.toFixed(4) + " ";
+    }
+    // Rebuilding every frame would churn the DOM at 60 Hz for a picture that
+    // changes when a fragment lands.
+    if (key === cachedKey) return;
+    cachedKey = key;
+    cached.textContent = "";
+    parts.forEach(function (seg) {
+      var el = document.createElement("i");
+      el.style.left = (seg[0] * 100).toFixed(2) + "%";
+      el.style.width = ((seg[1] - seg[0]) * 100).toFixed(2) + "%";
+      cached.appendChild(el);
+    });
+  }
+
   function render() {
     var v = activeVideo();
     if (proxyAttached) measureTimelineOffset();
@@ -788,6 +874,7 @@
       if (!scrubbing && dur > 0) {
         scrub.value = String(Math.round(((pos - r.start) / dur) * 1000));
       }
+      renderCached(r);
       updateLiveState(r.end - pos);
       var atLive = liveState;
       document.body.dataset.live = atLive ? "1" : "0";

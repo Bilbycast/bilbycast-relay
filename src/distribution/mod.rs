@@ -749,6 +749,72 @@ mod tests {
         assert!(html.contains("-proxy"), "page does not reference a proxy rendition");
     }
 
+    /// Pull the body of a JS function out of the page.
+    ///
+    /// A string assertion on a script is a poor substitute for running it, but
+    /// the alternative is no coverage at all on the part of the player an
+    /// operator touches most, and both failures below are silent in a browser.
+    fn js_fn<'a>(html: &'a str, name: &str) -> &'a str {
+        let after = html
+            .split(&format!("function {name}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} not found in dvr.html"));
+        after
+            .split("
+  }")
+            .next()
+            .unwrap_or_else(|| panic!("{name} has no body"))
+    }
+
+    /// The shaded part of the scrub bar must describe the element a scrub
+    /// actually seeks.
+    ///
+    /// The shading tells the operator which positions respond immediately.
+    /// Deriving it from the proxy, or from whichever element happens to be on
+    /// screen, would light up a region that does not respond — a confident
+    /// wrong answer, which is worse than no shading at all. Nothing in the
+    /// browser would report it: the bar would simply lie.
+    #[test]
+    fn the_scrubbable_shading_describes_the_element_a_scrub_seeks() {
+        let html = include_str!("dvr.html");
+        let shade = js_fn(html, "renderCached");
+        assert!(
+            shade.contains("main.buffered"),
+            "shading is not derived from main's buffer: {shade}"
+        );
+        assert!(
+            !shade.contains("proxy.buffered") && !shade.contains("activeVideo"),
+            "shading follows an element a scrub does not seek: {shade}"
+        );
+
+        // And the premise: a scrub drives `main`. If that ever moves to the
+        // proxy, this shading becomes the wrong answer and must move with it.
+        let input = html
+            .split(r#"scrub.addEventListener("input""#)
+            .nth(1)
+            .expect("no scrub input handler");
+        assert!(
+            input.contains("activeVideo()"),
+            "the scrub handler no longer picks its element the way this assumes"
+        );
+        assert!(
+            js_fn(html, "activeVideo").contains(r#"mode === "shuttle" ? proxy : main"#),
+            "`activeVideo` changed; re-check what a held scrub seeks before              trusting the shading"
+        );
+    }
+
+    /// The shading has to be recomputed as fragments land, or it freezes at
+    /// whatever was buffered on the first frame and then quietly misleads.
+    #[test]
+    fn the_shading_is_refreshed_by_the_render_loop() {
+        assert!(
+            // `render()` with the parens: bare "render" also prefix-matches
+            // `renderCached` itself, which trivially contains its own name.
+            js_fn(include_str!("dvr.html"), "render()").contains("renderCached("),
+            "nothing updates the shading after the first paint"
+        );
+    }
+
     /// Both placeholders must be substituted, and the page must offer the
     /// portal only when there is one.
     ///
