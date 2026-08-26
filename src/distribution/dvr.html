@@ -87,6 +87,17 @@
     position: absolute; top: 0; width: 2px; height: 14px; margin-left: -1px;
     background: var(--live); border-radius: 1px;
   }
+  #marktip {
+    position: absolute; bottom: 30px; display: none; pointer-events: none;
+    transform: translateX(-50%); z-index: 4; max-width: 22em;
+    background: var(--panel); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 8px; font-size: 12px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+    box-shadow: 0 4px 14px rgba(0,0,0,.5);
+  }
+  body[data-marktip="1"] #marktip { display: block; }
+  #marktip b { color: var(--live); font-weight: 700; }
   #markbar i::after {
     content: ""; position: absolute; top: -3px; left: -3px;
     border-left: 4px solid transparent; border-right: 4px solid transparent;
@@ -242,6 +253,7 @@
       <div id="cached" aria-hidden="true"></div>
       <div id="ticks" aria-hidden="true"></div>
       <div id="markbar" aria-hidden="true"></div>
+      <div id="marktip" aria-hidden="true"></div>
       <div id="preview" aria-hidden="true"><i></i><b></b></div>
       <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
     </div>
@@ -254,7 +266,9 @@
     <button id="btnPause" title="Pause">&#10073;&#10073;</button>
     <button id="btnMute" aria-pressed="true" title="Unmute">&#128263;</button>
     <button id="btnFull" aria-pressed="false" title="Full screen (F)">FULL</button>
+    <button id="btnPrevMark" title="Jump to the previous mark ([)">&#9198;</button>
     <button id="btnMark" title="Mark this moment (M)">MARK</button>
+    <button id="btnNextMark" title="Jump to the next mark (])">&#9197;</button>
     <button id="btnDrawer" aria-pressed="false" title="Show the marks list">MARKS</button>
     <div class="sep"></div>
 
@@ -280,7 +294,7 @@
     Keys: <b>J</b>/<b>L</b> rewind/forward (press again to speed up) &middot;
     <b>K</b> stop &middot; <b>,</b>/<b>.</b> frame step &middot;
     <b>Space</b> play/pause &middot; <b>End</b> live &middot; <b>F</b> full screen &middot;
-    <b>M</b> mark<br>
+    <b>M</b> mark &middot; <b>[</b>/<b>]</b> previous/next mark<br>
     The <b style="color:var(--accent)">lit</b> part of the bar is held on this
     device: dragging there moves the real picture, frame for frame. Outside it you
     get a preview thumbnail while you drag, and the video arrives when you let go.<br>
@@ -369,6 +383,7 @@
   var ticks = document.getElementById("ticks");
   var markbar = document.getElementById("markbar");
   var markList = document.getElementById("markList");
+  var marktip = document.getElementById("marktip");
   var preview = document.getElementById("preview");
   var previewImg = preview.querySelector("i");
   var previewLabel = preview.querySelector("b");
@@ -382,6 +397,8 @@
   var btnMute = document.getElementById("btnMute");
   var btnFull = document.getElementById("btnFull");
   var btnMark = document.getElementById("btnMark");
+  var btnPrevMark = document.getElementById("btnPrevMark");
+  var btnNextMark = document.getElementById("btnNextMark");
   var btnDrawer = document.getElementById("btnDrawer");
   var btnRew = document.getElementById("btnRew");
   var btnFf = document.getElementById("btnFf");
@@ -1135,13 +1152,41 @@
     }
   }
 
-  scrub.addEventListener("pointerdown", beginScrub);
+  /// Suppress the one `input` the browser fires from a press we handled.
+  ///
+  /// Pressing a range input sets its value and fires `input` even when the
+  /// press is defaulted away. Without this, landing on a mark would seek to
+  /// the mark and then immediately seek again to wherever the pointer was —
+  /// close, but not the mark, which is the whole point of clicking it.
+  var suppressNextInput = false;
+
+  scrub.addEventListener("pointerdown", function (e) {
+    // Clear it here, not only when an `input` consumes it. Preventing the
+    // default means the press may fire no `input` at all, in which case the
+    // flag survives and swallows the first event of the *next* drag — a real
+    // stall, found by pressing a mark and then dragging elsewhere.
+    suppressNextInput = false;
+    // Pressing a mark goes to it exactly and stops there. You have hovered it,
+    // you have read its name, and a drag that lands "near" it is not what was
+    // asked for.
+    var r = scrub.getBoundingClientRect();
+    var m = r.width ? markNear((e.clientX - r.left) / r.width) : null;
+    hideMarkTip();
+    if (m && markIsReachable(m)) {
+      e.preventDefault();
+      suppressNextInput = true;
+      goToMark(m);          // seeks, and pauses there
+      return;
+    }
+    beginScrub();
+  });
   /// Move the transport to wherever the thumb currently is.
   ///
   /// Shared by the drag itself and by the edge-pan loop below, because the two
   /// must agree: panning changes which moment sits under a stationary thumb,
   /// and that moment is what has to be shown.
   function applyScrubPosition() {
+    if (suppressNextInput) { suppressNextInput = false; return; }
     handPictureToProxy();   // the proxy may have become ready since pointerdown
     var v = activeVideo();
     // The bar is calibrated on main's clock (see `render`), so pick the
@@ -1317,6 +1362,14 @@
       name.placeholder = "Name this mark";
       name.setAttribute("data-id", String(m.id));
       name.addEventListener("input", function () { renameMark(m.id, name.value); });
+      // Enter means done: the name is already saved on every keystroke, so
+      // this is about getting the drawer out of the way and the picture back.
+      name.addEventListener("keydown", function (e) {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        name.blur();
+        closeDrawer();
+      });
 
       var del = document.createElement("button");
       del.className = "del";
@@ -1328,6 +1381,87 @@
       markList.appendChild(li);
     });
     renderFlags();
+  }
+
+  // ── the name under the pointer ─────────────────────────────────────────
+  // Hovering a flag should say what it is. Deliberately NOT done by giving the
+  // flags pointer events and a `title`: they sit inside the slider's own hit
+  // box, so a 2 px element that swallows a press would cost a drag near the
+  // mark — and a native `title` waits a second and never appears on a touch
+  // screen at all. Hit-test from the track's pointer position instead, which
+  // takes nothing away from the bar.
+
+  /// How near the pointer must be, as a fraction of the bar.
+  var MARK_HOVER_FRAC = 0.012;
+
+  function markNear(frac) {
+    var view = viewRange();
+    if (!view) return null;
+    var span = view.end - view.start;
+    if (!(span > 0)) return null;
+    var best = null, bestD = MARK_HOVER_FRAC;
+    for (var i = 0; i < marks.length; i++) {
+      var t = mainTimeAtWall(marks[i].at);
+      if (t === null) continue;
+      var d = Math.abs((t - view.start) / span - frac);
+      if (d <= bestD) { bestD = d; best = marks[i]; }
+    }
+    return best;
+  }
+
+  function showMarkTip(m, frac) {
+    marktip.textContent = "";
+    var b = document.createElement("b");
+    b.textContent = fmtTimeOfDay(m.at).slice(0, 8);
+    marktip.appendChild(b);
+    marktip.appendChild(document.createTextNode("  " + (m.name || "Unnamed mark")));
+    var trackW = cached.getBoundingClientRect().width || 1;
+    // Keep it on screen at either end, the same way the scrub preview does.
+    var halfPct = (marktip.offsetWidth / 2 + 6) / trackW * 100;
+    var pct = Math.max(halfPct, Math.min(100 - halfPct, frac * 100));
+    marktip.style.left = pct + "%";
+    document.body.dataset.marktip = "1";
+  }
+
+  function hideMarkTip() { document.body.dataset.marktip = "0"; }
+
+  scrub.addEventListener("pointermove", function (e) {
+    // While dragging, the scrub preview owns this space.
+    if (scrubbing) { hideMarkTip(); return; }
+    var r = scrub.getBoundingClientRect();
+    if (!r.width) return;
+    var frac = (e.clientX - r.left) / r.width;
+    var m = markNear(frac);
+    if (m) showMarkTip(m, frac); else hideMarkTip();
+  });
+  scrub.addEventListener("pointerleave", hideMarkTip);
+
+  /// The nearest reachable mark before (`dir < 0`) or after (`dir > 0`) the
+  /// playhead, or null.
+  ///
+  /// The margin matters: land exactly on a mark and without it "next" finds
+  /// the one you are already sitting on, so the button appears dead. A quarter
+  /// of a second is far longer than the seek precision and far shorter than
+  /// anything an operator would mark twice.
+  var MARK_SKIP_EPS_MS = 250;
+
+  function markRelative(dir) {
+    var v = activeVideo();
+    var now = wallClockAt(toMainTime(playhead(v), v));
+    if (now === null) return null;
+    var best = null;
+    for (var i = 0; i < marks.length; i++) {
+      var m = marks[i];
+      var past = dir > 0 ? m.at > now + MARK_SKIP_EPS_MS : m.at < now - MARK_SKIP_EPS_MS;
+      if (!past || !markIsReachable(m)) continue;
+      if (!best || (dir > 0 ? m.at < best.at : m.at > best.at)) best = m;
+    }
+    return best;
+  }
+
+  function skipToMark(dir) {
+    var m = markRelative(dir);
+    if (m) goToMark(m);
   }
 
   /// Re-decide which marks can still be reached.
@@ -1342,6 +1476,11 @@
   /// It also changes on its own as the window rolls past a mark, so it has to
   /// be re-decided anyway rather than latched.
   function refreshMarkStates() {
+    // A skip button with nowhere to go is disabled rather than inert: there is
+    // no feedback from a jump that does not happen, so a live-looking button
+    // reads as broken.
+    btnPrevMark.disabled = !markRelative(-1);
+    btnNextMark.disabled = !markRelative(1);
     var rows = markList.children;
     for (var i = 0; i < rows.length && i < marks.length; i++) {
       var li = rows[i];
@@ -1913,6 +2052,8 @@
   }
 
   btnMark.addEventListener("click", addMark);
+  btnPrevMark.addEventListener("click", function () { skipToMark(-1); });
+  btnNextMark.addEventListener("click", function () { skipToMark(1); });
   btnDrawer.addEventListener("click", toggleDrawer);
   document.getElementById("drawerClose").addEventListener("click", closeDrawer);
 
@@ -1969,6 +2110,8 @@
       case "End": goLive(); break;
       case "f": case "F": toggleFullscreen(); break;
       case "m": case "M": addMark(); break;
+      case "[": skipToMark(-1); break;
+      case "]": skipToMark(1); break;
       case "Escape": if (document.body.dataset.drawer === "1") closeDrawer(); else return; break;
       case " ":
         e.preventDefault();

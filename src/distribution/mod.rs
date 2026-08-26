@@ -877,6 +877,122 @@ mod tests {
         );
     }
 
+    /// Pressing a mark on the bar goes to it exactly, and stops.
+    ///
+    /// You have hovered it and read its name; a drag that lands *near* it is
+    /// not what was asked for. So a press within the hover radius seeks to the
+    /// mark and pauses there instead of starting a scrub.
+    ///
+    /// The subtlety is that a range input sets its value and fires `input`
+    /// from that press even when the default is prevented — which would seek
+    /// to the mark and then immediately seek again to wherever the pointer
+    /// actually was. Close, but not the mark.
+    #[test]
+    fn pressing_a_mark_on_the_bar_goes_to_it_exactly() {
+        let html = include_str!("dvr.html");
+        let down = html
+            .split(r#"scrub.addEventListener("pointerdown", function (e) {"#)
+            .nth(1)
+            .expect("no pointerdown handler")
+            .split("
+  });")
+            .next()
+            .expect("unterminated pointerdown handler");
+        assert!(down.contains("markNear("), "the press does not look for a mark: {down}");
+        assert!(down.contains("goToMark(m)"), "a press on a mark does not go to it: {down}");
+        assert!(
+            down.contains("e.preventDefault()") && down.contains("suppressNextInput = true"),
+            "the input the press fires would seek away from the mark again: {down}"
+        );
+        assert!(
+            down.contains("beginScrub();"),
+            "a press away from a mark no longer starts a scrub: {down}"
+        );
+        // The suppression must be cleared two ways. Consuming an `input`
+        // clears it — but preventing the default means the press may fire no
+        // `input` at all, and the flag then survives to swallow the first
+        // event of the next drag. Found by pressing a mark and then dragging
+        // elsewhere: the drag did nothing.
+        assert!(
+            js_fn(html, "applyScrubPosition")
+                .contains("if (suppressNextInput) { suppressNextInput = false; return; }"),
+            "a consumed input does not clear the suppression"
+        );
+        assert!(
+            down.starts_with("
+    // Clear it here")
+                || down.contains("suppressNextInput = false;
+    // Pressing a mark"),
+            "the press does not clear a suppression left over from the last one: {down}"
+        );
+    }
+
+    /// Skipping to the next mark must not find the one you are sitting on.
+    ///
+    /// Land exactly on a mark — which is what the previous press just did —
+    /// and a naive "first mark after now" finds that same mark, seeks nowhere,
+    /// and the button reads as dead. Hence the margin.
+    ///
+    /// Skips are also bounded by reachability: a mark the window has rolled
+    /// past is not a place the transport can go, so it must not be a skip
+    /// target either.
+    #[test]
+    fn skipping_between_marks_steps_off_the_current_one() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "markRelative");
+        assert!(
+            f.contains("MARK_SKIP_EPS_MS"),
+            "no margin, so `next` finds the mark already under the playhead: {f}"
+        );
+        assert!(
+            f.contains("markIsReachable(m)"),
+            "a skip could target a mark outside the window: {f}"
+        );
+        // Both directions come from the same search rather than two copies.
+        assert!(
+            f.contains("dir > 0 ? m.at > now") && f.contains("dir > 0 ? m.at < best.at"),
+            "the two directions are not symmetric: {f}"
+        );
+        // A skip with nowhere to go is disabled, not inert: nothing happens
+        // either way, but only one of them looks broken.
+        assert!(
+            js_fn(html, "refreshMarkStates").contains("btnNextMark.disabled = !markRelative(1)"),
+            "a skip button with no target stays live and appears broken"
+        );
+    }
+
+    /// Hovering a mark names it, without taking anything from the bar.
+    ///
+    /// The obvious implementation — pointer events on the flags plus a
+    /// `title` — is wrong twice over. The flags sit inside the slider's own
+    /// hit box, so a 2 px element that swallows a press costs a drag right
+    /// where the operator is aiming; and a native `title` waits a second and
+    /// never appears on a touch screen at all, which is the target device.
+    #[test]
+    fn hovering_a_mark_names_it_without_stealing_the_drag() {
+        let html = include_str!("dvr.html");
+        assert!(
+            html.contains("#markbar { position: absolute")
+                && html.contains("pointer-events: none; z-index: 1; }"),
+            "the flag layer takes pointer events, so it can swallow a drag"
+        );
+        // Hit-tested from the slider's own pointer position instead.
+        assert!(
+            html.contains(r#"scrub.addEventListener("pointermove""#),
+            "nothing detects the pointer over a mark"
+        );
+        let near = js_fn(html, "markNear");
+        assert!(
+            near.contains("MARK_HOVER_FRAC"),
+            "no proximity bound, so the tip would show for any position: {near}"
+        );
+        // The scrub preview owns this space during a drag.
+        assert!(
+            html.contains("if (scrubbing) { hideMarkTip(); return; }"),
+            "the mark tip fights the scrub preview during a drag"
+        );
+    }
+
     /// A mark the window has rolled past must be visibly unreachable.
     ///
     /// Marks outlive the DVR window — they are kept for the session, the
@@ -912,6 +1028,29 @@ mod tests {
         assert!(
             js_fn(html, "goToMark").contains("t < r.start || t > r.end"),
             "goToMark would seek outside the window"
+        );
+    }
+
+    /// Enter in a mark's name closes the drawer.
+    ///
+    /// The name is saved on every keystroke, so Enter is not a commit — it is
+    /// "done, give me the picture back". Without it the drawer covers a third
+    /// of the screen until the operator finds the close button, right after
+    /// they have marked something they wanted to watch.
+    #[test]
+    fn enter_in_a_mark_name_closes_the_drawer() {
+        let render = js_fn(include_str!("dvr.html"), "renderMarks");
+        assert!(
+            render.contains(r#"if (e.key !== "Enter") return;"#),
+            "Enter is not handled in the name field: {render}"
+        );
+        assert!(
+            render.contains("closeDrawer();"),
+            "Enter does not close the drawer: {render}"
+        );
+        assert!(
+            render.contains("e.preventDefault();"),
+            "Enter would submit or scroll as well as close: {render}"
         );
     }
 

@@ -380,6 +380,20 @@ playlist — computed once at load, every mark rendered disabled on a fresh relo
 until something else happened to redraw the list, which looked exactly like
 marks not working.
 
+**Getting back to a mark.** Three ways, all landing on it exactly and pausing
+there: the time in the drawer, the `⏮`/`⏭` buttons (`[` and `]`) for the nearest
+mark either side of the playhead, or pressing the flag on the bar itself.
+
+Hovering a flag names it. That is hit-tested from the slider's own pointer
+position rather than by giving the flags pointer events: they sit inside the
+slider's hit box, so a 2 px element that swallowed a press would cost a drag
+right where the operator is aiming — and a native `title` waits a second and
+never appears on a touch screen, which is the target device.
+
+Skipping uses a 250 ms margin, or "next" finds the mark already under the
+playhead — which is where the previous press just put it — and the button reads
+as dead. A skip with nowhere to go is disabled rather than inert.
+
 **They are kept in `localStorage`, per feed, on this device.** That survives a
 reload and a whole event. It does **not** share a mark with the operator
 sitting next to you — that needs somewhere server-side to put them, which does
