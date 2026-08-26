@@ -351,6 +351,30 @@ at the narrow presets the whole visible span is usually instant *and*
 frame-exact. That is a consequence of the back buffer's size rather than a
 designed property, and it does not hold for a viewer who has just joined.
 
+### The layout
+
+The picture is the page. Controls are overlaid on it, arranged so the four
+things an operator reaches for without looking are in the four corners:
+
+| | |
+|---|---|
+| top left | full screen, settings, mute — the quietest controls, smallest and dimmest |
+| top right | **MARK**. Tap marks; **hold** opens the marks list |
+| bottom left | **play** — green while running, grey with a white glyph when stopped |
+| bottom right | **LIVE** |
+| right edge | the zoom slider: top is the whole window, drag down to zoom in |
+| bottom | timeline, then speed / frame-step / shuttle |
+
+**The picture stops above the transport** rather than running underneath it, so
+nothing is ever read against moving video. Note this needs an explicit
+`height: calc(100% - var(--hud))` and not a `bottom` inset: `<video>` is a
+*replaced* element, so with `height: auto` the browser takes its intrinsic
+height and silently ignores the inset.
+
+**The zoom slider is a rotated horizontal range**, not `writing-mode:
+vertical-*` — engines disagree about which end of a vertical range is the
+minimum, and it put `ALL` at the bottom.
+
 ### Transport controls
 
 **Play means forward at full speed**, from whatever the transport was doing —

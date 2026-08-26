@@ -6,87 +6,252 @@
 <title>DVR — __STREAM_ID__</title>
 <style>
   :root {
-    --bg: #0b0d10; --panel: #14181d; --line: #232a32;
-    --fg: #e8edf2; --dim: #93a1b0; --accent: #37d3a6; --live: #ff4d4f;
+    --bg: #06080a; --panel: #12171d; --line: #263039;
+    --fg: #f2f6fa; --dim: #9aa8b6; --accent: #37d3a6; --live: #ff4d4f;
     /* The slider thumb. Its *centre* travels inset by half this at each end,
-       so every layer that must line up with the playhead is inset to match —
-       see `barPct`. Drawn across the full width instead, a mark and the
-       playhead disagree by up to half a thumb, worst at the ends. */
+       so every layer that must line up with the playhead is inset to match
+       — see `barPct`. */
     --thumb: 18px;
+    /* One corner action. Big enough to hit with a thumb without looking,
+       which is the whole point of putting them in the corners. */
+    --corner: 116px;
+    /* How much of the bottom the transport owns. The picture stops here
+       rather than running underneath, so nothing is ever read against moving
+       video. */
+    --hud: 138px;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
   body {
-    background: var(--bg); color: var(--fg);
+    background: #000; color: var(--fg);
     font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display: flex; flex-direction: column;
     /* A tablet in a gallery or truck is often handled with one thumb. */
     -webkit-user-select: none; user-select: none;
     -webkit-tap-highlight-color: transparent;
   }
-  header { padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; }
-  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
-  header .id { color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  #stage { position: relative; flex: 1; min-height: 0; background: #000; }
-  #stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+  /* ── the picture ────────────────────────────────────────────────────── */
+  #stage { position: fixed; inset: 0; background: #000; overflow: hidden; }
+  /* An explicit height, not an inset. `<video>` is a *replaced* element: with
+     `height: auto` the browser takes its intrinsic height and quietly ignores
+     the `bottom` inset, which left the picture running the full height and
+     the controls sitting on top of moving video. */
+  #stage video {
+    position: absolute; top: 0; left: 0; width: 100%;
+    height: calc(100% - var(--hud));
+    object-fit: contain; background: #000;
+  }
   #proxy { display: none; }
   body[data-picture="proxy"] #proxy { display: block; }
   body[data-picture="proxy"] #main  { display: none; }
+
+  /* Legibility, not decoration: the picture is what is being watched, so the
+     scrim is gone well before the middle of the frame. */
+  #scrim {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    height: calc(var(--hud) + 130px);
+    background: linear-gradient(to top,
+      rgba(0,0,0,1) 0%,
+      rgba(0,0,0,1) var(--hud),
+      rgba(0,0,0,.86) calc(var(--hud) + 34px),
+      rgba(0,0,0,.45) calc(var(--hud) + 82px),
+      rgba(0,0,0,0) 100%);
+    pointer-events: none; z-index: 1;
+  }
+  #scrimTop {
+    position: absolute; left: 0; right: 0; top: 0; height: 150px;
+    background: linear-gradient(to bottom, rgba(0,0,0,.7) 0%, rgba(0,0,0,0) 100%);
+    pointer-events: none; z-index: 1;
+  }
+
   #badge {
-    position: absolute; top: 10px; left: 10px; padding: 3px 9px; border-radius: 999px;
-    font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
-    background: #2a3038; color: var(--dim);
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 3;
+    padding: 4px 11px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    background: rgba(20,26,32,.8); color: var(--dim); backdrop-filter: blur(6px);
   }
   body[data-live="1"] #badge { background: var(--live); color: #fff; }
-  #status { position: absolute; top: 10px; right: 10px; font-family: ui-monospace, Menlo, monospace;
-            font-size: 11px; color: var(--dim); background: rgba(0,0,0,.55); padding: 3px 8px; border-radius: 6px; }
-  #debug { display: none; position: absolute; left: 10px; top: 40px; margin: 0;
-           font: 11px/1.45 ui-monospace, Menlo, monospace; color: #9ef;
-           background: rgba(0,0,0,.75); padding: 8px 10px; border-radius: 6px;
-           white-space: pre; pointer-events: none; }
+  #status {
+    display: none; position: absolute; left: 68px; top: 16px; z-index: 6;
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--dim);
+  }
+  body[data-debug="1"] #status { display: block; }
+  body[data-debug="1"] #debug { top: 40px; }
+  #debug {
+    display: none; position: absolute; left: 68px; top: 16px; margin: 0; z-index: 6;
+    font: 11px/1.45 ui-monospace, Menlo, monospace; color: #9ef;
+    background: rgba(0,0,0,.8); padding: 10px 12px; border-radius: 8px;
+    white-space: pre; pointer-events: none; max-width: 70vw;
+  }
   body[data-debug="1"] #debug { display: block; }
-  #selftest {
-    display: none; position: absolute; inset: 8px; overflow: auto; z-index: 5;
-    background: rgba(8,11,14,.97); border: 1px solid var(--line); border-radius: 10px;
-    padding: 14px 16px;
+
+  /* ── buttons ────────────────────────────────────────────────────────── */
+  button {
+    background: rgba(28,36,45,.72); color: var(--fg);
+    border: 1px solid rgba(255,255,255,.09);
+    border-radius: 12px; padding: 0 14px;
+    font: inherit; font-size: 14px; font-weight: 600;
+    min-width: 52px; min-height: 52px;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; backdrop-filter: blur(8px);
+    transition: background .12s, border-color .12s, opacity .12s;
   }
-  body[data-selftest="1"] #selftest { display: block; }
-  #selftest h2 { margin: 0 0 6px; font-size: 16px; }
-  #selftest p { margin: 0 0 12px; color: var(--dim); font-size: 13px; max-width: 60ch; }
-  #selftest button { background: var(--accent); color: #05231b; border-color: var(--accent); }
-  #selftest pre {
-    margin: 14px 0 0; white-space: pre-wrap; word-break: break-word;
-    font: 13px/1.5 ui-monospace, Menlo, monospace; color: var(--fg);
+  button:active { background: rgba(60,74,88,.85); }
+  button[aria-pressed="true"] { background: var(--accent); color: #04241c; border-color: transparent; }
+  button:disabled { opacity: .32; cursor: default; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  .icon svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2;
+              stroke-linecap: round; stroke-linejoin: round; }
+  .icon svg .fill { fill: currentColor; stroke-width: 1.5; }
+
+  /* ── corner actions ─────────────────────────────────────────────────── */
+  .corner {
+    position: absolute; z-index: 4;
+    width: var(--corner); height: var(--corner);
+    border: 0; border-radius: 0; padding: 0;
+    background: rgba(18,24,30,.62);
+    font-size: 17px; font-weight: 700; letter-spacing: .08em;
+    backdrop-filter: blur(10px);
   }
-  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 14px 14px; }
-  .timeline { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .corner:active { background: rgba(48,60,72,.82); }
+  .corner span { display: block; }
+  .corner.tr { top: 0; right: 0; border-radius: 0 0 0 100%; }
+  .corner.tr span { transform: translate(14px, -12px); }
+  .corner.bl { bottom: 0; left: 0; border-radius: 0 100% 0 0; }
+  .corner.bl svg { width: 44px; height: 44px; transform: translate(-20px, 20px); }
+  .corner.br { bottom: 0; right: 0; border-radius: 100% 0 0 0; }
+  .corner.br span { transform: translate(13px, 13px); }
+  #btnLive[aria-pressed="true"] { background: var(--live); color: #fff; }
+  /* Running: green with a black glyph, the same language every engaged
+     control here speaks. Stopped: grey with a white glyph and an outline, so
+     it reads as the offer it is rather than as a disabled control. */
+  #btnPlay[aria-pressed="true"]  { background: var(--accent); color: #04241c; }
+  #btnPlay[aria-pressed="false"] {
+    background: rgba(120,132,146,.42); color: #fff;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.22);
+  }
+  #btnPlay[aria-pressed="false"]:active { background: rgba(150,162,176,.55); }
+  #btnMark.holding { background: var(--accent); color: #04241c; }
+
+
+
+  /* ── the top-left tools ─────────────────────────────────────────────── */
+  #tools {
+    position: absolute; top: 14px; left: 14px; z-index: 4;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #tools .icon {
+    min-width: 44px; min-height: 44px; padding: 0;
+    background: rgba(12,16,20,.42); border-color: rgba(255,255,255,.07);
+    color: var(--dim);
+  }
+  #tools .icon:hover, #tools .icon:active { color: var(--fg); background: rgba(30,38,47,.7); }
+  #btnMute[aria-pressed="true"] { background: rgba(12,16,20,.42); color: var(--dim); }
+  #btnMute[aria-pressed="true"] #muteWaves { display: none; }
+  #btnMute[aria-pressed="false"] #muteX { display: none; }
+  #btnSettings[aria-pressed="true"] { background: var(--accent); color: #04241c; }
+
+  /* ── zoom, on the right edge ────────────────────────────────────────── */
+  /* Top is the whole window; dragging down zooms in. A slider rather than
+     presets because the span it sets is continuous — see `zoomFromSlider`. */
+  #zoomWrap {
+    position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    z-index: 4; display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  /* A horizontal range rotated a quarter turn. `writing-mode: vertical-*`
+     disagrees between engines about which end is the minimum, and it put ALL
+     at the bottom; a rotation is unambiguous. */
+  #zoomRail { position: relative; width: 44px; height: min(46vh, 300px); }
+  #zoomRail input {
+    position: absolute; top: 50%; left: 50%;
+    width: min(46vh, 300px); height: 44px; margin: 0;
+    transform: translate(-50%, -50%) rotate(90deg);
+    transform-origin: center;
+  }
+  #zoomLabel {
+    font: 11px/1 ui-monospace, Menlo, monospace; font-weight: 700;
+    letter-spacing: .06em; color: var(--fg); text-shadow: 0 1px 3px rgba(0,0,0,.85);
+  }
+  #zoom { -webkit-appearance: none; appearance: none; background: transparent; }
+  #zoom::-webkit-slider-runnable-track { height: 4px; background: rgba(255,255,255,.3); border-radius: 2px; }
+  #zoom::-moz-range-track { height: 4px; background: rgba(255,255,255,.3); border-radius: 2px; }
+  #zoom::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%;
+    background: var(--fg); border: 2px solid rgba(0,0,0,.55); margin-top: -9px;
+  }
+  #zoom::-moz-range-thumb {
+    width: 22px; height: 22px; border-radius: 50%;
+    background: var(--fg); border: 2px solid rgba(0,0,0,.55);
+  }
+
+  /* ── the transport ──────────────────────────────────────────────────── */
+  #hud {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
+    padding: 0 calc(var(--corner) + 10px) 18px;
+    pointer-events: none;
+  }
+  #hud > * { pointer-events: auto; }
+  .timeline { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
   .timeline .track { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; }
-  /* The native slider paints its own filled track, which covered the shading
-     entirely -- the DOM was correct and the screen showed a plain blue bar.
-     So the track is ours and transparent, and #cached behind it *is* the
-     track: dark where a drag would fetch, lit where it is instant. The thumb
-     stays large enough for a thumb. */
   .timeline .track input[type=range] {
     -webkit-appearance: none; appearance: none;
     display: block; width: 100%; height: 46px; margin: 0;
     position: relative; background: transparent; z-index: 2;
   }
-  /* A ruler under the bar. The marks sit at round clock times, so as the view
-     follows the playhead they drift left on their own — the motion is the
-     passage of time itself, not an animation put on top of it. Their spacing
-     is also the readable signal for how far the bar is zoomed. */
+  .timeline .track input[type=range]::-webkit-slider-runnable-track { height: 5px; background: transparent; }
+  .timeline .track input[type=range]::-moz-range-track { height: 5px; background: transparent; }
+  .timeline .track input[type=range]::-moz-range-progress { background: transparent; }
+  .timeline .track input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: var(--thumb); height: var(--thumb);
+    border-radius: 50%; background: var(--fg); border: 2px solid rgba(0,0,0,.55);
+    margin-top: -6.5px;
+  }
+  .timeline .track input[type=range]::-moz-range-thumb {
+    width: var(--thumb); height: var(--thumb); border-radius: 50%;
+    border: 2px solid rgba(0,0,0,.55); background: var(--fg);
+  }
+  .t {
+    font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--fg);
+    min-width: 8.6em; font-weight: 600; text-shadow: 0 1px 3px rgba(0,0,0,.85);
+    font-variant-numeric: tabular-nums;
+  }
+  .t.right { text-align: right; min-width: 5.5em; color: var(--dim); }
+
+  .row { display: flex; align-items: center; gap: 10px; }
+  .grp { display: flex; align-items: center; gap: 8px; }
+  .grp.left { flex: 0 0 auto; }
+  .grp.mid { flex: 1 1 auto; justify-content: center; }
+  .grp.right { flex: 0 0 auto; }
+  .row button { min-width: 56px; min-height: 52px; }
+  .grp.left button { min-width: 62px; }
+
+  .err { color: #ffb4b4; font-size: 12px; margin-top: 8px; min-height: 1.2em;
+         text-shadow: 0 1px 3px rgba(0,0,0,.85); }
+
+  /* ── the bar's layers ───────────────────────────────────────────────── */
+  #cached {
+    position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
+    top: 50%; height: 5px;
+    transform: translateY(-50%); pointer-events: none; border-radius: 3px;
+    background: rgba(255,255,255,.16);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.35);
+  }
+  #cached i { position: absolute; top: 0; bottom: 0; background: var(--accent); border-radius: 3px; }
+
   #ticks {
     position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
     top: 50%; height: 22px;
     margin-top: 3px; pointer-events: none; overflow: hidden; z-index: 1;
   }
-  /* Bright enough to read at arm's length on a tablet. `--line` is a border
-     colour and disappears against the panel — the first build was correct and
-     invisible. */
-  #ticks i { position: absolute; top: 0; width: 1px; height: 5px; background: #4d5a68; }
-  #ticks i.major { height: 10px; width: 1px; background: #8494a4; }
-  /* Marks on the bar. Above the ruler and below the slider, so a flag never
-     swallows a drag. */
+  #ticks i { position: absolute; top: 0; width: 1px; height: 5px; background: rgba(255,255,255,.32); }
+  #ticks i.major { height: 10px; width: 1px; background: rgba(255,255,255,.64); }
+  #ticks b {
+    position: absolute; top: 11px; transform: translateX(-50%);
+    font: 10px/1 ui-monospace, Menlo, monospace; color: var(--dim);
+    white-space: nowrap; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,.9);
+  }
+
   #markbar { position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
              top: 50%; height: 14px;
              margin-top: -17px; pointer-events: none; z-index: 1; }
@@ -96,164 +261,230 @@
     position: absolute; top: 0; width: 2px; height: 14px; margin-left: -1px;
     background: var(--c, var(--live)); border-radius: 1px;
   }
-  #marktip {
-    position: absolute; bottom: 30px; display: none; pointer-events: none;
-    transform: translateX(-50%); z-index: 4; max-width: 22em;
-    background: var(--panel); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 6px;
-    padding: 4px 8px; font-size: 12px; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis;
-    box-shadow: 0 4px 14px rgba(0,0,0,.5);
-  }
-  body[data-marktip="1"] #marktip { display: block; }
-  #marktip b { color: var(--live); font-weight: 700; }
   #markbar i::after {
     content: ""; position: absolute; top: -3px; left: -3px;
     border-left: 4px solid transparent; border-right: 4px solid transparent;
     border-top: 5px solid var(--c, var(--live));
   }
-  #ticks b {
-    position: absolute; top: 10px; transform: translateX(-50%);
-    font: 10px/1 ui-monospace, Menlo, monospace; color: var(--dim);
-    white-space: nowrap; font-weight: 500;
+
+  #marktip {
+    position: absolute; bottom: 34px; display: none; pointer-events: none;
+    transform: translateX(-50%); z-index: 4; max-width: 22em;
+    background: rgba(18,23,29,.95); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 5px 9px; font-size: 12px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+    box-shadow: 0 4px 14px rgba(0,0,0,.6); backdrop-filter: blur(8px);
   }
-  .timeline .track input[type=range]::-webkit-slider-runnable-track { height: 5px; background: transparent; }
-  .timeline .track input[type=range]::-moz-range-track { height: 5px; background: transparent; }
-  .timeline .track input[type=range]::-moz-range-progress { background: transparent; }
-  .timeline .track input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: var(--thumb); height: var(--thumb);
-    border-radius: 50%; background: var(--fg); border: 2px solid var(--panel);
-    margin-top: -6.5px;
-  }
-  .timeline .track input[type=range]::-moz-range-thumb {
-    width: var(--thumb); height: var(--thumb); border-radius: 50%;
-    border: 2px solid var(--panel); background: var(--fg);
-  }
-  .timeline .track input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
-  /* The part of the window that is buffered, drawn behind the slider. It sits
-     under the native track, which is centred, and spans the element's full
-     width -- the thumb's travel is inset by half its own width, so the shading
-     runs up to ~1% wide at each end. This is a "here it is instant" hint, not
-     a measurement. */
-  #cached {
-    position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
-    top: 50%; height: 5px;
-    transform: translateY(-50%); pointer-events: none; border-radius: 3px;
-    background: #000914; border: 1px solid var(--line); border-width: 0;
-    box-shadow: inset 0 0 0 1px var(--line);
-  }
-  #cached i { position: absolute; top: 0; bottom: 0; background: var(--accent); border-radius: 3px; }
-  /* Scrub preview. Hidden until there is a picture *and* a position to put it
-     at, so it never flashes an empty frame. */
+  body[data-marktip="1"] #marktip { display: block; }
+  #marktip b { color: var(--live); font-weight: 700; }
+
   #preview {
-    position: absolute; bottom: 26px; display: none; pointer-events: none;
+    position: absolute; bottom: 34px; display: none; pointer-events: none;
     transform: translateX(-50%); z-index: 3;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 4px; box-shadow: 0 6px 18px rgba(0,0,0,.55);
+    background: rgba(18,23,29,.95); border: 1px solid var(--line); border-radius: 10px;
+    padding: 5px; box-shadow: 0 6px 18px rgba(0,0,0,.6); backdrop-filter: blur(8px);
   }
   body[data-preview="1"] #preview { display: block; }
-  #preview i { display: block; background-color: #000; background-repeat: no-repeat; border-radius: 4px; }
+  #preview i { display: block; background-color: #000; background-repeat: no-repeat; border-radius: 6px; }
   #preview b {
     display: block; text-align: center; font-weight: 600;
     font-family: ui-monospace, Menlo, monospace; font-size: 11px;
-    color: var(--dim); padding-top: 3px;
+    color: var(--dim); padding-top: 4px;
   }
-  .t { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--dim); min-width: 8.5em; }
-  /* The time of day is the one an operator reads off and says out loud. */
-  #tPos { color: var(--fg); font-weight: 600; }
-  .t.right { text-align: right; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  button {
-    background: #1c222a; color: var(--fg); border: 1px solid var(--line);
-    border-radius: 8px; padding: 10px 12px; font-size: 14px; font-weight: 600;
-    min-width: 44px; min-height: 44px; /* touch target */
-    cursor: pointer;
-  }
-  button:active { background: #263039; }
-  button[aria-pressed="true"] { background: var(--accent); color: #05231b; border-color: var(--accent); }
-  button.live[aria-pressed="true"] { background: var(--live); color: #fff; border-color: var(--live); }
-  button:disabled { opacity: .4; cursor: default; }
-  .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
-  .grow { flex: 1; }
-  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
-  .zoomlabel {
-    color: var(--dim); font-size: 11px; font-weight: 700; letter-spacing: .08em;
-    align-self: center; padding-right: 2px;
-  }
-  .err { color: #ffb4b4; font-size: 12px; margin-top: 8px; min-height: 1.2em; }
-  /* The drawer. Off-canvas rather than hidden, so it slides rather than
-     appears — an operator should see where it came from. */
-  #drawer {
-    position: fixed; top: 0; right: 0; bottom: 0; width: min(340px, 86vw);
-    background: var(--panel); border-left: 1px solid var(--line);
-    transform: translateX(100%); transition: transform .18s ease-out;
+
+  /* ── slide-out panels ───────────────────────────────────────────────── */
+  #drawer, #settings {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(360px, 88vw);
+    background: rgba(14,18,23,.96); border-left: 1px solid var(--line);
+    transform: translateX(100%); transition: transform .2s ease-out;
     display: flex; flex-direction: column; z-index: 10;
-    box-shadow: -8px 0 24px rgba(0,0,0,.45);
+    box-shadow: -10px 0 30px rgba(0,0,0,.55); backdrop-filter: blur(14px);
   }
   body[data-drawer="1"] #drawer { transform: translateX(0); }
-  @media (prefers-reduced-motion: reduce) { #drawer { transition: none; } }
-  #drawer header {
+  body[data-settings="1"] #settings { transform: translateX(0); }
+  @media (prefers-reduced-motion: reduce) { #drawer, #settings { transition: none; } }
+  #drawer header, #settings header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 12px; border-bottom: 1px solid var(--line);
+    padding: 12px 14px; border-bottom: 1px solid var(--line);
   }
-  #drawer h2 { margin: 0; font-size: 14px; font-weight: 600; }
-  #drawerClose { min-width: 36px; min-height: 36px; padding: 4px 10px; font-size: 18px; }
+  #drawer h2, #settings h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  #drawerClose, #settingsClose { min-width: 40px; min-height: 40px; padding: 0; font-size: 20px; }
+  #settings .body { padding: 14px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+  #settings .opt { display: flex; align-items: center; gap: 10px; font-size: 14px; padding: 8px 0; }
+  #settings .opt input { width: 20px; height: 20px; accent-color: var(--accent); }
+  #settings .body button { align-self: flex-start; }
+  .note { color: var(--dim); font-size: 12px; margin: 0 0 12px; }
+  #settings .note.bar { border-top: 1px solid var(--line); padding-top: 12px; line-height: 1.6; }
+  #settings .note.bar b { color: var(--accent); }
+  #settings .foot { border-top: 1px solid var(--line); padding: 12px 14px; margin: auto 0 0; line-height: 1.7; }
+
   #markList { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
   #markList li {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 8px 10px; border-bottom: 1px solid var(--line);
+    padding: 9px 12px; border-bottom: 1px solid var(--line);
   }
   #markList li > .palette { flex: 1 0 100%; }
   #markList li.gone { opacity: .45; }
   #markList .at {
     font-family: ui-monospace, Menlo, monospace; font-size: 12px;
     color: var(--accent); cursor: pointer; background: none; border: 0;
-    min-width: 0; padding: 4px 2px; min-height: 32px;
+    min-width: 0; padding: 6px 2px; min-height: 36px; font-weight: 700;
   }
   #markList li.gone .at { color: var(--dim); cursor: default; }
-  #markList input {
-    flex: 1; min-width: 0; background: #1c222a; color: var(--fg);
-    border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px;
+  #markList input[type=text] {
+    flex: 1; min-width: 0; background: rgba(0,0,0,.35); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px;
     font: inherit; font-size: 13px;
   }
   #markList .swatch {
-    min-width: 30px; min-height: 30px; padding: 0; flex: 0 0 auto;
-    border-radius: 7px; border: 1px solid var(--line); background: transparent;
-    display: flex; align-items: center; justify-content: center;
+    min-width: 36px; min-height: 36px; padding: 0; flex: 0 0 auto;
+    border-radius: 9px; border: 1px solid var(--line); background: transparent;
   }
   #markList .swatch i {
-    display: block; width: 15px; height: 15px; border-radius: 50%;
+    display: block; width: 16px; height: 16px; border-radius: 50%;
     background: var(--c, var(--live));
   }
-  #markList .palette {
-    display: none; gap: 6px; padding: 2px 10px 10px 10px; flex-wrap: wrap;
-  }
+  #markList .palette { display: none; gap: 8px; padding: 2px 0 8px; flex-wrap: wrap; }
   #markList li.picking .palette { display: flex; }
   #markList .palette button {
-    min-width: 30px; min-height: 30px; padding: 0; border-radius: 50%;
+    min-width: 34px; min-height: 34px; padding: 0; border-radius: 50%;
     border: 2px solid transparent;
   }
   #markList .palette button[aria-pressed="true"] { border-color: var(--fg); }
   #markList .del {
-    min-width: 34px; min-height: 34px; padding: 2px 8px; font-size: 15px;
+    min-width: 38px; min-height: 38px; padding: 0; font-size: 17px;
     background: transparent; border-color: transparent; color: var(--dim);
   }
-  #markEmpty, #drawer .note { color: var(--dim); font-size: 12px; padding: 12px; margin: 0; }
-  #drawer .note { border-top: 1px solid var(--line); }
+  #markEmpty { color: var(--dim); font-size: 12px; padding: 14px; margin: 0; }
   body[data-marks="0"] #markList { display: none; }
   body[data-marks="1"] #markEmpty { display: none; }
-  @media (max-width: 560px) { .label-long { display: none; } }
+
+  /* ── self-test ──────────────────────────────────────────────────────── */
+  #selftest {
+    display: none; position: absolute; inset: 10px; overflow: auto; z-index: 8;
+    background: rgba(6,9,12,.97); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px;
+  }
+  body[data-selftest="1"] #selftest { display: block; }
+  #selftest h2 { margin: 0 0 6px; font-size: 16px; }
+  #selftest p { margin: 0 0 12px; color: var(--dim); font-size: 13px; max-width: 60ch; }
+  #selftest button { background: var(--accent); color: #04241c; border-color: transparent; }
+  #selftest pre {
+    margin: 14px 0 0; white-space: pre-wrap; word-break: break-word;
+    font: 13px/1.5 ui-monospace, Menlo, monospace; color: var(--fg);
+  }
+
+  @media (max-width: 760px) {
+    :root { --corner: 92px; }
+    .grp.right { display: none; }
+    .t { min-width: 7.2em; font-size: 12px; }
+  }
 </style>
 </head>
 <body data-mode="live" data-live="1" data-picture="main">
-<header>
-  <h1>DVR</h1><span class="id">__STREAM_ID__</span>
-</header>
 
 <div id="stage">
   <video id="main" playsinline muted></video>
   <video id="proxy" playsinline muted></video>
+
+  <!-- The gradient the controls sit on. Purely a legibility surface: the
+       picture underneath is the thing being watched, so it fades to nothing
+       well before the middle of the frame. -->
+  <div id="scrim" aria-hidden="true"></div>
+  <div id="scrimTop" aria-hidden="true"></div>
+
   <div id="badge">live</div>
+  <div id="status">—</div>
+  <pre id="debug"></pre>
+
+  <!-- top left: view controls, least often touched, so smallest and quietest -->
+  <div id="tools">
+    <button id="btnFull" class="icon" aria-pressed="false" title="Full screen (F)" aria-label="Full screen">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    </button>
+    <button id="btnSettings" class="icon" aria-pressed="false" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.1"/><path d="M19.4 14.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.55V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 8.9 19.3a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1.03H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.7 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.03-1.55V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1.03 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.55 1.03H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1.03z"/></svg>
+    </button>
+    <button id="btnMute" class="icon" aria-pressed="true" title="Unmute" aria-label="Unmute">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path id="muteX" d="M16 9.5l5 5M21 9.5l-5 5"/><path id="muteWaves" d="M15.5 9a4.5 4.5 0 0 1 0 6M18 6.8a8 8 0 0 1 0 10.4"/></svg>
+    </button>
+  </div>
+
+  <!-- top right: mark. Tap marks, hold opens the list. -->
+  <button id="btnMark" class="corner tr" title="Mark this moment (M) — hold for the list">
+    <span>MARK</span>
+  </button>
+
+
+  <!-- right edge: how much of the window the bar shows -->
+  <div id="zoomWrap">
+    <span id="zoomLabel">ALL</span>
+    <div id="zoomRail">
+      <input id="zoom" type="range" min="0" max="1000" value="0" step="1"
+             aria-label="Timeline zoom" title="Drag down to zoom in">
+    </div>
+  </div>
+
+  <!-- bottom left: play. bottom right: live. -->
+  <button id="btnPlay" class="corner bl" title="Play at 100% forward" aria-label="Play">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7z" class="fill"/></svg>
+  </button>
+  <button id="btnLive" class="corner br" aria-pressed="true" title="Jump to live">
+    <span>LIVE</span>
+  </button>
+
+  <div id="hud">
+    <div class="timeline">
+      <span class="t" id="tPos" title="Time of day this frame was ingested">--:--:--:--</span>
+      <div class="track">
+        <div id="cached" aria-hidden="true"></div>
+        <div id="ticks" aria-hidden="true"></div>
+        <div id="markbar" aria-hidden="true"></div>
+        <div id="marktip" aria-hidden="true"></div>
+        <div id="preview" aria-hidden="true"><i></i><b></b></div>
+        <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
+      </div>
+      <span class="t right" id="tDur" title="How far behind live">--:--</span>
+    </div>
+
+    <div class="row">
+      <div class="grp left">
+        <button data-rate="0.3333" title="Play at one third speed">33%</button>
+        <button data-rate="0.5" title="Play at half speed">50%</button>
+        <button data-rate="1" aria-pressed="true" title="Play at normal speed">100%</button>
+      </div>
+
+      <div class="grp mid">
+        <button data-jog="-1" class="icon" title="Step back one frame" aria-label="Step back one frame">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 5l-9 7 9 7z" class="fill"/><path d="M6 5v14" /></svg>
+        </button>
+        <button id="btnPause" class="icon" title="Pause" aria-label="Pause">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5v14M15 5v14"/></svg>
+        </button>
+        <button data-jog="1" class="icon" title="Step forward one frame" aria-label="Step forward one frame">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l9 7-9 7z" class="fill"/><path d="M18 5v14"/></svg>
+        </button>
+      </div>
+
+      <div class="grp right">
+        <button id="btnPrevMark" class="icon" title="Previous mark ([)" aria-label="Previous mark">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5l-9 7 9 7z" class="fill"/><path d="M6 5v14"/></svg>
+        </button>
+        <button id="btnNextMark" class="icon" title="Next mark (])" aria-label="Next mark">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5l9 7-9 7z" class="fill"/><path d="M18 5v14"/></svg>
+        </button>
+        <button id="btnRew" class="icon" title="Rewind — press again for 4x, 8x, 16x" aria-label="Rewind">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6l-8 6 8 6z" class="fill"/><path d="M21 6l-8 6 8 6z" class="fill"/></svg>
+        </button>
+        <button id="btnFf" class="icon" title="Fast forward — press again for 4x, 8x, 16x" aria-label="Fast forward">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6l8 6-8 6z" class="fill"/><path d="M3 6l8 6-8 6z" class="fill"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="err" id="err"></div>
+  </div>
+
   <div id="selftest">
     <h2>Player self-test</h2>
     <p id="stExplain">Measures what this device can actually present. Takes about a minute.
@@ -261,78 +492,45 @@
     <button id="stRun" type="button">Run the test</button>
     <pre id="stOut"></pre>
   </div>
-  <div id="status">—</div>
-  <pre id="debug"></pre>
 </div>
+
+<aside id="settings" aria-label="Settings">
+  <header>
+    <h2>Settings</h2>
+    <button id="settingsClose" title="Close" aria-label="Close">&times;</button>
+  </header>
+  <div class="body">
+    <label class="opt">
+      <input type="checkbox" id="optDebug">
+      <span>Show the diagnostic overlay</span>
+    </label>
+    <p class="note">Stream, buffer and decode state, for working out why a
+       picture is not what you expect.</p>
+    <p class="note bar">The <b>lit</b> part of the timeline is held on this
+       device: dragging there moves the real picture, frame for frame. Outside
+       it you get a preview thumbnail while you drag, and the video arrives
+       when you let go. The slider on the right sets how much of the window the
+       bar covers &mdash; a narrower view is a finer drag.</p>
+    <button id="optSelftest" type="button">Run the player self-test</button>
+    <p class="note">Measures what this device can actually present — shuttle
+       rate, scrub preview coverage, token renewal. About a minute.</p>
+  </div>
+  <p class="note foot">Keys: <b>J</b>/<b>L</b> shuttle &middot; <b>K</b> stop &middot;
+     <b>,</b>/<b>.</b> frame step &middot; <b>Space</b> play/pause &middot;
+     <b>End</b> live &middot; <b>F</b> full screen &middot; <b>M</b> mark &middot;
+     <b>[</b>/<b>]</b> previous/next mark</p>
+</aside>
 
 <aside id="drawer" aria-label="Marks">
   <header>
     <h2>Marks</h2>
-    <button id="drawerClose" data-act="close" title="Close">&times;</button>
+    <button id="drawerClose" data-act="close" title="Close" aria-label="Close">&times;</button>
   </header>
   <ol id="markList"></ol>
   <p id="markEmpty">Nothing marked yet. Press <b>MARK</b>, or <b>M</b>, to mark
      the moment you are looking at.</p>
   <p class="note">Kept on this device, for this feed.</p>
 </aside>
-
-<footer>
-  <div class="timeline">
-    <span class="t" id="tPos" title="Time of day this frame was ingested">--:--:--:--</span>
-    <div class="track">
-      <div id="cached" aria-hidden="true"></div>
-      <div id="ticks" aria-hidden="true"></div>
-      <div id="markbar" aria-hidden="true"></div>
-      <div id="marktip" aria-hidden="true"></div>
-      <div id="preview" aria-hidden="true"><i></i><b></b></div>
-      <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
-    </div>
-    <span class="t right" id="tDur" title="How far behind live">--:--</span>
-  </div>
-
-  <div class="row">
-    <button id="btnLive" class="live" aria-pressed="true" title="Jump to live">LIVE</button>
-    <button id="btnPlay" title="Play">&#9654;</button>
-    <button id="btnPause" title="Pause">&#10073;&#10073;</button>
-    <button id="btnMute" aria-pressed="true" title="Unmute">&#128263;</button>
-    <button id="btnFull" aria-pressed="false" title="Full screen (F)">FULL</button>
-    <button id="btnPrevMark" title="Jump to the previous mark ([)">&#9198;</button>
-    <button id="btnMark" title="Mark this moment (M)">MARK</button>
-    <button id="btnNextMark" title="Jump to the next mark (])">&#9197;</button>
-    <button id="btnDrawer" aria-pressed="false" title="Show the marks list">MARKS</button>
-    <div class="sep"></div>
-
-    <button data-jog="-1" title="Step back one frame">&#9664;|</button>
-    <button data-jog="1" title="Step forward one frame">|&#9654;</button>
-    <div class="sep"></div>
-
-    <button id="btnRew" title="Rewind — click again for 4x, 8x, 16x">&#9664;&#9664;</button>
-    <button data-rate="0.3333" title="Play at one third speed">33%</button>
-    <button data-rate="0.5" title="Play at half speed">50%</button>
-    <button data-rate="1" aria-pressed="true" title="Play at normal speed">100%</button>
-    <button id="btnFf" title="Fast forward — click again for 4x, 8x, 16x">&#9654;&#9654;</button>
-    <div class="sep"></div>
-
-    <span class="zoomlabel">VIEW</span>
-    <button data-zoom="0" aria-pressed="true" title="Show the whole window">ALL</button>
-    <button data-zoom="1800" title="Show 30 minutes across the bar">30m</button>
-    <button data-zoom="600" title="Show 10 minutes across the bar">10m</button>
-    <button data-zoom="120" title="Show 2 minutes across the bar">2m</button>
-    <button data-zoom="30" title="Show 30 seconds across the bar — about one frame per step">30s</button>
-  </div>
-  <div class="hint">
-    Keys: <b>J</b>/<b>L</b> rewind/forward (press again to speed up) &middot;
-    <b>K</b> stop &middot; <b>,</b>/<b>.</b> frame step &middot;
-    <b>Space</b> play/pause &middot; <b>End</b> live &middot; <b>F</b> full screen &middot;
-    <b>M</b> mark &middot; <b>[</b>/<b>]</b> previous/next mark<br>
-    The <b style="color:var(--accent)">lit</b> part of the bar is held on this
-    device: dragging there moves the real picture, frame for frame. Outside it you
-    get a preview thumbnail while you drag, and the video arrives when you let go.<br>
-    <b>VIEW</b> sets how much of the window the bar covers &mdash; a narrower view
-    is a finer drag. It follows the playhead, and holds still while you scrub.
-  </div>
-  <div class="err" id="err"></div>
-</footer>
 
 <script src="/dvr/hls.js"></script>
 <script>
@@ -429,7 +627,9 @@
   var btnMark = document.getElementById("btnMark");
   var btnPrevMark = document.getElementById("btnPrevMark");
   var btnNextMark = document.getElementById("btnNextMark");
-  var btnDrawer = document.getElementById("btnDrawer");
+  var btnSettings = document.getElementById("btnSettings");
+  var zoomInput = document.getElementById("zoom");
+  var zoomLabel = document.getElementById("zoomLabel");
   var btnRew = document.getElementById("btnRew");
   var btnFf = document.getElementById("btnFf");
 
@@ -1059,17 +1259,41 @@
     main.play().catch(function () {});
     syncRateButtons();
   }
-  function syncZoomButtons() {
-    document.querySelectorAll("[data-zoom]").forEach(function (b) {
-      b.setAttribute("aria-pressed", parseInt(b.dataset.zoom, 10) === zoomSecs ? "true" : "false");
-    });
+  /// The span the slider position asks for, in seconds.
+  ///
+  /// Top of the slider is the whole window; dragging down zooms in. The scale
+  /// is geometric, not linear — a linear one spends most of its travel between
+  /// "an hour" and "half an hour", which are the same picture, and crams
+  /// everything an operator actually hunts at into the last few millimetres.
+  ///
+  /// `0` is returned for the top position and means "the whole window,
+  /// whatever it becomes", so the view keeps up as the window grows rather
+  /// than freezing at whatever it was when the slider was let go.
+  var ZOOM_MIN_SECS = 15;
+
+  function zoomFromSlider(pos, whole) {
+    if (pos <= 0) return 0;
+    var span = Math.max(ZOOM_MIN_SECS, Math.min(whole, 3600));
+    var frac = pos / 1000;
+    return Math.max(ZOOM_MIN_SECS, span * Math.pow(ZOOM_MIN_SECS / span, frac));
   }
 
-  function setZoom(secs) {
-    zoomSecs = secs;
-    // Not while a drag is in flight, so the bar cannot move under the thumb.
+  /// A span as something to read at a glance, not a duration to the second.
+  function zoomText(secs, whole) {
+    if (!secs || secs >= whole) return "ALL";
+    if (secs >= 3600) return Math.round(secs / 3600) + "h";
+    if (secs >= 60) return Math.round(secs / 60) + "m";
+    return Math.round(secs) + "s";
+  }
+
+  function applyZoom() {
+    var full = range(main);
+    var whole = full ? full.end - full.start : 0;
+    zoomSecs = zoomFromSlider(parseInt(zoomInput.value, 10), whole || 3600);
+    // Never leave the view pinned where the slider was last released: the
+    // window is still growing.
     viewAnchor = null;
-    syncZoomButtons();
+    zoomLabel.textContent = zoomText(zoomSecs, whole || Infinity);
     render();
   }
 
@@ -1344,11 +1568,12 @@
     sortMarks();
     saveMarks();
     renderMarks();
-    openDrawer();
-    // Focus the new row's name field: naming is the point, and a prompt is a
-    // poor thing to hand someone holding a tablet.
-    var input = markList.querySelector('input[data-id="' + m.id + '"]');
-    if (input) { input.focus(); input.select(); }
+    // Marking does NOT open the list. A tap on MARK is "that, there" — often
+    // while something is still happening on screen — and throwing a drawer
+    // over a third of the picture to ask for a name is the wrong moment. The
+    // flag appearing on the bar is the acknowledgement; holding MARK opens the
+    // list to name it.
+    lastMarkId = m.id;
   }
 
   function deleteMark(id) {
@@ -1616,13 +1841,23 @@
     }
   }
 
+  /// The most recent mark, so opening the list can offer it for naming.
+  var lastMarkId = null;
+
   function openDrawer() {
     document.body.dataset.drawer = "1";
-    btnDrawer.setAttribute("aria-pressed", "true");
+    // Opened straight after marking, put the cursor in the new row: that is
+    // the one thing the operator came here to do.
+    if (lastMarkId !== null) {
+      var input = markList.querySelector('input[data-id="' + lastMarkId + '"]');
+      if (input) { input.focus(); input.select(); }
+      lastMarkId = null;
+    }
+    btnMark.setAttribute("aria-pressed", "true");
   }
   function closeDrawer() {
     document.body.dataset.drawer = "0";
-    btnDrawer.setAttribute("aria-pressed", "false");
+    btnMark.setAttribute("aria-pressed", "false");
   }
   function toggleDrawer() {
     if (document.body.dataset.drawer === "1") closeDrawer(); else openDrawer();
@@ -2172,10 +2407,71 @@
     btnFull.remove();
   }
 
-  btnMark.addEventListener("click", addMark);
+  // ── mark: tap to mark, hold for the list ──────────────────────────────
+  // One corner, two jobs. The hold is the *discoverable* one — an operator
+  // presses MARK expecting to mark, and finding the list is something they do
+  // deliberately — so the tap must never be swallowed by an accidental hold,
+  // and the hold must give feedback before it fires or it feels like nothing
+  // happened.
+  var MARK_HOLD_MS = 450;
+  var markHoldTimer = null, markHeld = false;
+
+  function endMarkHold() {
+    if (markHoldTimer !== null) { clearTimeout(markHoldTimer); markHoldTimer = null; }
+    btnMark.classList.remove("holding");
+  }
+
+  btnMark.addEventListener("pointerdown", function () {
+    markHeld = false;
+    endMarkHold();
+    btnMark.classList.add("holding");
+    markHoldTimer = setTimeout(function () {
+      markHoldTimer = null;
+      markHeld = true;      // the tap is now spent
+      btnMark.classList.remove("holding");
+      openDrawer();
+    }, MARK_HOLD_MS);
+  });
+  btnMark.addEventListener("pointerup", function () {
+    var wasHeld = markHeld;
+    endMarkHold();
+    if (!wasHeld) addMark();
+  });
+  // A press that wanders off the button, or is taken over by a scroll, is not
+  // a tap and must not mark.
+  btnMark.addEventListener("pointercancel", function () { markHeld = true; endMarkHold(); });
+  btnMark.addEventListener("pointerleave", function () {
+    if (markHoldTimer !== null) { markHeld = true; endMarkHold(); }
+  });
+  // Keyboard activation fires `click` without pointer events.
+  btnMark.addEventListener("click", function (e) {
+    if (e.detail === 0) addMark();
+  });
+
+  // ── settings ──────────────────────────────────────────────────────────
+  function openSettings() {
+    document.body.dataset.settings = "1";
+    btnSettings.setAttribute("aria-pressed", "true");
+  }
+  function closeSettings() {
+    document.body.dataset.settings = "0";
+    btnSettings.setAttribute("aria-pressed", "false");
+  }
+  btnSettings.addEventListener("click", function () {
+    if (document.body.dataset.settings === "1") closeSettings(); else openSettings();
+  });
+  document.getElementById("settingsClose").addEventListener("click", closeSettings);
+  document.getElementById("optDebug").addEventListener("change", function (e) {
+    dbg = e.target.checked ? document.getElementById("debug") : null;
+    document.body.dataset.debug = e.target.checked ? "1" : "0";
+  });
+  document.getElementById("optSelftest").addEventListener("click", function () {
+    closeSettings();
+    document.body.dataset.selftest = "1";
+  });
   btnPrevMark.addEventListener("click", function () { skipToMark(-1); });
   btnNextMark.addEventListener("click", function () { skipToMark(1); });
-  btnDrawer.addEventListener("click", toggleDrawer);
+
   document.getElementById("drawerClose").addEventListener("click", closeDrawer);
 
   btnPlay.addEventListener("click", function () {
@@ -2214,9 +2510,7 @@
   document.querySelectorAll("[data-rate]").forEach(function (b) {
     b.addEventListener("click", function () { setRate(parseFloat(b.dataset.rate)); });
   });
-  document.querySelectorAll("[data-zoom]").forEach(function (b) {
-    b.addEventListener("click", function () { setZoom(parseInt(b.dataset.zoom, 10)); });
-  });
+  zoomInput.addEventListener("input", applyZoom);
   btnRew.addEventListener("click", function () { cycleShuttle(-1); });
   btnFf.addEventListener("click", function () { cycleShuttle(1); });
 

@@ -1210,6 +1210,77 @@ mod tests {
         );
     }
 
+    /// MARK is one corner with two jobs, and the tap must survive the hold.
+    ///
+    /// An operator presses MARK expecting to mark; finding the list is
+    /// something they do deliberately. So a press that becomes a hold must
+    /// spend the tap rather than doing both, a press that wanders off the
+    /// button must do neither, and the hold has to show something before it
+    /// fires or it reads as nothing having happened.
+    #[test]
+    fn mark_taps_and_holds_are_told_apart() {
+        let html = include_str!("dvr.html");
+        assert!(html.contains("MARK_HOLD_MS"), "no hold threshold");
+        // A tap marks and nothing else. Throwing the drawer over a third of
+        // the picture to ask for a name is the wrong moment — the operator is
+        // usually still watching the thing they just marked.
+        let add = js_fn(html, "addMark");
+        assert!(
+            !add.contains("openDrawer()"),
+            "marking still opens the list, so a tap covers the picture: {add}"
+        );
+        assert!(
+            js_fn(html, "openDrawer").contains("lastMarkId"),
+            "opening the list after a mark does not offer it for naming"
+        );
+        assert!(
+            html.contains("markHeld = true;      // the tap is now spent"),
+            "a hold would also mark when the finger lifts"
+        );
+        assert!(
+            html.contains(r#"btnMark.classList.add("holding")"#),
+            "the hold gives no feedback before it fires"
+        );
+        // Leaving or cancelling must not mark.
+        assert!(
+            html.contains(r#"btnMark.addEventListener("pointercancel""#)
+                && html.contains(r#"btnMark.addEventListener("pointerleave""#),
+            "a press dragged off the button still marks"
+        );
+        // Keyboard activation has no pointer events at all.
+        assert!(
+            html.contains("if (e.detail === 0) addMark();"),
+            "MARK cannot be operated from the keyboard"
+        );
+    }
+
+    /// The zoom slider is geometric, and its top means "the whole window".
+    ///
+    /// A linear scale spends most of its travel between an hour and half an
+    /// hour — the same picture — and crams everything an operator hunts at
+    /// into the last few millimetres. And the top position must mean "whatever
+    /// the window becomes", not the number it happened to be when released, or
+    /// the view stops keeping up as the window grows.
+    #[test]
+    fn the_zoom_slider_is_geometric_and_its_top_is_the_whole_window() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "zoomFromSlider");
+        assert!(
+            f.contains("if (pos <= 0) return 0;"),
+            "the top of the slider pins a number instead of tracking the window: {f}"
+        );
+        assert!(
+            f.contains("Math.pow(ZOOM_MIN_SECS / span, frac)"),
+            "the scale is not geometric: {f}"
+        );
+        assert!(
+            js_fn(html, "applyZoom").contains("viewAnchor = null;"),
+            "changing zoom leaves the view pinned where it was"
+        );
+        // The old preset buttons are gone, not merely hidden.
+        assert!(!html.contains("data-zoom="), "the VIEW preset buttons are still present");
+    }
+
     /// The bar spans the view; live is still measured against the whole window.
     ///
     /// Zooming trades reach for granularity — at 30 s across a 1000-step bar a
@@ -1567,6 +1638,13 @@ mod tests {
         assert!(
             html.contains("preview thumbnail while you drag"),
             "nothing tells the operator a preview exists outside the lit part"
+        );
+        // It moved into Settings when the picture went full-bleed. Wherever it
+        // lives, it has to be reachable: an explanation of the green bar that
+        // nothing links to is an explanation nobody reads.
+        assert!(
+            html.contains(r#"id="btnSettings""#) && html.contains(r#"class="note bar""#),
+            "the explanation of the bar has no home in the UI"
         );
     }
 
