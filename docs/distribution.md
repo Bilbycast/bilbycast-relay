@@ -444,32 +444,51 @@ not exist yet. Note the viewing token deliberately uses `sessionStorage`
 instead: a credential has no business outliving its tab, and a test asserts the
 two do not get confused.
 
-### Low-resolution mode
+### Picture modes
 
-For a link that cannot carry the main rendition. It plays the proxy **in place
-of** main rather than alongside it, so it saves the bandwidth *and* a decoder:
-the proxy is already all-intra, so shuttle and scrub run on the one element and
-nothing needs a second. Everything downstream — the clock, the ruler, marks, the
-preview — is expressed against whatever `main` is loading, so this is a URL swap
-rather than a second code path.
+Three points on the curve, chosen in Settings. They are genuinely different
+things rather than three sizes of the same one:
 
-Measured over 30 s of playback on the live feed:
-
-| mode | fetched | rate | picture |
+| mode | moving | stopped | continuous rate |
 |---|---|---|---|
-| normal | 34.9 MB | 9.3 Mbit/s | 1920x1080 |
-| low-res | 11.5 MB | 3.1 Mbit/s | 640x360 |
+| **Full** (default) | 1080p | 1080p | ~9.3 Mbit/s |
+| **Balanced** | 640x360 | **1080p** | ~3.1 Mbit/s + ~2 MB a still |
+| **Low** | 640x360 | 640x360 | ~3.1 Mbit/s |
 
-**Three times, and no more — do not sell it as the answer to a bad link.** The
-proxy is all-intra by design, which is deliberately inefficient: every frame is
-a keyframe. A purpose-made low-bitrate long-GOP rendition of the same 640x360
-picture would be nearer 600-800 kbit/s, so ten times rather than three. This is
-the tool that already exists, not the right one.
+Measured on the live feed over 30 s: 34.9 MB against 11.5 MB, a **3x** saving,
+with the second video element left with no source at all in the reduced modes —
+so it is one decoder instead of two, which is the other thing a struggling
+device has none of to spare. Shuttle and scrub work in all three, because the
+low-resolution rendition is all-intra.
 
-It takes effect on reload rather than swapping under a running player: changing
-the stream mid-session means tearing down hls.js, re-seeking and re-deriving the
-clock, all of which a reload does correctly while keeping the token
-(`sessionStorage`) and the marks (`localStorage`).
+**Balanced is the interesting one.** Resolution matters most when someone has
+stopped to look at something, and that is exactly when a fetch is affordable:
+one segment when you stop instead of a megabyte a second forever.
+
+**Full stays the default.** A quieter default would silently soften the picture
+for viewers who never asked; the ladder exists for links that need it.
+
+**Three is not ten.** The proxy is all-intra by design — every frame a keyframe
+— which is deliberately inefficient. A purpose-made low-bitrate long-GOP
+rendition of the same 640x360 picture would be nearer 600-800 kbit/s. This is
+the tool that already exists, not the right one, and if poor links become a real
+requirement the answer is a third rendition.
+
+**The still never blanks the picture.** On the links Balanced is for, that fetch
+takes seconds, so the low-resolution frame stays up and is replaced only once
+the full one has decoded *and* landed within half a second of the position asked
+for. It also settles for 220 ms first, or frame-stepping would fetch a 2 MB
+segment per step.
+
+**A reduced picture says so** — a badge beside LIVE reading `LOW` while moving
+and `HD` once the full-resolution still is up, and `data-quality` on the body
+for support. A softened picture with nothing to explain it becomes a support
+call, and "degraded but invisible" is a failure this player has produced more
+than once.
+
+Switching takes effect on reload: changing the stream mid-session means tearing
+down hls.js, re-seeking and re-deriving the clock, which a reload does correctly
+while keeping the token and the marks.
 
 ### The two readouts
 

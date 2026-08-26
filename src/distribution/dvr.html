@@ -71,6 +71,17 @@
     background: rgba(20,26,32,.8); color: var(--dim); backdrop-filter: blur(6px);
   }
   body[data-live="1"] #badge { background: var(--live); color: #fff; }
+  /* Says what the picture actually is. A softened picture with nothing to
+     explain it becomes a support call — and "degraded but invisible" is the
+     failure shape this player has produced more than once. */
+  #qbadge {
+    display: none; position: absolute; top: 14px; left: calc(50% + 44px); z-index: 3;
+    padding: 4px 9px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; letter-spacing: .09em;
+    background: rgba(20,26,32,.8); color: var(--dim); backdrop-filter: blur(6px);
+  }
+  body[data-q="1"] #qbadge { display: block; }
+  #qbadge.hd { background: var(--accent); color: #04241c; }
   #status {
     display: none; position: absolute; left: 68px; top: 16px; z-index: 6;
     font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--dim);
@@ -312,7 +323,13 @@
   #drawerClose, #settingsClose { min-width: 40px; min-height: 40px; padding: 0; font-size: 20px; }
   #settings .body { padding: 14px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
   #settings .opt { display: flex; align-items: center; gap: 10px; font-size: 14px; padding: 8px 0; }
-  #settings .opt input { width: 20px; height: 20px; accent-color: var(--accent); }
+  #settings .opt input { width: 20px; height: 20px; accent-color: var(--accent); flex: 0 0 auto; }
+  #settings .quality { border: 0; margin: 0; padding: 0; }
+  #settings .quality legend { padding: 0 0 4px; font-size: 12px; color: var(--dim);
+                              letter-spacing: .06em; text-transform: uppercase; }
+  #settings .quality .opt { align-items: flex-start; }
+  #settings .quality .opt span { line-height: 1.4; }
+  #settings .quality b { color: var(--fg); }
   #settings .body button { align-self: flex-start; }
   .note { color: var(--dim); font-size: 12px; margin: 0 0 12px; }
   #settings .note.bar { border-top: 1px solid var(--line); padding-top: 12px; line-height: 1.6; }
@@ -395,6 +412,7 @@
   <div id="scrimTop" aria-hidden="true"></div>
 
   <div id="badge">live</div>
+  <div id="qbadge" aria-hidden="true"></div>
   <div id="status">—</div>
   <pre id="debug"></pre>
 
@@ -511,14 +529,17 @@
        it you get a preview thumbnail while you drag, and the video arrives
        when you let go. The slider on the right sets how much of the window the
        bar covers &mdash; a narrower view is a finer drag.</p>
-    <label class="opt">
-      <input type="checkbox" id="optLowRes">
-      <span>Low-resolution mode</span>
-    </label>
-    <p class="note">Plays the low-resolution rendition instead of the main one,
-       for a connection that cannot carry it — about a third of the bandwidth,
-       and one decoder instead of two. Shuttle and scrub still work, because
-       that rendition is all-intra. Takes effect on reload.</p>
+    <fieldset class="quality">
+      <legend>Picture</legend>
+      <label class="opt"><input type="radio" name="q" value="full"><span><b>Full</b> — 1080p throughout</span></label>
+      <label class="opt"><input type="radio" name="q" value="balanced"><span><b>Balanced</b> — low-resolution while moving, full resolution when stopped</span></label>
+      <label class="opt"><input type="radio" name="q" value="low"><span><b>Low</b> — low-resolution throughout</span></label>
+    </fieldset>
+    <p class="note">Measured on this feed: Full is about 9.3 Mbit/s, the other
+       two about 3.1. Balanced fetches roughly 2 MB once each time you stop, so
+       the frame you are looking at is sharp without paying for sharpness while
+       it moves. Shuttle and scrub work in all three, because the
+       low-resolution rendition is all-intra. Takes effect on reload.</p>
     <button id="optSelftest" type="button">Run the player self-test</button>
     <p class="note">Measures what this device can actually present — shuttle
        rate, scrub preview coverage, token renewal. About a minute.</p>
@@ -570,9 +591,37 @@
   // purpose-made low-bitrate long-GOP rendition of the same picture would be
   // nearer 10x. All-intra is deliberately inefficient; this is the tool that
   // already exists, not the right one.
+  // Three points on the curve, not three sizes of the same thing:
+  //
+  //   full      1080p moving, 1080p stopped        ~9.3 Mbit/s
+  //   balanced  360p moving, **1080p stopped**     ~3.1 Mbit/s + ~2 MB a still
+  //   low       360p moving, 360p stopped          ~3.1 Mbit/s
+  //
+  // `balanced` is the interesting one, and the economics are why: resolution
+  // matters most when the operator has stopped to look at something, and that
+  // is exactly when a fetch is affordable. You pay for one segment when you
+  // stop instead of a megabyte a second forever.
+  //
+  // The default is `full` — the behaviour every existing viewer already has.
+  // A quieter default would silently soften the picture for people who never
+  // asked, and the ladder exists for links that need it, not for everyone.
+  var QUALITY_KEY = "bilbycast.dvr.quality." + STREAM;
   var LOWRES_KEY = "bilbycast.dvr.lowres." + STREAM;
-  var lowRes = false;
-  try { lowRes = window.localStorage.getItem(LOWRES_KEY) === "1"; } catch (e) { lowRes = false; }
+  var quality = "full";
+  try {
+    var q = window.localStorage.getItem(QUALITY_KEY);
+    if (q === "full" || q === "balanced" || q === "low") quality = q;
+    // Carry over the boolean this replaced, so anyone who set it keeps it.
+    else if (window.localStorage.getItem(LOWRES_KEY) === "1") quality = "low";
+  } catch (e) { quality = "full"; }
+
+  /// The moving picture comes from the proxy in everything but `full`.
+  var lowRes = quality !== "full";
+  /// Stopped, `balanced` fetches the frame at full resolution.
+  var wantHiresStills = quality === "balanced";
+  /// The stream the full-resolution still comes from. In `full` mode `main`
+  /// is already it and nothing else is needed.
+  var HIRES = MAIN;
   if (lowRes) MAIN = PROXY;
   // ONE token for both renditions.
   //
@@ -641,6 +690,7 @@
   var markbar = document.getElementById("markbar");
   var markList = document.getElementById("markList");
   var marktip = document.getElementById("marktip");
+  var qbadge = document.getElementById("qbadge");
   var preview = document.getElementById("preview");
   var previewImg = preview.querySelector("i");
   var previewLabel = preview.querySelector("b");
@@ -993,7 +1043,10 @@
   }
   function onProxy() { return activeVideo() === proxy; }
   /// Make the stylesheet agree with `activeVideo`.
-  function syncPicture() { document.body.dataset.picture = onProxy() ? "proxy" : "main"; }
+  function syncPicture() {
+    document.body.dataset.picture = (stillShowing || onProxy()) ? "proxy" : "main";
+    syncQualityBadge();
+  }
 
   /// Index of the frame containing `t`.
   function frameIndexAt(t) { return Math.floor(t * FPS + 1e-6); }
@@ -1891,6 +1944,22 @@
     document.body.dataset.drawer = "0";
     btnMark.setAttribute("aria-pressed", "false");
   }
+  /// Keep the picture badge honest about what is on screen.
+  function syncQualityBadge() {
+    // Also published as state: which mode a viewer is in is the first
+    // question to ask when they say the picture looks wrong, and a closure
+    // variable cannot be asked.
+    document.body.dataset.quality = quality;
+    if (quality === "full") { document.body.dataset.q = "0"; return; }
+    document.body.dataset.q = "1";
+    var hd = stillShowing;
+    qbadge.textContent = hd ? "HD" : "LOW";
+    qbadge.title = hd
+      ? "Stopped, so this frame is at full resolution"
+      : "Moving picture is the low-resolution rendition";
+    qbadge.className = hd ? "hd" : "";
+  }
+
   function toggleDrawer() {
     if (document.body.dataset.drawer === "1") closeDrawer(); else openDrawer();
   }
@@ -2419,6 +2488,7 @@
       }
       renderCached(view);
       refreshMarkStates();
+      updateStill();
       updateLiveState(r.end - pos);
       var atLive = liveState;
       document.body.dataset.live = atLive ? "1" : "0";
@@ -2589,16 +2659,20 @@
     dbg = e.target.checked ? document.getElementById("debug") : null;
     document.body.dataset.debug = e.target.checked ? "1" : "0";
   });
-  var optLowRes = document.getElementById("optLowRes");
-  optLowRes.checked = lowRes;
-  optLowRes.addEventListener("change", function (e) {
-    try { window.localStorage.setItem(LOWRES_KEY, e.target.checked ? "1" : "0"); }
-    catch (err) { /* nothing to do: the setting simply will not stick */ }
+  document.querySelectorAll('input[name="q"]').forEach(function (r) {
+    r.checked = (r.value === quality);
+    r.addEventListener("change", function () {
+      if (!r.checked) return;
+      try {
+        window.localStorage.setItem(QUALITY_KEY, r.value);
+        window.localStorage.removeItem(LOWRES_KEY);   // the boolean it replaced
+      } catch (err) { /* nothing to do: the setting simply will not stick */ }
     // Reload rather than re-attach. Swapping the stream under a running
     // player means tearing down hls.js, re-seeking and re-deriving the clock
     // mid-session; a reload does all of that correctly and keeps the token
     // (sessionStorage) and the marks (localStorage).
-    location.reload();
+      location.reload();
+    });
   });
   document.getElementById("optSelftest").addEventListener("click", function () {
     closeSettings();
@@ -2997,6 +3071,7 @@
     document.getElementById("stRun").addEventListener("click", stRunAll);
   }
   scheduleRenewal();
+  syncQualityBadge();   // setMode returns early at startup, so seed it here
   loadMarks();
   renderMarks();
   mainHls = attach(main, MAIN, "main");
@@ -3004,6 +3079,90 @@
   // decoders, and Chrome's hardware decoder budget is small and shared —
   // exhausting it makes the *visible* element play with no picture, which
   // looks exactly like a black stream. Attach on first jog/shuttle instead.
+  // ── the full-resolution still ──────────────────────────────────────────
+  // In `balanced`, the moving picture is the proxy and the *stopped* picture
+  // is the main rendition, fetched on demand into the spare element.
+  //
+  // The rule that matters: **never blank.** On the links this mode is for that
+  // fetch takes seconds, so the low-resolution frame stays on screen the whole
+  // time and is replaced only once the full one has actually decoded. A
+  // spinner where a picture used to be would be a worse answer than the soft
+  // picture it replaced.
+  var STILL_SETTLE_MS = 220;
+  var stillAttached = false, stillShowing = false, stillTimer = null, stillWantAt = null;
+  /// The position a pending settle timer is already waiting on.
+  var stillPendingAt = null;
+
+  /// Is a still called for right now? Stopped, not scrubbing, not shuttling.
+  function stillWanted() {
+    return wantHiresStills && !scrubbing && mode !== "shuttle" && main.paused;
+  }
+
+  function ensureStill() {
+    if (stillAttached) return;
+    stillAttached = true;
+    proxyHls = attach(proxy, HIRES, "still");
+    proxy.addEventListener("loadedmetadata", function () {
+      var n = 0;
+      var t = setInterval(function () {
+        measureTimelineOffset();
+        if (++n >= OFFSET_SAMPLES) clearInterval(t);
+      }, 60);
+    }, { once: true });
+  }
+
+  function hideStill() {
+    if (stillTimer !== null) { clearTimeout(stillTimer); stillTimer = null; }
+    stillWantAt = null; stillPendingAt = null;
+    if (!stillShowing) return;
+    stillShowing = false;
+    syncPicture();
+  }
+
+  /// Show the still, but only once it holds the frame that was asked for.
+  function stillReady() {
+    if (stillWantAt === null || !stillWanted()) return;
+    if (proxy.readyState < 2 || proxy.seeking) return;
+    // Within half a second of the position asked for: a seek that landed
+    // somewhere else entirely is not this frame.
+    var at = toMainTime(proxy.currentTime, proxy);
+    if (Math.abs(at - stillWantAt) > 0.5) return;
+    if (stillShowing) return;
+    stillShowing = true;
+    syncPicture();
+  }
+
+  proxy.addEventListener("seeked", stillReady);
+  proxy.addEventListener("loadeddata", stillReady);
+
+  /// Called whenever the transport settles or moves.
+  function updateStill() {
+    if (!stillWanted()) { hideStill(); return; }
+    var t = toMainTime(playhead(main), main);
+    if (!isFinite(t)) return;
+    // Already showing this frame: nothing to do.
+    if (stillShowing && stillWantAt !== null && Math.abs(t - stillWantAt) < 0.05) return;
+    // A timer already waiting on this same frame must be left alone.
+    // `render` calls this every 200 ms and the settle is 220, so restarting
+    // the timer on every tick meant it never fired at all — the still was
+    // never even requested, which is exactly what the rig showed.
+    if (stillTimer !== null && stillPendingAt !== null &&
+        Math.abs(t - stillPendingAt) < 0.05) return;
+    if (stillTimer !== null) clearTimeout(stillTimer);
+    stillPendingAt = t;
+    // Settle first. Frame-stepping fires this on every step, and fetching a
+    // 2 MB segment per step would make stepping worse, not better.
+    stillTimer = setTimeout(function () {
+      stillTimer = null;
+      if (!stillWanted()) return;
+      ensureStill();
+      stillWantAt = toMainTime(playhead(main), main);
+      if (!offsetSamples.length) { measureTimelineOffset(); }
+      seekWhenReady(proxy, stillWantAt);
+      stillReady();
+    }, STILL_SETTLE_MS);
+  }
+
   function ensureProxy() {
     // In low-res mode `main` is already the all-intra rendition, so a second
     // element would fetch the same stream twice and hold a second decoder for

@@ -1166,6 +1166,98 @@ mod tests {
         );
     }
 
+    /// The picture ladder is three distinct points, not three sizes.
+    ///
+    /// `balanced` is the one worth having: the moving picture comes from the
+    /// proxy and the *stopped* picture from the main rendition, fetched on
+    /// demand. Resolution matters most when someone has stopped to look, and
+    /// that is exactly when a fetch is affordable — one segment when you stop
+    /// instead of a megabyte a second forever.
+    ///
+    /// The default stays `full`. A quieter default would silently soften the
+    /// picture for viewers who never asked; the ladder exists for links that
+    /// need it.
+    #[test]
+    fn the_picture_ladder_has_three_distinct_modes() {
+        let html = include_str!("dvr.html");
+        assert!(html.contains(r#"var quality = "full";"#), "the default is no longer full");
+        assert!(
+            html.contains(r#"var lowRes = quality !== "full";"#),
+            "balanced does not take its moving picture from the proxy"
+        );
+        assert!(
+            html.contains(r#"var wantHiresStills = quality === "balanced";"#),
+            "balanced does not fetch a full-resolution still"
+        );
+        // The boolean this replaced must still be honoured for anyone who set it.
+        assert!(
+            html.contains(r#"window.localStorage.getItem(LOWRES_KEY) === "1"#),
+            "an existing low-res preference is dropped on upgrade"
+        );
+    }
+
+    /// The still never blanks the picture to fetch a better one.
+    ///
+    /// On the links `balanced` is for, that fetch takes seconds. Swapping the
+    /// element before it holds the frame would replace a soft picture with no
+    /// picture, which is a worse answer than the one it replaced.
+    #[test]
+    fn a_full_resolution_still_never_blanks_the_picture() {
+        let html = include_str!("dvr.html");
+        let ready = js_fn(html, "stillReady");
+        assert!(
+            ready.contains("proxy.readyState < 2 || proxy.seeking"),
+            "the still is shown before it has decoded anything: {ready}"
+        );
+        assert!(
+            ready.contains("Math.abs(at - stillWantAt) > 0.5"),
+            "a seek that landed elsewhere would be shown as this frame: {ready}"
+        );
+        // And it settles first: frame-stepping must not fetch a segment a step.
+        let upd = js_fn(html, "updateStill");
+        assert!(
+            upd.contains("STILL_SETTLE_MS"),
+            "every frame step would fetch a full-resolution segment"
+        );
+        // A settle timer that is restarted faster than it can expire never
+        // fires. `render` calls this at 5 Hz and the settle is 220 ms, so
+        // clearing unconditionally meant the still was never once requested —
+        // which is what the rig showed, with no error anywhere.
+        assert!(
+            upd.contains("Math.abs(t - stillPendingAt) < 0.05) return;"),
+            "the settle timer is restarted on every tick and can never fire: {upd}"
+        );
+        // Moving again drops it.
+        assert!(
+            js_fn(html, "stillWanted").contains("!scrubbing && mode !== \"shuttle\" && main.paused"),
+            "the still would persist over a moving picture"
+        );
+    }
+
+    /// A softened picture says so.
+    ///
+    /// This player has produced "degraded but invisible" more than once — a
+    /// preview box that painted black, buttons that did nothing, a ruler that
+    /// stood still. A quieter picture with nothing to explain it is the same
+    /// shape, and becomes a support call.
+    #[test]
+    fn a_reduced_picture_is_labelled() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "syncQualityBadge");
+        assert!(
+            f.contains(r#"if (quality === "full")"#),
+            "the badge shows even when nothing is reduced: {f}"
+        );
+        assert!(
+            f.contains(r#"hd ? "HD" : "LOW""#),
+            "the badge does not distinguish a full-resolution still: {f}"
+        );
+        assert!(
+            js_fn(html, "syncPicture").contains("syncQualityBadge()"),
+            "the badge is not refreshed when the picture changes"
+        );
+    }
+
     /// Low-res mode replaces the main rendition rather than adding to it.
     ///
     /// The point is a link that cannot carry the main stream, so attaching
@@ -2044,7 +2136,7 @@ mod tests {
         // a new preference is welcome and a new secret is not. Comments are
         // skipped — this section explains itself in prose, and prose stores
         // nothing.
-        const NON_SECRET_KEYS: [&str; 2] = ["MARKS_KEY", "LOWRES_KEY"];
+        const NON_SECRET_KEYS: [&str; 3] = ["MARKS_KEY", "LOWRES_KEY", "QUALITY_KEY"];
         for line in html.lines().filter(|l| {
             let t = l.trim_start();
             l.contains("localStorage") && !t.starts_with("//") && !t.starts_with("*")
