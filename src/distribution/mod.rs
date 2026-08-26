@@ -820,10 +820,14 @@ mod tests {
         );
         // And the wall clock must come from the playlist's own absolute time,
         // not from anything the player invented.
-        let wall = js_fn(html, "wallClockAt");
+        let wall = js_fn(html, "wallOn");
         assert!(
             wall.contains("programDateTime"),
             "wall clock is not taken from #EXT-X-PROGRAM-DATE-TIME: {wall}"
+        );
+        assert!(
+            js_fn(html, "wallClockAt").contains("wallOn(main"),
+            "main's wall clock no longer reads the playlist dates"
         );
     }
 
@@ -866,10 +870,14 @@ mod tests {
             "a feed with no clock would store a mark that points nowhere: {add}"
         );
         // And going back to one converts the other way.
-        let inv = js_fn(html, "mainTimeAtWall");
+        let inv = js_fn(html, "mediaOn");
         assert!(
             inv.contains("f.programDateTime"),
             "the inverse does not go through the playlist clock: {inv}"
+        );
+        assert!(
+            js_fn(html, "mainTimeAtWall").contains("mediaOn(main"),
+            "the inverse no longer reads the playlist dates"
         );
         assert!(
             js_fn(html, "goToMark").contains("mainTimeAtWall(m.at)"),
@@ -1231,6 +1239,106 @@ mod tests {
         assert!(
             js_fn(html, "stillWanted").contains("!scrubbing && mode !== \"shuttle\" && main.paused"),
             "the still would persist over a moving picture"
+        );
+    }
+
+    /// The still is not positioned until the two clocks have been related.
+    ///
+    /// The elements hold two different streams and hls.js zeroes each
+    /// timeline at whichever fragment it loaded first, so the offset between
+    /// them is arbitrary and must be measured. Positioned on an unmeasured
+    /// offset, the hi-res still lands somewhere else entirely — the same
+    /// handover bug the scrub path was already guarded against, repeated in
+    /// the new path and reported by AJ.
+    ///
+    /// Nothing downstream can catch it. The seek and the check that verifies
+    /// it both convert through the same offset, so they agree with each other
+    /// while both are wrong. The guard has to be before the seek.
+    #[test]
+    fn the_still_waits_for_the_two_clocks_to_be_related() {
+        let html = include_str!("dvr.html");
+        let upd = js_fn(html, "updateStill");
+        assert!(
+            upd.contains("offsetSamples.length < STILL_MIN_OFFSET_SAMPLES"),
+            "the still is positioned on an unmeasured offset: {upd}"
+        );
+        // Enough samples for a median, not the single one a moving handover
+        // can live with.
+        assert!(
+            html.contains("var STILL_MIN_OFFSET_SAMPLES = 5;"),
+            "one sample of a sawtoothing signal is treated as a measurement"
+        );
+        // And the sampling has to actually run in this mode. It was gated on
+        // `proxyAttached`, which balanced never sets, so the offset stayed 0.
+        assert!(
+            html.contains("if (proxyAttached || stillAttached) measureTimelineOffset();"),
+            "the offset is not sampled while a still is attached"
+        );
+        // A median that improves after the fact must move the still with it.
+        assert!(
+            upd.contains("Math.abs(timelineOffset - stillOffsetUsed) > 0.08"),
+            "a still placed on an early estimate is left there: {upd}"
+        );
+        // That whole apparatus is the fallback. Where the playlists carry
+        // dates the conversion is exact and there is no estimate to revise,
+        // so the wait and the correction must be skipped rather than left to
+        // chase a number the still no longer depends on.
+        assert!(
+            upd.contains("var exact = pdtLinked();") && upd.contains("if (!exact) {"),
+            "an exactly-placed still is still made to wait for the median: {upd}"
+        );
+        assert!(
+            upd.contains("stillOffsetUsed = exact ? null : timelineOffset;"),
+            "an exactly-placed still records an offset it did not use: {upd}"
+        );
+    }
+
+    /// The two renditions are related by the clock they both publish, not by
+    /// the difference between their live edges.
+    ///
+    /// `timelineOffset` is a median of `proxy.end - main.end`. Each end is
+    /// quantised to its own segment grid, so the raw signal sawtooths and the
+    /// median leaves a residual of a fair fraction of a segment. Behind a
+    /// moving picture that residual is invisible — which is why scrub handover
+    /// never showed it — but the balanced-mode still is *looked at*, and AJ
+    /// reported exactly that: the hi-res frame arriving on a different moment
+    /// than the low-res frame it replaced.
+    ///
+    /// Both playlists carry `#EXT-X-PROGRAM-DATE-TIME`, which relates them
+    /// exactly and needs no measurement at all. The offset stays only for a
+    /// feed that publishes no dates.
+    #[test]
+    fn the_two_renditions_are_related_by_their_published_clock() {
+        let html = include_str!("dvr.html");
+        for name in ["toMainTime", "fromMainTime"] {
+            let f = js_fn(html, name);
+            assert!(
+                f.contains("wallOn(") && f.contains("mediaOn("),
+                "{name} converts without consulting the playlist dates: {f}"
+            );
+            // The offset is the fallback, so it must come *after* the exact
+            // path rather than instead of it.
+            let exact = f.find("mediaOn(").expect("no exact path");
+            let approx = f.find("timelineOffset").expect("no fallback");
+            assert!(
+                exact < approx,
+                "{name} reaches for the median before the exact clock: {f}"
+            );
+        }
+        // The date is read off the fragment that covers the position. Summing
+        // `EXTINF` from the head of a three-hour window accumulates the
+        // rounding in every one of several thousand durations.
+        let w = js_fn(html, "wallOn");
+        assert!(
+            w.contains("fragAt(frags, t)"),
+            "the clock is anchored on the head of the playlist: {w}"
+        );
+        // And a feed with no dates must fall through rather than convert
+        // through a date that is not there.
+        assert!(
+            js_fn(html, "fragsFor")
+                .contains(r#"typeof frags[0].programDateTime !== "number""#),
+            "a dateless playlist is treated as having a clock"
         );
     }
 
@@ -2001,6 +2109,15 @@ mod tests {
         let f = js_fn(include_str!("dvr.html"), "handPictureToProxy");
         assert!(f.contains("proxy.readyState"), "hands over to an element that may show nothing: {f}");
         assert!(f.contains("offsetSamples.length"), "hands over on an unmeasured offset: {f}");
+        // And never in the reduced modes: there the moving picture is already
+        // the low-resolution one, and the second element is the hi-res still
+        // sitting on an old frame rather than a scrub proxy. Handing over to
+        // it made `endScrub` seek the transport back to that frame on every
+        // release — the drag moved, then snapped back.
+        assert!(
+            f.contains("if (lowRes) return;"),
+            "the scrub handover runs in a mode where the second element is the still: {f}"
+        );
     }
 
     /// The stylesheet and `activeVideo` must not decide the picture separately.

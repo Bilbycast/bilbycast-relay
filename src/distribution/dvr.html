@@ -1093,11 +1093,94 @@
     timelineOffset = sorted[Math.floor(sorted.length / 2)];
   }
 
+  /// The fragment list for `v`'s current level, or null when it carries no
+  /// `#EXT-X-PROGRAM-DATE-TIME` to read a clock from.
+  function fragsFor(v) {
+    var h = hlsFor(v);
+    if (!h || !h.levels) return null;
+    var lvl = h.levels[h.currentLevel >= 0 ? h.currentLevel : 0];
+    var det = lvl && lvl.details;
+    var frags = det && det.fragments;
+    if (!frags || !frags.length) return null;
+    if (typeof frags[0].programDateTime !== "number") return null;
+    return frags;
+  }
+
+  /// The fragment covering `t` on the element's own clock, else the nearer end.
+  function fragAt(frags, t) {
+    var lo = 0, hi = frags.length - 1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      var f = frags[mid];
+      if (t < f.start) hi = mid - 1;
+      else if (t >= f.start + f.duration) lo = mid + 1;
+      else return f;
+    }
+    return t < frags[0].start ? frags[0] : frags[frags.length - 1];
+  }
+
+  /// Wall clock, in ms, at a position on `v`'s **own** timeline.
+  ///
+  /// Anchored on the fragment that actually covers the position rather than on
+  /// the head of the playlist: `EXTINF` is rounded to milliseconds, so summing
+  /// durations across a three-hour window accumulates an error that the
+  /// per-fragment date does not carry.
+  function wallOn(v, t) {
+    var frags = fragsFor(v);
+    if (!frags || !isFinite(t)) return null;
+    var f = fragAt(frags, t);
+    if (typeof f.programDateTime !== "number") return null;
+    return f.programDateTime + (t - f.start) * 1000;
+  }
+
+  /// Position on `v`'s **own** timeline, in seconds, for a wall clock in ms.
+  function mediaOn(v, wallMs) {
+    var frags = fragsFor(v);
+    if (!frags || !isFinite(wallMs)) return null;
+    var lo = 0, hi = frags.length - 1, f = null;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      var g = frags[mid];
+      if (typeof g.programDateTime !== "number") return null;
+      if (wallMs < g.programDateTime) hi = mid - 1;
+      else if (wallMs >= g.programDateTime + g.duration * 1000) lo = mid + 1;
+      else { f = g; break; }
+    }
+    if (!f) f = wallMs < frags[0].programDateTime ? frags[0] : frags[frags.length - 1];
+    return f.start + (wallMs - f.programDateTime) / 1000;
+  }
+
   /// Convert between the two clocks. Everything the operator sees — the
   /// timecode, the scrub bar — is expressed on main's, so the reading does not
   /// jump when the picture hands over.
-  function toMainTime(t, el) { return el === proxy ? t - timelineOffset : t; }
-  function fromMainTime(t, el) { return el === proxy ? t + timelineOffset : t; }
+  ///
+  /// The two renditions publish the same wall clock in their playlists, so
+  /// relate them through **that** and not through `timelineOffset`. The offset
+  /// is a median of a difference between two live edges, each quantised to its
+  /// own segment grid; the median rejects the sawtooth but leaves a residual
+  /// of a fair fraction of a segment. Behind a moving picture that residual is
+  /// invisible, which is why scrub handover never showed it — but a still is
+  /// looked at, and a second of error there is plainly a different moment.
+  /// The offset stays as the fallback for a feed with no dates in its
+  /// playlist, where there is nothing better to convert through.
+  function toMainTime(t, el) {
+    if (el !== proxy) return t;
+    var wall = wallOn(proxy, t);
+    if (wall !== null) {
+      var m = mediaOn(main, wall);
+      if (m !== null) return m;
+    }
+    return t - timelineOffset;
+  }
+  function fromMainTime(t, el) {
+    if (el !== proxy) return t;
+    var wall = wallOn(main, t);
+    if (wall !== null) {
+      var p = mediaOn(proxy, wall);
+      if (p !== null) return p;
+    }
+    return t + timelineOffset;
+  }
 
   /// A handover seek that has not been applied yet: `{ el, t }`.
   ///
@@ -1453,6 +1536,13 @@
   /// main exactly as it used to and takes over the moment it can — promoting
   /// to an element with no picture would trade a choppy scrub for a black one.
   function handPictureToProxy() {
+    // Not in the reduced modes. The moving picture is *already* the
+    // low-resolution rendition there, so there is nothing to hand over to —
+    // and the second element is not a scrub proxy at all, it is the hi-res
+    // still, parked on whatever frame was last stopped on. Handing over to it
+    // meant `endScrub` seeked the transport back to that old frame on every
+    // release: the drag moved correctly and then snapped back.
+    if (lowRes) return;
     if (!scrubbing || scrubOnProxy || mode === "shuttle") return;
     if (proxy.readyState < 2 || !proxy.seekable.length) return;
     // And only once the two clocks have been related. `timelineOffset` starts
@@ -1620,16 +1710,7 @@
   ///
   /// `null` when there is no playlist clock to convert through, which is the
   /// same condition that makes the time-of-day readout fall back.
-  function mainTimeAtWall(wallMs) {
-    if (!mainHls || !mainHls.levels) return null;
-    var lvl = mainHls.levels[mainHls.currentLevel >= 0 ? mainHls.currentLevel : 0];
-    var det = lvl && lvl.details;
-    var frags = det && det.fragments;
-    if (!frags || !frags.length) return null;
-    var f = frags[0];
-    if (typeof f.programDateTime !== "number") return null;
-    return f.start + (wallMs - f.programDateTime) / 1000;
-  }
+  function mainTimeAtWall(wallMs) { return mediaOn(main, wallMs); }
 
   /// Is this mark still inside the window, and therefore reachable?
   function markIsReachable(m) {
@@ -2216,16 +2297,7 @@
   /// its timeline at whichever fragment it loaded first — so the mapping runs
   /// through `#EXT-X-PROGRAM-DATE-TIME`. Native HLS (no hls.js) exposes no
   /// equivalent, so there is simply no preview there.
-  function wallClockAt(mainT) {
-    if (!mainHls || !mainHls.levels) return null;
-    var lvl = mainHls.levels[mainHls.currentLevel >= 0 ? mainHls.currentLevel : 0];
-    var det = lvl && lvl.details;
-    var frags = det && det.fragments;
-    if (!frags || !frags.length) return null;
-    var f = frags[0];
-    if (typeof f.programDateTime !== "number") return null;
-    return f.programDateTime + (mainT - f.start) * 1000;
-  }
+  function wallClockAt(mainT) { return wallOn(main, mainT); }
 
   /// The cue covering a position on main's timeline, or null.
   function cueAt(mainT) {
@@ -2465,7 +2537,11 @@
 
   function render() {
     var v = activeVideo();
-    if (proxyAttached) measureTimelineOffset();
+    // Either element being attached means there are two clocks to relate.
+    // This used to test `proxyAttached` alone, which balanced mode never
+    // sets — so the offset was never sampled, stayed 0, and the hi-res still
+    // landed at an arbitrary point.
+    if (proxyAttached || stillAttached) measureTimelineOffset();
     // Always present the window and the position on main's clock, so the
     // readout does not shift when the picture hands over to the proxy.
     var r = range(main);
@@ -2538,10 +2614,14 @@
         "  dropped=" + (q ? q.droppedVideoFrames : "n/a"),
       "mediaError=" + (v.error ? v.error.code + " " + v.error.message : "none"),
       "proxyAttached=" + proxyAttached +
+        "  clockLink=" + (pdtLinked() ? "playlist dates (exact)" : "median offset (fallback)") +
         "  timelineOffset=" + timelineOffset.toFixed(2) + "s",
       "mainT=" + main.currentTime.toFixed(2) +
         "  proxyT=" + proxy.currentTime.toFixed(2) +
-        "  (same instant when proxyT - mainT = offset)",
+        "  skew=" + (function () {
+          var a = wallOn(main, main.currentTime), b = wallOn(proxy, proxy.currentTime);
+          return a === null || b === null ? "n/a" : ((b - a) / 1000).toFixed(3) + "s";
+        })() + "  (the two elements are on the same instant when skew is 0)",
       "lastHlsError=" + (lastHlsError || "none"),
       // The preview has three independent ways to be silently absent: no
       // index published, no absolute time on the playlist to map through, or
@@ -3089,9 +3169,32 @@
   // spinner where a picture used to be would be a worse answer than the soft
   // picture it replaced.
   var STILL_SETTLE_MS = 220;
+  /// Offset samples required before the still may be positioned **on the
+  /// fallback path** — a feed whose playlists carry no dates, where
+  /// `timelineOffset` is the only thing relating the two renditions.
+  ///
+  /// That offset is a median over a rolling window and the raw signal
+  /// sawtooths by up to a segment. One sample is enough for a scrub handover,
+  /// where being a second out is invisible against a moving picture; a still
+  /// is looked at, so it needs the median to have settled.
+  ///
+  /// Nothing downstream can catch this being wrong: the seek and the check
+  /// that verifies it both convert through the same offset, so they agree
+  /// with each other while both being wrong. The guard has to be here.
+  ///
+  /// When both playlists carry `#EXT-X-PROGRAM-DATE-TIME` the conversion is
+  /// exact and none of this applies — see `toMainTime`.
+  var STILL_MIN_OFFSET_SAMPLES = 5;
   var stillAttached = false, stillShowing = false, stillTimer = null, stillWantAt = null;
   /// The position a pending settle timer is already waiting on.
   var stillPendingAt = null;
+  /// The offset the still was positioned with, so a later correction is
+  /// noticed rather than left on screen.
+  var stillOffsetUsed = null;
+
+  /// True when both renditions publish a wall clock, so a position on one can
+  /// be carried to the other exactly rather than through the median offset.
+  function pdtLinked() { return fragsFor(main) !== null && fragsFor(proxy) !== null; }
 
   /// Is a still called for right now? Stopped, not scrubbing, not shuttling.
   function stillWanted() {
@@ -3113,7 +3216,7 @@
 
   function hideStill() {
     if (stillTimer !== null) { clearTimeout(stillTimer); stillTimer = null; }
-    stillWantAt = null; stillPendingAt = null;
+    stillWantAt = null; stillPendingAt = null; stillOffsetUsed = null;
     if (!stillShowing) return;
     stillShowing = false;
     syncPicture();
@@ -3140,6 +3243,18 @@
     if (!stillWanted()) { hideStill(); return; }
     var t = toMainTime(playhead(main), main);
     if (!isFinite(t)) return;
+    // The median keeps improving as samples arrive. A still positioned on an
+    // early estimate is showing the wrong frame, so re-place it when the
+    // offset moves by more than a couple of frames. Only the fallback path
+    // records an offset; a still placed through the playlist dates has no
+    // estimate to revise.
+    if (stillShowing && stillOffsetUsed !== null &&
+        Math.abs(timelineOffset - stillOffsetUsed) > 0.08) {
+      stillOffsetUsed = timelineOffset;
+      stillWantAt = t;
+      seekWhenReady(proxy, t);
+      return;
+    }
     // Already showing this frame: nothing to do.
     if (stillShowing && stillWantAt !== null && Math.abs(t - stillWantAt) < 0.05) return;
     // A timer already waiting on this same frame must be left alone.
@@ -3156,8 +3271,15 @@
       stillTimer = null;
       if (!stillWanted()) return;
       ensureStill();
+      // Attach first, then wait for the clocks to be related. Returning here
+      // leaves `stillPendingAt` clear, so the next render tick tries again.
+      var exact = pdtLinked();
+      if (!exact) {
+        measureTimelineOffset();
+        if (offsetSamples.length < STILL_MIN_OFFSET_SAMPLES) { stillPendingAt = null; return; }
+      }
       stillWantAt = toMainTime(playhead(main), main);
-      if (!offsetSamples.length) { measureTimelineOffset(); }
+      stillOffsetUsed = exact ? null : timelineOffset;
       seekWhenReady(proxy, stillWantAt);
       stillReady();
     }, STILL_SETTLE_MS);
