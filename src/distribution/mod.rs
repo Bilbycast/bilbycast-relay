@@ -877,6 +877,51 @@ mod tests {
         );
     }
 
+    /// Everything drawn on the bar is inset to the thumb's travel.
+    ///
+    /// A range thumb's **centre** moves between half a thumb from each end,
+    /// not across the full width. A layer drawn edge to edge therefore
+    /// disagrees with the playhead by up to half a thumb — worst at the ends,
+    /// zero in the middle — and a mark clicked or skipped to did not line up
+    /// under the dot. Reported by AJ, and the geometry was already written
+    /// down in the shading's own comment when it was built.
+    #[test]
+    fn the_bar_layers_are_inset_to_the_thumbs_travel() {
+        let html = include_str!("dvr.html");
+        assert!(html.contains("--thumb: 18px;"), "the thumb size is not named once");
+
+        // Every layer that must agree with the playhead, and the thumb itself,
+        // take their geometry from that one value.
+        assert_eq!(
+            html.matches("left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);")
+                .count(),
+            3,
+            "a layer on the bar is still drawn edge to edge"
+        );
+        assert!(
+            html.contains("width: var(--thumb); height: var(--thumb);"),
+            "the thumb no longer takes its size from the value the insets assume"
+        );
+
+        // And anything measured in script uses the same correction.
+        let g = js_fn(html, "barGeom");
+        assert!(
+            g.contains("r.left + THUMB_PX / 2") && g.contains("r.width - THUMB_PX"),
+            "pointer positions are measured against the full width: {g}"
+        );
+        assert!(
+            js_fn(html, "barPct").contains("THUMB_PX / 2 + frac * (w - THUMB_PX)"),
+            "the floating labels are placed against the full width"
+        );
+        // The hover hit-test and the press must both go through it, or a mark
+        // is named at one position and acted on at another.
+        assert_eq!(
+            html.matches("var g = barGeom();").count(),
+            2,
+            "the hover and the press do not share the same geometry"
+        );
+    }
+
     /// Pressing a mark on the bar goes to it exactly, and stops.
     ///
     /// You have hovered it and read its name; a drag that lands *near* it is

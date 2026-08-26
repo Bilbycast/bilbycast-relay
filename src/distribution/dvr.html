@@ -8,6 +8,11 @@
   :root {
     --bg: #0b0d10; --panel: #14181d; --line: #232a32;
     --fg: #e8edf2; --dim: #93a1b0; --accent: #37d3a6; --live: #ff4d4f;
+    /* The slider thumb. Its *centre* travels inset by half this at each end,
+       so every layer that must line up with the playhead is inset to match —
+       see `barPct`. Drawn across the full width instead, a mark and the
+       playhead disagree by up to half a thumb, worst at the ends. */
+    --thumb: 18px;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
@@ -71,7 +76,8 @@
      passage of time itself, not an animation put on top of it. Their spacing
      is also the readable signal for how far the bar is zoomed. */
   #ticks {
-    position: absolute; left: 0; right: 0; top: 50%; height: 22px;
+    position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
+    top: 50%; height: 22px;
     margin-top: 3px; pointer-events: none; overflow: hidden; z-index: 1;
   }
   /* Bright enough to read at arm's length on a tablet. `--line` is a border
@@ -81,7 +87,8 @@
   #ticks i.major { height: 10px; width: 1px; background: #8494a4; }
   /* Marks on the bar. Above the ruler and below the slider, so a flag never
      swallows a drag. */
-  #markbar { position: absolute; left: 0; right: 0; top: 50%; height: 14px;
+  #markbar { position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
+             top: 50%; height: 14px;
              margin-top: -17px; pointer-events: none; z-index: 1; }
   #markbar i {
     position: absolute; top: 0; width: 2px; height: 14px; margin-left: -1px;
@@ -112,12 +119,13 @@
   .timeline .track input[type=range]::-moz-range-track { height: 5px; background: transparent; }
   .timeline .track input[type=range]::-moz-range-progress { background: transparent; }
   .timeline .track input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
-    background: var(--fg); border: 2px solid var(--panel); margin-top: -6.5px;
+    -webkit-appearance: none; width: var(--thumb); height: var(--thumb);
+    border-radius: 50%; background: var(--fg); border: 2px solid var(--panel);
+    margin-top: -6.5px;
   }
   .timeline .track input[type=range]::-moz-range-thumb {
-    width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--panel);
-    background: var(--fg);
+    width: var(--thumb); height: var(--thumb); border-radius: 50%;
+    border: 2px solid var(--panel); background: var(--fg);
   }
   .timeline .track input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
   /* The part of the window that is buffered, drawn behind the slider. It sits
@@ -126,7 +134,8 @@
      runs up to ~1% wide at each end. This is a "here it is instant" hint, not
      a measurement. */
   #cached {
-    position: absolute; left: 0; right: 0; top: 50%; height: 5px;
+    position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
+    top: 50%; height: 5px;
     transform: translateY(-50%); pointer-events: none; border-radius: 3px;
     background: #000914; border: 1px solid var(--line); border-width: 0;
     box-shadow: inset 0 0 0 1px var(--line);
@@ -1169,8 +1178,8 @@
     // Pressing a mark goes to it exactly and stops there. You have hovered it,
     // you have read its name, and a drag that lands "near" it is not what was
     // asked for.
-    var r = scrub.getBoundingClientRect();
-    var m = r.width ? markNear((e.clientX - r.left) / r.width) : null;
+    var g = barGeom();
+    var m = markNear((e.clientX - g.left) / g.width);
     hideMarkTip();
     if (m && markIsReachable(m)) {
       e.preventDefault();
@@ -1394,6 +1403,30 @@
   /// How near the pointer must be, as a fraction of the bar.
   var MARK_HOVER_FRAC = 0.012;
 
+  /// Width of the slider thumb, matching `--thumb`.
+  var THUMB_PX = 18;
+
+  /// Where the thumb's **centre** can be, in client coordinates.
+  ///
+  /// Not the input's own box: a range thumb is inset by half its width at each
+  /// end, so a pointer position measured against the full width does not
+  /// correspond to the value the thumb would take. The layers drawn on the bar
+  /// are inset in CSS for the same reason; this is the same correction for
+  /// anything measured in script.
+  function barGeom() {
+    var r = scrub.getBoundingClientRect();
+    return { left: r.left + THUMB_PX / 2, width: Math.max(1, r.width - THUMB_PX) };
+  }
+
+  /// A bar fraction as a percentage of the **track**, for the floating labels.
+  ///
+  /// They are positioned against `.track`, which is the full width, while the
+  /// fraction refers to the thumb's inset travel.
+  function barPct(frac) {
+    var w = scrub.getBoundingClientRect().width || 1;
+    return ((THUMB_PX / 2 + frac * (w - THUMB_PX)) / w) * 100;
+  }
+
   function markNear(frac) {
     var view = viewRange();
     if (!view) return null;
@@ -1415,10 +1448,10 @@
     b.textContent = fmtTimeOfDay(m.at).slice(0, 8);
     marktip.appendChild(b);
     marktip.appendChild(document.createTextNode("  " + (m.name || "Unnamed mark")));
-    var trackW = cached.getBoundingClientRect().width || 1;
+    var trackW = scrub.getBoundingClientRect().width || 1;
     // Keep it on screen at either end, the same way the scrub preview does.
     var halfPct = (marktip.offsetWidth / 2 + 6) / trackW * 100;
-    var pct = Math.max(halfPct, Math.min(100 - halfPct, frac * 100));
+    var pct = Math.max(halfPct, Math.min(100 - halfPct, barPct(frac)));
     marktip.style.left = pct + "%";
     document.body.dataset.marktip = "1";
   }
@@ -1428,9 +1461,8 @@
   scrub.addEventListener("pointermove", function (e) {
     // While dragging, the scrub preview owns this space.
     if (scrubbing) { hideMarkTip(); return; }
-    var r = scrub.getBoundingClientRect();
-    if (!r.width) return;
-    var frac = (e.clientX - r.left) / r.width;
+    var g = barGeom();
+    var frac = (e.clientX - g.left) / g.width;
     var m = markNear(frac);
     if (m) showMarkTip(m, frac); else hideMarkTip();
   });
@@ -1860,9 +1892,9 @@
     var r = range(main);
     previewLabel.textContent = pw === null ? (r ? fmt(mainT - r.start) : "") : fmtTimeOfDay(pw);
     // Keep the box on screen when the thumb is near either end.
-    var trackW = cached.getBoundingClientRect().width || 1;
+    var trackW = scrub.getBoundingClientRect().width || 1;
     var halfPct = (cue.w / 2 + 5) / trackW * 100;
-    var pct = Math.max(halfPct, Math.min(100 - halfPct, frac * 100));
+    var pct = Math.max(halfPct, Math.min(100 - halfPct, barPct(frac)));
     preview.style.left = pct + "%";
     document.body.dataset.preview = "1";
   }

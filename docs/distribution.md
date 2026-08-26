@@ -265,6 +265,14 @@ origin had evicted and 30 % footage that had not happened, both showing nothing.
 The window comes from hls.js (`fragments[0].start` + `totalduration`), falling
 back to `seekable` for native HLS, which exposes no playlist.
 
+**Everything drawn on the bar is inset to the thumb's travel.** A range thumb's
+*centre* moves between half a thumb from each end, not across the full width, so
+a layer drawn edge to edge disagrees with the playhead by up to half a thumb —
+worst at the ends, zero in the middle. The shading, the ruler and the marks are
+all inset by `calc(var(--thumb) / 2)`, and anything measured in script goes
+through `barGeom()` / `barPct()` for the same correction. Measured after the
+fix: thumb centre to mark within 0.9 px, against 9 px before it.
+
 **The lit part of the bar is `main.buffered`** — where a drag moves the real
 picture with no fetch. It is capped by `backBufferLength`, so on a long window
 it is a small fraction of the bar and *shrinks* as a proportion the longer a
