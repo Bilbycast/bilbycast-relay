@@ -444,6 +444,33 @@ not exist yet. Note the viewing token deliberately uses `sessionStorage`
 instead: a credential has no business outliving its tab, and a test asserts the
 two do not get confused.
 
+### Low-resolution mode
+
+For a link that cannot carry the main rendition. It plays the proxy **in place
+of** main rather than alongside it, so it saves the bandwidth *and* a decoder:
+the proxy is already all-intra, so shuttle and scrub run on the one element and
+nothing needs a second. Everything downstream — the clock, the ruler, marks, the
+preview — is expressed against whatever `main` is loading, so this is a URL swap
+rather than a second code path.
+
+Measured over 30 s of playback on the live feed:
+
+| mode | fetched | rate | picture |
+|---|---|---|---|
+| normal | 34.9 MB | 9.3 Mbit/s | 1920x1080 |
+| low-res | 11.5 MB | 3.1 Mbit/s | 640x360 |
+
+**Three times, and no more — do not sell it as the answer to a bad link.** The
+proxy is all-intra by design, which is deliberately inefficient: every frame is
+a keyframe. A purpose-made low-bitrate long-GOP rendition of the same 640x360
+picture would be nearer 600-800 kbit/s, so ten times rather than three. This is
+the tool that already exists, not the right one.
+
+It takes effect on reload rather than swapping under a running player: changing
+the stream mid-session means tearing down hls.js, re-seeking and re-deriving the
+clock, all of which a reload does correctly while keeping the token
+(`sessionStorage`) and the marks (`localStorage`).
+
 ### The two readouts
 
 **Left: the time of day the frame was ingested**, as `HH:MM:SS:FF` in the

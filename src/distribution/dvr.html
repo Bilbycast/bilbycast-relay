@@ -511,6 +511,14 @@
        it you get a preview thumbnail while you drag, and the video arrives
        when you let go. The slider on the right sets how much of the window the
        bar covers &mdash; a narrower view is a finer drag.</p>
+    <label class="opt">
+      <input type="checkbox" id="optLowRes">
+      <span>Low-resolution mode</span>
+    </label>
+    <p class="note">Plays the low-resolution rendition instead of the main one,
+       for a connection that cannot carry it — about a third of the bandwidth,
+       and one decoder instead of two. Shuttle and scrub still work, because
+       that rendition is all-intra. Takes effect on reload.</p>
     <button id="optSelftest" type="button">Run the player self-test</button>
     <p class="note">Measures what this device can actually present — shuttle
        rate, scrub preview coverage, token renewal. About a minute.</p>
@@ -545,6 +553,27 @@
   var qs     = new URLSearchParams(location.search);
   var MAIN   = qs.get("main")  || STREAM;
   var PROXY  = qs.get("proxy") || (STREAM + "-proxy");
+
+  // ── low-res mode ───────────────────────────────────────────────────────
+  // For a link that cannot carry the main rendition. It plays the **proxy in
+  // place of** main rather than alongside it, which saves the bandwidth and a
+  // whole decoder: the proxy is already all-intra, so shuttle and scrub can
+  // run on the one element and nothing needs a second.
+  //
+  // Everything downstream — the clock, the ruler, marks, the preview — is
+  // expressed against whatever `main` is loading, so swapping the URL here is
+  // the entire change. That is why this is a two-line feature and not a
+  // rewrite.
+  //
+  // **It is not a good answer to a genuinely bad link, and should not be sold
+  // as one.** Measured: main ~8 Mbit/s, proxy ~2.6 — a 3x saving, where a
+  // purpose-made low-bitrate long-GOP rendition of the same picture would be
+  // nearer 10x. All-intra is deliberately inefficient; this is the tool that
+  // already exists, not the right one.
+  var LOWRES_KEY = "bilbycast.dvr.lowres." + STREAM;
+  var lowRes = false;
+  try { lowRes = window.localStorage.getItem(LOWRES_KEY) === "1"; } catch (e) { lowRes = false; }
+  if (lowRes) MAIN = PROXY;
   // ONE token for both renditions.
   //
   // The player is two streams -- `{stream}` and `{stream}-proxy` -- but it is
@@ -958,7 +987,10 @@
   /// frame they landed on, and 640x360 is not what they stopped to look at.
   var scrubOnProxy = false;
 
-  function activeVideo() { return (mode === "shuttle" || scrubOnProxy) ? proxy : main; }
+  function activeVideo() {
+    if (lowRes) return main;   // there is only one element to be active
+    return (mode === "shuttle" || scrubOnProxy) ? proxy : main;
+  }
   function onProxy() { return activeVideo() === proxy; }
   /// Make the stylesheet agree with `activeVideo`.
   function syncPicture() { document.body.dataset.picture = onProxy() ? "proxy" : "main"; }
@@ -2465,6 +2497,17 @@
     dbg = e.target.checked ? document.getElementById("debug") : null;
     document.body.dataset.debug = e.target.checked ? "1" : "0";
   });
+  var optLowRes = document.getElementById("optLowRes");
+  optLowRes.checked = lowRes;
+  optLowRes.addEventListener("change", function (e) {
+    try { window.localStorage.setItem(LOWRES_KEY, e.target.checked ? "1" : "0"); }
+    catch (err) { /* nothing to do: the setting simply will not stick */ }
+    // Reload rather than re-attach. Swapping the stream under a running
+    // player means tearing down hls.js, re-seeking and re-deriving the clock
+    // mid-session; a reload does all of that correctly and keeps the token
+    // (sessionStorage) and the marks (localStorage).
+    location.reload();
+  });
   document.getElementById("optSelftest").addEventListener("click", function () {
     closeSettings();
     document.body.dataset.selftest = "1";
@@ -2870,6 +2913,10 @@
   // exhausting it makes the *visible* element play with no picture, which
   // looks exactly like a black stream. Attach on first jog/shuttle instead.
   function ensureProxy() {
+    // In low-res mode `main` is already the all-intra rendition, so a second
+    // element would fetch the same stream twice and hold a second decoder for
+    // nothing.
+    if (lowRes) return;
     if (!proxyAttached) {
       proxyAttached = true;
       proxyHls = attach(proxy, PROXY, "proxy");

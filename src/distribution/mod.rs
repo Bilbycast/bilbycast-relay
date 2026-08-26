@@ -1099,6 +1099,33 @@ mod tests {
         );
     }
 
+    /// Low-res mode replaces the main rendition rather than adding to it.
+    ///
+    /// The point is a link that cannot carry the main stream, so attaching
+    /// both would defeat it. Playing the proxy *as* main also means one
+    /// decoder instead of two, which is the other thing a struggling device
+    /// does not have to spare — and costs nothing, because that rendition is
+    /// already all-intra, so shuttle and scrub work on it directly.
+    ///
+    /// Everything downstream is expressed against whatever `main` is loading,
+    /// which is why this is a URL swap and not a rewrite.
+    #[test]
+    fn low_res_mode_replaces_the_main_rendition() {
+        let html = include_str!("dvr.html");
+        assert!(
+            html.contains("if (lowRes) MAIN = PROXY;"),
+            "low-res mode does not swap the stream, so it saves no bandwidth"
+        );
+        assert!(
+            js_fn(html, "ensureProxy").contains("if (lowRes) return;"),
+            "the second element still attaches, fetching the same stream twice"
+        );
+        assert!(
+            js_fn(html, "activeVideo").contains("if (lowRes) return main;"),
+            "shuttle would hand over to an element that was never attached"
+        );
+    }
+
     /// A mark's colour comes from a closed palette, and is validated.
     ///
     /// The colour is written into an inline `style`, and marks are read from
@@ -1944,16 +1971,20 @@ mod tests {
                 "{f} would outlive the tab: {body}"
             );
         }
-        // And nothing else may put a credential there either. Comments are
-        // skipped: this section explains itself in prose, and the prose is not
-        // what stores anything.
+        // And nothing else may put a credential there either. The allow-list
+        // is by *key*, and deliberately explicit: the property being defended
+        // is "no credential outlives the tab", not "only marks are stored", so
+        // a new preference is welcome and a new secret is not. Comments are
+        // skipped — this section explains itself in prose, and prose stores
+        // nothing.
+        const NON_SECRET_KEYS: [&str; 2] = ["MARKS_KEY", "LOWRES_KEY"];
         for line in html.lines().filter(|l| {
             let t = l.trim_start();
             l.contains("localStorage") && !t.starts_with("//") && !t.starts_with("*")
         }) {
             assert!(
-                line.contains("MARKS_KEY"),
-                "localStorage used for something other than marks: {line}"
+                NON_SECRET_KEYS.iter().any(|k| line.contains(k)),
+                "localStorage used for a key that is not on the non-secret list: {line}"
             );
         }
         // Every access wrapped: a browser with site data blocked throws on
