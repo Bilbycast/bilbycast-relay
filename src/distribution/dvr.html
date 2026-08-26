@@ -2191,19 +2191,45 @@
   /// hundred tiles on a sheet cost one request between them, not one each.
   var sheetUrls = Object.create(null);
   var sheetOrder = [];
-  var SHEET_CACHE = 20;
+
+  /// How much sheet imagery to keep, in bytes.
+  ///
+  /// Bounded by **bytes, not count**, because a count is a guess about sheet
+  /// size and this has to degrade sensibly on a long event. At roughly 100 KB
+  /// a sheet covering 40 s, 24 MB holds about two and a half hours — the whole
+  /// window for the event this is built for — and on anything longer it keeps
+  /// the most recently used and drops the rest, rather than thrashing a
+  /// twenty-slot cache that a single drag can evict end to end.
+  ///
+  /// For scale: the media for that same window is about 12 GB. The imagery
+  /// that makes the entire bar previewable is 0.2 % of it.
+  var SHEET_CACHE_BYTES = 24 * 1024 * 1024;
+  var sheetBytes = 0;
+
+  /// Drop least-recently-used sheets until the cache is inside its budget.
+  function trimSheets() {
+    while (sheetBytes > SHEET_CACHE_BYTES && sheetOrder.length > 1) {
+      var old = sheetOrder.shift();
+      var e = sheetUrls[old];
+      if (!e) continue;
+      if (e.url) URL.revokeObjectURL(e.url);
+      sheetBytes -= e.bytes || 0;
+      delete sheetUrls[old];
+    }
+  }
+
+  /// Mark a sheet as just used, so the trim keeps it.
+  function touchSheet(uri) {
+    var i = sheetOrder.indexOf(uri);
+    if (i >= 0) { sheetOrder.splice(i, 1); sheetOrder.push(uri); }
+  }
 
   function sheetUrl(uri) {
     var hit = sheetUrls[uri];
-    if (hit) return hit.url;      // null while the fetch is still in flight
-    var entry = { url: null };
+    if (hit) { touchSheet(uri); return hit.url; }   // null while in flight
+    var entry = { url: null, bytes: 0 };
     sheetUrls[uri] = entry;
     sheetOrder.push(uri);
-    while (sheetOrder.length > SHEET_CACHE) {
-      var old = sheetOrder.shift();
-      if (sheetUrls[old] && sheetUrls[old].url) URL.revokeObjectURL(sheetUrls[old].url);
-      delete sheetUrls[old];
-    }
     var opts = {};
     if (TOKEN_IN_HEADER && TOKEN) opts.headers = { Authorization: "Bearer " + TOKEN };
     fetch(url(STREAM, uri), opts)
@@ -2211,6 +2237,9 @@
       .then(function (b) {
         if (!b || sheetUrls[uri] !== entry) return;
         entry.url = URL.createObjectURL(b);
+        entry.bytes = b.size;
+        sheetBytes += b.size;
+        trimSheets();
         // Repaint. Without this the first position on every sheet stays blank
         // until the thumb moves again: `sheetUrl` answers null while the
         // fetch is in flight, and nothing else redraws. Measured as a
@@ -2224,6 +2253,69 @@
         if (sheetUrls[uri] === entry) delete sheetUrls[uri];
       });
     return null;
+  }
+
+  // ── prefetching the preview ────────────────────────────────────────────
+  // Fetched only on demand, a sheet arrives while the thumb is already past
+  // it, so the first drag across any stretch of bar is the one that shows
+  // nothing. Pulling them in the background fixes that everywhere at once.
+  //
+  // It is affordable in a way caching media is not: about 100 KB a sheet
+  // against 2 MB a media segment, so the imagery for a whole 2h30m event is
+  // ~22 MB against ~12 GB of video — 0.2 %.
+  //
+  // Two things it must not do. It must not race the media stream, on exactly
+  // the poor connections this helps most — hence one at a time, with a gap,
+  // and at low priority where the browser understands that. And it must not
+  // start until the player is actually playing, so it is never competing with
+  // the initial buffering that decides whether the picture starts at all.
+
+  /// Gap between prefetches. Slow on purpose: there is no deadline, and the
+  /// media stream has one.
+  var PREFETCH_GAP_MS = 350;
+  /// How long after playback starts before any of this begins.
+  var PREFETCH_START_DELAY_MS = 8000;
+  var prefetchTimer = null, prefetchStarted = false;
+
+  /// The next sheet worth fetching: nearest to the playhead, outward.
+  ///
+  /// Nearest-first because that is where the operator is most likely to drag
+  /// next, so the ordering pays off immediately rather than only once the
+  /// sweep completes.
+  function nextSheetToPrefetch() {
+    if (!thumbs || !thumbs.cues.length) return null;
+    var v = activeVideo();
+    var here = wallClockAt(toMainTime(playhead(v), v));
+    if (here === null) return null;
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < thumbs.cues.length; i++) {
+      var c = thumbs.cues[i];
+      if (sheetUrls[c.uri]) continue;                 // held, or in flight
+      var at = thumbs.epoch + c.start * 1000;
+      var d = Math.abs(at - here);
+      if (d < bestD) { bestD = d; best = c.uri; }
+    }
+    return best;
+  }
+
+  function prefetchStep() {
+    prefetchTimer = null;
+    // Never while the operator is dragging: their fetches are the ones with a
+    // deadline.
+    if (!scrubbing) {
+      var uri = nextSheetToPrefetch();
+      if (uri) sheetUrl(uri);   // the fetch, the cache and the trim are shared
+    }
+    prefetchTimer = setTimeout(prefetchStep, PREFETCH_GAP_MS);
+  }
+
+  function startPrefetch() {
+    if (prefetchStarted) return;
+    prefetchStarted = true;
+    setTimeout(function () {
+      loadThumbs();
+      if (prefetchTimer === null) prefetchTimer = setTimeout(prefetchStep, PREFETCH_GAP_MS);
+    }, PREFETCH_START_DELAY_MS);
   }
 
   /// The position the preview was last asked for, so a sheet arriving
@@ -2932,6 +3024,8 @@
     }
   }
   main.addEventListener("loadedmetadata", function () { goLive(); });
+  // Once there is a picture, start filling the preview in behind it.
+  main.addEventListener("playing", startPrefetch);
   main.addEventListener("playing", syncRateButtons);
   main.addEventListener("pause", syncRateButtons);
   // Put the mute button in the state the elements are actually in, rather

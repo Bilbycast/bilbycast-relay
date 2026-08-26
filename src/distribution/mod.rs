@@ -1099,6 +1099,73 @@ mod tests {
         );
     }
 
+    /// The preview is prefetched, without racing the media.
+    ///
+    /// Fetched only on demand, a sheet lands after the thumb has passed it, so
+    /// the first drag across any stretch of bar shows nothing. Pulling them in
+    /// the background fixes that everywhere.
+    ///
+    /// The constraint is that this helps most on exactly the connections it
+    /// could hurt. So: one at a time, with a gap, never while the operator is
+    /// dragging (their fetches have a deadline), and not until playback has
+    /// started so it never competes with the buffering that decides whether
+    /// there is a picture at all.
+    #[test]
+    fn the_preview_is_prefetched_without_racing_the_media() {
+        let html = include_str!("dvr.html");
+        let step = js_fn(html, "prefetchStep");
+        assert!(
+            step.contains("if (!scrubbing)"),
+            "prefetching competes with the drag it exists to serve: {step}"
+        );
+        assert!(
+            step.contains("setTimeout(prefetchStep, PREFETCH_GAP_MS)"),
+            "prefetching is not paced: {step}"
+        );
+        let start = js_fn(html, "startPrefetch");
+        assert!(
+            start.contains("PREFETCH_START_DELAY_MS"),
+            "prefetching starts against the initial buffering: {start}"
+        );
+        assert!(
+            html.contains(r#"main.addEventListener("playing", startPrefetch)"#),
+            "prefetching does not wait for a picture"
+        );
+        // Nearest-first, so the ordering pays off before the sweep finishes.
+        assert!(
+            js_fn(html, "nextSheetToPrefetch").contains("Math.abs(at - here)"),
+            "sheets are not fetched nearest-first"
+        );
+    }
+
+    /// The sheet cache is bounded by bytes and evicts least-recently-used.
+    ///
+    /// A count is a guess about sheet size, and the twenty-slot version could
+    /// be evicted end to end by a single drag — which is worse than useless
+    /// once anything is prefetched into it. Bytes degrade sensibly instead:
+    /// the whole window for a 2h30m event fits, and a longer one keeps what
+    /// was used most recently.
+    #[test]
+    fn the_sheet_cache_is_bounded_by_bytes_and_evicts_lru() {
+        let html = include_str!("dvr.html");
+        assert!(html.contains("SHEET_CACHE_BYTES"), "the cache is still bounded by count");
+        assert!(!html.contains("SHEET_CACHE = 20"), "the old count bound is still there");
+        let trim = js_fn(html, "trimSheets");
+        assert!(
+            trim.contains("sheetBytes > SHEET_CACHE_BYTES") && trim.contains("sheetOrder.shift()"),
+            "the trim does not drop the oldest by byte budget: {trim}"
+        );
+        assert!(
+            trim.contains("URL.revokeObjectURL"),
+            "evicted sheets leak their object URLs: {trim}"
+        );
+        // Used means recently used, or the LRU is really a FIFO.
+        assert!(
+            js_fn(html, "sheetUrl").contains("touchSheet(uri)"),
+            "a cache hit does not count as use, so the LRU is a FIFO"
+        );
+    }
+
     /// Low-res mode replaces the main rendition rather than adding to it.
     ///
     /// The point is a link that cannot carry the main stream, so attaching

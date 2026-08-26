@@ -531,6 +531,31 @@ Two things the player must do, both of which were silently wrong first:
   and kept, it drifts out from under the bar and every position resolves outside
   its span.
 
+### Prefetching the preview
+
+Fetched only on demand, a sheet lands after the thumb has already passed it, so
+the *first* drag across any stretch of bar is the one that shows nothing. The
+player pulls them in the background instead, nearest to the playhead outward.
+
+It is affordable in a way caching media is not: ~100 KB a sheet against 2 MB a
+media segment, so the imagery for a whole 2h30m event is about 22 MB against
+~12 GB of video — 0.2 %.
+
+Three constraints, because this helps most on the connections it could hurt:
+one fetch at a time with a gap, never while the operator is dragging (their
+fetches have a deadline), and not until playback has started, so it never
+competes with the buffering that decides whether there is a picture at all.
+
+Measured on the live feed: **16 sheets, 1.57 MB, fetched during 55 s of sitting
+still**, after which a first fast drag across an untouched stretch showed
+**20 of 20** positions — where it would previously blank at every sheet
+boundary.
+
+The cache is bounded by **bytes, not count**, and evicts least-recently-used. A
+count is a guess about sheet size, and the twenty-slot version it replaced could
+be evicted end to end by a single drag, which is worse than useless once
+anything has been prefetched into it.
+
 ### Self-test (`?selftest=1`)
 
 The player carries its own measurement, because the question "what can this
