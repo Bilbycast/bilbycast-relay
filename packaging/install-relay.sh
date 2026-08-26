@@ -63,6 +63,7 @@ REQUIRE_BIND_AUTH=0
 UPGRADE_INSTALLER=0
 WITH_PORTAL=0
 PORTAL_MANAGER_URL=""
+PORTAL_PLAYER_ORIGIN=""
 
 # ── Argument parsing ──────────────────────────────────────────────────
 usage() {
@@ -88,6 +89,10 @@ Options:
   --upgrade-installer          Refresh service unit + install script,
                                leave config untouched
   --with-portal <manager-url>  Also install the viewer portal
+  --player-origin <origin>     Where the DVR player is served from, e.g.
+                               https://relay.example.com. Without it a viewer's
+                               token cannot be renewed and access ends after
+                               three hours, mid-event.
                                (bilbycast-portal), pointed at this
                                manager's https:// base URL. Only in the
                                distribution tarball. Installed but NOT
@@ -110,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         --channel) CHANNEL="$2"; shift 2;;
         --upgrade-installer) UPGRADE_INSTALLER=1; shift;;
         --with-portal) WITH_PORTAL=1; PORTAL_MANAGER_URL="$2"; shift 2;;
+        --player-origin) PORTAL_PLAYER_ORIGIN="$2"; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 1;;
     esac
@@ -124,6 +130,29 @@ if [[ "${WITH_PORTAL}" -eq 1 ]]; then
         http://*|https://*) ;;
         *) echo "--with-portal URL must start with http:// or https://" >&2; exit 1;;
     esac
+
+    # Renewal is a cross-origin request carrying the viewer's session cookie, so
+    # the portal answers only origins named here. Empty means nobody: safe, and
+    # silent — the portal works, viewers sign in, and three hours later their
+    # access ends mid-event with nothing to say why. Hence the warning.
+    PORTAL_ORIGINS_JSON=""
+    if [[ -n "${PORTAL_PLAYER_ORIGIN}" ]]; then
+        case "${PORTAL_PLAYER_ORIGIN}" in
+            http://*|https://*) ;;
+            *) echo "--player-origin must start with http:// or https://" >&2; exit 1;;
+        esac
+        PORTAL_PLAYER_ORIGIN="${PORTAL_PLAYER_ORIGIN%/}"
+        # An Origin header is scheme://host[:port] and never carries a path, so
+        # one written with a path could never match anything.
+        case "${PORTAL_PLAYER_ORIGIN#*://}" in
+            */*) echo "--player-origin has a path; an origin is scheme://host[:port]" >&2; exit 1;;
+        esac
+        PORTAL_ORIGINS_JSON="\"${PORTAL_PLAYER_ORIGIN}\""
+    else
+        echo "note: no --player-origin given, so viewing tokens will not renew." >&2
+        echo "      Viewers lose access three hours after signing in." >&2
+        echo "      Add the player's origin to player_origins in portal.json." >&2
+    fi
 fi
 
 # ── Pre-flight checks ─────────────────────────────────────────────────
@@ -442,7 +471,8 @@ EOF
   "listen_addr": "127.0.0.1:8088",
   "manager_url": "${PORTAL_MANAGER_URL}",
   "username_header": "Remote-User",
-  "trusted_proxies": ["127.0.0.1", "::1"]
+  "trusted_proxies": ["127.0.0.1", "::1"],
+  "player_origins": [${PORTAL_ORIGINS_JSON}]
 }
 EOF
         chmod 0644 "${PORTAL_CONFIG}"

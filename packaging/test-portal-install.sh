@@ -86,5 +86,47 @@ check "binary path parsed from ExecStart" \
 check "no unit -> nothing to upgrade" "$(detect '')" ""
 
 echo
+echo
+echo "== --player-origin decides whether a viewing token can ever renew =="
+# Run the real installer far enough to hit argument validation. Anything that
+# reaches the download is "accepted" as far as this check is concerned.
+porigin() {
+  out=$(bash ./install-relay.sh --manager wss://m/ws --registration-token t \
+        --with-portal https://m.example --player-origin "$1" 2>&1 >/dev/null </dev/null || true)
+  case "$out" in
+    *"must start with http"*) echo "reject-scheme";;
+    *"has a path"*)           echo "reject-path";;
+    *)                        echo "accept";;
+  esac
+}
+check "player-origin scheme-less refused" "$(porigin relay.example)"               "reject-scheme"
+check "player-origin with a path refused" "$(porigin https://relay.example/watch)" "reject-path"
+check "player-origin https accepted"      "$(porigin https://relay.example)"       "accept"
+
+# Absent, it must fail closed AND say so — an unrenewable token is a silent
+# failure three hours later, not an error at install time.
+warned=$(bash ./install-relay.sh --manager wss://m/ws --registration-token t \
+         --with-portal https://m.example 2>&1 >/dev/null </dev/null || true)
+case "$warned" in
+  *"will not renew"*) ok "no player-origin warns that tokens will not renew";;
+  *) bad "no player-origin is silent about renewal being off";;
+esac
+
+# And the config it writes must be valid JSON either way.
+cfgjson() {  # $1 = what the installer substitutes
+  python3 - "$1" <<'PY'
+import json, sys
+tpl = '{ "listen_addr": "127.0.0.1:8088", "manager_url": "https://m.example",' \
+      ' "username_header": "Remote-User", "trusted_proxies": ["127.0.0.1", "::1"],' \
+      ' "player_origins": [%s] }'
+try:
+    print(",".join(json.loads(tpl % sys.argv[1])["player_origins"]) or "empty")
+except Exception:
+    print("INVALID-JSON")
+PY
+}
+check "config with an origin is valid"  "$(cfgjson '"https://relay.example"')" "https://relay.example"
+check "config without one is valid"     "$(cfgjson '')"                        "empty"
+
 echo "-- $PASS passed, $FAIL failed --"
 [ "$FAIL" -eq 0 ]

@@ -226,6 +226,11 @@ that skipped the check would quietly turn "access lasts three hours" into
 "access lasts as long as the tab is open", and withdrawing access would stop
 working.
 
+`install-relay.sh` takes `--player-origin https://relay.example.com` alongside
+`--with-portal` and writes it for you. Without it the installer warns, because
+the failure is otherwise silent: the portal installs, viewers sign in, and three
+hours later their access ends mid-event with nothing to say why.
+
 Renewal is **off until you name the player's origin**, because it is a
 cross-origin request carrying the viewer's session cookie — the shape a CSRF
 wants:
