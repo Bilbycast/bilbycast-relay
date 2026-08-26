@@ -186,6 +186,7 @@
     <button id="btnPlay" title="Play">&#9654;</button>
     <button id="btnPause" title="Pause">&#10073;&#10073;</button>
     <button id="btnMute" aria-pressed="true" title="Unmute">&#128263;</button>
+    <button id="btnFull" aria-pressed="false" title="Full screen (F)">FULL</button>
     <div class="sep"></div>
 
     <button data-jog="-1" title="Step back one frame">&#9664;|</button>
@@ -209,7 +210,7 @@
   <div class="hint">
     Keys: <b>J</b>/<b>L</b> rewind/forward (press again to speed up) &middot;
     <b>K</b> stop &middot; <b>,</b>/<b>.</b> frame step &middot;
-    <b>Space</b> play/pause &middot; <b>End</b> live<br>
+    <b>Space</b> play/pause &middot; <b>End</b> live &middot; <b>F</b> full screen<br>
     The <b style="color:var(--accent)">lit</b> part of the bar is held on this
     device: dragging there moves the real picture, frame for frame. Outside it you
     get a preview thumbnail while you drag, and the video arrives when you let go.<br>
@@ -307,6 +308,7 @@
   var btnPlay = document.getElementById("btnPlay");
   var btnPause = document.getElementById("btnPause");
   var btnMute = document.getElementById("btnMute");
+  var btnFull = document.getElementById("btnFull");
   var btnRew = document.getElementById("btnRew");
   var btnFf = document.getElementById("btnFf");
 
@@ -1586,10 +1588,54 @@
   // Separate play and pause rather than one toggle: on a transport you press
   // the control you want, without first reading the button to find out what
   // it currently means.
+  // ── full screen ────────────────────────────────────────────────────────
+  // On a tablet the address bar and the system bar take a serious bite out of
+  // a 1080p picture. Prefixed calls are here for Safari; where neither exists
+  // the button is removed rather than left to do nothing when pressed.
+  function fullscreenNow() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  function toggleFullscreen() {
+    var el = document.documentElement;
+    try {
+      if (fullscreenNow()) {
+        var exit = document.exitFullscreen || document.webkitExitFullscreen;
+        if (exit) exit.call(document);
+      } else {
+        var enter = el.requestFullscreen || el.webkitRequestFullscreen;
+        if (enter) enter.call(el);
+      }
+    } catch (e) { /* a refusal is not worth an error message */ }
+  }
+
+  function syncFullscreenButton() {
+    var on = !!fullscreenNow();
+    btnFull.setAttribute("aria-pressed", on ? "true" : "false");
+    btnFull.textContent = on ? "EXIT" : "FULL";
+    btnFull.title = on ? "Leave full screen (F)" : "Full screen (F)";
+  }
+
+  if (document.documentElement.requestFullscreen ||
+      document.documentElement.webkitRequestFullscreen) {
+    btnFull.addEventListener("click", toggleFullscreen);
+    document.addEventListener("fullscreenchange", syncFullscreenButton);
+    document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
+  } else {
+    // iOS Safari fullscreens a `<video>` and nothing else, which would take
+    // the transport away with it — the one control an operator needs most.
+    btnFull.remove();
+  }
+
   btnPlay.addEventListener("click", function () {
+    // Play means *play*: forward, full speed, from whatever the transport was
+    // doing. It used to preserve the rate, so pressing it during a 4x
+    // fast-forward gave 4x playback and during a 33% review gave 33% — the
+    // operator asks for normal speed and gets something else, and the only way
+    // back was to find the 100% button.
     stopShuttle();
     if (mode === "jog") setMode("scrub");
-    setRate(rate > 0 ? rate : 1);
+    setRate(1);
   });
   /// Stop the transport, whatever it was doing.
   ///
@@ -1632,6 +1678,7 @@
       case ",": jog(-1); break;
       case ".": jog(1); break;
       case "End": goLive(); break;
+      case "f": case "F": toggleFullscreen(); break;
       case " ":
         e.preventDefault();
         if (mode === "shuttle" || !activeVideo().paused) pauseTransport();

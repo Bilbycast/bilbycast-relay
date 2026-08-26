@@ -343,6 +343,20 @@ at the narrow presets the whole visible span is usually instant *and*
 frame-exact. That is a consequence of the back buffer's size rather than a
 designed property, and it does not hold for a viewer who has just joined.
 
+### Transport controls
+
+**Play means forward at full speed**, from whatever the transport was doing —
+a fast-forward, a reverse shuttle, a 33 % review or a pause. It used to carry
+the previous rate forward, so pressing play during a 4x fast-forward gave 4x
+*playback*: the operator asks for normal speed and gets something else, with no
+obvious way back except finding the 100 % button.
+
+**Full screen** (`FULL`, or `F`) puts the player over the whole display — on a
+tablet the address bar and system bar take a serious bite out of a 1080p
+picture. Where the browser cannot fullscreen an arbitrary element the button is
+**removed** rather than left inert: iOS Safari fullscreens a `<video>` and
+nothing else, which would take the transport with it.
+
 ### The two readouts
 
 **Left: the time of day the frame was ingested**, as `HH:MM:SS:FF` in the

@@ -846,6 +846,58 @@ mod tests {
         );
     }
 
+    /// Play means forward at full speed, whatever the transport was doing.
+    ///
+    /// It used to preserve the rate, so pressing play during a 4x fast-forward
+    /// gave 4x *playback* and during a 33% review gave 33%. The operator asks
+    /// for normal speed and gets something else, with no obvious way back
+    /// except finding the 100% button.
+    #[test]
+    fn play_restores_forward_full_speed() {
+        let html = include_str!("dvr.html");
+        let handler = html
+            .split(r#"btnPlay.addEventListener("click", function () {"#)
+            .nth(1)
+            .expect("no play handler")
+            .split("
+  });")
+            .next()
+            .expect("unterminated play handler");
+        assert!(
+            handler.contains("setRate(1);"),
+            "play does not restore full speed: {handler}"
+        );
+        assert!(
+            !handler.contains("rate > 0 ? rate"),
+            "play still carries the previous rate forward: {handler}"
+        );
+        assert!(
+            handler.contains("stopShuttle()"),
+            "play does not stop a shuttle, so the loop would fight it: {handler}"
+        );
+    }
+
+    /// The full-screen button is removed where it could not work.
+    ///
+    /// iOS Safari fullscreens a `<video>` and nothing else, which would take
+    /// the transport with it — the one control an operator needs most. A
+    /// button that does nothing when pressed is worse than no button.
+    #[test]
+    fn the_fullscreen_button_is_removed_where_it_cannot_work() {
+        let html = include_str!("dvr.html");
+        assert!(html.contains(r#"id="btnFull""#), "no full-screen control");
+        assert!(
+            html.contains("btnFull.remove()"),
+            "an unsupported browser is left with a dead button"
+        );
+        // Prefixed calls for Safari, on both the enter and exit paths.
+        let t = js_fn(html, "toggleFullscreen");
+        assert!(
+            t.contains("webkitRequestFullscreen") && t.contains("webkitExitFullscreen"),
+            "only the unprefixed API is used: {t}"
+        );
+    }
+
     /// The bar spans the view; live is still measured against the whole window.
     ///
     /// Zooming trades reach for granularity — at 30 s across a 1000-step bar a
