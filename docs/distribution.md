@@ -402,6 +402,17 @@ Skipping uses a 250 ms margin, or "next" finds the mark already under the
 playhead — which is where the previous press just put it — and the button reads
 as dead. A skip with nowhere to go is disabled rather than inert.
 
+**Colour.** Marks default to red; the swatch in each drawer row opens a palette
+of six — red, amber, green, blue, purple, white. Deliberately a short list and a
+**closed** one, for two reasons. It has to read at the two-pixel width a flag
+actually gets on the bar, so the colours are bright and separated in brightness
+as well as hue (red and green are the pair most likely to be confused). And the
+colour is written into an inline `style` while marks come out of
+`localStorage`, which anything on the device can write — so a stored value is
+accepted only if it is one of the six, and anything else silently becomes red.
+The flag carries it via a `--c` custom property, because the pennant is a
+pseudo-element and cannot take an inline style.
+
 **They are kept in `localStorage`, per feed, on this device.** That survives a
 reload and a whole event. It does **not** share a mark with the operator
 sitting next to you — that needs somewhere server-side to put them, which does

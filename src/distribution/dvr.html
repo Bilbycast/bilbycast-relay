@@ -90,9 +90,11 @@
   #markbar { position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
              top: 50%; height: 14px;
              margin-top: -17px; pointer-events: none; z-index: 1; }
+  /* `--c` is set per flag from the mark's own colour. A pseudo-element cannot
+     take an inline style, so the custom property carries it down. */
   #markbar i {
     position: absolute; top: 0; width: 2px; height: 14px; margin-left: -1px;
-    background: var(--live); border-radius: 1px;
+    background: var(--c, var(--live)); border-radius: 1px;
   }
   #marktip {
     position: absolute; bottom: 30px; display: none; pointer-events: none;
@@ -108,7 +110,7 @@
   #markbar i::after {
     content: ""; position: absolute; top: -3px; left: -3px;
     border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 5px solid var(--live);
+    border-top: 5px solid var(--c, var(--live));
   }
   #ticks b {
     position: absolute; top: 10px; transform: translateX(-50%);
@@ -198,9 +200,10 @@
   #drawerClose { min-width: 36px; min-height: 36px; padding: 4px 10px; font-size: 18px; }
   #markList { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
   #markList li {
-    display: flex; align-items: center; gap: 8px;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     padding: 8px 10px; border-bottom: 1px solid var(--line);
   }
+  #markList li > .palette { flex: 1 0 100%; }
   #markList li.gone { opacity: .45; }
   #markList .at {
     font-family: ui-monospace, Menlo, monospace; font-size: 12px;
@@ -213,6 +216,24 @@
     border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px;
     font: inherit; font-size: 13px;
   }
+  #markList .swatch {
+    min-width: 30px; min-height: 30px; padding: 0; flex: 0 0 auto;
+    border-radius: 7px; border: 1px solid var(--line); background: transparent;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #markList .swatch i {
+    display: block; width: 15px; height: 15px; border-radius: 50%;
+    background: var(--c, var(--live));
+  }
+  #markList .palette {
+    display: none; gap: 6px; padding: 2px 10px 10px 10px; flex-wrap: wrap;
+  }
+  #markList li.picking .palette { display: flex; }
+  #markList .palette button {
+    min-width: 30px; min-height: 30px; padding: 0; border-radius: 50%;
+    border: 2px solid transparent;
+  }
+  #markList .palette button[aria-pressed="true"] { border-color: var(--fg); }
   #markList .del {
     min-width: 34px; min-height: 34px; padding: 2px 8px; font-size: 15px;
     background: transparent; border-color: transparent; color: var(--dim);
@@ -1224,6 +1245,35 @@
   // survive a reload and a whole event, and it is NOT enough to share a mark
   // with the operator sitting next to you — that needs somewhere server-side
   // to put them, which this does not have.
+  /// The colours a mark may be.
+  ///
+  /// Deliberately a short list, and a closed one. Each is bright enough to
+  /// read against the panel and distinct from its neighbours at the two-pixel
+  /// width a flag actually gets; red and green are the pair a colour-blind
+  /// operator is most likely to confuse, so they differ in brightness as well
+  /// as hue.
+  ///
+  /// **Closed matters for more than taste.** A mark's colour is written into
+  /// an inline `style`, and marks come out of `localStorage`, which anything
+  /// on the device can write. A stored value is accepted only if it is one of
+  /// these, so nothing can smuggle a declaration in through it.
+  var MARK_COLOURS = [
+    { name: "Red",    css: "#ff4d4f" },
+    { name: "Amber",  css: "#ffb020" },
+    { name: "Green",  css: "#37d3a6" },
+    { name: "Blue",   css: "#4da3ff" },
+    { name: "Purple", css: "#b07cff" },
+    { name: "White",  css: "#e8edf2" }
+  ];
+  var MARK_COLOUR_DEFAULT = MARK_COLOURS[0].css;
+
+  function isMarkColour(c) {
+    for (var i = 0; i < MARK_COLOURS.length; i++) {
+      if (MARK_COLOURS[i].css === c) return true;
+    }
+    return false;
+  }
+
   var MARKS_KEY = "bilbycast.dvr.marks." + STREAM;
   var marks = [];
   var markSeq = 0;
@@ -1241,6 +1291,9 @@
     });
     marks.forEach(function (m) {
       m.name = typeof m.name === "string" ? m.name : "";
+      // Anything not on the list becomes the default rather than being
+      // rejected: a mark is worth keeping even if its colour is not.
+      if (!isMarkColour(m.colour)) m.colour = MARK_COLOUR_DEFAULT;
       if (typeof m.id !== "number") m.id = ++markSeq;
       markSeq = Math.max(markSeq, m.id);
     });
@@ -1286,7 +1339,7 @@
       fail("This feed carries no clock, so marks cannot be placed on it.");
       return;
     }
-    var m = { id: ++markSeq, at: wall, name: "" };
+    var m = { id: ++markSeq, at: wall, name: "", colour: MARK_COLOUR_DEFAULT };
     marks.push(m);
     sortMarks();
     saveMarks();
@@ -1300,6 +1353,15 @@
 
   function deleteMark(id) {
     marks = marks.filter(function (m) { return m.id !== id; });
+    saveMarks();
+    renderMarks();
+  }
+
+  function recolourMark(id, css) {
+    if (!isMarkColour(css)) return;
+    var m = marks.filter(function (x) { return x.id === id; })[0];
+    if (!m) return;
+    m.colour = css;
     saveMarks();
     renderMarks();
   }
@@ -1343,6 +1405,7 @@
         if (!el) { el = document.createElement("i"); markbar.appendChild(el); flagPool.push(el); }
         el.style.left = (frac * 100).toFixed(3) + "%";
         el.style.display = "block";
+        el.style.setProperty("--c", marks[i].colour || MARK_COLOUR_DEFAULT);
         el.title = marks[i].name || "Mark";
         n++;
       }
@@ -1380,13 +1443,39 @@
         closeDrawer();
       });
 
+      var swatch = document.createElement("button");
+      swatch.className = "swatch";
+      swatch.title = "Colour";
+      swatch.setAttribute("aria-expanded", "false");
+      var dot = document.createElement("i");
+      dot.style.setProperty("--c", m.colour || MARK_COLOUR_DEFAULT);
+      swatch.appendChild(dot);
+
+      var palette = document.createElement("div");
+      palette.className = "palette";
+      MARK_COLOURS.forEach(function (c) {
+        var b = document.createElement("button");
+        b.style.background = c.css;
+        b.title = c.name;
+        b.setAttribute("aria-label", c.name);
+        b.setAttribute("aria-pressed",
+          (m.colour || MARK_COLOUR_DEFAULT) === c.css ? "true" : "false");
+        b.addEventListener("click", function () { recolourMark(m.id, c.css); });
+        palette.appendChild(b);
+      });
+      swatch.addEventListener("click", function () {
+        var open = li.classList.toggle("picking");
+        swatch.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+
       var del = document.createElement("button");
       del.className = "del";
       del.textContent = "\u00d7";
       del.title = "Delete this mark";
       del.addEventListener("click", function () { deleteMark(m.id); });
 
-      li.appendChild(at); li.appendChild(name); li.appendChild(del);
+      li.appendChild(at); li.appendChild(name); li.appendChild(swatch); li.appendChild(del);
+      li.appendChild(palette);
       markList.appendChild(li);
     });
     renderFlags();

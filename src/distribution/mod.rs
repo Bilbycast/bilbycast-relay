@@ -1099,6 +1099,47 @@ mod tests {
         );
     }
 
+    /// A mark's colour comes from a closed palette, and is validated.
+    ///
+    /// The colour is written into an inline `style`, and marks are read from
+    /// `localStorage`, which anything on the device can write. Accepting the
+    /// stored string would let it carry a declaration of its own choosing
+    /// into the page. Membership of the list is the whole check.
+    #[test]
+    fn a_mark_colour_must_be_one_of_the_palette() {
+        let html = include_str!("dvr.html");
+        let load = js_fn(html, "loadMarks");
+        assert!(
+            load.contains("if (!isMarkColour(m.colour)) m.colour = MARK_COLOUR_DEFAULT;"),
+            "a stored colour is trusted as read: {load}"
+        );
+        let set = js_fn(html, "recolourMark");
+        assert!(
+            set.contains("if (!isMarkColour(css)) return;"),
+            "a colour can be set to something off the palette: {set}"
+        );
+        // Red by default, as the flags have always been.
+        assert!(
+            html.contains(r#"var MARK_COLOUR_DEFAULT = MARK_COLOURS[0].css;"#)
+                && html.contains(r##"{ name: "Red",    css: "#ff4d4f" }"##),
+            "the default is no longer the red the bar used"
+        );
+        assert!(
+            js_fn(html, "addMark").contains("colour: MARK_COLOUR_DEFAULT"),
+            "a new mark has no colour"
+        );
+        // The flag carries it through a custom property: a pseudo-element
+        // draws the pennant and cannot take an inline style.
+        assert!(
+            js_fn(html, "renderFlags").contains(r#"el.style.setProperty("--c""#),
+            "the flag does not take the mark's colour"
+        );
+        assert!(
+            html.contains("border-top: 5px solid var(--c, var(--live));"),
+            "the pennant ignores the colour the flag was given"
+        );
+    }
+
     /// A stored list that does not parse must not take the player down.
     ///
     /// It is `localStorage` — a previous version, another tab, or someone with
