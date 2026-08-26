@@ -846,6 +846,93 @@ mod tests {
         );
     }
 
+    /// A mark is stored against wall clock, never against `currentTime`.
+    ///
+    /// hls.js zeroes its timeline at whichever fragment it happened to load
+    /// first, so a mark recorded against the media clock points somewhere else
+    /// after a reload and somewhere else again for a second viewer. Wall clock
+    /// is the only thing two sessions agree on, and the only thing that
+    /// survives the window rolling underneath it.
+    #[test]
+    fn a_mark_is_stored_against_wall_clock() {
+        let html = include_str!("dvr.html");
+        let add = js_fn(html, "addMark");
+        assert!(
+            add.contains("wallClockAt(t)"),
+            "a mark is not recorded against the clock: {add}"
+        );
+        assert!(
+            add.contains("if (wall === null)"),
+            "a feed with no clock would store a mark that points nowhere: {add}"
+        );
+        // And going back to one converts the other way.
+        let inv = js_fn(html, "mainTimeAtWall");
+        assert!(
+            inv.contains("f.programDateTime"),
+            "the inverse does not go through the playlist clock: {inv}"
+        );
+        assert!(
+            js_fn(html, "goToMark").contains("mainTimeAtWall(m.at)"),
+            "going to a mark does not convert from wall clock"
+        );
+    }
+
+    /// A mark the window has rolled past must be visibly unreachable.
+    ///
+    /// Marks outlive the DVR window — they are kept for the session, the
+    /// window is minutes or hours. One that can no longer be seeked to has to
+    /// say so rather than sit there looking like a button that does nothing.
+    #[test]
+    fn a_mark_outside_the_window_is_shown_as_unreachable() {
+        let html = include_str!("dvr.html");
+        assert!(
+            js_fn(html, "markIsReachable").contains("t >= r.start && t <= r.end"),
+            "nothing decides whether a mark can still be reached"
+        );
+        let render = js_fn(html, "renderMarks");
+        assert!(
+            render.contains("at.disabled = !reachable"),
+            "an unreachable mark still offers a control that cannot work: {render}"
+        );
+        assert!(render.contains(r#"li.className = "gone""#), "no visible sign: {render}");
+
+        // And it must be re-decided, not latched. The list is first drawn
+        // before hls.js has a playlist, so every mark looks unreachable at
+        // that moment; computed once, a freshly reloaded player had every mark
+        // disabled until something else redrew the list. It also changes on
+        // its own as the window rolls past a mark.
+        assert!(
+            js_fn(html, "render()").contains("refreshMarkStates()"),
+            "reachability is decided once, when it cannot yet be known"
+        );
+        assert!(
+            js_fn(html, "refreshMarkStates").contains("markIsReachable(marks[i])"),
+            "the refresh does not actually re-decide"
+        );
+        assert!(
+            js_fn(html, "goToMark").contains("t < r.start || t > r.end"),
+            "goToMark would seek outside the window"
+        );
+    }
+
+    /// A stored list that does not parse must not take the player down.
+    ///
+    /// It is `localStorage` — a previous version, another tab, or someone with
+    /// devtools open can have left anything there.
+    #[test]
+    fn a_corrupt_marks_store_is_survived() {
+        let f = js_fn(include_str!("dvr.html"), "loadMarks");
+        assert!(f.contains("try {") && f.contains("catch"), "no guard on the read: {f}");
+        assert!(
+            f.contains("Array.isArray(marks)"),
+            "a stored value that is not a list would be iterated: {f}"
+        );
+        assert!(
+            f.contains("typeof m.at === \"number\"") && f.contains("isFinite(m.at)"),
+            "an entry with no usable time survives and renders at NaN%: {f}"
+        );
+    }
+
     /// Play means forward at full speed, whatever the transport was doing.
     ///
     /// It used to preserve the rate, so pressing play during a 4x fast-forward
@@ -1537,7 +1624,35 @@ mod tests {
         );
         // Per tab, not per browser: a viewing credential has no business
         // outliving the tab it was opened in.
-        assert!(!html.contains("localStorage"), "a viewer token must not persist beyond the tab");
+        //
+        // Asserted against the token's own helpers rather than by banning the
+        // string `localStorage` from the file, which is what this used to do.
+        // Marks are kept in `localStorage` deliberately — they are notes, not
+        // a credential — and a file-wide ban would have to be deleted to let
+        // them in, taking the real guarantee with it.
+        for f in ["rememberToken", "recallToken", "forgetToken"] {
+            let body = js_fn(html, f);
+            assert!(
+                body.contains("sessionStorage"),
+                "{f} does not use sessionStorage: {body}"
+            );
+            assert!(
+                !body.contains("localStorage"),
+                "{f} would outlive the tab: {body}"
+            );
+        }
+        // And nothing else may put a credential there either. Comments are
+        // skipped: this section explains itself in prose, and the prose is not
+        // what stores anything.
+        for line in html.lines().filter(|l| {
+            let t = l.trim_start();
+            l.contains("localStorage") && !t.starts_with("//") && !t.starts_with("*")
+        }) {
+            assert!(
+                line.contains("MARKS_KEY"),
+                "localStorage used for something other than marks: {line}"
+            );
+        }
         // Every access wrapped: a browser with site data blocked throws on
         // read rather than returning null, and that must not take the player
         // down with it.

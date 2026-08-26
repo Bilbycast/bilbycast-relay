@@ -79,6 +79,19 @@
      invisible. */
   #ticks i { position: absolute; top: 0; width: 1px; height: 5px; background: #4d5a68; }
   #ticks i.major { height: 10px; width: 1px; background: #8494a4; }
+  /* Marks on the bar. Above the ruler and below the slider, so a flag never
+     swallows a drag. */
+  #markbar { position: absolute; left: 0; right: 0; top: 50%; height: 14px;
+             margin-top: -17px; pointer-events: none; z-index: 1; }
+  #markbar i {
+    position: absolute; top: 0; width: 2px; height: 14px; margin-left: -1px;
+    background: var(--live); border-radius: 1px;
+  }
+  #markbar i::after {
+    content: ""; position: absolute; top: -3px; left: -3px;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 5px solid var(--live);
+  }
   #ticks b {
     position: absolute; top: 10px; transform: translateX(-50%);
     font: 10px/1 ui-monospace, Menlo, monospace; color: var(--dim);
@@ -146,6 +159,48 @@
     align-self: center; padding-right: 2px;
   }
   .err { color: #ffb4b4; font-size: 12px; margin-top: 8px; min-height: 1.2em; }
+  /* The drawer. Off-canvas rather than hidden, so it slides rather than
+     appears — an operator should see where it came from. */
+  #drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(340px, 86vw);
+    background: var(--panel); border-left: 1px solid var(--line);
+    transform: translateX(100%); transition: transform .18s ease-out;
+    display: flex; flex-direction: column; z-index: 10;
+    box-shadow: -8px 0 24px rgba(0,0,0,.45);
+  }
+  body[data-drawer="1"] #drawer { transform: translateX(0); }
+  @media (prefers-reduced-motion: reduce) { #drawer { transition: none; } }
+  #drawer header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border-bottom: 1px solid var(--line);
+  }
+  #drawer h2 { margin: 0; font-size: 14px; font-weight: 600; }
+  #drawerClose { min-width: 36px; min-height: 36px; padding: 4px 10px; font-size: 18px; }
+  #markList { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  #markList li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-bottom: 1px solid var(--line);
+  }
+  #markList li.gone { opacity: .45; }
+  #markList .at {
+    font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+    color: var(--accent); cursor: pointer; background: none; border: 0;
+    min-width: 0; padding: 4px 2px; min-height: 32px;
+  }
+  #markList li.gone .at { color: var(--dim); cursor: default; }
+  #markList input {
+    flex: 1; min-width: 0; background: #1c222a; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px;
+    font: inherit; font-size: 13px;
+  }
+  #markList .del {
+    min-width: 34px; min-height: 34px; padding: 2px 8px; font-size: 15px;
+    background: transparent; border-color: transparent; color: var(--dim);
+  }
+  #markEmpty, #drawer .note { color: var(--dim); font-size: 12px; padding: 12px; margin: 0; }
+  #drawer .note { border-top: 1px solid var(--line); }
+  body[data-marks="0"] #markList { display: none; }
+  body[data-marks="1"] #markEmpty { display: none; }
   @media (max-width: 560px) { .label-long { display: none; } }
 </style>
 </head>
@@ -169,12 +224,24 @@
   <pre id="debug"></pre>
 </div>
 
+<aside id="drawer" aria-label="Marks">
+  <header>
+    <h2>Marks</h2>
+    <button id="drawerClose" data-act="close" title="Close">&times;</button>
+  </header>
+  <ol id="markList"></ol>
+  <p id="markEmpty">Nothing marked yet. Press <b>MARK</b>, or <b>M</b>, to mark
+     the moment you are looking at.</p>
+  <p class="note">Kept on this device, for this feed.</p>
+</aside>
+
 <footer>
   <div class="timeline">
     <span class="t" id="tPos" title="Time of day this frame was ingested">--:--:--:--</span>
     <div class="track">
       <div id="cached" aria-hidden="true"></div>
       <div id="ticks" aria-hidden="true"></div>
+      <div id="markbar" aria-hidden="true"></div>
       <div id="preview" aria-hidden="true"><i></i><b></b></div>
       <input id="scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="Scrub">
     </div>
@@ -187,6 +254,8 @@
     <button id="btnPause" title="Pause">&#10073;&#10073;</button>
     <button id="btnMute" aria-pressed="true" title="Unmute">&#128263;</button>
     <button id="btnFull" aria-pressed="false" title="Full screen (F)">FULL</button>
+    <button id="btnMark" title="Mark this moment (M)">MARK</button>
+    <button id="btnDrawer" aria-pressed="false" title="Show the marks list">MARKS</button>
     <div class="sep"></div>
 
     <button data-jog="-1" title="Step back one frame">&#9664;|</button>
@@ -210,7 +279,8 @@
   <div class="hint">
     Keys: <b>J</b>/<b>L</b> rewind/forward (press again to speed up) &middot;
     <b>K</b> stop &middot; <b>,</b>/<b>.</b> frame step &middot;
-    <b>Space</b> play/pause &middot; <b>End</b> live &middot; <b>F</b> full screen<br>
+    <b>Space</b> play/pause &middot; <b>End</b> live &middot; <b>F</b> full screen &middot;
+    <b>M</b> mark<br>
     The <b style="color:var(--accent)">lit</b> part of the bar is held on this
     device: dragging there moves the real picture, frame for frame. Outside it you
     get a preview thumbnail while you drag, and the video arrives when you let go.<br>
@@ -297,6 +367,8 @@
   var scrub = document.getElementById("scrub");
   var cached = document.getElementById("cached");
   var ticks = document.getElementById("ticks");
+  var markbar = document.getElementById("markbar");
+  var markList = document.getElementById("markList");
   var preview = document.getElementById("preview");
   var previewImg = preview.querySelector("i");
   var previewLabel = preview.querySelector("b");
@@ -309,6 +381,8 @@
   var btnPause = document.getElementById("btnPause");
   var btnMute = document.getElementById("btnMute");
   var btnFull = document.getElementById("btnFull");
+  var btnMark = document.getElementById("btnMark");
+  var btnDrawer = document.getElementById("btnDrawer");
   var btnRew = document.getElementById("btnRew");
   var btnFf = document.getElementById("btnFf");
 
@@ -1085,6 +1159,215 @@
     renderCached(r);
   }
 
+  // ── marks ──────────────────────────────────────────────────────────────
+  // An operator watching a match wants to say "that, there" and come back to
+  // it. Marks are stored against **wall clock**, not `currentTime`: hls.js
+  // zeroes its timeline at whichever fragment it loaded first, so a mark
+  // recorded against the media clock points somewhere else after a reload and
+  // somewhere else again for a second viewer.
+  //
+  // They live in `localStorage`, per feed, on this device. That is enough to
+  // survive a reload and a whole event, and it is NOT enough to share a mark
+  // with the operator sitting next to you — that needs somewhere server-side
+  // to put them, which this does not have.
+  var MARKS_KEY = "bilbycast.dvr.marks." + STREAM;
+  var marks = [];
+  var markSeq = 0;
+
+  function loadMarks() {
+    try {
+      var raw = window.localStorage.getItem(MARKS_KEY);
+      if (raw) marks = JSON.parse(raw) || [];
+    } catch (e) { marks = []; }
+    if (!Array.isArray(marks)) marks = [];
+    // A stored file from a future version, or a hand-edited one, must not take
+    // the feature down: keep what parses and drop the rest.
+    marks = marks.filter(function (m) {
+      return m && typeof m.at === "number" && isFinite(m.at);
+    });
+    marks.forEach(function (m) {
+      m.name = typeof m.name === "string" ? m.name : "";
+      if (typeof m.id !== "number") m.id = ++markSeq;
+      markSeq = Math.max(markSeq, m.id);
+    });
+    sortMarks();
+  }
+
+  function saveMarks() {
+    try { window.localStorage.setItem(MARKS_KEY, JSON.stringify(marks)); }
+    catch (e) { /* private mode, or full: the marks still work for this tab */ }
+  }
+
+  function sortMarks() { marks.sort(function (a, b) { return a.at - b.at; }); }
+
+  /// Media time for a wall clock — the inverse of `wallClockAt`.
+  ///
+  /// `null` when there is no playlist clock to convert through, which is the
+  /// same condition that makes the time-of-day readout fall back.
+  function mainTimeAtWall(wallMs) {
+    if (!mainHls || !mainHls.levels) return null;
+    var lvl = mainHls.levels[mainHls.currentLevel >= 0 ? mainHls.currentLevel : 0];
+    var det = lvl && lvl.details;
+    var frags = det && det.fragments;
+    if (!frags || !frags.length) return null;
+    var f = frags[0];
+    if (typeof f.programDateTime !== "number") return null;
+    return f.start + (wallMs - f.programDateTime) / 1000;
+  }
+
+  /// Is this mark still inside the window, and therefore reachable?
+  function markIsReachable(m) {
+    var t = mainTimeAtWall(m.at);
+    var r = range(main);
+    return t !== null && r !== null && t >= r.start && t <= r.end;
+  }
+
+  function addMark() {
+    var v = activeVideo();
+    var t = toMainTime(playhead(v), v);
+    var wall = wallClockAt(t);
+    if (wall === null) {
+      // Without a playlist clock a mark could not be found again, so refuse
+      // rather than store one that silently points nowhere.
+      fail("This feed carries no clock, so marks cannot be placed on it.");
+      return;
+    }
+    var m = { id: ++markSeq, at: wall, name: "" };
+    marks.push(m);
+    sortMarks();
+    saveMarks();
+    renderMarks();
+    openDrawer();
+    // Focus the new row's name field: naming is the point, and a prompt is a
+    // poor thing to hand someone holding a tablet.
+    var input = markList.querySelector('input[data-id="' + m.id + '"]');
+    if (input) { input.focus(); input.select(); }
+  }
+
+  function deleteMark(id) {
+    marks = marks.filter(function (m) { return m.id !== id; });
+    saveMarks();
+    renderMarks();
+  }
+
+  function renameMark(id, name) {
+    var m = marks.filter(function (x) { return x.id === id; })[0];
+    if (!m) return;
+    m.name = name;
+    saveMarks();
+    renderFlags();      // the title on the bar follows the name
+  }
+
+  function goToMark(m) {
+    var t = mainTimeAtWall(m.at);
+    if (t === null) return;
+    var r = range(main);
+    if (!r || t < r.start || t > r.end) return;
+    if (mode === "live" || mode === "shuttle") setMode("scrub");
+    stopShuttle();
+    var v = activeVideo();
+    v.pause();
+    pendingSeek = null;
+    try { v.currentTime = fromMainTime(t, v); } catch (e) {}
+    render();
+  }
+
+  /// Flags on the bar, for the marks inside the current view.
+  var flagPool = [];
+  function renderFlags() {
+    var view = viewRange();
+    if (!view) return;
+    var span = view.end - view.start;
+    var n = 0;
+    if (span > 0) {
+      for (var i = 0; i < marks.length; i++) {
+        var t = mainTimeAtWall(marks[i].at);
+        if (t === null) continue;
+        var frac = (t - view.start) / span;
+        if (frac < 0 || frac > 1) continue;
+        var el = flagPool[n];
+        if (!el) { el = document.createElement("i"); markbar.appendChild(el); flagPool.push(el); }
+        el.style.left = (frac * 100).toFixed(3) + "%";
+        el.style.display = "block";
+        el.title = marks[i].name || "Mark";
+        n++;
+      }
+    }
+    for (; n < flagPool.length; n++) flagPool[n].style.display = "none";
+  }
+
+  function renderMarks() {
+    document.body.dataset.marks = marks.length ? "1" : "0";
+    markList.textContent = "";
+    marks.forEach(function (m) {
+      var li = document.createElement("li");
+      var reachable = markIsReachable(m);
+      if (!reachable) li.className = "gone";
+
+      var at = document.createElement("button");
+      at.className = "at";
+      at.textContent = fmtTimeOfDay(m.at).slice(0, 8);
+      at.title = reachable ? "Go to this mark" : "Past the end of the window";
+      at.disabled = !reachable;
+      at.addEventListener("click", function () { goToMark(m); });
+
+      var name = document.createElement("input");
+      name.type = "text";
+      name.value = m.name;
+      name.placeholder = "Name this mark";
+      name.setAttribute("data-id", String(m.id));
+      name.addEventListener("input", function () { renameMark(m.id, name.value); });
+
+      var del = document.createElement("button");
+      del.className = "del";
+      del.textContent = "\u00d7";
+      del.title = "Delete this mark";
+      del.addEventListener("click", function () { deleteMark(m.id); });
+
+      li.appendChild(at); li.appendChild(name); li.appendChild(del);
+      markList.appendChild(li);
+    });
+    renderFlags();
+  }
+
+  /// Re-decide which marks can still be reached.
+  ///
+  /// Reachability cannot be known when the list is first drawn: the page
+  /// renders before hls.js has a playlist, so `mainTimeAtWall` returns null
+  /// and every mark looks unreachable. Computed once at load, that left a
+  /// freshly reloaded player with every mark disabled until something else
+  /// happened to redraw the list — which looked exactly like marks not
+  /// working, and was.
+  ///
+  /// It also changes on its own as the window rolls past a mark, so it has to
+  /// be re-decided anyway rather than latched.
+  function refreshMarkStates() {
+    var rows = markList.children;
+    for (var i = 0; i < rows.length && i < marks.length; i++) {
+      var li = rows[i];
+      var at = li.querySelector(".at");
+      if (!at) continue;
+      var reachable = markIsReachable(marks[i]);
+      if (at.disabled !== !reachable) {
+        at.disabled = !reachable;
+        li.className = reachable ? "" : "gone";
+        at.title = reachable ? "Go to this mark" : "Past the end of the window";
+      }
+    }
+  }
+
+  function openDrawer() {
+    document.body.dataset.drawer = "1";
+    btnDrawer.setAttribute("aria-pressed", "true");
+  }
+  function closeDrawer() {
+    document.body.dataset.drawer = "0";
+    btnDrawer.setAttribute("aria-pressed", "false");
+  }
+  function toggleDrawer() {
+    if (document.body.dataset.drawer === "1") closeDrawer(); else openDrawer();
+  }
+
   // ── the ruler ──────────────────────────────────────────────────────────
   // Marks along the bar, at round clock times. Two jobs:
   //
@@ -1184,6 +1467,7 @@
 
   function tickLoop() {
     renderTicks();
+    renderFlags();   // the flags ride the same view, so they move with it
     requestAnimationFrame(tickLoop);
   }
 
@@ -1515,6 +1799,7 @@
         scrub.value = String(Math.round(Math.max(0, Math.min(1, frac)) * 1000));
       }
       renderCached(view);
+      refreshMarkStates();
       updateLiveState(r.end - pos);
       var atLive = liveState;
       document.body.dataset.live = atLive ? "1" : "0";
@@ -1627,6 +1912,10 @@
     btnFull.remove();
   }
 
+  btnMark.addEventListener("click", addMark);
+  btnDrawer.addEventListener("click", toggleDrawer);
+  document.getElementById("drawerClose").addEventListener("click", closeDrawer);
+
   btnPlay.addEventListener("click", function () {
     // Play means *play*: forward, full speed, from whatever the transport was
     // doing. It used to preserve the rate, so pressing it during a 4x
@@ -1679,6 +1968,8 @@
       case ".": jog(1); break;
       case "End": goLive(); break;
       case "f": case "F": toggleFullscreen(); break;
+      case "m": case "M": addMark(); break;
+      case "Escape": if (document.body.dataset.drawer === "1") closeDrawer(); else return; break;
       case " ":
         e.preventDefault();
         if (mode === "shuttle" || !activeVideo().paused) pauseTransport();
@@ -2013,6 +2304,8 @@
     document.getElementById("stRun").addEventListener("click", stRunAll);
   }
   scheduleRenewal();
+  loadMarks();
+  renderMarks();
   mainHls = attach(main, MAIN, "main");
   // The proxy is NOT attached up front. Two live MSE elements hold two
   // decoders, and Chrome's hardware decoder budget is small and shared —

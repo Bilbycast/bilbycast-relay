@@ -357,6 +357,36 @@ picture. Where the browser cannot fullscreen an arbitrary element the button is
 **removed** rather than left inert: iOS Safari fullscreens a `<video>` and
 nothing else, which would take the transport with it.
 
+### Marks
+
+`MARK` (or `M`) records the moment on screen; `MARKS` slides out a drawer on
+the right listing them, each with its time of day, an editable name, and a
+delete. Clicking the time seeks there. Pressing `MARK` opens the drawer with
+the new row's name field focused, because naming is the point and a modal
+prompt is a poor thing to hand someone holding a tablet.
+
+**A mark is stored against wall clock, never `currentTime`.** hls.js zeroes its
+timeline at whichever fragment it loaded first, so a mark recorded against the
+media clock points somewhere else after a reload and somewhere else again for a
+second viewer. Wall clock is the only thing two sessions agree on, and the only
+thing that survives the window rolling underneath it. A feed with no
+`#EXT-X-PROGRAM-DATE-TIME` refuses to take marks rather than storing ones that
+point nowhere.
+
+**Reachability is re-decided continuously, not latched.** Marks outlive the DVR
+window; one the window has rolled past is greyed and its control disabled. This
+also has to be recomputed because the list is first drawn *before* hls.js has a
+playlist — computed once at load, every mark rendered disabled on a fresh reload
+until something else happened to redraw the list, which looked exactly like
+marks not working.
+
+**They are kept in `localStorage`, per feed, on this device.** That survives a
+reload and a whole event. It does **not** share a mark with the operator
+sitting next to you — that needs somewhere server-side to put them, which does
+not exist yet. Note the viewing token deliberately uses `sessionStorage`
+instead: a credential has no business outliving its tab, and a test asserts the
+two do not get confused.
+
 ### The two readouts
 
 **Left: the time of day the frame was ingested**, as `HH:MM:SS:FF` in the
