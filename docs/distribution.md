@@ -131,10 +131,32 @@ segments the store does not hold are dropped, and `EXT-X-MEDIA-SEQUENCE` and
   manifest can arrive a beat before the first segment; rewriting that to empty
   turns a transient into a hard player error.
 
-The loss itself — a restart discarding a window whose files are on disk the
-whole time — is [relay#8](https://github.com/Bilbycast/bilbycast-relay/issues/8).
-Until that lands, **restart the edge whenever you restart the relay**, or
-accept a window that restarts from empty.
+### A restart keeps the window
+
+The store used to delete its root on startup, so a relay restart cost the
+whole DVR window — 2h30m of footage, and 2h30m of wall time to rebuild it, for
+files that were on disk and readable throughout.
+
+Startup now **adopts** what is there: the segment index from the files
+present, the eviction queue in age order from their mtimes, and the byte
+counters from their sizes. What bounds the directory is the retention and
+byte-cap sweep that runs anyway — the wipe was a blunt substitute for it that
+could only be applied at startup. Three things it has to get right:
+
+* `stored_at` carries the file's real age. Stamped "now", a recovered window
+  looks brand new and is held for a full retention period again.
+* The queue is oldest-first. In directory order, eviction deletes the newest
+  footage and keeps the oldest.
+* A `.part` is discarded: it is a PUT interrupted by the very restart being
+  recovered from, and truncated by definition.
+
+Manifests and `init.mp4` are memory-only and still die with the process. The
+edge re-publishes both — that is what `init_last_upload` exists for on that
+side — so the gap is a segment or two, and the trim above keeps the playlist
+honest across it.
+
+Measured: relay restarted alone, adopted 906 segments (1191 MB) across two
+streams, and the served window then probed 0 of 43 missing.
 
 ## Access tokens
 
