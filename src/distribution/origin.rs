@@ -42,7 +42,7 @@ use super::{token, DistributionState};
 #[derive(Debug, Clone)]
 pub struct OriginConfig {
     /// Directory media segments are written under, one sub-directory per
-    /// stream. Wiped on startup — see [`OriginStore::new`].
+    /// stream. Adopted on startup — see [`OriginStore::new`].
     pub root: PathBuf,
     /// Primary policy: evict a segment once it is older than this. Size it to
     /// the DVR window the edge advertises **plus headroom** — a viewer parked
@@ -225,26 +225,150 @@ pub struct OriginStore {
 }
 
 impl OriginStore {
-    /// Build the store, creating `root` and clearing anything already there.
+    /// Build the store, adopting whatever is already in `root`.
     ///
-    /// Segments from a previous run are dead weight: the manifests that
-    /// referenced them lived in memory and died with the process, so nothing
-    /// can address them. Wiping on startup is what stops the directory growing
-    /// without bound across restarts.
+    /// This used to delete the root, on the reasoning that the manifests
+    /// referencing those segments lived in memory and died with the process,
+    /// so nothing could address them. That holds only when the **producer**
+    /// restarts too. The edge usually does not: it re-publishes a manifest
+    /// describing its whole window within a segment or two, and each segment
+    /// is PUT exactly once as it is produced — so everything older than the
+    /// restart was gone for good, and the demo rig lost a 2h30m window and
+    /// 2h30m of wall time rebuilding it, every time.
+    ///
+    /// Adopting them instead makes a relay restart cost nothing: the files
+    /// were on disk and readable throughout. What bounds the directory is the
+    /// retention and byte-cap sweep that runs anyway — the wipe was a blunt
+    /// substitute for it, and one that could only be applied at startup.
+    ///
+    /// Manifests and `init.mp4` are memory-only and still die with the
+    /// process. That is already handled: the edge re-publishes both, which is
+    /// what `init_last_upload` exists for on that side.
     pub fn new(cfg: OriginConfig) -> std::io::Result<Self> {
-        if cfg.root.exists() {
-            std::fs::remove_dir_all(&cfg.root)?;
-        }
         std::fs::create_dir_all(&cfg.root)?;
         let policy = arc_swap::ArcSwap::from_pointee(cfg.policy());
-        Ok(Self {
+        let store = Self {
             cfg,
             policy,
             stream_policy: DashMap::new(),
             streams: DashMap::new(),
             total_bytes: AtomicU64::new(0),
             started: Instant::now(),
-        })
+        };
+        store.adopt_existing();
+        Ok(store)
+    }
+
+    /// Index the segments already on disk, so a restart keeps the window.
+    ///
+    /// Failures here are logged and skipped rather than fatal: an
+    /// unreadable file from a previous run must not stop the relay coming up,
+    /// and a segment that cannot be indexed is simply one the store does not
+    /// know it has — which the playlist trim then declines to advertise.
+    fn adopt_existing(&self) {
+        let root = match std::fs::read_dir(&self.cfg.root) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("origin: cannot read {}: {e}", self.cfg.root.display());
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now();
+        let mut streams = 0usize;
+        let mut adopted = 0usize;
+        let mut bytes = 0u64;
+
+        for entry in root.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Some(stream) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let files = match std::fs::read_dir(entry.path()) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("origin: cannot read stream dir '{stream}': {e}");
+                    continue;
+                }
+            };
+            // Collect first so the queue can be built oldest-first. Eviction
+            // drops from the front, so directory order would drop whichever
+            // end the filesystem happened to list first.
+            let mut found: Vec<(String, PathBuf, u64, std::time::Duration)> = Vec::new();
+            for f in files.flatten() {
+                let name = match f.file_name().to_str() {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                // Only media segments live on disk, so anything else here is
+                // debris — including a `.part`, which is a PUT interrupted by
+                // the very restart being recovered from and truncated by
+                // definition. `is_media_segment` already rejects it on the
+                // extension; the point is that it is removed rather than left
+                // to accumulate across restarts.
+                if !is_media_segment(&name) {
+                    let _ = std::fs::remove_file(f.path());
+                    continue;
+                }
+                let Ok(meta) = f.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let age = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .unwrap_or_default();
+                found.push((name, f.path(), meta.len(), age));
+            }
+            if found.is_empty() {
+                continue;
+            }
+            found.sort_by(|a, b| b.3.cmp(&a.3));
+
+            let origin = self.ensure(&stream);
+            // `try_lock`, not `blocking_lock`: the store is constructed inside
+            // the async runtime (`run_distribution`), where blocking on a
+            // tokio mutex panics outright. It cannot contend here — nothing
+            // else holds a reference to the store yet — so a failure to
+            // acquire means something is wrong enough to skip the stream
+            // rather than to stall startup.
+            let Ok(mut order) = origin.order.try_lock() else {
+                tracing::warn!("origin: stream '{stream}' busy during adoption; skipped");
+                continue;
+            };
+            for (name, path, len, age) in found {
+                // `stored_at` has to carry the file's real age, or the
+                // retention sweep treats a whole recovered window as brand
+                // new and holds it well past its span.
+                let stored_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+                origin.segments.insert(
+                    name.clone(),
+                    Arc::new(SegmentMeta {
+                        path,
+                        content_type: content_type_for(&name),
+                        len,
+                        stored_at,
+                    }),
+                );
+                order.push_back(name);
+                origin.bytes.fetch_add(len, Ordering::Relaxed);
+                self.total_bytes.fetch_add(len, Ordering::Relaxed);
+                adopted += 1;
+                bytes += len;
+            }
+            drop(order);
+            streams += 1;
+        }
+        if adopted > 0 {
+            tracing::info!(
+                adopted,
+                streams,
+                megabytes = bytes as f64 / 1e6,
+                "origin: adopted segments from a previous run; retention trims them as normal"
+            );
+        }
     }
 
     /// The policy in force for one stream: its override if it has one, else
@@ -1395,17 +1519,122 @@ seg-1.m4s
     }
 
     #[tokio::test]
-    async fn startup_wipes_a_stale_root() {
+    async fn startup_adopts_the_window_already_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("origin");
         std::fs::create_dir_all(root.join("s")).unwrap();
-        std::fs::write(root.join("s/stale.m4s"), b"old").unwrap();
+        std::fs::write(root.join("s/seg-00001.m4s"), b"old").unwrap();
+        std::fs::write(root.join("s/seg-00002.m4s"), b"newer").unwrap();
+        // A PUT interrupted by the very restart being recovered from. It is
+        // truncated by definition, so it goes.
+        std::fs::write(root.join("s/seg-00003.m4s.part"), b"half").unwrap();
 
-        // Segments from a previous run are unaddressable — the manifests that
-        // referenced them died with the process.
+        // This asserted the opposite — that a stale root is wiped — on the
+        // reasoning that the manifests referencing those segments died with
+        // the process. They do; the *producer* does not. The edge keeps
+        // running and re-publishes a manifest naming every one of these, and
+        // it never sends them again, so wiping cost the whole window.
         let s = store(&tmp, 8);
-        assert!(!root.join("s/stale.m4s").exists());
-        assert!(s.get("s", "stale.m4s").await.is_none());
+        assert!(
+            s.get("s", "seg-00001.m4s").await.is_some(),
+            "a segment on disk was discarded on startup"
+        );
+        assert!(s.get("s", "seg-00002.m4s").await.is_some());
+        assert!(
+            !root.join("s/seg-00003.m4s.part").exists(),
+            "an interrupted PUT was adopted as if it were a whole segment"
+        );
+        // And the bytes are accounted for, or the byte cap is blind to
+        // everything recovered and the stream overruns its bound.
+        assert_eq!(s.total_bytes(), 8, "adopted bytes are not accounted for");
+    }
+
+    /// An adopted segment keeps its real age.
+    ///
+    /// `stored_at` decides retention. Stamped with "now" at adoption, a
+    /// recovered window looks brand new and is held for a full retention
+    /// period again — on the demo rig, 2h30m of footage the operator was told
+    /// had aged out.
+    #[tokio::test]
+    async fn an_adopted_segment_ages_from_its_file_not_from_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("origin");
+        std::fs::create_dir_all(root.join("s")).unwrap();
+        let old = root.join("s/seg-00001.m4s");
+        std::fs::write(&old, b"xx").unwrap();
+        let f = std::fs::File::options().write(true).open(&old).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+        ))
+        .unwrap();
+
+        let s = store(&tmp, 0);
+        s.set_default_policy(OriginPolicy {
+            retention: std::time::Duration::from_secs(60),
+            max_bytes_per_stream: u64::MAX,
+            min_segments: 0,
+            idle_grace: std::time::Duration::from_secs(60),
+        });
+        // Any PUT runs the sweep.
+        s.put("s", "seg-00002.m4s", Bytes::from_static(b"zz")).await.unwrap();
+        assert!(
+            s.get("s", "seg-00001.m4s").await.is_none(),
+            "a ten-minute-old segment survived a one-minute retention"
+        );
+        assert!(s.get("s", "seg-00002.m4s").await.is_some());
+    }
+
+    /// Adoption puts the queue in age order, not directory order.
+    ///
+    /// Eviction drops from the front. Ordered by whatever the filesystem
+    /// happened to list first, a restart would start deleting the newest
+    /// footage while keeping the oldest — the opposite of a DVR window.
+    #[tokio::test]
+    async fn an_adopted_window_evicts_its_oldest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("origin");
+        std::fs::create_dir_all(root.join("s")).unwrap();
+        // The names run *opposite* to the ages on purpose. Sorted by name —
+        // which is roughly what `read_dir` returns — the queue comes out
+        // exactly backwards, so a missing sort cannot pass by luck. An earlier
+        // version of this fixture had name and age agreeing and did.
+        for (name, age_secs) in [("seg-00001.m4s", 1u64), ("seg-00009.m4s", 600)] {
+            let p = root.join("s").join(name);
+            std::fs::write(&p, b"xx").unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+        }
+        let s = store(&tmp, 0);
+
+        // Assert the queue itself. Reaching this through eviction depended on
+        // whatever order `read_dir` happened to return, so it passed with the
+        // sort removed — a test that agreed by luck rather than by reason.
+        let origin = s.streams.get("s").expect("stream adopted").clone();
+        let queued: Vec<String> = origin.order.lock().await.iter().cloned().collect();
+        assert_eq!(
+            queued,
+            vec!["seg-00009.m4s".to_string(), "seg-00001.m4s".to_string()],
+            "the eviction queue is not in age order"
+        );
+
+        // And the consequence: a bound that forces one eviction drops the
+        // oldest, not whichever the filesystem listed first.
+        s.set_default_policy(OriginPolicy {
+            retention: std::time::Duration::from_secs(86_400),
+            max_bytes_per_stream: 4,
+            min_segments: 0,
+            idle_grace: std::time::Duration::from_secs(60),
+        });
+        s.put("s", "seg-00010.m4s", Bytes::from_static(b"zz")).await.unwrap();
+        assert!(
+            s.get("s", "seg-00009.m4s").await.is_none(),
+            "the oldest adopted segment survived eviction"
+        );
+        assert!(
+            s.get("s", "seg-00010.m4s").await.is_some(),
+            "the newest segment was evicted instead"
+        );
     }
 
     /// The kept/evictable split still drives *how* an object is cached, but
