@@ -1303,6 +1303,48 @@ mod tests {
         );
     }
 
+    /// Nothing asks "has a sample been taken" when it means "are the clocks
+    /// related".
+    ///
+    /// The sampler stands down while the playlists relate the two renditions
+    /// exactly, so `offsetSamples` stays empty for the whole session on a
+    /// dated feed. `handPictureToProxy` gated on `offsetSamples.length` and
+    /// therefore never handed the picture over at all: a held scrub ran on the
+    /// 1920p main rendition, which this player measures at 6-8 fps on the
+    /// target tablet against 18-19 on the proxy. That is what AJ reported as
+    /// full-mode scrubbing being badly skewed "when working at all", and as
+    /// the proxy not being used.
+    ///
+    /// It is the same mistake as the still chasing the offset, in the same
+    /// change: altering what a variable means without auditing its readers.
+    #[test]
+    fn the_handover_asks_whether_the_clocks_are_related() {
+        let html = include_str!("dvr.html");
+        let hand = js_fn(html, "handPictureToProxy");
+        assert!(
+            hand.contains("if (!clocksRelated()) return;"),
+            "the handover still gates on a sample count: {hand}"
+        );
+        assert!(
+            !hand.contains("offsetSamples"),
+            "the handover reads the sampler directly: {hand}"
+        );
+        // And the helper must admit both routes, or it is the old gate under
+        // a better name.
+        let rel = js_fn(html, "clocksRelated");
+        assert!(
+            rel.contains("pdtLinked()") && rel.contains("offsetSamples.length"),
+            "clocksRelated does not cover both routes: {rel}"
+        );
+        // Priming has to work from whichever direction converts first: the
+        // handover converts main->proxy, and if only the other direction
+        // primed, the fallback would still be sitting at its initial zero.
+        assert!(
+            js_fn(html, "fromMainTime").contains("timelineOffset = p - t;"),
+            "the main-to-proxy direction never primes the fallback"
+        );
+    }
+
     /// The two conversions never disagree with each other.
     ///
     /// `toMainTime` prefers the playlists' dates and falls back to
@@ -2196,7 +2238,15 @@ mod tests {
     fn the_scrub_handover_waits_for_a_picture_and_a_measured_offset() {
         let f = js_fn(include_str!("dvr.html"), "handPictureToProxy");
         assert!(f.contains("proxy.readyState"), "hands over to an element that may show nothing: {f}");
-        assert!(f.contains("offsetSamples.length"), "hands over on an unmeasured offset: {f}");
+        // The property, not one particular way of establishing it. This
+        // asserted `offsetSamples.length` — the sampler's own counter — and so
+        // held the bug in place: once the sampler stood down in favour of the
+        // playlists' dates, that counter stayed at zero for the session and
+        // the handover never fired, with the test still green.
+        assert!(
+            f.contains("if (!clocksRelated()) return;"),
+            "hands over before the two clocks are related: {f}"
+        );
         // And never in the reduced modes: there the moving picture is already
         // the low-resolution one, and the second element is the hi-res still
         // sitting on an old frame rather than a scrub proxy. Handing over to

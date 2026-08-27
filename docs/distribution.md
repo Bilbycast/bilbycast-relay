@@ -101,6 +101,41 @@ The first such drop in a WHEP session raises the warning event
 `bilbycast_relay_distribution_offpath_sessions` — once per session, never per
 datagram, so a reflection flood cannot amplify its own alarm.
 
+### The advertised window must be one the origin can serve
+
+The origin store wipes its root on startup, because the manifests referencing
+those segments lived in memory and died with the process. That reasoning holds
+only if the **producer restarts too**. When the relay is restarted on its own
+the edge keeps running, and within a segment or two it re-publishes a manifest
+describing its whole window — naming thousands of files that were just deleted
+and, since each segment is PUT once as it is produced, will never be sent
+again.
+
+Measured on the demo rig after a relay-only restart: **4500 segments
+advertised, 24 of 42 probed across the window 404'd**, on both renditions, and
+it would have stayed that way for the 2h30m the window takes to roll past the
+restart. That is not a clean failure. The player calibrates its scrub bar on
+the advertised window, so most of the bar addressed footage the origin could
+not serve — presenting as a badly skewed scrub and, separately, as a proxy
+rendition that would not load at all.
+
+So a media playlist is trimmed on the way *in*: leading entries naming
+segments the store does not hold are dropped, and `EXT-X-MEDIA-SEQUENCE` and
+`EXT-X-PROGRAM-DATE-TIME` move with them. Three deliberate limits:
+
+* **Only the head.** A hole further in is a different fault, and closing it
+  would report the window as contiguous when it is not — worse than a 404,
+  because nothing would indicate why playback stalls partway through.
+* **A trailing entry is never dropped.** Its PUT may still be in flight.
+* **A playlist with nothing backed at all is left alone.** At cold start the
+  manifest can arrive a beat before the first segment; rewriting that to empty
+  turns a transient into a hard player error.
+
+The loss itself — a restart discarding a window whose files are on disk the
+whole time — is [relay#8](https://github.com/Bilbycast/bilbycast-relay/issues/8).
+Until that lands, **restart the edge whenever you restart the relay**, or
+accept a window that restarts from empty.
+
 ## Access tokens
 
 Short-lived, stateless HMAC-SHA256 tokens (same pattern as `authorize_tunnel`
@@ -489,6 +524,60 @@ than once.
 Switching takes effect on reload: changing the stream mid-session means tearing
 down hls.js, re-seeking and re-deriving the clock, which a reload does correctly
 while keeping the token and the marks.
+
+### Relating the two renditions
+
+The player holds two streams in two elements, and hls.js zeroes each timeline
+at whichever fragment it happened to load first — so a position on one means
+nothing on the other until the two are related. Everything the operator sees is
+expressed on main's clock, so the reading does not jump when the picture hands
+over.
+
+**They are related through `#EXT-X-PROGRAM-DATE-TIME`,** which both playlists
+publish, and not by measuring the distance between their live edges. The older
+`timelineOffset` was a median of `proxy.end - main.end`; each end is quantised
+to its own segment grid, so the raw signal sawtooths and the median leaves a
+residual of a fair fraction of a segment. Behind a moving picture that is
+invisible — which is why scrub handover never showed it — but the balanced-mode
+still is *looked at*, and it measured two frames late.
+
+Two properties that are easy to get wrong, and were:
+
+* **The fallback must not be an independent measurement.** `timelineOffset`
+  survives for feeds with no dates in their playlists, and hls.js drops a
+  level's fragment list for a beat on every playlist refresh, so both formulas
+  get used interchangeably several times a minute. Measured 26 s apart on the
+  demo rig — the picture was thrown that far and back again. The offset is now
+  *derived* from the exact conversion whenever there is one, and the sampler
+  stands down while the exact link holds.
+* **Nothing may chase the published clock.** Because that offset now tracks the
+  playlists, anything watching it for a change sees the ~50 ms the two clocks
+  move on every refresh ([edge#139](https://github.com/Bilbycast/bilbycast-edge/issues/139)).
+  The still's "re-place if the estimate improved" logic did exactly that,
+  re-seeking and refetching 2 MB several times a minute. It re-places once when
+  the exact link arrives, then stops.
+
+**The still lands on a frame, not between two.** A position taken off one
+rendition is a frame boundary there and almost never one on the other, and a
+seek to a boundary may present either side — the ambiguity `frameCentre` was
+already written for on the jog path. Only the still snaps; on a moving picture
+it buys nothing.
+
+**What remains is edge#139.** The CMAF output stamps `PROGRAM-DATE-TIME` from
+`Utc::now()` when a segment closes, so the two renditions place the same
+content 31–81 ms apart, and only one tag is emitted, at the playlist head. The
+player converts correctly through what it is given. Do not compensate for the
+gap here: that is the empirical-estimate approach this replaced, and it would
+hide the fault rather than fix it.
+
+**How to check any of this.** The page's own `skew` reading proves nothing —
+the seek target and the read-back convert through the same code, so they agree
+with each other whether or not the frame is right. Hold the still fixed, sweep
+the other element past it a frame at a time, and diff downscaled *normalised*
+thumbnails; the minimum locates the still and gives the sign of the error.
+Normalising matters, because the two encodes decode to different luma ranges
+and a raw difference measures the encoder. Check the spread before believing
+the minimum: racing footage discriminates, a studio talking head does not.
 
 ### The two readouts
 

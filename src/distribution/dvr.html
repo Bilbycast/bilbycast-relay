@@ -1157,6 +1157,16 @@
     return f.start + (wallMs - f.programDateTime) / 1000;
   }
 
+  /// Are the two renditions related yet — by either route?
+  ///
+  /// The question callers have is "can I convert a position between the
+  /// elements", never "has a sample been taken". They are not the same, and
+  /// reading `offsetSamples.length` for the former is what broke the scrub
+  /// handover: the sampler stands down while the playlists relate the two
+  /// exactly, so the array stays empty forever and every caller testing it
+  /// concluded the clocks were unrelated and gave up.
+  function clocksRelated() { return pdtLinked() || offsetSamples.length > 0; }
+
   /// Convert between the two clocks. Everything the operator sees — the
   /// timecode, the scrub bar — is expressed on main's, so the reading does not
   /// jump when the picture hands over.
@@ -1199,7 +1209,13 @@
     var wall = wallOn(main, t);
     if (wall !== null) {
       var p = mediaOn(proxy, wall);
-      if (p !== null) return p;
+      if (p !== null && isFinite(p)) {
+        // Prime the fallback from this direction too. Otherwise a beat with
+        // no playlist details, before any proxy-to-main conversion has
+        // happened, falls back on an offset still sitting at its initial 0.
+        timelineOffset = p - t;
+        return p;
+      }
     }
     return t + timelineOffset;
   }
@@ -1582,7 +1598,7 @@
     // And only once the two clocks have been related. `timelineOffset` starts
     // at 0, which is not a measurement — handing over on it would put the drag
     // seconds away from where the thumb says it is.
-    if (!offsetSamples.length) return;
+    if (!clocksRelated()) return;
     var t = toMainTime(playhead(main), main);
     scrubOnProxy = true;
     main.pause();
