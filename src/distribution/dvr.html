@@ -1199,20 +1199,32 @@
   /// use the proxy is created moments earlier and has no seekable window yet,
   /// so the offset is not measurable and the correction would be a silent
   /// no-op. By apply-time the element has metadata and can be measured.
-  function seekWhenReady(v, mainT) {
+  ///
+  /// `snapToFrame` lands on the *centre* of the frame containing the converted
+  /// position rather than on the position itself. Crossing renditions, a
+  /// position that was a frame boundary on one side almost never is on the
+  /// other, and a seek to a boundary may present either side of it — the same
+  /// ambiguity `frameCentre` was written for on the jog path. It is worth
+  /// about two frames on the still and nothing at all on a moving picture, so
+  /// only the still asks for it.
+  function seekWhenReady(v, mainT, snapToFrame) {
     if (!isFinite(mainT) || mainT <= 0) return;
     var apply = function () {
       measureTimelineOffset();
-      var target = pendingSeek && pendingSeek.el === v ? pendingSeek.mainT : mainT;
-      try { v.currentTime = fromMainTime(target, v); } catch (e) {}
-      if (pendingSeek && pendingSeek.el === v) pendingSeek = null;
+      var mine = pendingSeek && pendingSeek.el === v;
+      var target = mine ? pendingSeek.mainT : mainT;
+      var snap = mine ? pendingSeek.snap : snapToFrame;
+      var t = fromMainTime(target, v);
+      if (snap) t = frameCentre(frameIndexAt(t));
+      try { v.currentTime = t; } catch (e) {}
+      if (mine) pendingSeek = null;
     };
     if (v.readyState >= 1 && v.seekable.length) {
       pendingSeek = null;
       apply();
       return;
     }
-    pendingSeek = { el: v, mainT: mainT };
+    pendingSeek = { el: v, mainT: mainT, snap: !!snapToFrame };
     v.addEventListener("loadedmetadata", apply, { once: true });
   }
 
@@ -3252,7 +3264,7 @@
         Math.abs(timelineOffset - stillOffsetUsed) > 0.08) {
       stillOffsetUsed = timelineOffset;
       stillWantAt = t;
-      seekWhenReady(proxy, t);
+      seekWhenReady(proxy, t, true);
       return;
     }
     // Already showing this frame: nothing to do.
@@ -3280,7 +3292,7 @@
       }
       stillWantAt = toMainTime(playhead(main), main);
       stillOffsetUsed = exact ? null : timelineOffset;
-      seekWhenReady(proxy, stillWantAt);
+      seekWhenReady(proxy, stillWantAt, true);
       stillReady();
     }, STILL_SETTLE_MS);
   }

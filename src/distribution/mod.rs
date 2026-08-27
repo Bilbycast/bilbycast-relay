@@ -1293,6 +1293,46 @@ mod tests {
         );
     }
 
+    /// The still lands on a frame, not between two.
+    ///
+    /// A position taken off one rendition is a frame boundary on that
+    /// rendition and almost never one on the other, and a seek to a boundary
+    /// may present either side of it — the ambiguity `frameCentre` already
+    /// existed for on the jog path. Measured on the rig at full window depth:
+    /// the still sat **+0.08 s, two frames, late** at every position tried,
+    /// while the player's own clocks agreed to within 40 ms. So the seek was
+    /// landing exactly where it was aimed and the *aim* was between frames.
+    ///
+    /// Only the still asks for the snap. On a moving picture it buys nothing,
+    /// and a scrub handover that quantised every position would be doing
+    /// arithmetic no one can see the benefit of.
+    #[test]
+    fn the_still_lands_on_a_frame_rather_than_between_two() {
+        let html = include_str!("dvr.html");
+        let seek = js_fn(html, "seekWhenReady");
+        assert!(
+            seek.contains("if (snap) t = frameCentre(frameIndexAt(t));"),
+            "the seek does not snap to a frame at all: {seek}"
+        );
+        // A deferred seek has to carry the request, or the first still after
+        // an attach — the one case the deferral exists for — skips it.
+        assert!(
+            seek.contains("snap: !!snapToFrame") && seek.contains("pendingSeek.snap"),
+            "a deferred seek forgets whether it was asked to snap: {seek}"
+        );
+        let upd = js_fn(html, "updateStill");
+        assert_eq!(
+            upd.matches("seekWhenReady(proxy, ").count(),
+            upd.matches(", true);").count(),
+            "a still seek was left without the snap: {upd}"
+        );
+        // And the scrub handover must NOT snap.
+        assert!(
+            js_fn(html, "setMode").contains("seekWhenReady(to, toMainTime(t, from));"),
+            "the moving handover quantises positions for no benefit"
+        );
+    }
+
     /// The two renditions are related by the clock they both publish, not by
     /// the difference between their live edges.
     ///
