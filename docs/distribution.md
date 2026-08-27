@@ -601,6 +601,37 @@ Normalising matters, because the two encodes decode to different luma ranges
 and a raw difference measures the encoder. Check the spread before believing
 the minimum: racing footage discriminates, a studio talking head does not.
 
+### Frame stepping on the still
+
+A frame step in Balanced moves the transport on the low-resolution rendition
+and re-places the full-resolution still on the new frame. Two things decide
+whether that feels immediate, and both were wrong:
+
+**"Already showing this frame" means the same frame.** It was a 50 ms
+tolerance, and a frame at 25 fps is 40 ms — so a single step fell inside it and
+was discarded, and only every *second* step reached the still. No tolerance in
+seconds can express this: any value wide enough to absorb conversion noise is
+wider than a frame. Compare frame indices.
+
+**Holding the data is not the same as being ready this instant.** The check for
+"is this position already buffered" consulted `readyState`, which drops below 2
+while a seek settles — which, during a run of steps, is most of the time. So
+the player concluded it did not hold data it plainly did and woke the loader,
+paying about a second per step while fetching **zero bytes over the network**.
+That last detail is what identified it. `buffered` answers the question
+whatever the element is doing.
+
+Measured over 70 consecutive steps across segment boundaries: **70 of 70
+advanced, median 19 ms, worst 30 ms, no bytes fetched** — against 4 of 8
+advancing at 512 ms alternating with timeouts. A frame is 40 ms, so stepping
+runs at real time.
+
+**What was tried and removed:** parking hls.js's loader while a still is up, so
+a stopped transport stops streaming. Against a control with the whole mechanism
+disabled it made the first still at a cold position **5.09 s against 2.60 s**
+and gained nothing on stepping. A stopped transport that keeps a loader running
+is not costing anything worth this.
+
 ### The two readouts
 
 **Left: the time of day the frame was ingested**, as `HH:MM:SS:FF` in the
