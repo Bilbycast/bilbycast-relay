@@ -3242,6 +3242,89 @@
   /// noticed rather than left on screen.
   var stillOffsetUsed = null;
 
+  /// Stop hls.js managing the still element's buffer, and start it again.
+  ///
+  /// A stopped transport is not streaming: it wants one frame, and the segment
+  /// holding it is already decoded. But hls.js keeps running its loader
+  /// against `maxBufferLength`/`backBufferLength` and re-evaluates on every
+  /// seek, so a 40 ms frame step re-fetched a ~2 MB segment it was already
+  /// holding. Measured on the rig: alternate steps cost 695-1003 ms and 1.4 to
+  /// 4.6 MB, against 22 ms and nothing for the steps that happened to escape
+  /// it.
+  ///
+  /// So while a still is up, the loader stands down and stepping is pure seek
+  /// and decode across whatever is buffered — on this feed, ten seconds either
+  /// side, which is a couple of hundred frames rather than the ten AJ asked
+  /// for. It starts again the moment a position outside that is wanted.
+  /// How much decoded picture either side of the still counts as "enough in
+  /// hand" to stop fetching. Rather more than a segment, so crossing a
+  /// boundary while stepping does not immediately need the network.
+  var STILL_IDLE_MARGIN_SECS = 2.5;
+
+  /// Is there enough buffered around the still to stand the loader down?
+  ///
+  /// Stopping on the very next landing was too eager: it aborted the fetch of
+  /// the segment the next few steps were about to need, so a run of steps
+  /// across a boundary thrashed — twelve steps at ~1000 ms and ~2 MB each,
+  /// before recovering. The question is not "has a frame landed" but "is there
+  /// enough in hand that stepping will not touch the network".
+  function stillLoaderMayIdle() {
+    if (proxy.readyState < 2) return false;
+    var t = proxy.currentTime;
+    var b = proxy.buffered;
+    for (var i = 0; i < b.length; i++) {
+      if (t < b.start(i) || t > b.end(i)) continue;
+      var behind = t - b.start(i);
+      var ahead = b.end(i) - t;
+      // Near the live edge there may be nothing further to fetch ahead, and
+      // waiting for a margin that cannot arrive would leave the loader running
+      // for ever.
+      var r = range(proxy);
+      var atEdge = r !== null && b.end(i) >= r.end - 1 / FPS;
+      return behind >= STILL_IDLE_MARGIN_SECS && (ahead >= STILL_IDLE_MARGIN_SECS || atEdge);
+    }
+    return false;
+  }
+
+  function stillLoaderStop() {
+    var h = hlsFor(proxy);
+    if (h && typeof h.stopLoad === "function") { try { h.stopLoad(); } catch (e) {} }
+  }
+  function stillLoaderStart(at) {
+    var h = hlsFor(proxy);
+    if (h && typeof h.startLoad === "function") {
+      try { h.startLoad(isFinite(at) ? at : -1); } catch (e) {}
+    }
+  }
+
+  /// Do two positions on main's clock name the same frame?
+  ///
+  /// A tolerance in seconds cannot answer this: any value large enough to
+  /// absorb conversion noise is, at 25 fps, wider than a frame.
+  function sameFrame(a, b) { return frameIndexAt(a) === frameIndexAt(b); }
+
+  /// Does the still element already hold the frame at `mainT`, decoded and
+  /// ready, so that showing it costs a seek rather than a fetch?
+  function stillHolds(mainT) {
+    // Deliberately not gated on `readyState`. It drops below 2 while a seek
+    // settles, which during a run of frame steps is most of the time — so
+    // asking it made the player conclude it did not hold data it plainly did,
+    // wake the loader, and pay about a second to re-establish. Measured: those
+    // steps fetched *zero* bytes over the network, which is what gave it away.
+    // `buffered` answers the question being asked, and answers it whatever the
+    // element is doing this instant.
+    if (!stillAttached) return false;
+    var t = fromMainTime(mainT, proxy);
+    if (!isFinite(t)) return false;
+    var b = proxy.buffered;
+    for (var i = 0; i < b.length; i++) {
+      // Inset by a frame at each end: a position sitting exactly on the
+      // boundary of a buffered range is not reliably decodable from it.
+      if (t >= b.start(i) + 1 / FPS && t <= b.end(i) - 1 / FPS) return true;
+    }
+    return false;
+  }
+
   /// True when both renditions publish a wall clock, so a position on one can
   /// be carried to the other exactly rather than through the median offset.
   function pdtLinked() { return fragsFor(main) !== null && fragsFor(proxy) !== null; }
@@ -3269,6 +3352,9 @@
     stillWantAt = null; stillPendingAt = null; stillOffsetUsed = null;
     if (!stillShowing) return;
     stillShowing = false;
+    // Hand the loader back: the element is no longer parked on one frame, and
+    // the next thing asked of it may be anywhere.
+    stillLoaderStart(-1);
     syncPicture();
   }
 
@@ -3280,6 +3366,21 @@
     // somewhere else entirely is not this frame.
     var at = toMainTime(proxy.currentTime, proxy);
     if (Math.abs(at - stillWantAt) > 0.5) return;
+    // The frame asked for is up and decoded, so nothing more needs fetching
+    // until a position outside the buffer is wanted.
+    //
+    // Every landing, not only the first. This sat below the `stillShowing`
+    // early return, so the loader was stood down once and never again — and
+    // one step that wakes it (a seek in flight drops `readyState` below 2,
+    // which is enough to make `stillHolds` say no) left it running for the
+    // rest of the session. Measured: three steps at ~20 ms, then every step
+    // after at ~1000 ms and a couple of megabytes.
+    //
+    // And only once there is enough either side to step across without the
+    // network. Stopping on the landing itself aborted the fetch the next few
+    // steps needed, which cost a dozen steps at ~1000 ms every time a run
+    // crossed a segment boundary.
+    if (stillLoaderMayIdle()) stillLoaderStop();
     if (stillShowing) return;
     stillShowing = true;
     syncPicture();
@@ -3310,22 +3411,38 @@
       if (nowExact || Math.abs(timelineOffset - stillOffsetUsed) > 0.08) {
         stillOffsetUsed = nowExact ? null : timelineOffset;
         stillWantAt = t;
+        if (!stillHolds(t)) stillLoaderStart(fromMainTime(t, proxy));
         seekWhenReady(proxy, t, true);
         return;
       }
     }
     // Already showing this frame: nothing to do.
-    if (stillShowing && stillWantAt !== null && Math.abs(t - stillWantAt) < 0.05) return;
+    //
+    // "This frame" means *this frame*, so compare frame indices. This was a
+    // 50 ms window, which at 25 fps is wider than a frame — so a single step
+    // fell inside it and was discarded, and only every second step reached the
+    // still. Measured on the rig: the hi-res picture advanced 0.08 s at a time
+    // while the transport advanced 0.04 s, with the steps in between timing
+    // out having changed nothing. That alternation is what reads as a
+    // one-to-two-second lag on a frame step.
+    if (stillShowing && stillWantAt !== null && sameFrame(t, stillWantAt)) return;
     // A timer already waiting on this same frame must be left alone.
     // `render` calls this every 200 ms and the settle is 220, so restarting
     // the timer on every tick meant it never fired at all — the still was
     // never even requested, which is exactly what the rig showed.
     if (stillTimer !== null && stillPendingAt !== null &&
-        Math.abs(t - stillPendingAt) < 0.05) return;
+        sameFrame(t, stillPendingAt)) return;
     if (stillTimer !== null) clearTimeout(stillTimer);
     stillPendingAt = t;
     // Settle first. Frame-stepping fires this on every step, and fetching a
     // 2 MB segment per step would make stepping worse, not better.
+    //
+    // Unless the still already holds the frame being asked for — then there is
+    // no fetch to avoid and the wait is pure added latency. Stepping within a
+    // segment is the common case, and the whole segment is buffered as soon as
+    // the first still in it lands.
+    var held = stillHolds(t);
+    var settle = held ? 0 : STILL_SETTLE_MS;
     stillTimer = setTimeout(function () {
       stillTimer = null;
       if (!stillWanted()) return;
@@ -3339,9 +3456,12 @@
       }
       stillWantAt = toMainTime(playhead(main), main);
       stillOffsetUsed = exact ? null : timelineOffset;
+      // Wake the loader only for a position it does not already hold —
+      // otherwise this is the step that costs nothing.
+      if (!held) stillLoaderStart(fromMainTime(stillWantAt, proxy));
       seekWhenReady(proxy, stillWantAt, true);
       stillReady();
-    }, STILL_SETTLE_MS);
+    }, settle);
   }
 
   function ensureProxy() {

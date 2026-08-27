@@ -1231,8 +1231,13 @@ mod tests {
         // fires. `render` calls this at 5 Hz and the settle is 220 ms, so
         // clearing unconditionally meant the still was never once requested —
         // which is what the rig showed, with no error anywhere.
+        //
+        // The property, not the comparison. This named the 50 ms tolerance the
+        // guard happened to use, and that tolerance turned out to be wider
+        // than a frame — so it also pinned the bug where only every second
+        // frame step reached the still.
         assert!(
-            upd.contains("Math.abs(t - stillPendingAt) < 0.05) return;"),
+            upd.contains("sameFrame(t, stillPendingAt)) return;"),
             "the settle timer is restarted on every tick and can never fire: {upd}"
         );
         // Moving again drops it.
@@ -1380,6 +1385,148 @@ mod tests {
         assert!(
             to.contains("isFinite(m)"),
             "a non-finite conversion is written into the fallback: {to}"
+        );
+    }
+
+    /// A frame step moves the still by a frame.
+    ///
+    /// "Already showing this frame" was a 50 ms window, and a frame at 25 fps
+    /// is 40 ms — so a single step fell inside it and was discarded, and only
+    /// every *second* step reached the still. Measured on the rig: the hi-res
+    /// picture advanced 0.08 s at a time while the transport advanced 0.04 s,
+    /// the steps in between timing out having changed nothing. AJ reported it
+    /// as a one-to-two-second lag on stepping.
+    ///
+    /// A tolerance in seconds cannot express this question at all — any value
+    /// wide enough to absorb conversion noise is wider than a frame. So ask
+    /// the question directly, by frame index.
+    #[test]
+    fn a_frame_step_moves_the_still_by_a_frame() {
+        let html = include_str!("dvr.html");
+        let upd = js_fn(html, "updateStill");
+        assert!(
+            upd.contains("sameFrame(t, stillWantAt)") && upd.contains("sameFrame(t, stillPendingAt)"),
+            "the still still decides sameness with a tolerance in seconds: {upd}"
+        );
+        assert!(
+            !upd.contains("< 0.05"),
+            "a seconds tolerance survives somewhere in the still path: {upd}"
+        );
+        assert!(
+            js_fn(html, "sameFrame").contains("frameIndexAt(a) === frameIndexAt(b)"),
+            "sameFrame is not asking about frames"
+        );
+    }
+
+    /// A stopped transport does not keep streaming.
+    ///
+    /// hls.js runs its loader against `maxBufferLength`/`backBufferLength` and
+    /// re-evaluates on every seek. Parked on a still, that meant a 40 ms frame
+    /// step re-fetched a ~2 MB segment the element was already holding.
+    /// Measured on the rig: alternate steps cost 695-1003 ms and 1.4 to 4.6 MB
+    /// against 22 ms and nothing for the steps that escaped it.
+    ///
+    /// So the loader stands down while a still is up, and steps become pure
+    /// seek and decode across what is buffered — on this feed about ten
+    /// seconds either side, a couple of hundred frames. It starts again for a
+    /// position outside that, and when the still is dismissed, because the
+    /// element may then be asked for anything.
+    #[test]
+    fn a_still_stands_the_loader_down_rather_than_refetching_what_it_holds() {
+        let html = include_str!("dvr.html");
+        // On every landing, not only the first. Below the `stillShowing`
+        // early return this ran once per still and never again, so a single
+        // step that woke the loader left it running for the session.
+        let ready = js_fn(html, "stillReady");
+        let stop = ready.find("stillLoaderStop();").expect("loader never stood down");
+        let early = ready.find("if (stillShowing) return;").expect("no showing guard");
+        assert!(
+            stop < early,
+            "the loader is only stood down on the first landing: {ready}"
+        );
+        // And only with enough in hand to step on without the network.
+        // Stopping on the landing itself aborted the fetch the next few steps
+        // needed: a dozen steps at ~1000 ms every time a run crossed a segment
+        // boundary.
+        assert!(
+            ready.contains("if (stillLoaderMayIdle()) stillLoaderStop();"),
+            "the loader is stopped the instant a frame lands: {ready}"
+        );
+        let idle = js_fn(html, "stillLoaderMayIdle");
+        assert!(
+            idle.contains("behind >= STILL_IDLE_MARGIN_SECS")
+                && idle.contains("ahead >= STILL_IDLE_MARGIN_SECS"),
+            "idling does not require margin on both sides: {idle}"
+        );
+        // Near the live edge there is nothing further ahead to fetch, and
+        // waiting for a margin that cannot arrive would leave it running.
+        assert!(
+            idle.contains("atEdge"),
+            "the loader can never idle near the live edge: {idle}"
+        );
+        // Restarted for a position not held, or the still can never leave the
+        // buffered span it stopped in.
+        let upd = js_fn(html, "updateStill");
+        assert!(
+            upd.contains("if (!held) stillLoaderStart("),
+            "a position outside the buffer is sought without waking the loader: {upd}"
+        );
+        // And handed back when the still goes, or the element stays frozen for
+        // whatever is asked of it next.
+        assert!(
+            js_fn(html, "hideStill").contains("stillLoaderStart(-1);"),
+            "the loader is left stopped after the still is dismissed"
+        );
+        // Both guarded: native HLS has no hls.js instance at all.
+        for f in ["stillLoaderStop", "stillLoaderStart"] {
+            let b = js_fn(html, f);
+            assert!(
+                b.contains("typeof h.") && b.contains("catch (e)"),
+                "{f} assumes an hls.js instance is present and willing: {b}"
+            );
+        }
+    }
+
+    /// A step to a frame already in hand does not wait out the settle.
+    ///
+    /// The settle exists so that a run of steps does not fetch a 2 MB segment
+    /// each time. When the position is already buffered there is no fetch to
+    /// avoid, and the wait is pure added latency on the common case —
+    /// stepping within a segment, all of which is buffered as soon as the
+    /// first still in it lands.
+    #[test]
+    fn a_buffered_step_skips_the_settle() {
+        let html = include_str!("dvr.html");
+        let upd = js_fn(html, "updateStill");
+        assert!(
+            upd.contains("var held = stillHolds(t);")
+                && upd.contains("var settle = held ? 0 : STILL_SETTLE_MS;")
+                && upd.contains("}, settle);"),
+            "every step waits out the settle whether or not it needs to: {upd}"
+        );
+        // And the buffered test has to be about the *still* element, at the
+        // converted position — asking main would answer a different question.
+        let holds = js_fn(html, "stillHolds");
+        assert!(
+            holds.contains("fromMainTime(mainT, proxy)") && holds.contains("proxy.buffered"),
+            "stillHolds does not ask the still element about its own clock: {holds}"
+        );
+        // A position on the very edge of a buffered range is not reliably
+        // decodable from it, so the range is inset by a frame at each end.
+        assert!(
+            holds.contains("+ 1 / FPS") && holds.contains("- 1 / FPS"),
+            "a boundary position counts as held: {holds}"
+        );
+        // And it must not ask `readyState`. That drops below 2 while a seek
+        // settles — most of the time during a run of frame steps — so the
+        // player concluded it did not hold data it did, woke the loader, and
+        // paid ~1 s per step to re-establish while fetching zero bytes.
+        // Match the expression, not the word: the comment above it in the
+        // source explains the trap by name, and a bare `contains("readyState")`
+        // fired on that instead of on any code.
+        assert!(
+            !holds.contains("proxy.readyState <"),
+            "holding data is confused with being ready this instant: {holds}"
         );
     }
 
