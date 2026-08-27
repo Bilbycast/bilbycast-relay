@@ -573,8 +573,9 @@ Two properties that are easy to get wrong, and were:
   *derived* from the exact conversion whenever there is one, and the sampler
   stands down while the exact link holds.
 * **Nothing may chase the published clock.** Because that offset now tracks the
-  playlists, anything watching it for a change sees the ~50 ms the two clocks
-  move on every refresh ([edge#139](https://github.com/Bilbycast/bilbycast-edge/issues/139)).
+  playlists, anything watching it for a change sees whatever those clocks do —
+  which at the time was ~50 ms on every refresh (edge#139, since fixed; the
+  edge now steers a shared epoch, so the movement is 5 ms and monotonic).
   The still's "re-place if the estimate improved" logic did exactly that,
   re-seeking and refetching 2 MB several times a minute. It re-places once when
   the exact link arrives, then stops.
@@ -585,12 +586,22 @@ seek to a boundary may present either side — the ambiguity `frameCentre` was
 already written for on the jog path. Only the still snaps; on a moving picture
 it buys nothing.
 
-**What remains is edge#139.** The CMAF output stamps `PROGRAM-DATE-TIME` from
-`Utc::now()` when a segment closes, so the two renditions place the same
-content 31–81 ms apart, and only one tag is emitted, at the playlist head. The
-player converts correctly through what it is given. Do not compensate for the
-gap here: that is the empirical-estimate approach this replaced, and it would
-hide the fault rather than fix it.
+**The gap was in the edge, and was fixed there** — edge#139. The CMAF output
+stamped `PROGRAM-DATE-TIME` from `Utc::now()` when a segment closed, so the two
+renditions placed the same content 31–81 ms apart, moving ~50 ms sample to
+sample, and emitted only one tag at the playlist head. It now derives the date
+from the media timeline against an epoch shared per flow, and emits a tag per
+segment: measured **0 ms between renditions over 2535 shared segments**.
+
+That is why the player does not compensate for a rendition gap, and must not
+start: compensating is the empirical-estimate approach this replaced, and it
+would have hidden a fault that belonged upstream. The player converts correctly
+through what it is given; the job was to give it something correct.
+
+One caveat survives. The published time of day is exact in *relative* terms but
+sits about 1.6 s behind the real world — pipeline delay, held constant. An
+SRT/MPEG-TS ingest carries no absolute clock to correct it against. Do not read
+this player's clock against a station clock without accounting for that.
 
 **How to check any of this.** The page's own `skew` reading proves nothing —
 the seek target and the read-back convert through the same code, so they agree
