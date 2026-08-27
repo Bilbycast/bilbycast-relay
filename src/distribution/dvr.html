@@ -1081,6 +1081,13 @@
   /// still filling its first fragments gives a value that is wrong and, before
   /// this was a median, then silently stuck.
   function measureTimelineOffset() {
+    // While the playlists relate the two renditions exactly, `timelineOffset`
+    // is not a measurement any more — it is whatever the exact conversion last
+    // produced, kept only so that a beat without playlist details degrades
+    // smoothly instead of jumping to an independent estimate. Sampling here
+    // would overwrite that with the live-edge difference every 200 ms and
+    // reintroduce the disagreement this is meant to remove.
+    if (pdtLinked()) return;
     var m = range(main);
     var p = range(proxy);
     if (!m || !p) return;
@@ -1168,7 +1175,22 @@
     var wall = wallOn(proxy, t);
     if (wall !== null) {
       var m = mediaOn(main, wall);
-      if (m !== null) return m;
+      if (m !== null && isFinite(m)) {
+        // Keep the fallback agreeing with the primary.
+        //
+        // `fragsFor` goes null for a beat whenever hls.js swaps a level's
+        // details — which it does on every playlist refresh — so these two
+        // formulas are used interchangeably, several times a minute. They are
+        // different measurements: this one relates the renditions by content,
+        // the other by the distance between two live edges, and on this rig
+        // they differed by 26 s. Flipping between them mid-scrub throws the
+        // picture that far and then throws it back, which is what a skew that
+        // comes and goes looks like. So the median is *re-derived* from the
+        // exact answer whenever there is one, and the fallback becomes the
+        // last good value rather than an independent guess.
+        timelineOffset = t - m;
+        return m;
+      }
     }
     return t - timelineOffset;
   }
@@ -3255,17 +3277,26 @@
     if (!stillWanted()) { hideStill(); return; }
     var t = toMainTime(playhead(main), main);
     if (!isFinite(t)) return;
-    // The median keeps improving as samples arrive. A still positioned on an
-    // early estimate is showing the wrong frame, so re-place it when the
-    // offset moves by more than a couple of frames. Only the fallback path
-    // records an offset; a still placed through the playlist dates has no
-    // estimate to revise.
-    if (stillShowing && stillOffsetUsed !== null &&
-        Math.abs(timelineOffset - stillOffsetUsed) > 0.08) {
-      stillOffsetUsed = timelineOffset;
-      stillWantAt = t;
-      seekWhenReady(proxy, t, true);
-      return;
+    // The median keeps improving as samples arrive, so a still placed on an
+    // early estimate is showing the wrong frame and has to be re-placed.
+    //
+    // This must stop the moment the playlists relate the renditions exactly.
+    // `timelineOffset` now tracks that exact conversion, and the two published
+    // clocks move by ~50 ms on every playlist refresh (edge#139) — so a still
+    // that keeps chasing it re-seeks several times a minute, refetching a 2 MB
+    // hi-res segment each time. On the links Balanced exists for, that is a
+    // still that never settles at all, which is what AJ reported as a long
+    // delay before the full-resolution frame appears.
+    //
+    // So: one re-place when the exact link arrives, then never again.
+    if (stillShowing && stillOffsetUsed !== null) {
+      var nowExact = pdtLinked();
+      if (nowExact || Math.abs(timelineOffset - stillOffsetUsed) > 0.08) {
+        stillOffsetUsed = nowExact ? null : timelineOffset;
+        stillWantAt = t;
+        seekWhenReady(proxy, t, true);
+        return;
+      }
     }
     // Already showing this frame: nothing to do.
     if (stillShowing && stillWantAt !== null && Math.abs(t - stillWantAt) < 0.05) return;

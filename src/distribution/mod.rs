@@ -1279,6 +1279,16 @@ mod tests {
             upd.contains("Math.abs(timelineOffset - stillOffsetUsed) > 0.08"),
             "a still placed on an early estimate is left there: {upd}"
         );
+        // But it must stop chasing once the conversion is exact. The offset
+        // now tracks the playlists, and those move ~50 ms every refresh
+        // (edge#139) — a still that follows that re-seeks several times a
+        // minute and refetches 2 MB each time, which on the links Balanced
+        // exists for is a still that never settles.
+        assert!(
+            upd.contains("var nowExact = pdtLinked();")
+                && upd.contains("stillOffsetUsed = nowExact ? null : timelineOffset;"),
+            "the still keeps chasing an offset that is no longer an estimate: {upd}"
+        );
         // That whole apparatus is the fallback. Where the playlists carry
         // dates the conversion is exact and there is no estimate to revise,
         // so the wait and the correction must be skipped rather than left to
@@ -1290,6 +1300,44 @@ mod tests {
         assert!(
             upd.contains("stillOffsetUsed = exact ? null : timelineOffset;"),
             "an exactly-placed still records an offset it did not use: {upd}"
+        );
+    }
+
+    /// The two conversions never disagree with each other.
+    ///
+    /// `toMainTime` prefers the playlists' dates and falls back to
+    /// `timelineOffset`. Those are different measurements — one relates the
+    /// renditions by content, the other by the distance between two live
+    /// edges — and on the demo rig they differed by 26 s. They are used
+    /// interchangeably, because `fragsFor` goes null for a beat whenever
+    /// hls.js swaps a level's details, which it does on every playlist
+    /// refresh. Left independent, the picture is thrown 26 s and back again
+    /// several times a minute: a skew that comes and goes, which is what AJ
+    /// reported of full-mode scrubbing.
+    ///
+    /// So the fallback is *derived* from the exact answer rather than
+    /// measured alongside it, and the sampler stands down while the exact
+    /// link holds — otherwise it would overwrite the derived value with the
+    /// live-edge difference every 200 ms and put the disagreement straight
+    /// back.
+    #[test]
+    fn the_fallback_offset_tracks_the_exact_conversion() {
+        let html = include_str!("dvr.html");
+        let to = js_fn(html, "toMainTime");
+        assert!(
+            to.contains("timelineOffset = t - m;"),
+            "the fallback is left as an independent estimate: {to}"
+        );
+        let measure = js_fn(html, "measureTimelineOffset");
+        assert!(
+            measure.contains("if (pdtLinked()) return;"),
+            "the sampler still overwrites the derived offset: {measure}"
+        );
+        // And the derivation must be guarded, or one non-finite conversion
+        // poisons the fallback for every later beat that needs it.
+        assert!(
+            to.contains("isFinite(m)"),
+            "a non-finite conversion is written into the fallback: {to}"
         );
     }
 

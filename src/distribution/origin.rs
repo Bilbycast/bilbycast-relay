@@ -357,6 +357,20 @@ impl OriginStore {
         origin.last_put_ms.store(self.now_ms(), Ordering::Relaxed);
 
         if !is_media_segment(file) {
+            // A media playlist may not advertise segments this store cannot
+            // serve. See `trim_unbacked_head`: after a relay-only restart the
+            // still-running edge re-publishes its whole window, and everything
+            // older than the restart names a file that was wiped and will
+            // never be sent again.
+            let bytes = if file.to_ascii_lowercase().ends_with(".m3u8") {
+                let segments = &origin.segments;
+                match trim_unbacked_head(&bytes, &|uri| segments.contains_key(uri)) {
+                    Some(trimmed) => Bytes::from(trimmed),
+                    None => bytes,
+                }
+            } else {
+                bytes
+            };
             origin
                 .kept
                 .insert(file.to_string(), Arc::new(KeptObject { bytes, content_type }));
@@ -536,6 +550,106 @@ impl OriginStore {
     pub fn root(&self) -> &FsPath {
         &self.cfg.root
     }
+}
+
+/// Trim leading media-playlist entries whose segments the store does not hold.
+///
+/// The store wipes its root on startup, on the reasoning that a manifest
+/// referencing those segments died with the process. That holds when the
+/// producer restarts too. It does **not** hold when the edge keeps running: it
+/// re-publishes a manifest describing its whole window within a segment or
+/// two, and every entry older than the restart names a file that was just
+/// deleted and will never be sent again — the edge PUTs each segment once, as
+/// it is produced.
+///
+/// Measured on the demo rig after a relay-only restart: the playlist
+/// advertised 4500 segments and **24 of 42 probed across the window 404'd**,
+/// for the 2h30m it takes the window to roll past the restart. To a player
+/// that is not a clean error — the scrub bar is calibrated on the advertised
+/// window, so more than half of it addressed footage the origin could not
+/// serve, and both renditions failed independently.
+///
+/// So make the advertised window mean what it says. Only the *head* is
+/// trimmed: a trailing entry may legitimately name a segment whose PUT is
+/// still in flight, and dropping that would fight the producer.
+///
+/// Returns `None` when nothing needs changing, which is the ordinary case.
+fn trim_unbacked_head(body: &[u8], has: &dyn Fn(&str) -> bool) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let is_uri = |l: &str| !l.is_empty() && !l.starts_with('#');
+
+    // Walk entries from the head, counting those that name a segment we do not
+    // hold. Stop at the first one we do: a hole further in is a different
+    // fault, and silently closing it would report the window as contiguous
+    // when it is not.
+    let mut dropped = 0usize;
+    let mut dropped_secs = 0f64;
+    let mut last_line = None;
+    let mut extinf: Option<f64> = None;
+    for (i, raw) in lines.iter().enumerate() {
+        let l = raw.trim();
+        if let Some(rest) = l.strip_prefix("#EXTINF:") {
+            extinf = rest
+                .split(',')
+                .next()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .or(Some(0.0));
+        } else if is_uri(l) {
+            let Some(secs) = extinf.take() else { continue };
+            if has(l) {
+                break;
+            }
+            dropped += 1;
+            dropped_secs += secs;
+            last_line = Some(i);
+        }
+    }
+    let last_line = last_line?;
+
+    // If nothing after the dropped run is backed either, this is a stream that
+    // has published nothing yet rather than one with a hole. Rewriting that
+    // into an empty playlist would turn a momentary cold start into a hard
+    // player error, so leave it as the producer wrote it.
+    if !lines[last_line + 1..].iter().any(|l| is_uri(l.trim())) {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for (i, raw) in lines.iter().enumerate() {
+        let l = raw.trim();
+        // Two header tags describe *which* segment the playlist starts at, so
+        // both move by what was dropped. Everything else in the header stands.
+        if let Some(rest) = l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            let n = rest.trim().parse::<u64>().unwrap_or(0);
+            out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}
+", n + dropped as u64));
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            match chrono::DateTime::parse_from_rfc3339(rest.trim()) {
+                Ok(t) => out.push_str(&format!(
+                    "#EXT-X-PROGRAM-DATE-TIME:{}
+",
+                    (t + chrono::Duration::nanoseconds((dropped_secs * 1e9) as i64))
+                        .with_timezone(&chrono::Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                )),
+                // An unparseable date is passed through rather than dropped: a
+                // wrong clock is recoverable, no clock at all is not.
+                Err(_) => out.push_str(&format!("{raw}
+")),
+            }
+            continue;
+        }
+        // Inside the dropped run, the entries go and the header stays.
+        if i <= last_line && (l.starts_with("#EXTINF:") || is_uri(l)) {
+            continue;
+        }
+        out.push_str(&format!("{raw}
+"));
+    }
+    Some(out.into_bytes())
 }
 
 /// Content-Type for a distribution object by extension.
@@ -1162,6 +1276,122 @@ mod tests {
         assert_eq!(s.total_bytes(), 0);
         assert!(s.get("s", "seg0.m4s").await.is_none());
         assert!(!tmp.path().join("origin/s").exists());
+    }
+
+    /// The advertised window may not promise segments the store cannot serve.
+    ///
+    /// The store wipes its root on startup. That is right when the producer
+    /// restarts too, but the edge usually does not: it re-publishes a manifest
+    /// describing its whole window within a segment or two, and every entry
+    /// older than the restart names a file that was just deleted and will
+    /// never be sent again.
+    ///
+    /// Measured on the demo rig after a relay-only restart: 4500 segments
+    /// advertised, **24 of 42 probed across the window 404'd**, and it stayed
+    /// that way for the 2h30m the window takes to roll past. The player
+    /// calibrates its scrub bar on the advertised window, so more than half
+    /// the bar addressed footage that could not be served.
+    #[tokio::test]
+    async fn a_manifest_does_not_advertise_segments_the_store_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        // Only the last two of four exist, as after a restart mid-window.
+        s.put("s", "seg-3.m4s", Bytes::from_static(b"c")).await.unwrap();
+        s.put("s", "seg-4.m4s", Bytes::from_static(b"d")).await.unwrap();
+
+        let m = "#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:1
+                 #EXT-X-PROGRAM-DATE-TIME:2026-08-27T00:00:00.000Z
+                 #EXT-X-MAP:URI=\"init.mp4\"
+                 #EXTINF:2.000,
+seg-1.m4s
+#EXTINF:2.000,
+seg-2.m4s
+                 #EXTINF:2.000,
+seg-3.m4s
+#EXTINF:2.000,
+seg-4.m4s
+";
+        s.put("s", "manifest.m3u8", Bytes::from(m)).await.unwrap();
+
+        let got = s.get("s", "manifest.m3u8").await.unwrap();
+        let body = String::from_utf8(got.bytes.to_vec()).unwrap();
+        assert!(
+            !body.contains("seg-1.m4s") && !body.contains("seg-2.m4s"),
+            "still advertising segments the store does not hold:
+{body}"
+        );
+        assert!(
+            body.contains("seg-3.m4s") && body.contains("seg-4.m4s"),
+            "dropped segments the store does hold:
+{body}"
+        );
+        // The two tags that say *which* segment the window starts at have to
+        // move with it, or the player's clock and the numbering both lie.
+        assert!(
+            body.contains("#EXT-X-MEDIA-SEQUENCE:3"),
+            "media sequence not advanced by the two dropped entries:
+{body}"
+        );
+        assert!(
+            body.contains("#EXT-X-PROGRAM-DATE-TIME:2026-08-27T00:00:04.000Z"),
+            "the clock still points at a segment that is gone:
+{body}"
+        );
+        // The rest of the header is not this function's business.
+        assert!(body.contains("#EXT-X-MAP:URI=\"init.mp4\""), "{body}");
+        assert!(body.contains("#EXT-X-TARGETDURATION:2"), "{body}");
+    }
+
+    /// A hole *inside* the window is left alone.
+    ///
+    /// Trimming to the first backed entry would report the window as
+    /// contiguous when it is not, which is a worse failure than a 404: the
+    /// player would calibrate its bar on a span it cannot actually play
+    /// through, with nothing to indicate why.
+    #[tokio::test]
+    async fn a_hole_in_the_middle_is_not_silently_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        s.put("s", "seg-1.m4s", Bytes::from_static(b"a")).await.unwrap();
+        s.put("s", "seg-3.m4s", Bytes::from_static(b"c")).await.unwrap();
+        let m = "#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:1
+                 #EXTINF:2.000,
+seg-1.m4s
+#EXTINF:2.000,
+seg-2.m4s
+                 #EXTINF:2.000,
+seg-3.m4s
+";
+        s.put("s", "manifest.m3u8", Bytes::from(m)).await.unwrap();
+        let body = String::from_utf8(
+            s.get("s", "manifest.m3u8").await.unwrap().bytes.to_vec()).unwrap();
+        assert!(body.contains("seg-2.m4s"), "an interior hole was closed:
+{body}");
+        assert!(body.contains("#EXT-X-MEDIA-SEQUENCE:1"), "{body}");
+    }
+
+    /// A stream that has published nothing yet is not rewritten to empty.
+    ///
+    /// At cold start the manifest can arrive before the first segment. An
+    /// empty playlist is a hard player error; a manifest a beat ahead of its
+    /// media resolves itself on the next PUT.
+    #[tokio::test]
+    async fn a_manifest_ahead_of_its_first_segment_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        let m = "#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:1
+#EXTINF:2.000,
+seg-1.m4s
+";
+        s.put("s", "manifest.m3u8", Bytes::from(m)).await.unwrap();
+        let body = String::from_utf8(
+            s.get("s", "manifest.m3u8").await.unwrap().bytes.to_vec()).unwrap();
+        assert!(body.contains("seg-1.m4s"), "cold start rewritten to empty:
+{body}");
     }
 
     #[tokio::test]
