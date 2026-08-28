@@ -1,7 +1,14 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Tier 1 — LL-HLS / CMAF HTTP origin + in-memory sliding-window cache.
+//! Tier 1 — LL-HLS / CMAF HTTP origin, disk-backed.
+//!
+//! Media segments are written to disk and retained by age, bounded by a
+//! per-stream byte cap and floored at a segment count. Manifests and init
+//! segments stay in memory: they are rewritten every segment and never
+//! evicted, so persisting them would be churn on the hottest objects here
+//! for no durability benefit — nothing reads them back after a restart,
+//! because the segments they reference are gone too.
 //!
 //! The edge's existing CMAF output PUTs browser-playable fMP4 segments +
 //! HLS/DASH manifests to `{ingest_url}/{file}`. Point that `ingest_url` at
@@ -143,6 +150,97 @@ pub struct StreamUsage {
 pub struct ObjectResponse {
     pub bytes: Bytes,
     pub content_type: &'static str,
+    /// Strong validator over the bytes.
+    ///
+    /// Everything here is served `must-revalidate`, because a name in a live
+    /// stream is not stable across restarts — but a revalidation with no
+    /// validator to compare is a full re-download every time. Scrubbing a
+    /// 60-minute DVR window re-fetches segments constantly, so the difference
+    /// is the whole window's bytes versus a few hundred 304s.
+    ///
+    /// Derived from the content, so a re-PUT under the same name changes it,
+    /// which is exactly the case a date-based validator would get wrong.
+    pub etag: String,
+}
+
+/// Is this object an HLS playlist, whose URIs a viewer will fetch next?
+fn is_hls_playlist(file: &str) -> bool {
+    file.ends_with(".m3u8")
+}
+
+/// Re-emit a playlist with `?token=` appended to every URI it names.
+///
+/// Two kinds of URI appear: a bare line (a media segment) and a quoted
+/// `URI="..."` attribute (`EXT-X-MAP`, `EXT-X-PART`, `EXT-X-PRELOAD-HINT`,
+/// `EXT-X-RENDITION-REPORT`). Both are relative, and both are fetched without
+/// the query the playlist itself arrived with.
+fn playlist_with_token(body: &[u8], token: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return body.to_vec(); // not a playlist after all; leave it alone
+    };
+    let enc = percent_encode_token(token);
+    let add = |uri: &str| -> String {
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        format!("{uri}{sep}token={enc}")
+    };
+
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let eol = &line[trimmed.len()..];
+        if trimmed.is_empty() {
+            out.push_str(line);
+        } else if let Some(rest) = trimmed.strip_prefix('#') {
+            // Rewrite each quoted URI attribute in place.
+            match rest.find("URI=\"") {
+                Some(i) => {
+                    let start = 1 + i + 5; // '#' + prefix + `URI="`
+                    match trimmed[start..].find('"') {
+                        Some(len) => {
+                            out.push_str(&trimmed[..start]);
+                            out.push_str(&add(&trimmed[start..start + len]));
+                            out.push_str(&trimmed[start + len..]);
+                        }
+                        None => out.push_str(trimmed),
+                    }
+                }
+                None => out.push_str(trimmed),
+            }
+            out.push_str(eol);
+        } else {
+            out.push_str(&add(trimmed));
+            out.push_str(eol);
+        }
+    }
+    out.into_bytes()
+}
+
+/// Percent-encode the characters a token can carry that are not safe to drop
+/// unescaped into a query. A multi-stream token carries `,`; nothing else in
+/// the alphabet (`0-9 a-z A-Z . - _ ,`) needs escaping.
+fn percent_encode_token(token: &str) -> String {
+    token.replace(',', "%2C")
+}
+
+/// RFC 9110 8.8.3.2: `If-None-Match` is `*` or a comma-separated list, and the
+/// comparison is weak — a `W/` prefix on either side still matches.
+fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
+    let strip = |t: &str| t.trim().trim_start_matches("W/").trim().to_string();
+    let want = strip(etag);
+    header_value
+        .split(',')
+        .any(|t| t.trim() == "*" || strip(t) == want)
+}
+
+/// A strong ETag over an object's bytes.
+fn etag_for(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    // Not a cryptographic digest: this distinguishes versions of an object the
+    // relay itself wrote, it is not a trust boundary. Length is mixed in so a
+    // hash collision also has to match the size.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("\"{:016x}-{:x}\"", h.finish(), bytes.len())
 }
 
 /// A small, hot object held in memory: manifests and init segments.
@@ -224,6 +322,10 @@ pub struct OriginStore {
     started: Instant,
 }
 
+/// Marker written into the origin root, so the startup wipe can tell a
+/// directory this store owns from one an operator pointed it at by mistake.
+const ORIGIN_MARKER: &str = ".bilbycast-origin";
+
 impl OriginStore {
     /// Build the store, creating `root` and clearing anything already there.
     ///
@@ -232,11 +334,30 @@ impl OriginStore {
     /// can address them. Wiping on startup is what stops the directory growing
     /// without bound across restarts.
     pub fn new(cfg: OriginConfig) -> std::io::Result<Self> {
+        // Only ever wipe a directory this store made. `origin_storage_dir` is
+        // operator-supplied and this is a recursive delete: pointed at a home
+        // directory or a mount point by a typo, an unconditional wipe destroys
+        // whatever is there. A directory that exists, is not empty, and has no
+        // marker is somebody else's.
+        let marker = cfg.root.join(ORIGIN_MARKER);
         if cfg.root.exists() {
+            let empty = std::fs::read_dir(&cfg.root)?.next().is_none();
+            if !empty && !marker.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "origin storage dir {} is not empty and was not created by the relay \
+                         (no {ORIGIN_MARKER}); refusing to erase it — point \
+                         distribution.origin_storage_dir at a directory of its own",
+                        cfg.root.display()
+                    ),
+                ));
+            }
             std::fs::remove_dir_all(&cfg.root)?;
         }
         std::fs::create_dir_all(&cfg.root)?;
         let policy = arc_swap::ArcSwap::from_pointee(cfg.policy());
+        std::fs::write(&marker, b"bilbycast-relay origin store\n")?;
         Ok(Self {
             cfg,
             policy,
@@ -330,6 +451,20 @@ impl OriginStore {
         out
     }
 
+    /// A stream name must resolve to exactly one ordinary directory under the
+    /// root — not `.`, not `..`, not a nested or absolute path.
+    ///
+    /// The HTTP handlers validate the name before it reaches here, but this
+    /// store's methods are `pub` and every one of them turns the name into a
+    /// filesystem path. `remove_stream` in particular does a
+    /// `remove_dir_all`, so a name of `..` would recursively delete the
+    /// origin root's *parent* — the relay's whole data directory.
+    fn safe_stream_name(stream: &str) -> bool {
+        let mut components = FsPath::new(stream).components();
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+    }
+
     fn ensure(&self, stream: &str) -> Arc<StreamOrigin> {
         if let Some(s) = self.streams.get(stream) {
             return s.clone();
@@ -352,6 +487,12 @@ impl OriginStore {
     /// index entry is published only once the bytes are in place, so a reader
     /// can never observe a half-written segment.
     pub async fn put(&self, stream: &str, file: &str, bytes: Bytes) -> std::io::Result<()> {
+        if !Self::safe_stream_name(stream) || !valid_object_name(file) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "origin: unsafe stream or object name",
+            ));
+        }
         let content_type = content_type_for(file);
         let origin = self.ensure(stream);
         origin.last_put_ms.store(self.now_ms(), Ordering::Relaxed);
@@ -367,8 +508,19 @@ impl OriginStore {
         let path = origin.dir.join(file);
         let tmp = origin.dir.join(format!("{file}.part"));
         tokio::fs::create_dir_all(&origin.dir).await?;
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        // A `.part` left behind is invisible to every bound in this file: it is
+        // in no index, counted in no byte total, and in no eviction queue, so
+        // nothing ever reclaims it. Clean up on the failure paths rather than
+        // waiting for the next startup wipe, which on a long-lived relay may
+        // be months away.
+        if let Err(e) = tokio::fs::write(&tmp, &bytes).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
 
         let meta = Arc::new(SegmentMeta {
             path,
@@ -376,13 +528,29 @@ impl OriginStore {
             len,
             stored_at: Instant::now(),
         });
-        // Re-PUT under the same name must not double-count the bytes.
+        // Re-PUT under the same name must not double-count the bytes, and
+        // must not leave the name where it was in the queue.
+        //
+        // `evict` only ever inspects `order.front()` and stops as soon as that
+        // one is young enough, which is sound only while the queue is ordered
+        // by `stored_at`. A re-PUT refreshes `stored_at`; leaving the name at
+        // its old position puts a young entry in front of genuinely expired
+        // ones, and eviction then stops at it — retention and the byte bound
+        // both quietly stop being enforced for that stream.
+        //
+        // This is not hypothetical: segment numbering restarts at `seg-00000`
+        // every time the producing flow restarts, so the first segment after a
+        // restart is a re-PUT of the oldest name in the queue.
+        let mut order = origin.order.lock().await;
         if let Some(prev) = origin.segments.insert(file.to_string(), meta) {
             origin.bytes.fetch_sub(prev.len, Ordering::Relaxed);
             self.total_bytes.fetch_sub(prev.len, Ordering::Relaxed);
-        } else {
-            origin.order.lock().await.push_back(file.to_string());
+            if let Some(pos) = order.iter().position(|n| n == file) {
+                order.remove(pos);
+            }
         }
+        order.push_back(file.to_string());
+        drop(order);
         origin.bytes.fetch_add(len, Ordering::Relaxed);
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
 
@@ -442,9 +610,13 @@ impl OriginStore {
     /// absent rather than as an error — that is a normal race against
     /// retention, not a fault.
     pub async fn get(&self, stream: &str, file: &str) -> Option<ObjectResponse> {
+        if !Self::safe_stream_name(stream) || !valid_object_name(file) {
+            return None;
+        }
         let origin = self.streams.get(stream)?.clone();
         if let Some(kept) = origin.kept.get(file) {
             return Some(ObjectResponse {
+                etag: etag_for(&kept.bytes),
                 bytes: kept.bytes.clone(),
                 content_type: kept.content_type,
             });
@@ -452,6 +624,7 @@ impl OriginStore {
         let meta = origin.segments.get(file).map(|m| m.clone())?;
         match tokio::fs::read(&meta.path).await {
             Ok(b) => Some(ObjectResponse {
+                etag: etag_for(&b),
                 bytes: Bytes::from(b),
                 content_type: meta.content_type,
             }),
@@ -469,6 +642,9 @@ impl OriginStore {
     }
 
     pub async fn remove_stream(&self, stream: &str) {
+        if !Self::safe_stream_name(stream) {
+            return;
+        }
         let Some((_, origin)) = self.streams.remove(stream) else {
             return;
         };
@@ -686,10 +862,20 @@ async fn origin_get(
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
     let Some(stream) = super::sanitize_stream_id(&stream) else {
-        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CACHE_CONTROL, "no-store")],
+            "invalid stream id",
+        )
+            .into_response();
     };
     if !valid_object_name(&file) {
-        return (StatusCode::BAD_REQUEST, "invalid object name").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CACHE_CONTROL, "no-store")],
+            "invalid object name",
+        )
+            .into_response();
     }
     // Checked before the store is touched, so a rejected request cannot be
     // used to probe which streams or segments exist.
@@ -699,7 +885,28 @@ async fn origin_get(
         return resp;
     }
     match st.origin.get(&stream, &file).await {
-        Some(obj) => {
+        Some(mut obj) => {
+            // Carry a query-borne credential into the playlist's own URIs.
+            //
+            // Native HLS (Safari, iOS) cannot set a request header, which is
+            // why `?token=` exists — but HLS resolves a playlist's URIs
+            // against the playlist's URL *without* its query, so every segment
+            // fetch that follows an authenticated manifest fetch arrives with
+            // no credential and is refused. Gated playback was therefore
+            // impossible on native HLS: the manifest loaded and nothing after
+            // it did.
+            //
+            // Only for the query form. hls.js sets `Authorization` on every
+            // request of its own, and rewriting for it would put a credential
+            // into URLs it did not need there.
+            if st.control.load().require_origin_token
+                && is_hls_playlist(&file)
+                && let Some(tok) = super::token_from_query(query.as_deref())
+            {
+                let rewritten = playlist_with_token(&obj.bytes, &tok);
+                obj.etag = etag_for(&rewritten);
+                obj.bytes = Bytes::from(rewritten);
+            }
             // Nothing here may be cached immutably, because no filename in a
             // live stream is stable across restarts.
             //
@@ -727,17 +934,42 @@ async fn origin_get(
             } else {
                 "no-cache, no-store, must-revalidate"
             };
+            // `must-revalidate` with no validator to compare means every
+            // revalidation is a full re-download. Answer the client's
+            // `If-None-Match` so the check costs a header exchange.
+            if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+                && if_none_match_matches(inm, &obj.etag)
+            {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (header::CACHE_CONTROL, cache.to_string()),
+                        (header::ETAG, obj.etag),
+                    ],
+                )
+                    .into_response();
+            }
             (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, obj.content_type.to_string()),
                     (header::CACHE_CONTROL, cache.to_string()),
+                    (header::ETAG, obj.etag),
                 ],
                 obj.bytes,
             )
                 .into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        // A miss is not durable: a segment the player is a moment early for
+        // becomes available seconds later, and one just evicted never does.
+        // Without a directive a fronting CDN is free to pick its own
+        // heuristic freshness for the 404 and keep serving it after the object
+        // lands — the negative-caching twin of the immutable trap above.
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response(),
     }
 }
 
@@ -946,6 +1178,84 @@ mod tests {
         assert_eq!((small.segments, small.bytes), (1, 100));
         assert!(big.policy_overridden, "an override must be visible to the operator");
         assert!(!small.policy_overridden);
+    }
+
+    /// A gated playlist must carry its credential into its own URIs.
+    ///
+    /// Native HLS cannot set a header, so `?token=` is how it authenticates —
+    /// but HLS resolves a playlist's URIs against the playlist URL *without*
+    /// its query, so without this every segment fetch after an authenticated
+    /// manifest fetch arrives bare and is refused.
+    #[test]
+    fn a_gated_playlist_carries_its_token_into_every_uri() {
+        let body = b"#EXTM3U\n\
+                     #EXT-X-VERSION:9\n\
+                     #EXT-X-MAP:URI=\"init.mp4\"\n\
+                     #EXTINF:2.000,\n\
+                     seg-00001.m4s\n\
+                     #EXT-X-PART:DURATION=0.5,URI=\"seg-00002.m4s?part=0\"\n\
+                     seg-00002.m4s\n";
+        let out = String::from_utf8(playlist_with_token(body, "1770000000.abc")).unwrap();
+
+        assert!(out.contains("#EXT-X-MAP:URI=\"init.mp4?token=1770000000.abc\""));
+        assert!(out.contains("\nseg-00001.m4s?token=1770000000.abc\n"));
+        // An existing query keeps it, and gets `&`.
+        assert!(out.contains("seg-00002.m4s?part=0&token=1770000000.abc"));
+        // Tags that name no URI are untouched.
+        assert!(out.contains("#EXT-X-VERSION:9\n"));
+        assert!(out.starts_with("#EXTM3U\n"));
+        // A comma in a multi-stream token has to survive the round trip.
+        let multi = String::from_utf8(playlist_with_token(body, "1770000000.a,b.abc")).unwrap();
+        assert!(multi.contains("seg-00001.m4s?token=1770000000.a%2Cb.abc"));
+        assert_eq!(
+            crate::distribution::token_from_query(Some("token=1770000000.a%2Cb.abc")).as_deref(),
+            Some("1770000000.a,b.abc"),
+            "the encoded form must decode back to the signed bytes"
+        );
+    }
+
+    /// A stream id names a directory under the origin root, so a name that is
+    /// a relative-path token escapes it. `remove_stream` does a
+    /// `remove_dir_all`, so `..` would recursively delete the relay's data
+    /// directory — the origin root's parent.
+    #[tokio::test]
+    async fn origin_refuses_stream_names_that_escape_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sibling = tmp.path().join("keep-me");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("important"), b"x").unwrap();
+        let s = store(&tmp, 8);
+
+        for escape in ["..", ".", "a/b", "/abs"] {
+            assert!(
+                s.put(escape, "seg0.m4s", Bytes::from_static(b"x")).await.is_err(),
+                "put accepted {escape:?}"
+            );
+            assert!(s.get(escape, "seg0.m4s").await.is_none(), "get accepted {escape:?}");
+            s.remove_stream(escape).await;
+        }
+
+        assert!(
+            sibling.join("important").exists(),
+            "a sibling of the origin root was deleted"
+        );
+        assert!(tmp.path().join("origin").exists(), "the origin root was deleted");
+        assert!(
+            !tmp.path().join("seg0.m4s").exists(),
+            "a segment was written outside the origin root"
+        );
+    }
+
+    /// The HTTP layer's own guard, which is what actually runs in production.
+    #[test]
+    fn stream_id_sanitiser_rejects_relative_path_tokens() {
+        use crate::distribution::sanitize_stream_id;
+        for bad in ["..", ".", "...", "....", " .. "] {
+            assert!(sanitize_stream_id(bad).is_none(), "accepted {bad:?}");
+        }
+        // Dots are still legal *inside* a real name.
+        assert_eq!(sanitize_stream_id("show.proxy").as_deref(), Some("show.proxy"));
+        assert_eq!(sanitize_stream_id("a").as_deref(), Some("a"));
     }
 
     #[tokio::test]
@@ -1170,12 +1480,52 @@ mod tests {
         let root = tmp.path().join("origin");
         std::fs::create_dir_all(root.join("s")).unwrap();
         std::fs::write(root.join("s/stale.m4s"), b"old").unwrap();
+        // What a previous run of this store would have left behind.
+        std::fs::write(root.join(ORIGIN_MARKER), b"x").unwrap();
 
         // Segments from a previous run are unaddressable — the manifests that
         // referenced them died with the process.
         let s = store(&tmp, 8);
         assert!(!root.join("s/stale.m4s").exists());
         assert!(s.get("s", "stale.m4s").await.is_none());
+        assert!(root.join(ORIGIN_MARKER).exists(), "marker must be re-written");
+    }
+
+    /// The startup wipe is a recursive delete of an operator-supplied path.
+    /// A directory the relay did not create must be refused, not erased.
+    #[tokio::test]
+    async fn startup_refuses_to_wipe_a_directory_it_did_not_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("someones-data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("thesis.txt"), b"years of work").unwrap();
+
+        let err = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(60),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            idle_grace: Duration::from_millis(80),
+        })
+        .map(|_| ())
+        .expect_err("a foreign non-empty directory must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(root.join("thesis.txt").exists(), "the directory was erased");
+
+        // An empty directory is fine — that is a fresh install.
+        let fresh = tmp.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        assert!(
+            OriginStore::new(OriginConfig {
+                root: fresh,
+                retention: Duration::from_secs(60),
+                max_bytes_per_stream: 1 << 30,
+                min_segments: 8,
+                idle_grace: Duration::from_millis(80),
+            })
+            .map(|_| ())
+            .is_ok()
+        );
     }
 
     /// The kept/evictable split still drives *how* an object is cached, but

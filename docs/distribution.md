@@ -63,7 +63,7 @@ they are not either/or.
 | `POST` | `/whip/{stream}` | Edge pushes a stream in (SDP offer → answer) |
 | `DELETE` | `/whip/{stream}/{session}` | Stop an ingest |
 | `GET` | `/watch/{stream}` | Built-in minimal `<video>` + WHEP player page (live only) |
-| `GET` | `/dvr/{stream}` | Browser DVR player: live, 60-min scrub-back, frame jog, shuttle |
+| `GET` | `/dvr/{stream}` | Browser DVR player: live, scrub-back, frame jog, shuttle. How far back is whatever `origin_retention_secs` holds — **60 s by default**; a DVR surface needs it raised, per stream or node-wide |
 | `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |
@@ -191,15 +191,18 @@ sub-second but live-only, with no buffer, no seekable range and no
 `playbackRate` — `/dvr` plays the LL-HLS origin and can therefore seek back
 across the whole advertised window and step individual frames.
 
-It expects **two renditions** of the same source:
+It expects **two renditions** of the same source, plus an optional thumbnail
+track (the player no-ops without it):
 
 | Rendition | Origin path | Encoding | Used for |
 |---|---|---|---|
-| main | `{stream}` | long-GOP | live, 1x, 0.25–4x forward, frame jog, and the still after a scrub |
+| main | `{stream}` | long-GOP | live, the 33 / 50 / 100 % speed presets, **frame jog**, and the still after a scrub |
 | proxy | `{stream}-proxy` | low-res **all-intra** | shuttle, reverse, and the picture *while* a scrub thumb is held |
 | thumbnails | `thumbs-*.jpg` + `thumbs.vtt` | sprite sheets | the preview under the thumb while dragging |
 
-That split has moved twice on measurement and is worth reading as measured
+The main rendition plays at 1x and below, not above: the presets are 33 %, 50 %
+and 100 %, and anything faster is a *seek* rate, which is what the shuttle is
+for. That split has moved twice on measurement and is worth reading as measured
 rather than as designed — see **Which rendition does what, and why** below.
 
 Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`

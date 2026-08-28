@@ -222,7 +222,7 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   panics str0m ("Pt locked multiple times: 111") once a session negotiates both
   H.264 and Opus (a WHEP client offering audio, or a server answering a
   default-codec offer). The fix drops the RTX slot on that one profile.
-- **Origin** (`PUT/GET /origin/{stream}/{file}`): in-memory sliding-window cache
+- **Origin** (`PUT/GET /origin/{stream}/{file}`): **disk-backed** store with time-based retention, a per-stream byte bound and a segment floor, swept every 30 s independently of ingest. Manifests and init segments stay in memory (rewritten every segment, never evicted). Retention is manager-owned at runtime, node-wide plus per-stream overrides
   of the edge's CMAF PUTs; front with a CDN for scale.
 - **Player**: built-in `GET /watch/{stream}` (`player.html`).
 - **Tokens** (`src/distribution/token.rs`): short-lived HMAC-SHA256
@@ -312,6 +312,9 @@ The accepted-lint set lives in `[lints.clippy]` in `Cargo.toml`, one documented
 reason per entry, so CI runs `-D warnings` with no inline `-A` flags to drift out
 of sync with the manifest.
 
-Triggers are branch-scoped (`branches: [main]` on both `push` and
-`pull_request`) — an unfiltered `push` also fires on tag refs, which would race
-`release-all.sh` for the same runner pool and cache.
+The `push` trigger is branch-scoped (`branches: [main]`) — an unfiltered `push`
+also fires on tag refs, which would race `release-all.sh` for the same runner
+pool and cache. **`pull_request` is deliberately not scoped**: scoping it to
+`main` meant a *stacked* PR — one whose base is another PR's branch — ran no CI
+at all, so the second half of a two-part change was never built until its base
+merged.

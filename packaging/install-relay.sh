@@ -121,14 +121,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# >>> portal-url-validation (lifted verbatim by test-portal-install.sh — keep
+# this block self-contained, and keep the markers)
 if [[ "${WITH_PORTAL}" -eq 1 ]]; then
     if [[ -z "${PORTAL_MANAGER_URL}" ]]; then
+        echo "reject-empty" >&2
         echo "--with-portal needs the manager's base URL, e.g. https://manager.example.com" >&2
         exit 1
     fi
     case "${PORTAL_MANAGER_URL}" in
         http://*|https://*) ;;
-        *) echo "--with-portal URL must start with http:// or https://" >&2; exit 1;;
+        *)
+            echo "reject-scheme" >&2
+            echo "--with-portal URL must start with http:// or https://" >&2
+            exit 1;;
     esac
 
     # Renewal is a cross-origin request carrying the viewer's session cookie, so
@@ -154,6 +160,7 @@ if [[ "${WITH_PORTAL}" -eq 1 ]]; then
         echo "      Add the player's origin to player_origins in portal.json." >&2
     fi
 fi
+# <<< portal-url-validation
 
 # ── Pre-flight checks ─────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -484,7 +491,9 @@ EOF
     if [[ ! -f "${PORTAL_ENV}" ]]; then
         cat > "${PORTAL_ENV}" <<'EOF'
 # Generate this in the manager: DVR Sessions -> Portal logins -> Generate a
-# token (super admin only). Shown once. Then: systemctl start bilbycast-portal
+# token (super admin only). Shown once. Then:
+#   systemctl enable --now bilbycast-portal
+# `enable` as well as `start`, or the portal is gone after the next reboot.
 BILBYCAST_PORTAL_TOKEN=
 EOF
         chmod 0600 "${PORTAL_ENV}"

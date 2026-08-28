@@ -140,8 +140,24 @@ impl DistributionControl {
     }
 
     /// Push a storage-policy change (manager). The origin store applies it.
+    ///
+    /// Merged into the retained value rather than replacing it. This is a
+    /// **delta** — a `None` field means "unchanged" — but it travels on a
+    /// latest-value-wins `watch`, so two pushes landing between receiver wakeups
+    /// would drop the first: a `{default, no per_stream}` push followed by a
+    /// `{no default, per_stream}` one loses the new default entirely.
+    ///
+    /// Merging also gives a late subscriber a complete picture, which
+    /// `subscribe_origin` needs — `watch::Sender::subscribe` marks the current
+    /// value as already seen, so anything pushed before the origin task starts
+    /// is never delivered by `changed()`.
     pub fn set_origin_policy(&self, update: OriginPolicyUpdate) {
-        let _ = self.origin_tx.send(update);
+        let prev = self.origin_keep.borrow().clone();
+        let merged = OriginPolicyUpdate {
+            default: update.default.or(prev.default),
+            per_stream: update.per_stream.or(prev.per_stream),
+        };
+        let _ = self.origin_tx.send(merged);
     }
 
     /// Current cascade-source list (for persistence to config.json).
@@ -197,6 +213,29 @@ pub struct DistUpdate {
     pub public_ip: Option<IpAddr>,
     pub public_base_url: Option<String>,
     pub portal_url: Option<String>,
+}
+
+/// Validate + normalize a stream id from the URL path. Streams are named by
+/// the manager; keep the character set tight to avoid path/URL abuse.
+///
+/// The character set alone is not enough now that a stream id names a
+/// **directory** under the origin root: `.` and `..` are built entirely from
+/// allowed characters, and `root.join("..")` is the origin's parent. Require at
+/// least one alphanumeric, which rejects every all-dot name without having to
+/// enumerate them.
+pub fn sanitize_stream_id(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 128 {
+        return None;
+    }
+    if !s.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        Some(s.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

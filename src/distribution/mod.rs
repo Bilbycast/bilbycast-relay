@@ -125,7 +125,7 @@ pub async fn run_distribution(
         retention: std::time::Duration::from_secs(config.origin_retention_secs),
         max_bytes_per_stream: config.origin_max_bytes_per_stream,
         min_segments: config.origin_window_segments,
-        idle_grace: std::time::Duration::from_secs(60),
+        idle_grace: std::time::Duration::from_secs(config.origin_idle_grace_secs),
     };
     tracing::info!(
         root = %origin_cfg.root.display(),
@@ -144,7 +144,16 @@ pub async fn run_distribution(
         let origin = origin.clone();
         let cancel = cancel.clone();
         let mut rx = control.subscribe_origin();
+        let retained = control.origin_policy_now();
         tokio::spawn(async move {
+            // `subscribe` marks the current value as seen, so a push that
+            // landed while the store was being built — plausible, since
+            // `OriginStore::new` wipes the root, which on a deep DVR window is
+            // thousands of files — would never be delivered. Apply what is
+            // retained before waiting for the next change.
+            if retained.default.is_some() || retained.per_stream.is_some() {
+                origin.apply_policy_update(&retained);
+            }
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -339,19 +348,14 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Validate + normalize a stream id from the URL path. Streams are named by
-/// the manager; keep the character set tight to avoid path/URL abuse.
-pub fn sanitize_stream_id(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    if s.is_empty() || s.len() > 128 {
-        return None;
-    }
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
-        Some(s.to_string())
-    } else {
-        None
-    }
-}
+/// Validate + normalize a stream id from the URL path.
+///
+/// Lives in `distribution_control` because the manager client — which is not
+/// feature-gated — validates the stream ids in a storage-policy push against
+/// the very same rule the request path applies. Two copies would drift, and a
+/// key that passes the push but fails the request is an override that is
+/// stored, acked and matches nothing.
+pub use crate::distribution_control::sanitize_stream_id;
 
 /// `POST /whep/{stream_id}` — accept a viewer's SDP offer, return the answer.
 async fn whep_offer(
@@ -580,15 +584,51 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 /// The `?` is already stripped by axum's `RawQuery` extractor, so this takes
 /// the query body only.
 ///
-/// No percent-decoding: a viewer token is `"{exp}.{hmac}"` — decimal digits, a
-/// dot, and lowercase hex — and nothing in that set is percent-encoded by a
-/// conforming client. Decoding would only widen what we accept.
-fn token_from_query(raw: Option<&str>) -> Option<String> {
-    raw?.split('&')
+/// Percent-decoded, and `+` is treated as a space is NOT — a token contains
+/// neither.
+///
+/// This used to decode nothing, on the reasoning that a viewer token is
+/// `"{exp}.{hmac}"` — decimal digits, a dot and lowercase hex — none of which a
+/// conforming client encodes. That set has since widened: a multi-stream token
+/// is `"{exp}.{a,b}.{hmac}"` and carries commas and stream names, and
+/// `encodeURIComponent` turns a comma into `%2C`. Undecoded, the HMAC then
+/// covers a different string and a valid credential is refused as a forgery.
+///
+/// Decoding cannot widen what is accepted: whatever comes out still has to
+/// carry a signature over the exact bytes.
+pub(super) fn token_from_query(raw: Option<&str>) -> Option<String> {
+    let raw_value = raw?
+        .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(k, _)| *k == "token")
-        .map(|(_, v)| v.to_string())
-        .filter(|v| !v.is_empty())
+        .map(|(_, v)| v)?;
+    let decoded = percent_decode(raw_value);
+    Some(decoded).filter(|v| !v.is_empty())
+}
+
+/// Minimal `%XX` decoder. Anything that is not a well-formed escape is passed
+/// through unchanged, so a token that needed no decoding is untouched.
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Validate a viewer token supplied via `Authorization: Bearer` **or** the
@@ -701,10 +741,17 @@ async fn dvr_page(
         .unwrap_or_default();
     let html = include_str!("dvr.html")
         .replace("__STREAM_ID__", &stream_id)
-        .replace("__PORTAL_URL__", &portal);
+        .replace("__PORTAL_URL__", &portal)
+        .replace("__HLS_JS_VERSION__", HLS_JS_VERSION);
     // The page is an app shell that changes with the build. Without this a
     // browser will happily serve a cached copy after an upgrade, so a fixed
-    // player looks unfixed. (`/dvr/hls.js` stays immutable — it is versioned.)
+    // player looks unfixed.
+    //
+    // The page is also what versions `/dvr/hls.js`: it is served `immutable`,
+    // which is a promise about a URL, and `/dvr/hls.js` on its own is a URL
+    // whose bytes change on every hls.js bump. The `?v=` the page appends is
+    // what makes the promise true — a viewer who cached the old bundle for a
+    // year is asked for a different URL after an upgrade.
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -721,6 +768,12 @@ async fn dvr_page(
 /// deployed where viewers have no route to the public internet, and because a
 /// player that silently stops working when a CDN changes is not a broadcast
 /// tool. Android Chrome has no native HLS, so this is not optional there.
+/// The vendored bundle's version, appended to its URL by the page above.
+///
+/// Keep in step with `vendor/README.md`; the pair is what lets the response be
+/// `immutable` without pinning viewers to a superseded bundle.
+pub const HLS_JS_VERSION: &str = "1.6.16";
+
 async fn dvr_hls_js() -> Response {
     (
         [
@@ -2174,6 +2227,22 @@ mod tests {
         assert!(
             expired[..expired.len().min(300)].contains("forgetToken"),
             "a refused token is kept, so the failure repeats on every reload"
+        );
+    }
+
+    /// `/dvr/hls.js` is served `immutable` for a year, which is a promise
+    /// about a URL. The page must therefore version the URL, or a viewer who
+    /// cached one bundle keeps it across every future upgrade — the same
+    /// same-URL-different-bytes trap the origin's own cache headers avoid.
+    #[test]
+    fn dvr_page_versions_the_immutable_hls_js_url() {
+        let html = include_str!("dvr.html")
+            .replace("__STREAM_ID__", "s")
+            .replace("__HLS_JS_VERSION__", HLS_JS_VERSION);
+        assert!(!html.contains("__HLS_JS_VERSION__"), "placeholder left in page");
+        assert!(
+            html.contains(&format!("/dvr/hls.js?v={HLS_JS_VERSION}")),
+            "hls.js is loaded from an unversioned URL while served immutable"
         );
     }
 

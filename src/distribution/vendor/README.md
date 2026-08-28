@@ -5,6 +5,8 @@
 - **Upstream**: https://github.com/video-dev/hls.js
 - **Version**: 1.6.16
 - **Source**: `https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js`
+- **sha256**: `442f599c34f103c3355b375a23bdff560592d7117d09a8c847242ea3de2d40e0`
+  (543 002 bytes; verified byte-identical to that URL on 2026-08-24)
 - **Licence**: Apache-2.0 (see upstream `LICENSE`)
 - **Served at**: `GET /dvr/hls.js`, via `include_str!` from
   `distribution::dvr_hls_js`.
@@ -28,10 +30,16 @@ is why this is the first vendored browser asset in the tree.
 
 ### Updating
 
-Replace the file, update the version above, and re-run
+Replace the file, update the version **and the sha256** above, and re-run
 `cargo test --features viewer-distribution`. The
 `vendored_hls_js_is_present_and_plausible` test is a smoke check on size and
 contents; it will catch a truncated download or an error page saved by
-mistake, but not a functional regression. Check the upstream changelog for
+mistake, but not a functional regression. The recorded digest is what makes
+the vendoring auditable without network access:
+
+```
+sha256sum src/distribution/vendor/hls.min.js
+curl -sL https://cdn.jsdelivr.net/npm/hls.js@<version>/dist/hls.min.js | sha256sum
+``` Check the upstream changelog for
 breaking changes to `Hls.Events` / the config keys used in `dvr.html`
 (`backBufferLength`, `maxBufferLength`, `lowLatencyMode`).

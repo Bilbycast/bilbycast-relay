@@ -659,23 +659,39 @@ fn apply_configure_distribution(
     if let Some(b) = action.get("require_ingest_token").and_then(|v| v.as_bool()) {
         update.require_ingest_token = Some(b);
     }
-    if let Some(s) = action.get("public_ip").and_then(|v| v.as_str()) {
+    // An empty string is "the operator left the box blank", not a value.
+    //
+    // The manager's own validators admit `""` for these three (each is guarded
+    // by `!v.is_empty() &&`) and its Distribution tab sends all three keys on
+    // every save, so a blank Public IP arrived here as `""` — and rejecting it
+    // aborts the WHOLE command, so the token secret, the gates and the cascade
+    // sources in the same push were not applied either. The ordinary case of
+    // saving that form with one box empty silently applied nothing.
+    let non_empty = |k: &str| -> Option<String> {
+        action
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(s) = non_empty("public_ip") {
         match s.parse() {
             Ok(ip) => update.public_ip = Some(ip),
             Err(_) => return Err(format!("invalid public_ip '{s}'")),
         }
     }
-    if let Some(s) = action.get("portal_url").and_then(|v| v.as_str()) {
+    if let Some(s) = non_empty("portal_url") {
         if !s.starts_with("http://") && !s.starts_with("https://") {
             return Err("portal_url must start with http:// or https://".to_string());
         }
-        update.portal_url = Some(s.to_string());
+        update.portal_url = Some(s);
     }
-    if let Some(s) = action.get("public_base_url").and_then(|v| v.as_str()) {
+    if let Some(s) = non_empty("public_base_url") {
         if !(s.starts_with("http://") || s.starts_with("https://")) {
             return Err("public_base_url must start with http:// or https://".to_string());
         }
-        update.public_base_url = Some(s.to_string());
+        update.public_base_url = Some(s);
     }
     control.apply(update);
 
@@ -695,7 +711,11 @@ fn apply_configure_distribution(
             .ok_or_else(|| "origin_stream_policies must be an object keyed by stream id".to_string())?;
         let mut per_stream = Vec::with_capacity(obj.len());
         for (stream, pv) in obj {
-            if stream.is_empty() || stream.len() > 128 {
+            // Same sanitiser the request path uses. A length check alone
+            // accepts a name no request can ever present — the override is
+            // then stored, acked as applied, reported on the health tick and
+            // matches nothing, so the session's window silently never applies.
+            if crate::distribution_control::sanitize_stream_id(stream).as_deref() != Some(stream.as_str()) {
                 return Err(format!("invalid stream id '{stream}'"));
             }
             let patch = parse_origin_policy_patch(pv)
@@ -784,6 +804,7 @@ fn persist_distribution_config(
     }
     let rt = control.load();
     let cascade = control.cascade_now();
+    let origin_policy = control.origin_policy_now();
     if let Err(e) = update_config_file(config_path, relay_config, |config| {
         let dcfg = config
             .distribution
@@ -791,11 +812,40 @@ fn persist_distribution_config(
         dcfg.enabled = true;
         dcfg.token_secret = rt.token_secret.clone();
         dcfg.require_viewer_token = rt.require_viewer_token;
+        // The origin gate persists alongside its two siblings. Omitting it
+        // made it the only gate that did not survive a restart — and because
+        // `require_viewer_token` did, an operator inspecting the file after a
+        // restart saw a gated session and concluded correctly for WHEP and
+        // wrongly for the CMAF tier, which is the exact bypass the gate exists
+        // to close. It fails OPEN, so the omission was silent.
+        dcfg.require_origin_token = rt.require_origin_token;
         dcfg.require_ingest_token = rt.require_ingest_token;
         dcfg.public_ip = rt.public_ip.map(|ip| ip.to_string());
         dcfg.public_base_url = rt.public_base_url.clone();
         dcfg.portal_url = rt.portal_url.clone();
         dcfg.cascade_sources = cascade;
+        // The node-wide storage policy persists too: it is the floor every
+        // stream falls back to, and losing it silently narrows the window on
+        // the next restart.
+        //
+        // Per-stream overrides deliberately do NOT persist. They belong to a
+        // session, and a session that ended while the relay was down must not
+        // come back holding that stream's disk at the widened window with
+        // nothing left referencing it.
+        if let Some(d) = &origin_policy.default {
+            if let Some(v) = d.retention_secs {
+                dcfg.origin_retention_secs = v;
+            }
+            if let Some(v) = d.max_bytes_per_stream {
+                dcfg.origin_max_bytes_per_stream = v;
+            }
+            if let Some(v) = d.min_segments {
+                dcfg.origin_window_segments = v;
+            }
+            if let Some(v) = d.idle_grace_secs {
+                dcfg.origin_idle_grace_secs = v;
+            }
+        }
     }) {
         tracing::warn!("failed to persist distribution config to {config_path:?}: {e}");
     }
@@ -821,6 +871,15 @@ fn build_health_message(
     let dist_snapshot = relay_stats.distribution_snapshot();
     if dist_snapshot.is_some() {
         capabilities.push("viewer-distribution");
+        // "origin-policy" => this build understands `require_origin_token`,
+        // `origin_policy` and `origin_stream_policies` on
+        // `configure_distribution`. A relay that predates them advertises
+        // `viewer-distribution` just the same and **acks the push anyway** —
+        // unknown keys are ignored, so the manager records a gate or a
+        // retention window as applied when nothing was. The bit is what lets
+        // the manager refuse instead of reporting a success it cannot see is
+        // false.
+        capabilities.push("origin-policy");
     }
 
     let mut payload = serde_json::json!({
@@ -1377,11 +1436,20 @@ mod manager_contract_tests {
                 "e2e":       { "retention_secs": 300 },
                 "e2e-proxy": { "retention_secs": 300 }
             },
-            "require_origin_token": false
+            // `true`, because that is what the manager sends. `relay_push_body`
+            // carries it unconditionally (migration 0063 — every DVR feed is
+            // gated), so a fixture pinning `false` pins a body the manager has
+            // never produced, and the one field whose value actually matters
+            // here would go unchecked.
+            "require_origin_token": true
         });
 
         apply_configure_distribution(Some(&control), &from_manager)
             .expect("the relay must accept the manager's push");
+        assert!(
+            control.load().require_origin_token,
+            "the gate the manager always sends must actually engage"
+        );
 
         // Applied, not merely parsed.
         let mut rx = control.subscribe_origin();
@@ -1394,6 +1462,52 @@ mod manager_contract_tests {
             per[0].1.retention_secs,
             Some(300),
             "the window must survive the wire"
+        );
+    }
+
+    /// A blank box on the Distribution tab must not abort the whole push.
+    ///
+    /// The manager admits `""` for `public_ip`, `public_base_url` and
+    /// `portal_url` and its form sends all three keys on every save, so the
+    /// ordinary case of leaving one empty used to return `Err` — which aborts
+    /// `apply_configure_distribution` entirely, so the token secret and the
+    /// gates in the same command were not applied either. Silently: the
+    /// manager reports `success: true, pushed: false` at most.
+    #[test]
+    fn a_blank_field_does_not_abort_the_rest_of_the_push() {
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "public_ip": "",
+                "portal_url": "",
+                "public_base_url": "https://relay.example.com",
+                "require_viewer_token": true,
+                "token_secret": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            }),
+        )
+        .expect("a blank field must not abort the push");
+
+        let rt = control.load();
+        assert_eq!(
+            rt.public_base_url.as_deref(),
+            Some("https://relay.example.com"),
+            "the field that WAS filled in must land"
+        );
+        assert!(rt.require_viewer_token, "the gate in the same push must land");
+        assert!(rt.token_secret.is_some(), "the secret in the same push must land");
+        assert!(rt.public_ip.is_none(), "a blank field stays unset");
+
+        // A non-empty but malformed value is still refused.
+        assert!(
+            apply_configure_distribution(
+                Some(&control),
+                &serde_json::json!({ "type": "configure_distribution", "public_ip": "not-an-ip" }),
+            )
+            .is_err()
         );
     }
 
