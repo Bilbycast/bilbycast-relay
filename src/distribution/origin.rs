@@ -56,6 +56,24 @@ pub struct OriginConfig {
     /// two say. Stops a stalled or very-low-bitrate stream having its whole
     /// window aged out from under a live player.
     pub min_segments: usize,
+    /// Never let the filesystem fall below this many bytes free.
+    ///
+    /// The guard of last resort, and the only one that cannot be got wrong
+    /// from outside. `retention` and `max_bytes_per_stream` are both pushed by
+    /// the manager, which sizes them from the DVR window it was asked for and
+    /// **cannot see this relay's disk** — nothing in a node's health payload
+    /// reports free space. So a 2h30m window on a small VPS is a policy the
+    /// manager will happily push and the relay will happily honour, right up
+    /// until the volume fills.
+    ///
+    /// It did: the demo rig filled its disk and took Postgres down with it,
+    /// which is what this exists to stop. The relay owns the disk, so the
+    /// relay has to be the one that refuses.
+    ///
+    /// Enforced across *all* streams, oldest first, because the failure is
+    /// node-wide: one stream inside its own byte cap can still be the one that
+    /// fills the volume when there are four of them.
+    pub min_free_bytes: u64,
     /// How long past `retention` a stream may sit without a PUT before it is
     /// reclaimed outright — segments, manifest, init and directory.
     ///
@@ -661,6 +679,76 @@ impl OriginStore {
                 self.remove_stream(&name).await;
             }
         }
+
+        self.enforce_free_space().await;
+    }
+
+    /// Give disk back until the volume is above its floor.
+    ///
+    /// Runs after the per-stream policies, not instead of them: this is the
+    /// guard for when those policies are simply too large for the disk they
+    /// landed on, which the manager cannot detect because no node health
+    /// payload reports free space.
+    ///
+    /// Oldest first across every stream, which is the only fair order — a DVR
+    /// window gives up its back end first, exactly as retention would. Taking
+    /// a whole stream instead would silently end one session to save another.
+    async fn enforce_free_space(&self) {
+        if self.cfg.min_free_bytes == 0 {
+            return;
+        }
+        let Some(free) = free_bytes(&self.cfg.root) else {
+            return;
+        };
+        if free >= self.cfg.min_free_bytes {
+            return;
+        }
+
+        let want = self.cfg.min_free_bytes.saturating_sub(free);
+        let mut freed: u64 = 0;
+        // Round-robin the streams rather than draining one: with several
+        // sessions, emptying the first alphabetically would take one feed's
+        // whole window while the others kept theirs.
+        let names: Vec<String> = self.streams.iter().map(|e| e.key().clone()).collect();
+        let mut progress = true;
+        while freed < want && progress {
+            progress = false;
+            for name in &names {
+                if freed >= want {
+                    break;
+                }
+                let Some(origin) = self.streams.get(name).map(|s| s.clone()) else {
+                    continue;
+                };
+                // Leave the newest few whatever happens: a player parked at
+                // the live edge must still have something to read, and a
+                // relay that deletes everything is not more useful than one
+                // that is short of space.
+                let mut order = origin.order.lock().await;
+                if order.len() <= EMERGENCY_KEEP_SEGMENTS {
+                    continue;
+                }
+                let Some(file) = order.pop_front() else { continue };
+                drop(order);
+                if let Some((_, meta)) = origin.segments.remove(&file) {
+                    let _ = tokio::fs::remove_file(&meta.path).await;
+                    origin.bytes.fetch_sub(meta.len, Ordering::Relaxed);
+                    self.total_bytes.fetch_sub(meta.len, Ordering::Relaxed);
+                    freed = freed.saturating_add(meta.len);
+                    progress = true;
+                }
+            }
+        }
+
+        // Say it every sweep it is needed, not once on the transition: this is
+        // the operator being told their window does not fit the disk, and it
+        // stays true until they change something.
+        tracing::warn!(
+            free_mb = free / 1_048_576,
+            floor_mb = self.cfg.min_free_bytes / 1_048_576,
+            freed_mb = freed / 1_048_576,
+            "origin: below the free-space floor — evicting across all streams.              The configured window does not fit this volume."
+        );
     }
 
     /// Bytes of media segments currently on disk across all streams
@@ -774,6 +862,42 @@ fn trim_unbacked_head(body: &[u8], has: &dyn Fn(&str) -> bool) -> Option<Vec<u8>
 "));
     }
     Some(out.into_bytes())
+}
+
+/// Segments a stream keeps even when the volume is below its floor.
+///
+/// A relay that deleted everything to make room is not more useful than one
+/// that is short of space — a player at the live edge still needs something to
+/// read. Small, because this only runs when the disk is already in trouble.
+const EMERGENCY_KEEP_SEGMENTS: usize = 4;
+
+/// Bytes free on the filesystem holding `path`, or `None` if it cannot be
+/// asked.
+///
+/// `None` is not "full": every caller treats it as "no opinion" and falls back
+/// to the byte and retention policies. A guard that failed closed on a
+/// `statvfs` error would stop a working relay for no reason.
+#[cfg(unix)]
+fn free_bytes(path: &FsPath) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `buf` is written only by `statvfs`, and only read on success.
+    unsafe {
+        let mut buf: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut buf) != 0 {
+            return None;
+        }
+        // `f_bavail` is what a non-root process may actually use, which is the
+        // honest number here: `f_bfree` includes the reserved blocks the relay
+        // cannot touch, and counting them is how a "safe" floor still fills
+        // the disk.
+        Some((buf.f_bavail as u64).saturating_mul(buf.f_frsize as u64))
+    }
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &FsPath) -> Option<u64> {
+    None
 }
 
 /// Content-Type for a distribution object by extension.
@@ -991,6 +1115,9 @@ mod tests {
             retention: Duration::from_secs(3600),
             max_bytes_per_stream: 1 << 30,
             min_segments,
+            // Off by default in tests: the guard is about the *real* volume,
+            // and a temp dir on a roomy disk would never trip it.
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .expect("store should build")
@@ -1210,6 +1337,7 @@ mod tests {
             retention: Duration::from_secs(3600),
             max_bytes_per_stream: 30,
             min_segments: 1,
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .unwrap();
@@ -1233,6 +1361,7 @@ mod tests {
             retention: Duration::from_millis(40),
             max_bytes_per_stream: 1 << 30,
             min_segments: 1,
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .unwrap();
@@ -1254,6 +1383,7 @@ mod tests {
             retention: Duration::from_millis(1),
             max_bytes_per_stream: 1,
             min_segments: 3,
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .unwrap();
@@ -1282,6 +1412,7 @@ mod tests {
             max_bytes_per_stream: 1 << 30,
             // A floor high enough that PUT-driven eviction would keep everything.
             min_segments: 8,
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .unwrap();
@@ -1315,6 +1446,7 @@ mod tests {
             retention: Duration::from_millis(30),
             max_bytes_per_stream: 1 << 30,
             min_segments: 2,
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .unwrap();
@@ -1342,6 +1474,7 @@ mod tests {
             retention: Duration::from_millis(1),
             max_bytes_per_stream: 1,
             min_segments: 0,
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .unwrap();
@@ -1367,6 +1500,7 @@ mod tests {
             retention: Duration::from_millis(1),
             max_bytes_per_stream: 1,
             min_segments: 0,
+            min_free_bytes: 0,
             idle_grace: Duration::from_millis(80),
         })
         .unwrap();
@@ -1400,6 +1534,72 @@ mod tests {
         assert_eq!(s.total_bytes(), 0);
         assert!(s.get("s", "seg0.m4s").await.is_none());
         assert!(!tmp.path().join("origin/s").exists());
+    }
+
+    /// The origin gives disk back before the volume fills.
+    ///
+    /// `retention` and `max_bytes_per_stream` both arrive from the manager,
+    /// which sizes them from the DVR window it was asked for and cannot see
+    /// this relay's disk — no node health payload reports free space. So a
+    /// window too large for the volume is a policy the manager will push and
+    /// the relay will honour, until the disk fills. On the demo rig it did,
+    /// and took the manager's own Postgres down with it.
+    ///
+    /// Driven by setting the floor above whatever the test volume actually
+    /// has free, so the guard is genuinely triggered rather than asserted
+    /// about.
+    #[tokio::test]
+    async fn the_origin_evicts_rather_than_filling_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("origin");
+        std::fs::create_dir_all(&root).unwrap();
+        // A floor no real filesystem will be above forces the guard on.
+        let s = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(86_400),
+            max_bytes_per_stream: 1 << 40,
+            min_segments: 0,
+            min_free_bytes: u64::MAX,
+            idle_grace: Duration::from_secs(3600),
+        })
+        .expect("store should build");
+
+        for i in 0..12 {
+            put_seg(&s, "a", &format!("seg-{i:05}.m4s"), 1024).await;
+        }
+        assert_eq!(s.total_bytes(), 12 * 1024, "all twelve should be held first");
+
+        s.sweep().await;
+
+        // Neither retention nor the byte cap would have removed anything —
+        // both are enormous here — so whatever went, went for space.
+        assert!(
+            s.total_bytes() < 12 * 1024,
+            "the floor did not reclaim anything: {} bytes still held",
+            s.total_bytes()
+        );
+        // But not everything: a player at the live edge still needs something.
+        assert!(
+            s.get("a", "seg-00011.m4s").await.is_some(),
+            "the newest segment was evicted, leaving a live player nothing"
+        );
+    }
+
+    /// The floor is off when it is set to zero, and off when the filesystem
+    /// cannot be asked.
+    ///
+    /// A guard that failed closed on a `statvfs` error would stop a working
+    /// relay for no reason, so both routes fall back to the byte and retention
+    /// policies rather than to eviction.
+    #[tokio::test]
+    async fn a_zero_floor_evicts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        for i in 0..6 {
+            put_seg(&s, "a", &format!("seg-{i:05}.m4s"), 1024).await;
+        }
+        s.sweep().await;
+        assert_eq!(s.total_bytes(), 6 * 1024, "a zero floor reclaimed something");
     }
 
     /// The advertised window may not promise segments the store cannot serve.

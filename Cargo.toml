@@ -181,3 +181,9 @@ required-features = ["viewer-distribution"]
 [[test]]
 name = "portal"
 required-features = ["portal"]
+
+# `statvfs`, for the origin's free-space floor (see `origin::free_bytes`).
+# Already in the tree via tokio; declared because the guard calls it directly.
+# Unix-only, which the origin already is — it writes a POSIX directory tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

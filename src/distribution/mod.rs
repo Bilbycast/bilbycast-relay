@@ -125,6 +125,7 @@ pub async fn run_distribution(
         retention: std::time::Duration::from_secs(config.origin_retention_secs),
         max_bytes_per_stream: config.origin_max_bytes_per_stream,
         min_segments: config.origin_window_segments,
+        min_free_bytes: config.origin_min_free_bytes,
         idle_grace: std::time::Duration::from_secs(60),
     };
     tracing::info!(
@@ -132,6 +133,7 @@ pub async fn run_distribution(
         retention_secs = config.origin_retention_secs,
         max_bytes_per_stream = config.origin_max_bytes_per_stream,
         min_segments = config.origin_window_segments,
+        min_free_bytes = config.origin_min_free_bytes,
         "distribution origin: disk-backed store"
     );
     let origin = Arc::new(OriginStore::new(origin_cfg)?);

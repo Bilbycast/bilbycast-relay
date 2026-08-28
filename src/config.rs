@@ -308,6 +308,21 @@ pub struct DistributionConfig {
     #[serde(default = "default_origin_max_bytes_per_stream")]
     pub origin_max_bytes_per_stream: u64,
 
+    /// Never let the origin volume fall below this many bytes free.
+    /// Default 5 GiB. Set 0 to disable.
+    ///
+    /// The guard of last resort. `origin_retention_secs` and
+    /// `origin_max_bytes_per_stream` are pushed by the manager, which sizes
+    /// them from the DVR window an operator asked for and **cannot see this
+    /// relay's disk** — no node health payload reports free space. A 2h30m
+    /// window on a small volume is therefore a policy the manager will happily
+    /// push and this relay will happily honour, until the volume fills.
+    ///
+    /// On the demo rig it did, and took the manager's Postgres down with it.
+    /// The relay owns the disk, so the relay is the one that has to refuse.
+    #[serde(default = "default_origin_min_free_bytes")]
+    pub origin_min_free_bytes: u64,
+
     /// Directory the origin writes media segments under. Defaults to
     /// `/var/lib/bilbycast/relay/origin` (inside the packaged unit's
     /// `ReadWritePaths`). Wiped on startup — segments from a previous run are
@@ -354,6 +369,7 @@ impl Default for DistributionConfig {
             origin_window_segments: default_origin_window_segments(),
             origin_retention_secs: default_origin_retention_secs(),
             origin_max_bytes_per_stream: default_origin_max_bytes_per_stream(),
+            origin_min_free_bytes: default_origin_min_free_bytes(),
             origin_storage_dir: None,
             cascade_sources: Vec::new(),
         }
@@ -370,6 +386,13 @@ fn default_origin_window_segments() -> usize {
 
 fn default_origin_retention_secs() -> u64 {
     60
+}
+
+/// 5 GiB, which is room for a couple of minutes of several renditions plus
+/// whatever else shares the volume — enough that the operator gets a warning
+/// and a shortened window rather than a full disk.
+fn default_origin_min_free_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
 }
 
 fn default_origin_max_bytes_per_stream() -> u64 {
