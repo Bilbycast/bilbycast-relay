@@ -105,6 +105,16 @@ pub struct OriginPolicyUpdate {
 pub struct DistributionControl {
     cfg: ArcSwap<RuntimeDistConfig>,
     cascade_tx: watch::Sender<Vec<CascadeSource>>,
+    /// Streams the manager has asked to drop outright.
+    ///
+    /// An **mpsc**, not a `watch` like the two below, and that is the whole
+    /// point: a `watch` keeps only the latest value, so two drops arriving
+    /// between polls would silently become one and a stream would keep its
+    /// disk for ever. A policy is a state and may be coalesced; a drop is an
+    /// event and may not.
+    drop_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Held so `drop_tx.send` cannot fail before the origin subscribes.
+    drop_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     /// Storage-policy pushes. A `watch` like the cascade channel: the origin
     /// store is the single consumer and only ever needs the latest value.
     origin_tx: watch::Sender<OriginPolicyUpdate>,
@@ -120,18 +130,40 @@ impl DistributionControl {
     pub fn new(initial: RuntimeDistConfig, cascade: Vec<CascadeSource>) -> Arc<Self> {
         let (cascade_tx, keep) = watch::channel(cascade);
         let (origin_tx, origin_keep) = watch::channel(OriginPolicyUpdate::default());
+        let (drop_tx, drop_rx) = tokio::sync::mpsc::unbounded_channel();
         Arc::new(Self {
             cfg: ArcSwap::from_pointee(initial),
             cascade_tx,
             cascade_keep: keep,
             origin_tx,
             origin_keep,
+            drop_tx,
+            drop_rx: std::sync::Mutex::new(Some(drop_rx)),
         })
     }
 
     /// Subscribe to storage-policy pushes (the origin store).
     pub fn subscribe_origin(&self) -> watch::Receiver<OriginPolicyUpdate> {
         self.origin_tx.subscribe()
+    }
+
+    /// Take the stream-drop queue. The origin store is the single consumer, so
+    /// this yields the receiver once and `None` thereafter.
+    pub fn take_drops(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
+        self.drop_rx.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Ask the origin to drop a stream's storage outright.
+    ///
+    /// Distinct from retention. Retention answers "how much history is worth
+    /// keeping"; this answers "nothing is going to want this again" — a
+    /// session deleted, its streams never to be written to. Without it a
+    /// deleted session holds its disk until the *node default* retention
+    /// expires, which has nothing to do with the window that session asked
+    /// for: on the demo rig, 2h40m for a session the operator deleted to
+    /// reclaim space.
+    pub fn drop_stream(&self, stream: &str) {
+        let _ = self.drop_tx.send(stream.to_string());
     }
 
     /// Current storage policy push (for persistence / reporting).

@@ -720,6 +720,16 @@ fn apply_configure_distribution(
         control.set_cascade(sources);
     }
 
+    // Streams to drop outright. Applied after the policy above, so a push that
+    // both re-states the override set and retires a session's streams does the
+    // two in the order the manager meant them.
+    if let Some(list) = action.get("drop_origin_streams").and_then(|v| v.as_array()) {
+        for name in list.iter().filter_map(|v| v.as_str()) {
+            // The origin sanitises its own stream ids; this only forwards.
+            control.drop_stream(name);
+        }
+    }
+
     tracing::info!("configure_distribution applied from manager");
     Ok(())
 }

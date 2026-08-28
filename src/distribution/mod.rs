@@ -146,10 +146,30 @@ pub async fn run_distribution(
         let origin = origin.clone();
         let cancel = cancel.clone();
         let mut rx = control.subscribe_origin();
+        // The drop queue, taken once — the origin store is its only consumer.
+        let mut drops = control.take_drops();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
+                    // A stream the manager says nothing will want again: a
+                    // deleted session's. Retention would hold it until the
+                    // *node default* expired, which is unrelated to the window
+                    // that session asked for.
+                    Some(stream) = async {
+                        match drops.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            // Nothing to receive from; park this arm for good
+                            // rather than spinning on a ready `None`.
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        origin.remove_stream(&stream).await;
+                        tracing::info!(
+                            stream = %stream,
+                            "distribution origin: stream dropped at the manager's request"
+                        );
+                    }
                     changed = rx.changed() => {
                         if changed.is_err() {
                             break; // control dropped

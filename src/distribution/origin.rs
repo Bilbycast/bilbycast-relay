@@ -1536,6 +1536,54 @@ mod tests {
         assert!(!tmp.path().join("origin/s").exists());
     }
 
+    /// Dropping a stream reclaims its disk immediately, not on retention.
+    ///
+    /// Releasing a retention override is not the same as reclaiming space:
+    /// with the override gone the stream falls back to the *node default*,
+    /// which has nothing to do with the window its session asked for. Measured
+    /// on the demo rig — two deleted sessions left 2.9 GB held, and the node
+    /// default would have held it for 2h40m. An operator who deletes a session
+    /// to reclaim space should get it back.
+    #[tokio::test]
+    async fn dropping_a_stream_gives_the_disk_back_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A retention long enough that nothing would age out on its own, so
+        // whatever goes, goes because it was dropped.
+        let s = OriginStore::new(OriginConfig {
+            root: tmp.path().join("origin"),
+            retention: Duration::from_secs(86_400),
+            max_bytes_per_stream: 1 << 40,
+            min_segments: 0,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_secs(86_400),
+        })
+        .expect("store should build");
+
+        for i in 0..5 {
+            put_seg(&s, "gone", &format!("seg-{i:05}.m4s"), 2048).await;
+            put_seg(&s, "stays", &format!("seg-{i:05}.m4s"), 2048).await;
+        }
+        assert_eq!(s.total_bytes(), 10 * 2048);
+
+        s.remove_stream("gone").await;
+
+        assert!(
+            s.get("gone", "seg-00000.m4s").await.is_none(),
+            "the dropped stream still serves segments"
+        );
+        assert_eq!(
+            s.total_bytes(),
+            5 * 2048,
+            "the dropped stream's bytes are still counted against the node"
+        );
+        // And its neighbour is untouched: a drop is one stream, not a purge.
+        assert!(s.get("stays", "seg-00000.m4s").await.is_some());
+        assert!(
+            !tmp.path().join("origin/gone").exists(),
+            "the directory is still on disk, so the space is not actually back"
+        );
+    }
+
     /// The origin gives disk back before the volume fills.
     ///
     /// `retention` and `max_bytes_per_stream` both arrive from the manager,
