@@ -131,6 +131,43 @@ segments the store does not hold are dropped, and `EXT-X-MEDIA-SEQUENCE` and
   manifest can arrive a beat before the first segment; rewriting that to empty
   turns a transient into a hard player error.
 
+### The free-space floor
+
+`retention` and `max_bytes_per_stream` both arrive from the manager, which
+sizes them from the DVR window an operator asked for. It **cannot see the
+relay's disk** — no node health payload reports free space — so there is no
+number it could check against, and a 2h30m window on a small volume is a
+policy it will happily push and this relay will happily honour, until the
+volume fills.
+
+It did: the demo rig filled its disk and took the manager's own Postgres down
+with it, leaving the manager up and listening with no database behind it.
+
+So the relay refuses, because it is the only party that knows. After the
+per-stream policies have run, the sweep asks `statvfs` and, if free space is
+under `origin_min_free_bytes` (default 5 GiB, `0` disables), evicts oldest
+first **across every stream** until it is not. Node-wide, because that is the
+shape of the failure: four streams each inside their own byte cap still fill
+one volume.
+
+* **Round-robin, not drain** — emptying the first stream alphabetically would
+  take one feed's whole window to save the others.
+* **Four segments kept per stream, always** — a relay that deleted everything
+  to make room is not more useful than one that is short of space.
+* **`f_bavail`, not `f_bfree`** — the reserved blocks are not the relay's to
+  use, and counting them is how a "safe" floor still fills the disk.
+* **An unaskable filesystem falls back to the byte and retention policies.** A
+  guard that failed closed on a `statvfs` error would stop a working relay for
+  no reason.
+
+It warns on every sweep it is needed rather than once on the transition: this
+is the operator being told their window does not fit the disk, and that stays
+true until they change something.
+
+Verified on the rig by setting the floor 20 GiB above actual free space: the
+store went from 487 MB to 29 MB across two sweeps, keeping the newest
+segments, and said so both times.
+
 ### A restart keeps the window
 
 The store used to delete its root on startup, so a relay restart cost the

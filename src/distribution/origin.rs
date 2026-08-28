@@ -747,7 +747,7 @@ impl OriginStore {
             free_mb = free / 1_048_576,
             floor_mb = self.cfg.min_free_bytes / 1_048_576,
             freed_mb = freed / 1_048_576,
-            "origin: below the free-space floor — evicting across all streams.              The configured window does not fit this volume."
+            "origin: below the free-space floor, evicting across all streams; the configured window does not fit this volume"
         );
     }
 
