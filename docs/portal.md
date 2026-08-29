@@ -231,9 +231,19 @@ working.
 the failure is otherwise silent: the portal installs, viewers sign in, and three
 hours later their access ends mid-event with nothing to say why.
 
-Renewal is **off until you name the player's origin**, because it is a
-cross-origin request carrying the viewer's session cookie — the shape a CSRF
-wants:
+Renewal needs **two** settings, on two different services, and the second is
+easy to miss.
+
+**On the relay: `distribution.portal_url` must be set.** The player's
+`scheduleRenewal()` returns immediately when it is empty, so a blank
+`portal_url` turns the three hours into a hard limit however the portal is
+configured. Nothing reports it at either end — the viewer simply loses access
+mid-event. The manager's Distribution tab labels the field "Optional", which is
+true of the sign-in-again link and false of renewal.
+
+**On the portal: renewal is off until you name the player's origin,** because it
+is a cross-origin request carrying the viewer's session cookie — the shape a
+CSRF wants:
 
 ```json
 "player_origins": ["https://relay.example.com"]

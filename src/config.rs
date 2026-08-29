@@ -227,11 +227,19 @@ pub struct DistributionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
 
-    /// The viewer portal's URL, offered to a viewer whose token has expired.
+    /// The viewer portal's URL. Two jobs, and the second one is easy to miss.
     ///
-    /// Set here or pushed by the manager. Without it the player can only say
-    /// that access ended, because a viewer who arrived from the portal has a
-    /// dead token in their URL and reloading re-presents it.
+    /// 1. Offered to a viewer whose token has expired. Without it the player
+    ///    can only say that access ended, because a viewer who arrived from
+    ///    the portal has a dead token in their URL and reloading re-presents
+    ///    it.
+    /// 2. **It also gates token renewal.** The player's `scheduleRenewal()`
+    ///    returns immediately when the substituted `PORTAL_URL` is empty
+    ///    (`src/distribution/dvr.html`), so leaving this blank turns the
+    ///    three-hour token into a hard limit however `player_origins` is
+    ///    configured — silently, with nothing reported at either end.
+    ///
+    /// Set here or pushed by the manager.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portal_url: Option<String>,
 

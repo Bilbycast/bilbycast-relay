@@ -62,6 +62,9 @@ API_ADDR="0.0.0.0:4480"
 REQUIRE_BIND_AUTH=0
 UPGRADE_INSTALLER=0
 WITH_PORTAL=0
+# distribution | default. Today's behaviour is `distribution`; see the
+# artefact-selection block below for why that is not simply "the first one".
+VARIANT="${VARIANT:-distribution}"
 PORTAL_MANAGER_URL=""
 PORTAL_PLAYER_ORIGIN=""
 
@@ -115,6 +118,7 @@ while [[ $# -gt 0 ]]; do
         --channel) CHANNEL="$2"; shift 2;;
         --upgrade-installer) UPGRADE_INSTALLER=1; shift;;
         --with-portal) WITH_PORTAL=1; PORTAL_MANAGER_URL="$2"; shift 2;;
+        --variant) VARIANT="$2"; shift 2;;
         --player-origin) PORTAL_PLAYER_ORIGIN="$2"; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 1;;
@@ -309,12 +313,40 @@ if [[ "${CHANNEL_IN_MANIFEST}" != "${CHANNEL}" ]]; then
     exit 1
 fi
 
-# Relay manifests carry a single artefact per arch — no variant axis
-# (unlike the edge's default / full split).
-ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" \
-    '.artefacts[] | select(.arch == $arch) | .url' manifest.json | head -1)"
-ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" \
-    '.artefacts[] | select(.arch == $arch) | .sha256' manifest.json | head -1)"
+# Relay manifests carry TWO artefacts per arch — `distribution` (WHEP SFU
+# + LL-HLS origin + the viewer portal binary) and `default` (the lean
+# opaque forwarder). An earlier comment here claimed there was no variant
+# axis; there is, and this script has always installed `distribution`
+# purely because it sorts first in the manifest. Select it explicitly so
+# the answer no longer depends on artefact ORDER, and let `--variant`
+# override.
+#
+# The default is deliberately left as `distribution`, unchanged: switching
+# a fresh install to the lean forwarder is a behaviour change for everyone
+# who follows the README, and `--with-portal` needs the distribution
+# tarball to find `bilbycast-portal`. See docs/distribution.md for what
+# that means for listeners.
+ARTEFACT_URL=""
+ARTEFACT_SHA256=""
+if [[ -n "${VARIANT}" ]]; then
+    ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" --arg v "${VARIANT}" \
+        '.artefacts[] | select(.arch == $arch and .variant == $v) | .url' manifest.json | head -1)"
+    ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" --arg v "${VARIANT}" \
+        '.artefacts[] | select(.arch == $arch and .variant == $v) | .sha256' manifest.json | head -1)"
+    if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
+        echo "No '${VARIANT}' artefact for arch=${ARCH} in this manifest. Available:" >&2
+        jq -r '.artefacts[] | "  \(.arch) / \(.variant)"' manifest.json >&2
+        exit 1
+    fi
+fi
+# Older manifests carry no `variant` key at all; fall back to the rule
+# this script has always used.
+if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
+    ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" \
+        '.artefacts[] | select(.arch == $arch) | .url' manifest.json | head -1)"
+    ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" \
+        '.artefacts[] | select(.arch == $arch) | .sha256' manifest.json | head -1)"
+fi
 
 if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
     echo "No artefact for arch=${ARCH} in manifest." >&2

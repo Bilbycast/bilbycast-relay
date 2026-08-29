@@ -48,11 +48,19 @@
 #      restarts (unless --no-rollback).
 #   8. Exits 0 only when the new version reports healthy.
 #
-# The relay is stateless: a restart drops connected edges, which all
-# reconnect automatically. There is no graceful-drain story to worry
-# about — operators who care about zero-disruption upgrades should run
-# multiple relay instances behind a load balancer and rolling-upgrade
-# them one at a time.
+# The opaque forwarder is stateless: a restart drops connected edges,
+# which all reconnect automatically. Operators who care about
+# zero-disruption upgrades should run multiple relay instances behind a
+# load balancer and rolling-upgrade them one at a time.
+#
+# **A distribution relay is NOT stateless.** `OriginStore::new` clears the
+# origin root at every start (src/distribution/origin.rs), so this restart
+# discards the whole DVR window. The feeding edge keeps publishing a
+# playlist — and a thumbnail index — naming segments that no longer exist,
+# so viewers get 404s on seek until the window rolls over: at the 3600 s
+# the manager provisions by default, that is an hour. Restart the edge in
+# step with the relay. This script warns when it detects that case; see
+# relay issues #6 and #8 for the underlying wipe.
 
 set -euo pipefail
 
@@ -69,6 +77,8 @@ VERIFY_COSIGN=1
 ROLLBACK=1
 TARGET_VERSION=""
 DRY_RUN=0
+# auto | distribution | default. `auto` keeps whatever is installed.
+VARIANT="${VARIANT:-auto}"
 
 # ── Argument parsing ──────────────────────────────────────────────────
 usage() {
@@ -86,10 +96,47 @@ while [[ $# -gt 0 ]]; do
         --no-rollback) ROLLBACK=0; shift;;
         --target-version) TARGET_VERSION="$2"; shift 2;;
         --dry-run) DRY_RUN=1; shift;;
+        --variant) VARIANT="$2"; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 1;;
     esac
 done
+
+# ── Which build is installed? ─────────────────────────────────────────
+# The manifest carries two artefacts per arch — `distribution` and
+# `default` — and an upgrade must keep the relay on the one it is already
+# running. Picking `head -1` of the arch match (what this script used to
+# do) works only because `-distribution.tar.gz.sha256` happens to sort
+# before `.tar.gz.sha256` in a glob in another repo. If that ever moves,
+# a working distribution relay is silently replaced by the lean forwarder:
+# every WHEP viewer drops, the origin 404s, and `/health` still answers
+# `ok` because it carries no variant field, so the rollback below never
+# fires.
+#
+# THREE-VALUED ON PURPOSE. "No match" is not proof of a lean build — the
+# probe also comes up empty when grep lacks `-a` (busybox), when
+# ExecStart resolves to a wrapper script rather than the ELF, or when the
+# file simply cannot be read. Each of those would downgrade a live
+# distribution relay. So a negative is only believed once a positive
+# control proves the probe can read this file at all, and anything
+# ambiguous falls back to the previous behaviour.
+#
+# `/whep/` and `str0m` are present only in a distribution build.
+# Do NOT probe for `viewer-distribution`: that string appears in BOTH
+# variants (it is a config-field name compiled unconditionally), so it
+# would report every lean relay as distribution.
+detect_installed_variant() {   # -> distribution | default | unknown
+    local bin="$1"
+    [[ -r "${bin}" ]] || { echo unknown; return; }
+    if grep -qa '/whep/' "${bin}" 2>/dev/null; then echo distribution; return; fi
+    # Positive control: a metric name every relay binary carries, in both
+    # variants. If this does not match either, the probe is not working
+    # and its silence means nothing.
+    if grep -qa 'bilbycast_relay_udp_sessions_total' "${bin}" 2>/dev/null; then
+        echo default; return
+    fi
+    echo unknown
+}
 
 # ── Pre-flight ────────────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -242,10 +289,43 @@ if [[ "${VERSION}" == "${CURRENT_VERSION}" ]]; then
     exit 0
 fi
 
-ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" \
-    '.artefacts[] | select(.arch == $arch) | .url' manifest.json | head -1)"
-ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" \
-    '.artefacts[] | select(.arch == $arch) | .sha256' manifest.json | head -1)"
+# Resolve which variant to install, then select it explicitly so the
+# answer no longer depends on the manifest's artefact ORDER.
+if [[ "${VARIANT}" == "auto" ]]; then
+    DETECTED="$(detect_installed_variant "${BINARY_PATH}")"
+else
+    DETECTED="${VARIANT}"
+fi
+case "${DETECTED}" in
+    distribution|default)
+        echo "  Variant       : ${DETECTED}$([[ "${VARIANT}" == "auto" ]] && echo ' (detected)' || echo ' (requested)')"
+        ;;
+    *)
+        # Could not tell. Reproduce the previous behaviour rather than
+        # guess `default` — guessing wrong here takes a live distribution
+        # relay off air, and guessing wrong the other way costs nothing.
+        echo "  Variant       : could not detect; keeping the previous selection rule"
+        ;;
+esac
+
+ARTEFACT_URL=""
+ARTEFACT_SHA256=""
+if [[ "${DETECTED}" == "distribution" || "${DETECTED}" == "default" ]]; then
+    ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" --arg v "${DETECTED}" \
+        '.artefacts[] | select(.arch == $arch and .variant == $v) | .url' manifest.json | head -1)"
+    ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" --arg v "${DETECTED}" \
+        '.artefacts[] | select(.arch == $arch and .variant == $v) | .sha256' manifest.json | head -1)"
+fi
+# Fallback: an older manifest with no `variant` key, or a requested
+# variant this release does not carry. Same rule this script always used.
+if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
+    [[ "${DETECTED}" == "distribution" || "${DETECTED}" == "default" ]] \
+        && echo "  note: no '${DETECTED}' artefact in this manifest — falling back to the first for this arch" >&2
+    ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" \
+        '.artefacts[] | select(.arch == $arch) | .url' manifest.json | head -1)"
+    ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" \
+        '.artefacts[] | select(.arch == $arch) | .sha256' manifest.json | head -1)"
+fi
 
 if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
     echo "No artefact for arch=${ARCH} in manifest." >&2
@@ -305,6 +385,29 @@ ORIG_MODE="$(stat -c '%a' "${BINARY_PATH}")"
 cp "${NEW_BIN}" "${NEW_STAGED}"
 chown "${ORIG_OWNER}" "${NEW_STAGED}"
 chmod "${ORIG_MODE}" "${NEW_STAGED}"
+
+# The restart discards the DVR window. Say so before doing it, because
+# the symptom (viewers getting 404s on seek for the next hour) points at
+# the edge rather than at this upgrade.
+#
+# Warn, never block: this script is a published release asset that is
+# curled and run non-interactively, and a prompt here would hang an
+# unattended upgrade. Every probe is `|| true`-guarded — `set -euo
+# pipefail` is active, and an operator whose relay.json cannot be parsed
+# must still get their upgrade rather than an exit 1 from a warning.
+if [[ "${DETECTED}" == "distribution" ]] || \
+   grep -qa '/whep/' "${BINARY_PATH}" 2>/dev/null; then
+    ORIGIN_ROOT="$(jq -r '.distribution.origin_root // "/var/lib/bilbycast-relay/origin"' \
+        /etc/bilbycast/relay.json 2>/dev/null || echo /var/lib/bilbycast-relay/origin)"
+    SEG_COUNT="$(find "${ORIGIN_ROOT}" -type f -name '*.m4s' 2>/dev/null | wc -l || echo 0)"
+    echo
+    echo "  !! This is a distribution relay. Restarting it CLEARS the DVR origin"
+    echo "     at ${ORIGIN_ROOT} (${SEG_COUNT} segment(s) held right now)."
+    echo "     The feeding edge keeps publishing a playlist naming those segments,"
+    echo "     so viewers get 404s on seek until the window rolls over. Restart the"
+    echo "     edge in step with this relay. See relay issues #6 and #8."
+    echo
+fi
 
 echo "Stopping ${SERVICE_NAME}…"
 systemctl stop "${SERVICE_NAME}"

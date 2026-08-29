@@ -4,10 +4,24 @@ The **viewer-distribution** subsystem turns a relay into a public "distribution
 node" that reaches **browser viewers directly** — no external WHIP/WHEP server
 (mediamtx, LiveKit, Cloudflare Stream, …) and no ports opened on the NAT'd edge.
 
-It is **default-off** and gated behind the `viewer-distribution` Cargo feature,
-hard-isolated from the stateless opaque forwarder. A plain `cargo build`
-produces the pure forwarder with **zero** media-termination surface and no
-OpenSSL/str0m build dependency. Build a distribution-capable relay with:
+The **Cargo feature** is default-off and hard-isolated from the opaque
+forwarder: a plain `cargo build` produces the pure forwarder with **zero**
+media-termination surface and no OpenSSL/str0m build dependency.
+
+**The shipped `-distribution` artefact is a different matter, and the
+distinction matters operationally.** `DistributionConfig::default()` sets
+`enabled: true`, `main.rs` reads the block with `unwrap_or_default()`, and
+`install-relay.sh` writes a `relay.json` containing no `distribution` block at
+all — so a relay installed from that artefact comes up with the subsystem
+**ENABLED**, listening on `0.0.0.0:4485` and `[::]:4485` (HTTP signalling and
+the origin) plus `:4486` (ingest), whether or not the operator asked for it.
+That is deliberate — it is what lets the manager configure a distribution node
+with no config edits — but it means "default-off" describes the build, not the
+box. `install-relay.sh` installs the distribution artefact by default; pass
+`--variant default` for the lean forwarder, or set
+`"distribution": { "enabled": false }` in `relay.json`.
+
+Build a distribution-capable relay with:
 
 ```bash
 cargo build --release --features viewer-distribution
