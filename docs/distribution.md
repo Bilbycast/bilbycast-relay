@@ -489,6 +489,13 @@ for support. A softened picture with nothing to explain it becomes a support
 call, and "degraded but invisible" is a failure this player has produced more
 than once.
 
+**The transport drives whichever element is on screen.** In Low and Balanced
+the `main` element already carries the all-intra rendition and no second one is
+attached, so the shuttle steps `main`; in Full it steps the proxy. Written to
+step the proxy unconditionally, FF and REW paused the visible picture and drove
+an element with no source — dead transport buttons in both reduced modes, with
+nothing reported anywhere.
+
 Switching takes effect on reload: changing the stream mid-session means tearing
 down hls.js, re-seeking and re-deriving the clock, which a reload does correctly
 while keeping the token and the marks.
@@ -578,11 +585,22 @@ count is a guess about sheet size, and the twenty-slot version it replaced could
 be evicted end to end by a single drag, which is worse than useless once
 anything has been prefetched into it.
 
-### Self-test (`?selftest=1`)
+The background prefetcher stops once the cache is within one sheet of that
+budget, and never resumes until an eviction makes room. Past that point every
+prefetch necessarily evicts something, and the "nearest sheet not held" search
+immediately picks the sheet just evicted — so the two loop, re-downloading the
+window every few seconds for as long as the tab is open, on exactly the
+connections the prefetcher exists to be gentle with. Eviction is left to the
+operator's own drags, which have a deadline behind them.
+
+### Self-test (`?selftest=1`, or Settings → Run the player self-test)
 
 The player carries its own measurement, because the question "what can this
 device present?" cannot be answered from a workstation — and on this project the
-workstation's answer was the opposite of the tablet's. It runs on a tap and
+workstation's answer was the opposite of the tablet's. The query flag decides
+only whether the panel is *shown* on load; it is also reachable from Settings,
+and either way the run itself waits for a deliberate tap. Close it with its
+own **×** or with Escape — it covers the picture while it is open. It runs and
 prints plainly enough to photograph: shuttle rate main vs proxy, scrub preview
 coverage across the bar, the real drag path (including which element the picture
 ended up on), and a token renewal.

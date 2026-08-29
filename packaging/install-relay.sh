@@ -89,10 +89,6 @@ Options:
   --upgrade-installer          Refresh service unit + install script,
                                leave config untouched
   --with-portal <manager-url>  Also install the viewer portal
-  --player-origin <origin>     Where the DVR player is served from, e.g.
-                               https://relay.example.com. Without it a viewer's
-                               token cannot be renewed and access ends after
-                               three hours, mid-event.
                                (bilbycast-portal), pointed at this
                                manager's https:// base URL. Only in the
                                distribution tarball. Installed but NOT
@@ -100,6 +96,10 @@ Options:
                                generate in the manager first, so
                                starting it would only fail every viewer.
                                See docs/portal.md.
+  --player-origin <origin>     Where the DVR player is served from, e.g.
+                               https://relay.example.com. Without it a viewer's
+                               token cannot be renewed and access ends after
+                               three hours, mid-event.
   -h, --help                   Show this message
 EOF
 }
@@ -140,7 +140,7 @@ if [[ "${WITH_PORTAL}" -eq 1 ]]; then
     # Renewal is a cross-origin request carrying the viewer's session cookie, so
     # the portal answers only origins named here. Empty means nobody: safe, and
     # silent — the portal works, viewers sign in, and three hours later their
-    # access ends mid-event with nothing to say why. Hence the warning.
+    # access ends mid-event with nothing to say why. Hence the note below.
     PORTAL_ORIGINS_JSON=""
     if [[ -n "${PORTAL_PLAYER_ORIGIN}" ]]; then
         case "${PORTAL_PLAYER_ORIGIN}" in
@@ -154,13 +154,20 @@ if [[ "${WITH_PORTAL}" -eq 1 ]]; then
             */*) echo "--player-origin has a path; an origin is scheme://host[:port]" >&2; exit 1;;
         esac
         PORTAL_ORIGINS_JSON="\"${PORTAL_PLAYER_ORIGIN}\""
-    else
-        echo "note: no --player-origin given, so viewing tokens will not renew." >&2
-        echo "      Viewers lose access three hours after signing in." >&2
-        echo "      Add the player's origin to player_origins in portal.json." >&2
     fi
 fi
 # <<< portal-url-validation
+
+# Advice, not validation, and outside the block above on purpose: that block is
+# lifted verbatim and run by packaging/test-portal-install.sh, which reads its
+# FIRST line of output as the verdict. Anything printed there on the accepting
+# path is therefore read as a refusal — this note used to sit inside it and
+# turned two passing checks red.
+if [[ "${WITH_PORTAL}" -eq 1 && -z "${PORTAL_PLAYER_ORIGIN}" ]]; then
+    echo "note: no --player-origin given, so viewing tokens will not renew." >&2
+    echo "      Viewers lose access three hours after signing in." >&2
+    echo "      Add the player's origin to player_origins in portal.json." >&2
+fi
 
 # ── Pre-flight checks ─────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then

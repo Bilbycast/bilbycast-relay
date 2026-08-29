@@ -1116,7 +1116,7 @@ mod tests {
         // disabled until something else redrew the list. It also changes on
         // its own as the window rolls past a mark.
         assert!(
-            js_fn(html, "render()").contains("refreshMarkStates()"),
+            js_fn(html, "render(remeasure)").contains("refreshMarkStates()"),
             "reachability is decided once, when it cannot yet be known"
         );
         assert!(
@@ -1168,8 +1168,17 @@ mod tests {
         let html = include_str!("dvr.html");
         let step = js_fn(html, "prefetchStep");
         assert!(
-            step.contains("if (!scrubbing)"),
+            step.contains("!scrubbing"),
             "prefetching competes with the drag it exists to serve: {step}"
+        );
+        // And it must stop before it starts evicting. Past the budget every
+        // prefetch evicts a sheet that `nextSheetToPrefetch` then re-selects
+        // as the nearest one not held, so the two loop forever — the window
+        // re-downloaded every `PREFETCH_GAP_MS` for as long as the tab is
+        // open, on connections this feature exists to be gentle with.
+        assert!(
+            step.contains("sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES"),
+            "the prefetcher evicts, so it thrashes the cache forever: {step}"
         );
         assert!(
             step.contains("setTimeout(prefetchStep, PREFETCH_GAP_MS)"),
@@ -1535,7 +1544,7 @@ mod tests {
     #[test]
     fn the_bar_spans_the_view_but_live_is_measured_against_the_whole_window() {
         let html = include_str!("dvr.html");
-        let render = js_fn(html, "render()");
+        let render = js_fn(html, "render(remeasure)");
         assert!(
             render.contains("viewRange()"),
             "the bar does not follow the view: {render}"
@@ -1645,7 +1654,7 @@ mod tests {
         // And that the loop is *started*. `tickLoop` re-arms itself, so the
         // call appears inside its own body and proves nothing on its own.
         assert!(
-            html.contains("setInterval(render, 200);
+            html.contains("setInterval(function () { render(true); }, 200);
   requestAnimationFrame(tickLoop);"),
             "the ruler loop is never started, so it only moves at render's 5 Hz"
         );
@@ -1692,7 +1701,7 @@ mod tests {
             2,
             "only one of the two view paths uses the smoothed edge: {vr}"
         );
-        let render = js_fn(html, "render()");
+        let render = js_fn(html, "render(remeasure)");
         assert!(
             render.contains(r#"tDur.textContent = "-" + fmt(Math.max(0, r.end - pos))"#),
             "`behind live` is reading the smoothed edge and would lag a segment"
@@ -1765,7 +1774,7 @@ mod tests {
 
         // Every place the position is shown must go through the same clock,
         // and every one must fall back rather than invent a time.
-        let render = js_fn(html, "render()");
+        let render = js_fn(html, "render(remeasure)");
         assert!(
             render.contains("wallClockAt(pos)") && render.contains("fmtTimeOfDay"),
             "the main readout does not show a time of day: {render}"
@@ -1833,24 +1842,38 @@ mod tests {
         );
     }
 
-    /// The self-test must be inert unless asked for.
+    /// The self-test must be inert unless asked for, and must be closable.
     ///
     /// It seeks both elements dozens of times and drives the preview by hand.
     /// Running any of that for an ordinary viewer would be a player that
-    /// jumps around on load, so the whole thing hangs off one query flag and
-    /// a deliberate tap.
+    /// jumps around on load, so what it hangs off is a deliberate tap.
+    ///
+    /// The query flag decides only whether the panel is *shown* on load, not
+    /// whether its button works: the panel is also reachable from Settings,
+    /// and gating the listener on the flag too gave that entry a panel whose
+    /// one button did nothing. The panel covers the picture, so it also needs
+    /// a way out — without one, opening it took the player off air until the
+    /// viewer thought to reload.
     #[test]
     fn the_self_test_runs_only_when_asked_for() {
         let html = include_str!("dvr.html");
         assert!(
             html.contains(r#"qs.get("selftest") === "1""#),
-            "the self-test is not behind a flag"
+            "the self-test panel is not behind a flag on load"
         );
-        // The only thing that starts it is the button, inside that guard.
+        // The only thing that starts it is the button.
         assert_eq!(
             html.matches("stRunAll").count(),
             2,
             "stRunAll is referenced somewhere other than its definition and its one listener"
+        );
+        assert!(
+            html.contains(r#"id="stClose""#) && html.contains(r#""stClose").addEventListener"#),
+            "the self-test panel covers the picture with no way to close it"
+        );
+        assert!(
+            js_fn(html, "closeSelftest").contains(r#"selftest = "0""#),
+            "closing the self-test does not actually hide it"
         );
         // And it must not be wired to anything that fires on load.
         for on_load in ["loadedmetadata\", stRunAll", "DOMContentLoaded\", stRunAll"] {
@@ -2087,9 +2110,9 @@ mod tests {
     #[test]
     fn the_shading_is_refreshed_by_the_render_loop() {
         assert!(
-            // `render()` with the parens: bare "render" also prefix-matches
+            // The full signature, not bare "render": that also prefix-matches
             // `renderCached` itself, which trivially contains its own name.
-            js_fn(include_str!("dvr.html"), "render()").contains("renderCached("),
+            js_fn(include_str!("dvr.html"), "render(remeasure)").contains("renderCached("),
             "nothing updates the shading after the first paint"
         );
     }

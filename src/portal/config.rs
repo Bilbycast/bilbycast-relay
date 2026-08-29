@@ -257,6 +257,7 @@ mod tests {
             username_header: default_header(),
             logout_url: None,
             trusted_proxies: default_proxies(),
+            player_origins: Vec::new(),
         };
         let err = cfg.validate().expect_err("plaintext must be refused by default");
         assert!(err.contains("BILBYCAST_ALLOW_INSECURE"), "{err}");

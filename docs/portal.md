@@ -243,6 +243,12 @@ Exact matches only, and `*` is refused at startup: a response carrying
 `Access-Control-Allow-Credentials` may not answer a wildcard origin, so a
 portal configured that way would look right and never renew.
 
+The origin is checked **before anything is done**, so an unlisted one cannot
+even cause a mint. Past that check every exit carries the CORS headers,
+including the refusals — the origin is already trusted by then, and withholding
+them only turns a clear 403 into an opaque browser error. The answer is
+`Cache-Control: no-store`: the body is a credential.
+
 Only a viewer who came through the portal can renew — they hold the session
 cookie. **A guest with a one-off link cannot, and should not:** their three
 hours are the point of the link.

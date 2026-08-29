@@ -384,6 +384,13 @@
     padding: 16px 18px;
   }
   body[data-selftest="1"] #selftest { display: block; }
+  /* The panel covers the picture, so it needs the same way out the drawer and
+     the settings pane have. Without one, opening it took the player off air
+     until the viewer thought to reload. */
+  #stClose {
+    float: right; min-width: 40px; min-height: 40px; padding: 0; font-size: 20px;
+    margin: -4px -6px 0 8px;
+  }
   #selftest h2 { margin: 0 0 6px; font-size: 16px; }
   #selftest p { margin: 0 0 12px; color: var(--dim); font-size: 13px; max-width: 60ch; }
   #selftest button { background: var(--accent); color: #04241c; border-color: transparent; }
@@ -504,6 +511,7 @@
   </div>
 
   <div id="selftest">
+    <button id="stClose" title="Close" aria-label="Close">&times;</button>
     <h2>Player self-test</h2>
     <p id="stExplain">Measures what this device can actually present. Takes about a minute.
       Leave the tab in front while it runs.</p>
@@ -561,7 +569,7 @@
   <p class="note">Kept on this device, for this feed.</p>
 </aside>
 
-<script src="/dvr/hls.js"></script>
+<script src="/dvr/hls.js?v=__HLS_JS_VERSION__"></script>
 <script>
 (function () {
   "use strict";
@@ -680,7 +688,6 @@
   }
   var FPS    = parseFloat(qs.get("fps") || "25");
   var dbg    = null;
-  var FRAME  = 1 / FPS;
 
   var main = document.getElementById("main");
   var proxy = document.getElementById("proxy");
@@ -777,7 +784,12 @@
   var PORTAL_URL = "__PORTAL_URL__";
 
   function fail(msg) {
-    if (accessExpired && msg && msg.indexOf("expired") === -1) return;
+    // The latch has to cover the CLEAR as well. Written to fire only on a
+    // non-empty message, `fail("")` — which every `setRate` and every stall
+    // recovery calls — wiped the expired notice and its sign-in link, leaving
+    // a player that had silently lost access and said nothing about it.
+    // Clearing a genuine expiry goes through `forgetToken()`.
+    if (accessExpired && (!msg || msg.indexOf("expired") === -1)) return;
     errEl.textContent = msg || "";
   }
 
@@ -798,10 +810,19 @@
    * who they are, so recovering should be one tap rather than "find your feed
    * again". Falls back to the front page if the stream name would not survive
    * a URL, which it always should — the relay validates it — but a link built
-   * by string concatenation gets checked. */
+   * by string concatenation gets checked.
+   *
+   * The test mirrors the relay's own `sanitize_stream_id`: up to 128 of
+   * alphanumeric, dot, dash or underscore, with at least one alphanumeric
+   * somewhere. Written narrower than the server's rule, it silently sent
+   * anyone on a feed named with a dot — or starting with an underscore — to
+   * the portal's front page instead of back to their feed, at the one moment
+   * they need one tap rather than a search. */
   function portalReturn() {
     if (!PORTAL_URL) return "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(STREAM)) return PORTAL_URL;
+    if (!/^[A-Za-z0-9._-]{1,128}$/.test(STREAM) || !/[A-Za-z0-9]/.test(STREAM)) {
+      return PORTAL_URL;
+    }
     return PORTAL_URL.replace(/\/+$/, "") + "/watch?stream=" + encodeURIComponent(STREAM);
   }
 
@@ -1201,7 +1222,17 @@
       return hls;
     }
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src; // Safari native HLS
+      // Safari native HLS. hls.js reports its failures through an event we
+      // subscribe to above; native playback has only the element's own
+      // `error`, and without this a refused credential or a missing manifest
+      // renders as a black rectangle with nothing said anywhere.
+      video.addEventListener("error", function () {
+        var code = video.error ? video.error.code : 0;
+        if (TOKEN) { failExpired(); }
+        else if (code === 4) { failNoToken(); }
+        else { fail("This feed could not be played."); }
+      });
+      video.src = src;
       return null;
     }
     fail("This browser cannot play HLS (no MSE and no native support).");
@@ -1223,7 +1254,7 @@
       // clock. The target travels on main's, and is converted when it lands.
       seekWhenReady(to, toMainTime(t, from));
     }
-    if (next === "jog" || next === "shuttle") { main.pause(); }
+    if (next === "shuttle") { main.pause(); }
     else { proxy.pause(); stopShuttle(); }
     document.body.dataset.live = (next === "live") ? "1" : "0";
     syncPicture();
@@ -1260,6 +1291,13 @@
   }
 
   // ── jog ────────────────────────────────────────────────────────────────
+  // One exact seek per step, on the MAIN rendition, at full resolution.
+  //
+  // The proxy exists for shuttle, not for this: measured against burnt-in
+  // timecode, long-GOP stepping is frame-exact as long as the seek names a
+  // frame *centre* (see `frameCentre`) — what broke stepping was landing on
+  // frame boundaries, not the GoP. An operator stepping frames is examining
+  // them, so they get the full-resolution picture.
   // One exact seek per step, on the all-intra proxy. On a long-GOP source
   // this would land on the nearest keyframe instead, which is the whole
   // reason the proxy exists.
@@ -1292,6 +1330,14 @@
   function startShuttle(r) {
     ensureProxy();
     setMode("shuttle");
+    // Whichever element is on screen. In `full` quality that is the proxy;
+    // in `low` and `balanced` there is no second element to drive — `main`
+    // already carries the all-intra rendition and `ensureProxy` deliberately
+    // attaches nothing. Driving `proxy` unconditionally stepped an element
+    // with no source while the visible one sat paused, so FF and REW did
+    // nothing at all in either reduced mode, with no error anywhere.
+    var v = activeVideo();
+    main.pause();
     proxy.pause();
     stopShuttle();
     rate = r;
@@ -1309,7 +1355,7 @@
       }
       // Hold position until the handover seek lands, or the loop would wind
       // away from 0 and then jump when it does.
-      if (awaitingSeek(proxy)) {
+      if (awaitingSeek(v)) {
         last = now;
         shuttleRAF = requestAnimationFrame(step);
         return;
@@ -1317,13 +1363,13 @@
       // Clamp so a stalled tab or a slow seek cannot produce one huge jump.
       var dt = Math.min((now - last) / 1000, 0.25);
       last = now;
-      var rng = range(proxy);
-      var t = proxy.currentTime + rate * dt;
+      var rng = range(v);
+      var t = v.currentTime + rate * dt;
       if (rng) {
         if (t <= rng.start) { t = rng.start; stopShuttle(); }
         if (t >= rng.end)   { stopShuttle(); goLive(); return; }
       }
-      try { proxy.currentTime = t; } catch (e) { /* mid-load */ }
+      try { v.currentTime = t; } catch (e) { /* mid-load */ }
       render();
       if (shuttleRAF !== null) shuttleRAF = requestAnimationFrame(step);
     };
@@ -1336,9 +1382,13 @@
 
   function setRate(r) {
     fail("");
-    if (r < 0) { startShuttle(r); syncRateButtons(); return; }
+    // A shuttle rate is a SEEK rate, and it is one in both directions. Routing
+    // only the negative ones here left `setRate(+4)` — which is what releasing
+    // the scrub bar mid-fast-forward asks for — assigning 4 to
+    // `main.playbackRate` and playing the feed at four times real speed.
+    if (r < 0 || Math.abs(r) > 1) { startShuttle(r); syncRateButtons(); return; }
     stopShuttle();
-    if (mode === "jog" || mode === "shuttle") setMode("scrub");
+    if (mode === "shuttle") setMode("scrub");
     rate = r;
     main.playbackRate = r;
     main.play().catch(function () {});
@@ -1427,15 +1477,23 @@
 
   function beginScrub() {
     if (scrubbing) return;
-    loadThumbs();
     scrubbing = true;
     ensureProxy();
     var v = activeVideo();
-    // `rate < 0` counts as playing: a reverse shuttle drives currentTime
-    // itself, so the element is paused even though the transport is running.
-    resumeAfterScrub = { playing: !v.paused || rate < 0, rate: rate };
+    // A shuttle counts as playing whichever way it runs: it drives
+    // `currentTime` itself and leaves BOTH elements paused, so asking the
+    // element is the wrong question. Testing `rate < 0` caught only reverse —
+    // scrubbing during a forward shuttle resumed nothing, leaving the
+    // transport dead and the picture on the paused low-res proxy.
+    resumeAfterScrub = { playing: !v.paused || shuttleRAF !== null, rate: rate };
     stopShuttle();
     v.pause();
+    // Only now, with the transport state recorded: fetching the preview index
+    // is the one thing in here that reaches the network, and a throw before
+    // `resumeAfterScrub` was set left the release with nothing to restore —
+    // the transport stayed dead and the picture stayed on the paused proxy.
+    // A preview must cost a preview and never the transport.
+    try { loadThumbs(); } catch (e) { /* no preview is not a transport failure */ }
     if (mode === "live") setMode("scrub");
     // Pin the view where it is: see `viewAnchor`.
     var pinned = viewRange();
@@ -1485,7 +1543,7 @@
     var st = resumeAfterScrub;
     resumeAfterScrub = null;
     if (st && st.playing) {
-      setRate(st.rate);   // restarts the shuttle loop when the rate is negative
+      setRate(st.rate);   // routes back to the shuttle when it was a seek rate
     } else {
       syncRateButtons();
     }
@@ -2274,6 +2332,13 @@
   /// that makes the entire bar previewable is 0.2 % of it.
   var SHEET_CACHE_BYTES = 24 * 1024 * 1024;
   var sheetBytes = 0;
+  /// Largest sheet seen, so the prefetcher can tell whether one more fits.
+  ///
+  /// Sheets vary with picture content, so a fixed guess would be wrong in
+  /// whichever direction cost more. Seeded above zero only after the first
+  /// sheet lands; until then the prefetcher runs, which is correct — an empty
+  /// cache has room.
+  var sheetBytesMax = 0;
 
   /// Drop least-recently-used sheets until the cache is inside its budget.
   function trimSheets() {
@@ -2308,6 +2373,7 @@
         entry.url = URL.createObjectURL(b);
         entry.bytes = b.size;
         sheetBytes += b.size;
+        if (b.size > sheetBytesMax) sheetBytesMax = b.size;
         trimSheets();
         // Repaint. Without this the first position on every sheet stays blank
         // until the thumb moves again: `sheetUrl` answers null while the
@@ -2371,7 +2437,14 @@
     prefetchTimer = null;
     // Never while the operator is dragging: their fetches are the ones with a
     // deadline.
-    if (!scrubbing) {
+    //
+    // And never once the cache is within one sheet of its budget. Past that
+    // point a prefetch necessarily evicts something, and `nextSheetToPrefetch`
+    // immediately picks the evicted sheet as the nearest one not held — so the
+    // pair loops forever, re-downloading the window at `PREFETCH_GAP_MS` and
+    // churning blob URLs for as long as the tab is open. Eviction is left to
+    // the operator's own fetches, which at least have a deadline behind them.
+    if (!scrubbing && sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES) {
       var uri = nextSheetToPrefetch();
       if (uri) sheetUrl(uri);   // the fetch, the cache and the trim are shared
     }
@@ -2463,9 +2536,14 @@
     });
   }
 
-  function render() {
+  function render(remeasure) {
     var v = activeVideo();
-    if (proxyAttached) measureTimelineOffset();
+    // Only from the 200 ms tick. `OFFSET_SAMPLES` is sized as "~5 s at the
+    // render cadence"; sampling from the shuttle's requestAnimationFrame
+    // instead fills the same slots in about 0.4 s at 60 Hz, so the median
+    // stops spanning a segment boundary and the handover offset chases the
+    // sawtooth it exists to filter out.
+    if (remeasure && proxyAttached) measureTimelineOffset();
     // Always present the window and the position on main's clock, so the
     // readout does not shift when the picture hands over to the proxy.
     var r = range(main);
@@ -2554,7 +2632,7 @@
       "graphics acceleration when available' off, then reload.",
     ].join("\n");
   }
-  setInterval(render, 200);
+  setInterval(function () { render(true); }, 200);
   requestAnimationFrame(tickLoop);
 
   // ── controls ───────────────────────────────────────────────────────────
@@ -2674,6 +2752,7 @@
       location.reload();
     });
   });
+  function closeSelftest() { document.body.dataset.selftest = "0"; }
   document.getElementById("optSelftest").addEventListener("click", function () {
     closeSettings();
     document.body.dataset.selftest = "1";
@@ -2736,7 +2815,14 @@
       case "m": case "M": addMark(); break;
       case "[": skipToMark(-1); break;
       case "]": skipToMark(1); break;
-      case "Escape": if (document.body.dataset.drawer === "1") closeDrawer(); else return; break;
+      // Innermost first. Escape is the reflex for "get this off my picture",
+      // and each of these covers it.
+      case "Escape":
+        if (document.body.dataset.selftest === "1") closeSelftest();
+        else if (document.body.dataset.settings === "1") closeSettings();
+        else if (document.body.dataset.drawer === "1") closeDrawer();
+        else return;
+        break;
       case " ":
         e.preventDefault();
         if (mode === "shuttle" || !activeVideo().paused) pauseTransport();
@@ -3066,9 +3152,15 @@
     dbg = document.getElementById("debug");
     document.body.dataset.debug = "1";
   }
+  // The listener is registered whatever the URL says, because the panel is
+  // also reachable from Settings — wired only under the flag, that entry
+  // opened a panel whose one button did nothing. What stays behind the flag
+  // is the panel being *shown* on load; what starts the run is still a
+  // deliberate tap, which is the property that matters.
+  document.getElementById("stRun").addEventListener("click", stRunAll);
+  document.getElementById("stClose").addEventListener("click", closeSelftest);
   if (qs.get("selftest") === "1") {
     document.body.dataset.selftest = "1";
-    document.getElementById("stRun").addEventListener("click", stRunAll);
   }
   scheduleRenewal();
   syncQualityBadge();   // setMode returns early at startup, so seed it here
