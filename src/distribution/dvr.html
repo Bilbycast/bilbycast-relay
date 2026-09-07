@@ -32,15 +32,44 @@
 
   /* ── the picture ────────────────────────────────────────────────────── */
   #stage { position: fixed; inset: 0; background: #000; overflow: hidden; }
-  /* An explicit height, not an inset. `<video>` is a *replaced* element: with
+  /* The picture area — and the only thing zoom and pan ever move.
+     An explicit height, not an inset. `<video>` is a *replaced* element: with
      `height: auto` the browser takes its intrinsic height and quietly ignores
      the `bottom` inset, which left the picture running the full height and
-     the controls sitting on top of moving video. */
-  #stage video {
-    position: absolute; top: 0; left: 0; width: 100%;
+     the controls sitting on top of moving video.
+     `overflow: hidden` is what keeps a zoomed picture inside its own window
+     instead of spilling under the transport. */
+  #pic {
+    position: absolute; top: 0; left: 0; right: 0;
     height: calc(100% - var(--hud));
-    object-fit: contain; background: #000;
+    overflow: hidden;
+    /* The browser must not pan or pinch-zoom the page here, because this
+       element handles those gestures itself. Deliberately not set anywhere
+       else: everything outside the picture keeps the platform's own zoom,
+       which is somebody's accessibility setting and not ours to disable. */
+    touch-action: none;
   }
+  #stage video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; background: #000;
+    /* Origin at the top-left keeps the transform arithmetic a plain
+       `screen = picture * scale + offset`, with no half-size terms to get
+       wrong when the window resizes. */
+    transform-origin: 0 0;
+  }
+  body[data-zoom="1"] #pic { cursor: grab; }
+  body[data-zoom="1"] #pic:active { cursor: grabbing; }
+  /* Shown only while zoomed: says how far in, and resets on a tap. Sits under
+     the live badge, where nothing else can collide with it. */
+  #zoomBadge {
+    display: none; position: absolute; top: 44px; left: 50%;
+    transform: translateX(-50%); z-index: 3;
+    padding: 4px 11px; border-radius: 999px; border: 0;
+    font-family: inherit; font-size: 11px; font-weight: 700; letter-spacing: .09em;
+    background: rgba(20,26,32,.8); color: var(--fg);
+    backdrop-filter: blur(6px); cursor: pointer;
+  }
+  body[data-zoom="1"] #zoomBadge { display: block; }
   #proxy { display: none; }
   body[data-picture="proxy"] #proxy { display: block; }
   body[data-picture="proxy"] #main  { display: none; }
@@ -409,8 +438,13 @@
 <body data-mode="live" data-live="1" data-picture="main">
 
 <div id="stage">
-  <video id="main" playsinline muted></video>
-  <video id="proxy" playsinline muted></video>
+  <!-- The picture and nothing else. Everything below is a sibling, not a
+       child, which is what keeps the controls the same size at every zoom
+       level: the transform applies here and stops here. -->
+  <div id="pic">
+    <video id="main" playsinline muted></video>
+    <video id="proxy" playsinline muted></video>
+  </div>
 
   <!-- The gradient the controls sit on. Purely a legibility surface: the
        picture underneath is the thing being watched, so it fades to nothing
@@ -420,6 +454,7 @@
 
   <div id="badge">live</div>
   <div id="qbadge" aria-hidden="true"></div>
+  <button id="zoomBadge" type="button" title="Reset zoom (0)">1.0&times;</button>
   <div id="status">—</div>
   <pre id="debug"></pre>
 
@@ -2900,6 +2935,156 @@
   // On a tablet the address bar and the system bar take a serious bite out of
   // a 1080p picture. Prefixed calls are here for Safari; where neither exists
   // the button is removed rather than left to do nothing when pressed.
+  // ── zoom and pan ─────────────────────────────────────────────────────────
+  //
+  // Only the picture moves. The transport, the corner controls and the badges
+  // are siblings of `#pic` rather than children, so they keep their size and
+  // position at every zoom level. That is the whole point: an operator zooms
+  // in to read a number on a shirt, not to make the scrub bar unusable — which
+  // is what the browser's own page zoom does here.
+  //
+  // Both video elements carry the same transform. Balanced mode swaps which
+  // one is displayed, sometimes mid-gesture, and a transform on only the
+  // visible element would make the picture jump at the handover.
+  var ZOOM_MIN = 1, ZOOM_MAX = 8;
+  var zoomScale = 1, zoomX = 0, zoomY = 0;
+  var pic = document.getElementById("pic");
+  var zoomBadge = document.getElementById("zoomBadge");
+
+  /// Where the picture actually sits inside `#pic`, in unzoomed pixels.
+  ///
+  /// `object-fit: contain` letterboxes, so the element box is not the picture.
+  /// Clamping to the element box would let the operator drag the picture off
+  /// its own window and leave a black margin they cannot get rid of.
+  function pictureBox() {
+    var w = pic.clientWidth, h = pic.clientHeight;
+    var v = activeVideo();
+    var vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) return { x: 0, y: 0, w: w, h: h };
+    var s = Math.min(w / vw, h / vh);
+    var pw = vw * s, ph = vh * s;
+    return { x: (w - pw) / 2, y: (h - ph) / 2, w: pw, h: ph };
+  }
+
+  /// Keep the picture covering its window: no dragging it into the void.
+  function clampZoom() {
+    if (zoomScale <= ZOOM_MIN) { zoomScale = ZOOM_MIN; zoomX = 0; zoomY = 0; return; }
+    var box = pictureBox(), w = pic.clientWidth, h = pic.clientHeight;
+    var sw = box.w * zoomScale, sh = box.h * zoomScale;
+    var left = zoomX + box.x * zoomScale, top = zoomY + box.y * zoomScale;
+    // Narrower than the window in an axis: centre it, because there is no
+    // position in that axis the operator could want more than the middle.
+    if (sw <= w) zoomX = (w - sw) / 2 - box.x * zoomScale;
+    else if (left > 0) zoomX -= left;
+    else if (left + sw < w) zoomX += w - (left + sw);
+    if (sh <= h) zoomY = (h - sh) / 2 - box.y * zoomScale;
+    else if (top > 0) zoomY -= top;
+    else if (top + sh < h) zoomY += h - (top + sh);
+  }
+
+  function applyZoom() {
+    clampZoom();
+    var t = "translate(" + zoomX.toFixed(2) + "px," + zoomY.toFixed(2) + "px) " +
+            "scale(" + zoomScale.toFixed(4) + ")";
+    main.style.transform = t;
+    proxy.style.transform = t;
+    var on = zoomScale > ZOOM_MIN + 1e-3;
+    document.body.dataset.zoom = on ? "1" : "0";
+    if (zoomBadge) zoomBadge.textContent = zoomScale.toFixed(1) + "×";
+  }
+
+  /// Zoom about a point on screen, leaving whatever is under it where it is.
+  function zoomAt(clientX, clientY, factor) {
+    var r = pic.getBoundingClientRect();
+    var px = clientX - r.left, py = clientY - r.top;
+    var next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomScale * factor));
+    if (Math.abs(next - zoomScale) < 1e-6) return;
+    zoomX = px - (px - zoomX) * (next / zoomScale);
+    zoomY = py - (py - zoomY) * (next / zoomScale);
+    zoomScale = next;
+    applyZoom();
+  }
+
+  function resetZoom() { zoomScale = ZOOM_MIN; zoomX = 0; zoomY = 0; applyZoom(); }
+
+  /// Keyboard zoom has no cursor to zoom about, so it uses the middle of the
+  /// picture — which is also where an operator looking at the whole frame is.
+  function zoomCentre(factor) {
+    var r = pic.getBoundingClientRect();
+    zoomAt(r.left + r.width / 2, r.top + r.height / 2, factor);
+  }
+
+  pic.addEventListener("wheel", function (e) {
+    // Taken unconditionally: ctrl+wheel is the desktop pinch, and a bare wheel
+    // has nothing else to do here — there is nothing on this page to scroll.
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+  }, { passive: false });
+
+  // One finger pans, two pinch. Panning is refused at 1x so an un-zoomed
+  // picture still behaves like a picture rather than sliding under the thumb.
+  var zoomPts = new Map(), pinchDist = 0, pinchMid = null;
+
+  function pinchState() {
+    var a = null, b = null;
+    zoomPts.forEach(function (p) { if (!a) a = p; else if (!b) b = p; });
+    var dx = b.x - a.x, dy = b.y - a.y;
+    return {
+      dist: Math.sqrt(dx * dx + dy * dy) || 1,
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+    };
+  }
+
+  pic.addEventListener("pointerdown", function (e) {
+    zoomPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (zoomPts.size === 2) { var s = pinchState(); pinchDist = s.dist; pinchMid = s.mid; }
+    try { pic.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+
+  pic.addEventListener("pointermove", function (e) {
+    var prev = zoomPts.get(e.pointerId);
+    if (!prev) return;
+    var dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+    zoomPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (zoomPts.size === 1) {
+      if (zoomScale <= ZOOM_MIN + 1e-3) return;
+      zoomX += dx; zoomY += dy;
+      applyZoom();
+    } else if (zoomPts.size === 2) {
+      var s = pinchState();
+      zoomAt(s.mid.x, s.mid.y, s.dist / (pinchDist || s.dist));
+      // The midpoint travels as well as spreads, and a pinch that only scaled
+      // would feel pinned to the spot the fingers first landed.
+      if (pinchMid) { zoomX += s.mid.x - pinchMid.x; zoomY += s.mid.y - pinchMid.y; applyZoom(); }
+      pinchDist = s.dist; pinchMid = s.mid;
+    }
+  });
+
+  function endZoomPointer(e) {
+    zoomPts.delete(e.pointerId);
+    if (zoomPts.size < 2) { pinchDist = 0; pinchMid = null; }
+  }
+  pic.addEventListener("pointerup", endZoomPointer);
+  pic.addEventListener("pointercancel", endZoomPointer);
+
+  // Double-tap: in to 2x on the spot, or straight back out if already in.
+  pic.addEventListener("dblclick", function (e) {
+    e.preventDefault();
+    if (zoomScale > ZOOM_MIN + 1e-3) resetZoom();
+    else zoomAt(e.clientX, e.clientY, 2);
+  });
+
+  if (zoomBadge) zoomBadge.addEventListener("click", resetZoom);
+
+  // iOS Safari does not hand a pinch over as two pointers; it fires these and
+  // zooms the whole page if they are not taken.
+  ["gesturestart", "gesturechange", "gestureend"].forEach(function (n) {
+    pic.addEventListener(n, function (e) { e.preventDefault(); }, { passive: false });
+  });
+
+  // A resize changes the letterbox, so the clamp has to run against the new one.
+  window.addEventListener("resize", function () { if (zoomScale > ZOOM_MIN) applyZoom(); });
+
   function fullscreenNow() {
     return document.fullscreenElement || document.webkitFullscreenElement || null;
   }
@@ -3071,6 +3256,9 @@
       case "m": case "M": addMark(); break;
       case "[": skipToMark(-1); break;
       case "]": skipToMark(1); break;
+      case "0": resetZoom(); break;
+      case "+": case "=": zoomCentre(1.25); break;
+      case "-": case "_": zoomCentre(1 / 1.25); break;
       // Innermost first. Escape is the reflex for "get this off my picture",
       // and each of these covers it.
       case "Escape":
