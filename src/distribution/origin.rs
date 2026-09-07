@@ -345,6 +345,48 @@ pub struct OriginStore {
 /// operator pointed it at by mistake.
 const ORIGIN_MARKER: &str = ".bilbycast-origin";
 
+/// Does this directory look like a store an older relay wrote?
+///
+/// Used only when the marker is absent, to tell "our own store, from before
+/// the marker existed" from "somebody else's directory". The guard exists for
+/// the home directory or mount point somebody names by typo, and that must
+/// still be refused — so this is deliberately narrow:
+///
+/// * every top-level entry is a directory (a home directory has files in it);
+/// * every file inside those is a segment, a thumbnail or an interrupted PUT;
+/// * and at least one is a `.m4s` segment.
+///
+/// That last clause is what keeps a photo library out. Thumbnails are `.jpg`,
+/// so folders-of-jpgs would otherwise pass — and this store ages its contents
+/// out, which makes a false positive expensive.
+fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
+    let mut saw_segment = false;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(ORIGIN_MARKER) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Ok(false);
+        }
+        for f in std::fs::read_dir(entry.path())? {
+            let f = f?;
+            if !f.file_type()?.is_file() {
+                return Ok(false);
+            }
+            let name = f.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".m4s") {
+                saw_segment = true;
+            } else if !(name.ends_with(".mp4") || name.ends_with(".jpg") || name.ends_with(".part"))
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(saw_segment)
+}
+
 impl OriginStore {
     /// Build the store, adopting whatever is already in `root`.
     ///
@@ -389,15 +431,32 @@ impl OriginStore {
         if cfg.root.exists() {
             let empty = std::fs::read_dir(&cfg.root)?.next().is_none();
             if !empty && !marker.exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "origin storage dir {} is not empty and was not created by the relay \
-                         (no {ORIGIN_MARKER}); refusing to adopt or erase it — point \
-                         distribution.origin_storage_dir at a directory of its own",
-                        cfg.root.display()
-                    ),
-                ));
+                // The marker landed after relays were already in the field, so a
+                // store written by an older one carries no marker and the test
+                // above cannot tell it from a stranger's directory. Refusing it
+                // means a relay that will not start after an upgrade, reporting
+                // what reads like a misconfiguration — measured on the demo rig
+                // upgrading 0.10.6 -> 0.13.0.
+                //
+                // Recognise the shape instead of the marker.
+                if looks_like_origin_store(&cfg.root)? {
+                    tracing::warn!(
+                        root = %cfg.root.display(),
+                        "origin storage dir has no {ORIGIN_MARKER} but holds only segment \
+                         directories; adopting it as this relay's own — a store written \
+                         before the marker existed. Writing the marker now."
+                    );
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "origin storage dir {} is not empty and was not created by the relay \
+                             (no {ORIGIN_MARKER}); refusing to adopt or erase it — point \
+                             distribution.origin_storage_dir at a directory of its own",
+                            cfg.root.display()
+                        ),
+                    ));
+                }
             }
         }
         std::fs::create_dir_all(&cfg.root)?;
@@ -2631,6 +2690,92 @@ seg-1.m4s
             s.get("s", "seg-00010.m4s").await.is_some(),
             "the newest segment was evicted instead"
         );
+    }
+
+    /// A store written before the marker existed must still start.
+    ///
+    /// The marker shipped after relays were already in the field, so on the
+    /// first upgrade the store the relay itself wrote looks foreign by the
+    /// marker test alone. Found on the demo rig going 0.10.6 -> 0.13.0: the
+    /// service refused to come up and reported what read like a
+    /// misconfiguration of a path the operator had never changed.
+    #[tokio::test]
+    async fn a_store_predating_the_marker_is_adopted_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("origin");
+        std::fs::create_dir_all(root.join("feed-a")).unwrap();
+        std::fs::write(root.join("feed-a/seg-00001.m4s"), b"xx").unwrap();
+        std::fs::write(root.join("feed-a/thumb-1.jpg"), b"j").unwrap();
+        assert!(!root.join(ORIGIN_MARKER).exists(), "fixture must have no marker");
+
+        let s = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(3600),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 0,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_millis(80),
+        })
+        .expect("an unmarked store of segment directories must be adopted");
+
+        assert!(
+            s.get("feed-a", "seg-00001.m4s").await.is_some(),
+            "the window was not adopted"
+        );
+        assert!(
+            root.join(ORIGIN_MARKER).exists(),
+            "the marker must be written, so the next start needs no shape check"
+        );
+    }
+
+    /// ...but shape is not a licence to adopt anything.
+    ///
+    /// Thumbnails are `.jpg`, so a directory of folders of pictures matches
+    /// every rule except the segment one. It has to be refused: adoption
+    /// enrols what it finds and the sweep then ages it out, so a false
+    /// positive here deletes somebody's photographs.
+    #[tokio::test]
+    async fn a_library_of_pictures_is_not_mistaken_for_a_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Pictures");
+        std::fs::create_dir_all(root.join("holiday")).unwrap();
+        std::fs::write(root.join("holiday/DSC_0001.jpg"), b"photo").unwrap();
+
+        let err = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(60),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_millis(80),
+        })
+        .map(|_| ())
+        .expect_err("folders of jpgs are not an origin store");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(root.join("holiday/DSC_0001.jpg").exists());
+    }
+
+    /// A stray file beside the segments is somebody else's directory.
+    #[tokio::test]
+    async fn a_loose_file_at_the_root_still_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("mixed");
+        std::fs::create_dir_all(root.join("feed-a")).unwrap();
+        std::fs::write(root.join("feed-a/seg-00001.m4s"), b"xx").unwrap();
+        std::fs::write(root.join("notes.txt"), b"mine").unwrap();
+
+        let err = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(60),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_millis(80),
+        })
+        .map(|_| ())
+        .expect_err("a loose file at the root means this is not our store");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(root.join("notes.txt").exists());
     }
 
     /// The origin root is an operator-supplied path, and every byte under
