@@ -2206,9 +2206,15 @@
       })
     };
 
+    // Where hls.js is in play the token rides in a header and `url()` leaves
+    // the query off, so a request that only set Content-Type would arrive
+    // unauthenticated. Both carriers, same as every other fetch here.
+    var headers = { "Content-Type": "application/json" };
+    if (TOKEN_IN_HEADER && TOKEN) headers.Authorization = "Bearer " + TOKEN;
+
     fetch(url(STREAM, "clips"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers,
       body: JSON.stringify(body)
     }).then(function (r) {
       if (r.status === 404 || r.status === 405) {

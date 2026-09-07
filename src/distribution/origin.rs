@@ -345,6 +345,20 @@ pub struct OriginStore {
 /// operator pointed it at by mistake.
 const ORIGIN_MARKER: &str = ".bilbycast-origin";
 
+/// Exported clips, inside the stream they were cut from.
+///
+/// Inside rather than beside, so the existing teardown gets them for free: the
+/// `remove_dir_all` in `remove_stream` already takes the whole stream
+/// directory, which is exactly the retention the clips are supposed to have —
+/// as long as the session, gone with it.
+///
+/// They are deliberately outside the segment bookkeeping. The sweep works from
+/// an in-memory queue that only `put` and adoption add to, so a clip is never
+/// a candidate for eviction by age or by byte cap: a clip that aged out at the
+/// same rate as the media it was cut from would vanish while the session that
+/// owns it is still running.
+const CLIPS_DIR: &str = "clips";
+
 /// Does this directory look like a store an older relay wrote?
 ///
 /// Used only when the marker is absent, to tell "our own store, from before
@@ -371,6 +385,14 @@ fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
         }
         for f in std::fs::read_dir(entry.path())? {
             let f = f?;
+            // Exported clips live in their own subdirectory of the stream, so a
+            // directory here is expected as long as it is that one.
+            if f.file_type()?.is_dir() {
+                if f.file_name() == std::ffi::OsStr::new(CLIPS_DIR) {
+                    continue;
+                }
+                return Ok(false);
+            }
             if !f.file_type()?.is_file() {
                 return Ok(false);
             }
@@ -518,6 +540,19 @@ impl OriginStore {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
+                // Exported clips are not segments: they must survive a restart
+                // untouched, and must not enter the eviction queue.
+                //
+                // Skipped explicitly rather than relying on what follows. The
+                // debris sweep below uses `remove_file`, which refuses a
+                // directory, so the clips would survive without this — but that
+                // is an accident of the call used, not a decision, and a later
+                // change to `remove_dir_all` would silently delete every
+                // exported clip on the next restart. Stating the intent here
+                // costs one comparison.
+                if name == CLIPS_DIR {
+                    continue;
+                }
                 // Only media segments live on disk, so anything else here is
                 // debris — including a `.part`, which is a PUT interrupted by
                 // the very restart being recovered from and truncated by
@@ -883,6 +918,100 @@ impl OriginStore {
                 None
             }
         }
+    }
+
+    fn clips_dir(&self, stream: &str) -> PathBuf {
+        self.cfg.root.join(stream).join(CLIPS_DIR)
+    }
+
+    /// Record what was asked for. The media follows later, from the edge.
+    ///
+    /// An existing record is left alone rather than overwritten: re-requesting
+    /// a mark somebody has already exported must not throw away the clip that
+    /// is sitting there ready.
+    pub fn record_clip_requests(
+        &self,
+        stream: &str,
+        req: &ClipRequest,
+    ) -> std::io::Result<Vec<ClipRecord>> {
+        let dir = self.clips_dir(stream);
+        std::fs::create_dir_all(&dir)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut out = Vec::new();
+        for ask in &req.clips {
+            let rec = ClipRecord {
+                name: ask.name.clone(),
+                at: ask.at.clone(),
+                pre_secs: req.pre_secs.min(MAX_CLIP_SECS),
+                post_secs: req.post_secs.min(MAX_CLIP_SECS),
+                requested_at: now.clone(),
+                bytes: 0,
+                ready: false,
+            };
+            let path = dir.join(format!("{}.json", rec.name));
+            if !path.exists() {
+                let body = serde_json::to_vec_pretty(&rec).map_err(std::io::Error::other)?;
+                std::fs::write(&path, body)?;
+            }
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Every clip this stream knows about, ready or not.
+    ///
+    /// `ready` and `bytes` come from the media file on disk, never from the
+    /// record: a record that claimed ready without the bytes behind it would
+    /// offer the portal a download that 404s.
+    pub fn list_clips(&self, stream: &str) -> Vec<ClipRecord> {
+        let dir = self.clips_dir(stream);
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for e in rd.flatten() {
+            let file = e.file_name().to_string_lossy().to_string();
+            let Some(stem) = file.strip_suffix(".json") else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read(e.path()) else {
+                continue;
+            };
+            let Ok(mut rec) = serde_json::from_slice::<ClipRecord>(&raw) else {
+                continue;
+            };
+            match std::fs::metadata(dir.join(format!("{stem}.mp4"))) {
+                Ok(m) if m.is_file() => {
+                    rec.ready = true;
+                    rec.bytes = m.len();
+                }
+                _ => {
+                    rec.ready = false;
+                    rec.bytes = 0;
+                }
+            }
+            out.push(rec);
+        }
+        out.sort_by(|a, b| a.at.cmp(&b.at));
+        out
+    }
+
+    /// The edge hands the finished media over.
+    ///
+    /// Written to `.part` and renamed, so a half-uploaded clip is never
+    /// visible as ready — `list_clips` decides on the media file existing.
+    pub async fn put_clip(&self, stream: &str, name: &str, body: &[u8]) -> std::io::Result<()> {
+        let dir = self.clips_dir(stream);
+        tokio::fs::create_dir_all(&dir).await?;
+        let tmp = dir.join(format!("{name}.mp4.part"));
+        tokio::fs::write(&tmp, body).await?;
+        tokio::fs::rename(&tmp, dir.join(format!("{name}.mp4"))).await
+    }
+
+    pub async fn read_clip(&self, stream: &str, name: &str) -> Option<Vec<u8>> {
+        tokio::fs::read(self.clips_dir(stream).join(format!("{name}.mp4")))
+            .await
+            .ok()
     }
 
     pub async fn remove_stream(&self, stream: &str) {
@@ -1320,13 +1449,248 @@ fn valid_object_name(file: &str) -> bool {
 /// opaque 413 while a low-bitrate test pattern sailed through.
 pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
+/// A clip export: what was asked for, and whether the media has arrived.
+///
+/// The record *is* the job. There is no separate queue, in memory or in a
+/// database: a `.json` beside the media is the whole state, so a relay restart
+/// loses nothing and the portal can list what is still coming as well as what
+/// is ready. `ready` is derived from the media file existing and is never
+/// trusted from disk.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClipRecord {
+    /// `<Marker TC> - <Marker name>`, sanitised by the player and re-checked
+    /// here — it becomes a filename and arrives from a browser.
+    pub name: String,
+    /// The marked instant, as the published clock saw it.
+    pub at: String,
+    pub pre_secs: u32,
+    pub post_secs: u32,
+    pub requested_at: String,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default, skip_deserializing)]
+    pub ready: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ClipRequest {
+    pub pre_secs: u32,
+    pub post_secs: u32,
+    pub clips: Vec<ClipAsk>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ClipAsk {
+    pub at: String,
+    pub name: String,
+}
+
+/// One request may not ask for an unbounded amount of edge work.
+const MAX_CLIPS_PER_REQUEST: usize = 50;
+/// Matches the player's own clamp, and bounds how much media one clip covers.
+const MAX_CLIP_SECS: u32 = 600;
+
+/// A clip name becomes a filename, and it arrives from a browser.
+///
+/// Deliberately stricter than `valid_object_name`: no separators, no leading
+/// dot, nothing that could climb out of the clips directory, and a length a
+/// filesystem will actually accept once the extension is added.
+fn valid_clip_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 180
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '(' | ')' | '[' | ']')
+        })
+}
+
 pub fn routes() -> Router<Arc<DistributionState>> {
     Router::new()
+        // Static segments beat the `{file}` capture, so these do not shadow the
+        // segment routes below.
+        .route(
+            "/origin/{stream}/clips",
+            axum::routing::post(clips_request).get(clips_list),
+        )
+        .route("/origin/{stream}/clips/{file}", put(clip_put).get(clip_get))
         .route("/origin/{stream}/{file}", put(origin_put).get(origin_get))
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
 }
 
 /// `PUT /origin/{stream}/{file}` — accept an edge CMAF/HLS upload.
+/// `POST /origin/{stream}/clips` — ask for clips around marks.
+///
+/// Gated exactly like a segment read: whoever may watch this feed may cut from
+/// it. The cut itself happens on the edge — the only component with a decoder
+/// — so all this does is record the ask where the portal and the edge can both
+/// see it.
+async fn clips_request(
+    State(st): State<Arc<DistributionState>>,
+    Path(stream): Path<String>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    axum::Json(req): axum::Json<ClipRequest>,
+) -> Response {
+    let Some(stream) = super::sanitize_stream_id(&stream) else {
+        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+    };
+    if st.control.load().require_origin_token
+        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
+    {
+        return resp;
+    }
+    if req.clips.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no clips requested").into_response();
+    }
+    if req.clips.len() > MAX_CLIPS_PER_REQUEST {
+        return (StatusCode::BAD_REQUEST, "too many clips in one request").into_response();
+    }
+    if req.pre_secs > MAX_CLIP_SECS || req.post_secs > MAX_CLIP_SECS {
+        return (StatusCode::BAD_REQUEST, "clip window too long").into_response();
+    }
+    if req.pre_secs == 0 && req.post_secs == 0 {
+        return (StatusCode::BAD_REQUEST, "a clip of zero seconds is not a clip").into_response();
+    }
+    for ask in &req.clips {
+        if !valid_clip_name(&ask.name) {
+            return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
+        }
+        if chrono::DateTime::parse_from_rfc3339(&ask.at).is_err() {
+            return (StatusCode::BAD_REQUEST, "invalid clip timestamp").into_response();
+        }
+    }
+
+    match st.origin.record_clip_requests(&stream, &req) {
+        Ok(recs) => {
+            tracing::info!(
+                stream = %stream, clips = recs.len(),
+                pre = req.pre_secs, post = req.post_secs,
+                "origin: clip export requested"
+            );
+            (StatusCode::ACCEPTED, axum::Json(recs)).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(stream = %stream, error = %e, "origin: could not record clip request");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request").into_response()
+        }
+    }
+}
+
+/// `GET /origin/{stream}/clips` — what has been asked for, and what is ready.
+async fn clips_list(
+    State(st): State<Arc<DistributionState>>,
+    Path(stream): Path<String>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let Some(stream) = super::sanitize_stream_id(&stream) else {
+        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+    };
+    if st.control.load().require_origin_token
+        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
+    {
+        return resp;
+    }
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(st.origin.list_clips(&stream)),
+    )
+        .into_response()
+}
+
+/// `GET /origin/{stream}/clips/{file}` — download a finished clip.
+async fn clip_get(
+    State(st): State<Arc<DistributionState>>,
+    Path((stream, file)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let Some(stream) = super::sanitize_stream_id(&stream) else {
+        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+    };
+    let Some(name) = file.strip_suffix(".mp4") else {
+        return (StatusCode::BAD_REQUEST, "clips are .mp4").into_response();
+    };
+    if !valid_clip_name(name) {
+        return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
+    }
+    if st.control.load().require_origin_token
+        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
+    {
+        return resp;
+    }
+    match st.origin.read_clip(&stream, name).await {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "video/mp4".to_string()),
+                // The name the operator asked for, on their disk.
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{file}\""),
+                ),
+                (header::CACHE_CONTROL, "private, max-age=300".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store")],
+            "clip not ready",
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /origin/{stream}/clips/{file}` — the edge hands over a finished clip.
+///
+/// Ingest-gated, like a segment PUT: this is a write surface, and the only
+/// thing that should be writing here is the edge that cut the clip.
+async fn clip_put(
+    State(st): State<Arc<DistributionState>>,
+    Path((stream, file)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(stream) = super::sanitize_stream_id(&stream) else {
+        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+    };
+    let Some(name) = file.strip_suffix(".mp4") else {
+        return (StatusCode::BAD_REQUEST, "clips are .mp4").into_response();
+    };
+    if !valid_clip_name(name) {
+        return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
+    }
+    let rt = st.control.load();
+    if rt.require_ingest_token {
+        let Some(ref secret) = rt.token_secret else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "ingest token gate misconfigured")
+                .into_response();
+        };
+        let tok = super::bearer(&headers);
+        if tok
+            .and_then(|t| token::verify_ingest_token(secret, &stream, &t).ok())
+            .is_none()
+        {
+            return (StatusCode::UNAUTHORIZED, "ingest token required").into_response();
+        }
+    }
+    if body.len() > MAX_OBJECT_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "clip too large").into_response();
+    }
+    match st.origin.put_clip(&stream, name, &body).await {
+        Ok(()) => {
+            tracing::info!(stream = %stream, clip = %name, bytes = body.len(), "origin: clip stored");
+            (StatusCode::CREATED, "stored").into_response()
+        }
+        Err(e) => {
+            tracing::warn!(stream = %stream, clip = %name, error = %e, "origin: clip write failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not store the clip").into_response()
+        }
+    }
+}
+
 async fn origin_put(
     State(st): State<Arc<DistributionState>>,
     Path((stream, file)): Path<(String, String)>,
@@ -2690,6 +3054,156 @@ seg-1.m4s
             s.get("s", "seg-00010.m4s").await.is_some(),
             "the newest segment was evicted instead"
         );
+    }
+
+    /// A clip is pending until its media lands, and ready the moment it does.
+    ///
+    /// `ready` is read off the filesystem rather than the record, so a job that
+    /// was recorded but never cut cannot advertise a download that 404s.
+    #[tokio::test]
+    async fn a_clip_is_pending_until_its_media_arrives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        let req = ClipRequest {
+            pre_secs: 10,
+            post_secs: 20,
+            clips: vec![ClipAsk {
+                at: "2026-09-07T23:06:53.200Z".into(),
+                name: "09-06-53-05 - Goal".into(),
+            }],
+        };
+        s.record_clip_requests("feed", &req).unwrap();
+
+        let listed = s.list_clips("feed");
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].ready, "a clip with no media must not read ready");
+        assert_eq!(listed[0].pre_secs, 10);
+        assert_eq!(listed[0].post_secs, 20);
+        assert!(s.read_clip("feed", "09-06-53-05 - Goal").await.is_none());
+
+        s.put_clip("feed", "09-06-53-05 - Goal", b"fake mp4 bytes")
+            .await
+            .unwrap();
+        let listed = s.list_clips("feed");
+        assert!(listed[0].ready, "media on disk must make the clip ready");
+        assert_eq!(listed[0].bytes, 14);
+        assert!(s.read_clip("feed", "09-06-53-05 - Goal").await.is_some());
+    }
+
+    /// Clips outlive the media they were cut from.
+    ///
+    /// The whole point of exporting is to keep a moment past the window. A clip
+    /// swept out with the segments would disappear while the session that owns
+    /// it is still running.
+    #[tokio::test]
+    async fn clips_are_not_evicted_with_the_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 5,
+                post_secs: 5,
+                clips: vec![ClipAsk {
+                    at: "2026-09-07T23:06:53.200Z".into(),
+                    name: "keeper".into(),
+                }],
+            },
+        )
+        .unwrap();
+        s.put_clip("feed", "keeper", b"clip").await.unwrap();
+
+        // A bound tight enough to evict everything the sweep can reach.
+        s.set_default_policy(OriginPolicy {
+            retention: Duration::from_millis(1),
+            max_bytes_per_stream: 1,
+            min_segments: 0,
+            idle_grace: Duration::from_secs(60),
+        });
+        for i in 0..6 {
+            put_seg(&s, "feed", &format!("seg-{i:05}.m4s"), 64).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        put_seg(&s, "feed", "seg-00099.m4s", 64).await;
+
+        assert!(
+            s.read_clip("feed", "keeper").await.is_some(),
+            "the sweep took a clip with the segments"
+        );
+        assert!(s.list_clips("feed")[0].ready);
+    }
+
+    /// ...but they do not outlive the session.
+    #[tokio::test]
+    async fn dropping_a_stream_takes_its_clips_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 5,
+                post_secs: 5,
+                clips: vec![ClipAsk {
+                    at: "2026-09-07T23:06:53.200Z".into(),
+                    name: "keeper".into(),
+                }],
+            },
+        )
+        .unwrap();
+        s.put_clip("feed", "keeper", b"clip").await.unwrap();
+        put_seg(&s, "feed", "seg-00001.m4s", 64).await;
+
+        s.remove_stream("feed").await;
+        assert!(s.read_clip("feed", "keeper").await.is_none());
+        assert!(s.list_clips("feed").is_empty());
+    }
+
+    /// A restart must not sweep the clips up as debris.
+    ///
+    /// Adoption deletes anything in a stream directory that is not a segment,
+    /// which is right for a truncated `.part` and catastrophic for a clip.
+    #[tokio::test]
+    async fn adoption_leaves_the_clips_directory_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("origin");
+        std::fs::create_dir_all(root.join("feed").join(CLIPS_DIR)).unwrap();
+        std::fs::write(root.join("feed/seg-00001.m4s"), b"xx").unwrap();
+        std::fs::write(root.join("feed").join(CLIPS_DIR).join("keeper.mp4"), b"clip").unwrap();
+        std::fs::write(root.join(ORIGIN_MARKER), b"x").unwrap();
+
+        let s = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(3600),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 0,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_millis(80),
+        })
+        .expect("store should build");
+
+        assert!(
+            root.join("feed").join(CLIPS_DIR).join("keeper.mp4").exists(),
+            "adoption deleted an exported clip"
+        );
+        assert!(s.read_clip("feed", "keeper").await.is_some());
+        // And the clip is not counted as adopted media, or the byte cap would
+        // evict segments to make room for something it must never evict.
+        assert_eq!(s.total_bytes(), 2, "the clip was adopted as a segment");
+    }
+
+    /// A clip name becomes a filename and arrives from a browser.
+    #[test]
+    fn clip_names_that_could_escape_are_refused() {
+        assert!(valid_clip_name("09-06-53-05 - Goal"));
+        assert!(valid_clip_name("14-35-22-11 - Try (second half)"));
+        assert!(!valid_clip_name("../../etc/passwd"));
+        assert!(!valid_clip_name("a/b"));
+        assert!(!valid_clip_name("a\\b"));
+        assert!(!valid_clip_name(".hidden"));
+        assert!(!valid_clip_name(""));
+        assert!(!valid_clip_name(&"x".repeat(181)));
+        // A store with clips must still be recognisable as ours on upgrade.
+        assert!(valid_clip_name("clip"));
     }
 
     /// A store written before the marker existed must still start.
