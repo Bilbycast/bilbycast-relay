@@ -156,7 +156,10 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
 
     let state = PortalState {
         cfg: Arc::new(cfg),
-        http: reqwest::Client::new(),
+        http: {
+            install_provider();
+            reqwest::Client::new()
+        },
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
@@ -168,7 +171,16 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
     (format!("http://{paddr}"), rec)
 }
 
+/// `reqwest` is built with `rustls-no-provider`, so a client built without an
+/// installed provider panics at the first request rather than failing to
+/// compile. The binary installs one while building its TLS config; these tests
+/// build bare clients, so they must install it themselves.
+fn install_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn client() -> reqwest::Client {
+    install_provider();
     reqwest::Client::new()
 }
 
@@ -380,7 +392,10 @@ async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
     cfg.normalise();
     let state = PortalState {
         cfg: Arc::new(cfg),
-        http: reqwest::Client::new(),
+        http: {
+            install_provider();
+            reqwest::Client::new()
+        },
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();

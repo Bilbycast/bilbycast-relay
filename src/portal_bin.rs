@@ -72,9 +72,31 @@ async fn main() -> anyhow::Result<()> {
         "viewer portal listening"
     );
 
+    // Hand reqwest a finished rustls config rather than letting it assemble
+    // one. Under `rustls-no-provider` it has neither: it calls the strict
+    // `CryptoProvider::get_default()`, which reads a process-installed
+    // provider and never crate features, and panics when nothing is
+    // installed. Supplying the config installs ring inline and keeps the
+    // portal on the bundled webpki roots — the same roots the relay's own
+    // manager link uses — so a host with an empty /etc/ssl/certs, which is
+    // every static-musl deployment, still reaches the manager.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // `use_preconfigured_tls` takes the config verbatim, so reqwest sets no
+    // ALPN of its own and the `http2` feature would never negotiate h2.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
     let state = PortalState {
         cfg: Arc::new(cfg),
         http: reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
             // The manager is one hop away and answers from a database. A
             // request that has not come back in ten seconds is not going to.
             .timeout(std::time::Duration::from_secs(10))

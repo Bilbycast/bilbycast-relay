@@ -31,7 +31,7 @@ result_large_err = "allow"
 quinn = "0.11.11"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
-rcgen = "0.14.9"
+rcgen = "0.14.10"
 
 # Async runtime
 tokio = { version = "1.53.1", features = ["full"] }
@@ -41,7 +41,7 @@ socket2 = "0.6.5"
 
 # HTTP API
 axum = "0.8.9"
-tower-http = { version = "0.7.0", features = ["cors"] }
+tower-http = { version = "0.7.1", features = ["cors"] }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -58,20 +58,33 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # PINNED to a release candidate on purpose, and the version number is
 # misleading: the 7.0 line is STALLED, not merely unreleased. 7.0.0-rc2 was
 # published 2025-03-05, there has never been an rc3, and upstream went on to
-# publish stable 6.2.1 on 2026-05-17 — fourteen months LATER. So `cargo update`
-# cannot move this, no fix will ever land on it, and an advisory against it
-# would have no upgrade path. It is NOT drift; do not "refresh" it to 6.2.1
-# without doing the attached work.
+# publish stable 6.2.1 on 2026-05-17 — fourteen months LATER. No fix will ever
+# land on rc2, and an advisory against it would have no upgrade path. It is NOT
+# drift; do not "refresh" it to 6.2.1 without doing the attached work.
+#
+# The requirement is `=7.0.0-rc2`, EXACT, and that matters: a caret on a
+# prerelease crosses to later prereleases of the same base version, so plain
+# "7.0.0-rc2" would take an rc3 or a 7.0.0 final on the next `cargo update`
+# — the routine bump procedure this monorepo uses, since dependabot's cargo
+# ecosystem is deliberately off — and land it in the hot-path registries with
+# no review. Nothing in [7.0.0-rc2, 8.0.0) has been published since
+# 2025-03-05, but the range would have taken it silently.
 #
 # Reverting to 6.2.1 is API-clean for our usage — every call site is `DashMap`,
 # `DashMap::new` or `Entry`, both versions re-export Entry/OccupiedEntry/
-# VacantEntry at the crate root, what 7.0 removed (the `Map` trait,
-# `SharedValue`, the `raw-api` feature) appears nowhere here, and no manifest
-# declares a dashmap feature. What stops it being a free swap is that 7.0
+# VacantEntry at the crate root, what 7.0 removed (the `Map` trait and
+# `SharedValue` — `raw-api` is declared in BOTH versions and was not removed)
+# appears nowhere here, and no manifest declares a dashmap feature. The lookup
+# bounds on get/remove/contains_key/remove_if do differ — `K: Borrow<Q>, Q:
+# Hash + Eq` in 6.2.1 against `Q: Hash + Equivalent<K>` in rc2 — which is
+# compile-compatible for our keys only because `equivalent`'s single impl is
+# the Borrow blanket. A revert also drags hashbrown 0.14.5 and once_cell into
+# three graphs that carry no 0.14.x, and steps back to edition 2018 / MSRV
+# 1.65. What stops it being a free swap is that 7.0
 # replaced hashbrown's RawTable with HashTable internally, and these maps are
 # the lock-free hot-path registries of Key Design Constraints #1/#2. Bench the
 # registries before moving, in edge, manager and relay together.
-dashmap = "7.0.0-rc2"
+dashmap = "=7.0.0-rc2"
 
 # WebSocket client (manager connection)
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
@@ -79,7 +92,7 @@ futures-util = "0.3.34"
 chrono = { version = "0.4.45", features = ["serde"] }
 
 # Utilities
-uuid = { version = "1.24.1", features = ["v4", "serde"] }
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
 anyhow = "1.0.104"
 bytes = "1.12.1"
 
@@ -101,8 +114,9 @@ arc-swap = "1.9.2"
 # is str0m (same as bilbycast-edge) with the OpenSSL DTLS backend — the pure-Rust
 # dimpl DTLS stalls on localhost active↔passive handshakes (see edge Cargo.toml).
 [dependencies.str0m]
-# 0.23.0, moved in lockstep with bilbycast-edge (both ends of a WHEP session
-# must agree). 0.22 -> 0.23 is API-only and reaches nothing here: the three
+# 0.23.1, moved in lockstep with bilbycast-edge (both ends of a WHEP session
+# must agree). 0.23.0 -> 0.23.1 is a dependency-only patch: `sctp-proto`
+# ^0.10.3 -> ^0.10.4, nothing else in the index entry moves. 0.22 -> 0.23 is API-only and reaches nothing here: the three
 # upstream changes (`DirectApi::send_pli_feedback` #1025, the RRTR -> DLRR
 # responder #1022, the RRTR originator-SSRC fix #1027) are additive or private,
 # and `src/media/` + `src/rtc.rs` are untouched. The last change that DID reach
@@ -118,7 +132,7 @@ arc-swap = "1.9.2"
 # earlier "in lockstep with bilbycast-edge" comment here was never true of the
 # `is` patchlevel. Fixing it means vendoring `is` here too (or upstreaming the
 # permissive parser); tracked separately so it gets its own interop run.
-version = "0.23.0"
+version = "0.23.1"
 optional = true
 default-features = false
 features = ["openssl"]
@@ -148,14 +162,26 @@ path = "src/portal_bin.rs"
 required-features = ["portal"]
 
 # HTTP client, portal only. The portal is the one component here that CALLS
-# something over HTTP — the relay's own manager link is a WebSocket. rustls with
-# webpki roots, matching `tokio-tungstenite`'s, so the build pulls in no second
-# TLS stack and no system OpenSSL.
+# something over HTTP — the relay's own manager link is a WebSocket.
+#
+# `rustls-no-provider`, NOT `rustls`: 0.13 folded the old
+# `rustls-tls-webpki-roots` feature away, and plain `rustls` now forces
+# aws-lc-rs (a cmake + C build) into a graph that is ring-only. The portal
+# ships in the static-musl release variants, whose workflow job installs
+# `musl-tools` and nothing else, so aws-lc-sys would not build there.
+# `rustls-no-provider` keeps the relay on ring, matching the `rustls` pin
+# above, at the cost of having to install the provider and supply the roots
+# ourselves — both done in `portal_bin.rs`, because reqwest 0.13 resolves its
+# provider with the STRICT `CryptoProvider::get_default()` (never from crate
+# features) and panics when none is installed.
+#
+# `query` is new here and not optional: `RequestBuilder::query` moved behind
+# it in 0.13, and `portal::manager_get` uses it.
 [dependencies.reqwest]
-version = "0.12.28"
+version = "0.13.4"
 optional = true
 default-features = false
-features = ["json", "rustls-tls-webpki-roots", "http2"]
+features = ["json", "query", "rustls-no-provider", "http2"]
 
 [features]
 # OFF by default: a plain `cargo build` produces the pure opaque forwarder with
