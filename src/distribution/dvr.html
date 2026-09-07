@@ -365,6 +365,35 @@
   #settings .note.bar b { color: var(--accent); }
   #settings .foot { border-top: 1px solid var(--line); padding: 12px 14px; margin: auto 0 0; line-height: 1.7; }
 
+  /* A number beside its label, rather than the checkbox row's layout. */
+  #settings .opt.num { justify-content: space-between; gap: 14px; }
+  #settings .opt.num input {
+    width: 5.5em; height: auto; padding: 6px 8px; text-align: right;
+    background: var(--panel2, rgba(255,255,255,.06)); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; font: inherit;
+  }
+  #settings .clips { border: 0; margin: 6px 0 0; padding: 0; }
+  #settings .clips legend { padding: 0 0 4px; font-size: 12px; color: var(--dim);
+    text-transform: uppercase; letter-spacing: .08em; }
+
+  /* Export controls sit at the foot of the marks panel. */
+  #markExport { border-top: 1px solid var(--line); padding: 10px 12px; }
+  #markExport button {
+    font: inherit; padding: 8px 12px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--line); background: rgba(255,255,255,.06); color: var(--fg);
+  }
+  #markExport button[disabled] { opacity: .45; cursor: default; }
+  #markExport button.quiet { background: none; }
+  #btnExportGo { background: var(--accent); color: #04241c; border-color: transparent; font-weight: 600; }
+  #exportBar { display: flex; align-items: center; gap: 8px; }
+  #exportBar .grow { flex: 1; }
+  #exportCount { font-size: 13px; color: var(--dim); }
+  /* The selector only exists while exporting, so the list is a list the rest
+     of the time. */
+  #markList li input.pick {
+    width: 20px; height: 20px; accent-color: var(--accent);
+    flex: 0 0 auto; margin: 0; cursor: pointer;
+  }
   #markList { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
   #markList li {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -583,6 +612,22 @@
        the frame you are looking at is sharp without paying for sharpness while
        it moves. Shuttle and scrub work in all three, because the
        low-resolution rendition is all-intra. Takes effect on reload.</p>
+    <fieldset class="clips">
+      <legend>Clip export</legend>
+      <label class="opt num">
+        <span>Seconds <b>before</b> the mark</span>
+        <input type="number" id="clipPre" min="0" max="600" step="1" value="10">
+      </label>
+      <label class="opt num">
+        <span>Seconds <b>after</b> the mark</span>
+        <input type="number" id="clipPost" min="0" max="600" step="1" value="20">
+      </label>
+    </fieldset>
+    <p class="note">Applied to every clip exported from the Marks panel, and
+       kept on this device like the marks themselves. A clip is cut on the edge,
+       so the in and out points land where you asked rather than on a segment
+       boundary. It appears on your sign-in page when it is ready, and is
+       cleaned up with the session.</p>
     <button id="optSelftest" type="button">Run the player self-test</button>
     <p class="note">Measures what this device can actually present — shuttle
        rate, scrub preview coverage, token renewal. About a minute.</p>
@@ -602,6 +647,19 @@
   <p id="markEmpty">Nothing marked yet. Press <b>MARK</b>, or <b>M</b>, to mark
      the moment you are looking at.</p>
   <p class="note">Kept on this device, for this feed.</p>
+  <!-- Export lives at the foot of the panel, and only turns the list into a
+       selectable thing once asked. A list that is always full of checkboxes
+       reads as a form; the common act here is still "go to that mark". -->
+  <div id="markExport">
+    <button id="btnExport" type="button">Export clips&hellip;</button>
+    <div id="exportBar" hidden>
+      <span id="exportCount">none selected</span>
+      <span class="grow"></span>
+      <button id="btnExportCancel" type="button" class="quiet">Cancel</button>
+      <button id="btnExportGo" type="button" disabled>Export</button>
+    </div>
+    <p id="exportNote" class="note" hidden></p>
+  </div>
 </aside>
 
 <script src="/dvr/hls.js?v=__HLS_JS_VERSION__"></script>
@@ -2062,6 +2120,134 @@
     for (; n < flagPool.length; n++) flagPool[n].style.display = "none";
   }
 
+  // ── clip export ──────────────────────────────────────────────────────────
+  //
+  // A clip is a window around a mark: so many seconds before it, so many
+  // after. The two numbers live in settings and on this device, next to the
+  // marks they apply to — the marks are already local, so a clip length that
+  // followed the account around would be the odd one out.
+  //
+  // The cut happens on the edge, which is the only component with a decoder:
+  // asking the relay to do it would mean parsing media in a service whose
+  // whole contract is that it does not.
+  var CLIP_PRE_KEY = "bilbycast.dvr.clip.pre";
+  var CLIP_POST_KEY = "bilbycast.dvr.clip.post";
+  var CLIP_PRE_DEFAULT = 10, CLIP_POST_DEFAULT = 20, CLIP_MAX = 600;
+  var exportMode = false, exportPicked = {}, exportBusy = false;
+
+  var btnExport = document.getElementById("btnExport");
+  var exportBar = document.getElementById("exportBar");
+  var exportCount = document.getElementById("exportCount");
+  var btnExportGo = document.getElementById("btnExportGo");
+  var btnExportCancel = document.getElementById("btnExportCancel");
+  var exportNote = document.getElementById("exportNote");
+  var clipPreInput = document.getElementById("clipPre");
+  var clipPostInput = document.getElementById("clipPost");
+
+  function clipSecs(key, dflt) {
+    var raw = null;
+    try { raw = window.localStorage.getItem(key); } catch (e) { /* blocked */ }
+    var n = parseInt(raw, 10);
+    if (!isFinite(n) || n < 0 || n > CLIP_MAX) return dflt;
+    return n;
+  }
+  function clipPre() { return clipSecs(CLIP_PRE_KEY, CLIP_PRE_DEFAULT); }
+  function clipPost() { return clipSecs(CLIP_POST_KEY, CLIP_POST_DEFAULT); }
+
+  /// `<Marker TC> - <MarkerName>`.
+  ///
+  /// The readout's colons cannot go in a filename on Windows and are awkward
+  /// everywhere else, so they become dashes. Doing it here rather than leaving
+  /// it to the browser means every viewer gets the same name for the same
+  /// clip, instead of one that varies by platform.
+  function clipFileName(m) {
+    var tc = fmtTimeOfDay(m.at).replace(/:/g, "-");
+    var name = String(m.name || "Mark").trim()
+      .replace(/[\\/:*?"<>|]+/g, " ")
+      .replace(/\s+/g, " ");
+    return tc + " - " + (name || "Mark");
+  }
+
+  function syncExportBar() {
+    var n = 0;
+    for (var k in exportPicked) if (Object.prototype.hasOwnProperty.call(exportPicked, k)) n++;
+    exportCount.textContent = n === 0 ? "none selected"
+      : n === 1 ? "1 selected" : n + " selected";
+    btnExportGo.disabled = (n === 0) || exportBusy;
+  }
+
+  function setExportMode(on) {
+    exportMode = on;
+    exportPicked = {};
+    btnExport.hidden = on;
+    exportBar.hidden = !on;
+    if (!on) { exportNote.hidden = true; exportNote.textContent = ""; }
+    syncExportBar();
+    renderMarks();
+  }
+
+  function say(msg) { exportNote.textContent = msg; exportNote.hidden = false; }
+
+  function exportSelected() {
+    var picked = marks.filter(function (m) { return exportPicked[m.id] && markIsReachable(m); });
+    if (!picked.length) return;
+    exportBusy = true;
+    syncExportBar();
+    say("Requesting " + picked.length + (picked.length === 1 ? " clip…" : " clips…"));
+
+    var body = {
+      pre_secs: clipPre(),
+      post_secs: clipPost(),
+      // The mark's wall-clock instant is the one thing both ends agree on:
+      // the player holds marks against it, and the edge dates its segments
+      // from the same published clock.
+      clips: picked.map(function (m) {
+        return { at: new Date(m.at).toISOString(), name: clipFileName(m) };
+      })
+    };
+
+    fetch(url(STREAM, "clips"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (r.status === 404 || r.status === 405) {
+        say("This relay cannot cut clips yet — it is running a build without clip export.");
+        return null;
+      }
+      if (!r.ok) { say("The relay refused the export (" + r.status + ")."); return null; }
+      return r.json().catch(function () { return {}; });
+    }).then(function (d) {
+      if (!d) return;
+      say(picked.length + (picked.length === 1 ? " clip is" : " clips are") +
+          " being cut. They appear on your sign-in page when ready.");
+      setTimeout(function () { setExportMode(false); }, 2500);
+    }).catch(function () {
+      say("Could not reach the relay to request the export.");
+    }).then(function () {
+      exportBusy = false;
+      syncExportBar();
+    });
+  }
+
+  btnExport.addEventListener("click", function () { setExportMode(true); });
+  btnExportCancel.addEventListener("click", function () { setExportMode(false); });
+  btnExportGo.addEventListener("click", exportSelected);
+
+  // Settings: seed the inputs from storage, and write back as they change.
+  clipPreInput.value = clipPre();
+  clipPostInput.value = clipPost();
+  [[clipPreInput, CLIP_PRE_KEY, CLIP_PRE_DEFAULT], [clipPostInput, CLIP_POST_KEY, CLIP_POST_DEFAULT]]
+    .forEach(function (pair) {
+      pair[0].addEventListener("change", function () {
+        var n = parseInt(pair[0].value, 10);
+        if (!isFinite(n) || n < 0) n = 0;
+        if (n > CLIP_MAX) n = CLIP_MAX;
+        pair[0].value = n;
+        try { window.localStorage.setItem(pair[1], String(n)); } catch (e) { /* blocked */ }
+      });
+    });
+
   function renderMarks() {
     document.body.dataset.marks = marks.length ? "1" : "0";
     markList.textContent = "";
@@ -2069,6 +2255,27 @@
       var li = document.createElement("li");
       var reachable = markIsReachable(m);
       if (!reachable) li.className = "gone";
+
+      // Only while exporting: the rest of the time this is a list you press to
+      // go somewhere, and a permanent column of checkboxes would say otherwise.
+      if (exportMode) {
+        var pick = document.createElement("input");
+        pick.type = "checkbox";
+        pick.className = "pick";
+        pick.checked = !!exportPicked[m.id];
+        // A mark that has aged out of the window has no media behind it, so
+        // there is nothing to cut. Saying so here beats a failed export.
+        pick.disabled = !reachable;
+        pick.title = reachable
+          ? "Include this mark in the export"
+          : "Past the end of the window — nothing left to cut";
+        pick.addEventListener("change", function () {
+          if (pick.checked) exportPicked[m.id] = true;
+          else delete exportPicked[m.id];
+          syncExportBar();
+        });
+        li.appendChild(pick);
+      }
 
       var at = document.createElement("button");
       at.className = "at";
