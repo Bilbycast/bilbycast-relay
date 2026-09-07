@@ -222,9 +222,20 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   panics str0m ("Pt locked multiple times: 111") once a session negotiates both
   H.264 and Opus (a WHEP client offering audio, or a server answering a
   default-codec offer). The fix drops the RTX slot on that one profile.
-- **Origin** (`PUT/GET /origin/{stream}/{file}`): in-memory sliding-window cache
+- **Origin** (`PUT/GET /origin/{stream}/{file}`): **disk-backed** store with time-based retention, a per-stream byte bound and a segment floor, swept every 30 s independently of ingest. Manifests and init segments stay in memory (rewritten every segment, never evicted). Retention is manager-owned at runtime, node-wide plus per-stream overrides
   of the edge's CMAF PUTs; front with a CDN for scale.
-- **Player**: built-in `GET /watch/{stream}` (`player.html`).
+- **Players**: two, and they are not variants of each other. `GET /watch/{stream}`
+  (`player.html`) is the WHEP one — sub-second, live-only, no buffer, no
+  seekable range. `GET /dvr/{stream}` (`dvr.html`) plays the LL-HLS origin, so
+  it seeks back across the whole advertised window, steps frames, shuttles and
+  shows a scrub preview. It expects **two renditions** — `{stream}` long-GOP and
+  `{stream}-proxy` low-res all-intra — plus the edge's optional thumbnail track,
+  and no-ops gracefully without either. Hand-written vanilla JS in one file with
+  no build step; `src/distribution/mod.rs`'s test module asserts against it by
+  lifting function bodies out of the page, and
+  `src/distribution/tests/dvr_page.test.cjs` drives the real page in jsdom
+  (opt-in, skips when jsdom is absent). Both matter: the page is 3 000+ lines
+  that nothing else parses or executes. Reference: [`docs/distribution.md`](docs/distribution.md).
 - **Tokens** (`src/distribution/token.rs`): short-lived HMAC-SHA256
   `"{exp}.{hmac}"` over `"{scope}:{stream}:{exp}"` with a shared 64-hex
   `token_secret` — same stateless-validation model as `authorize_tunnel`, plus
@@ -272,6 +283,17 @@ to mint, and the manager re-checks the entitlement first) and **the
 entitlements** (read from the manager per page load, so a withdrawal takes
 effect on the viewer's next click rather than on the next successful push).
 
+`GET /api/renew?stream=…` mints a viewing token for a player already watching,
+because three hours does not cover a match plus its build-up and the failure
+lands mid-second-half. It goes back through the manager exactly as the first
+mint did — that re-check is what keeps a short expiry meaningful as revocation
+latency rather than a countdown. It is a cross-origin request carrying the
+viewer's session cookie, i.e. the shape a CSRF wants, so it is gated on
+`player_origins`: exact matches only, no wildcard (a credentialed response may
+not answer `*`), and **empty means nobody** — an unconfigured portal simply does
+not offer renewal. The origin is checked *before* anything is done, so an
+unlisted one cannot even cause a mint.
+
 The trust boundary is the one thing to get right. Identity arrives in a header
 (`Remote-User`) that the authenticating proxy sets, which is a *claim*, not a
 proof. Two fail-closed controls hold it: `listen_addr` defaults to loopback, and
@@ -312,6 +334,9 @@ The accepted-lint set lives in `[lints.clippy]` in `Cargo.toml`, one documented
 reason per entry, so CI runs `-D warnings` with no inline `-A` flags to drift out
 of sync with the manifest.
 
-Triggers are branch-scoped (`branches: [main]` on both `push` and
-`pull_request`) — an unfiltered `push` also fires on tag refs, which would race
-`release-all.sh` for the same runner pool and cache.
+The `push` trigger is branch-scoped (`branches: [main]`) — an unfiltered `push`
+also fires on tag refs, which would race `release-all.sh` for the same runner
+pool and cache. **`pull_request` is deliberately not scoped**: scoping it to
+`main` meant a *stacked* PR — one whose base is another PR's branch — ran no CI
+at all, so the second half of a two-part change was never built until its base
+merged.

@@ -384,6 +384,13 @@
     padding: 16px 18px;
   }
   body[data-selftest="1"] #selftest { display: block; }
+  /* The panel covers the picture, so it needs the same way out the drawer and
+     the settings pane have. Without one, opening it took the player off air
+     until the viewer thought to reload. */
+  #stClose {
+    float: right; min-width: 40px; min-height: 40px; padding: 0; font-size: 20px;
+    margin: -4px -6px 0 8px;
+  }
   #selftest h2 { margin: 0 0 6px; font-size: 16px; }
   #selftest p { margin: 0 0 12px; color: var(--dim); font-size: 13px; max-width: 60ch; }
   #selftest button { background: var(--accent); color: #04241c; border-color: transparent; }
@@ -504,6 +511,7 @@
   </div>
 
   <div id="selftest">
+    <button id="stClose" title="Close" aria-label="Close">&times;</button>
     <h2>Player self-test</h2>
     <p id="stExplain">Measures what this device can actually present. Takes about a minute.
       Leave the tab in front while it runs.</p>
@@ -561,7 +569,7 @@
   <p class="note">Kept on this device, for this feed.</p>
 </aside>
 
-<script src="/dvr/hls.js"></script>
+<script src="/dvr/hls.js?v=__HLS_JS_VERSION__"></script>
 <script>
 (function () {
   "use strict";
@@ -680,7 +688,6 @@
   }
   var FPS    = parseFloat(qs.get("fps") || "25");
   var dbg    = null;
-  var FRAME  = 1 / FPS;
 
   var main = document.getElementById("main");
   var proxy = document.getElementById("proxy");
@@ -777,7 +784,12 @@
   var PORTAL_URL = "__PORTAL_URL__";
 
   function fail(msg) {
-    if (accessExpired && msg && msg.indexOf("expired") === -1) return;
+    // The latch has to cover the CLEAR as well. Written to fire only on a
+    // non-empty message, `fail("")` — which every `setRate` and every stall
+    // recovery calls — wiped the expired notice and its sign-in link, leaving
+    // a player that had silently lost access and said nothing about it.
+    // Clearing a genuine expiry goes through `forgetToken()`.
+    if (accessExpired && (!msg || msg.indexOf("expired") === -1)) return;
     errEl.textContent = msg || "";
   }
 
@@ -798,10 +810,19 @@
    * who they are, so recovering should be one tap rather than "find your feed
    * again". Falls back to the front page if the stream name would not survive
    * a URL, which it always should — the relay validates it — but a link built
-   * by string concatenation gets checked. */
+   * by string concatenation gets checked.
+   *
+   * The test mirrors the relay's own `sanitize_stream_id`: up to 128 of
+   * alphanumeric, dot, dash or underscore, with at least one alphanumeric
+   * somewhere. Written narrower than the server's rule, it silently sent
+   * anyone on a feed named with a dot — or starting with an underscore — to
+   * the portal's front page instead of back to their feed, at the one moment
+   * they need one tap rather than a search. */
   function portalReturn() {
     if (!PORTAL_URL) return "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(STREAM)) return PORTAL_URL;
+    if (!/^[A-Za-z0-9._-]{1,128}$/.test(STREAM) || !/[A-Za-z0-9]/.test(STREAM)) {
+      return PORTAL_URL;
+    }
     return PORTAL_URL.replace(/\/+$/, "") + "/watch?stream=" + encodeURIComponent(STREAM);
   }
 
@@ -1132,6 +1153,12 @@
   /// the head of the playlist: `EXTINF` is rounded to milliseconds, so summing
   /// durations across a three-hour window accumulates an error that the
   /// per-fragment date does not carry.
+  ///
+  /// This direction needs none of the care `mediaOn` does, and the reason is
+  /// worth writing down so it is not "fixed" too: `fragAt` searches `start`,
+  /// which hls.js builds by accumulating durations, so it ascends whatever the
+  /// dates do. A date that steps backwards changes what this returns, never
+  /// where it looks.
   function wallOn(v, t) {
     var frags = fragsFor(v);
     if (!frags || !isFinite(t)) return null;
@@ -1140,20 +1167,129 @@
     return f.programDateTime + (t - f.start) * 1000;
   }
 
-  /// Position on `v`'s **own** timeline, in seconds, for a wall clock in ms.
-  function mediaOn(v, wallMs) {
-    var frags = fragsFor(v);
-    if (!frags || !isFinite(wallMs)) return null;
-    var lo = 0, hi = frags.length - 1, f = null;
+  /// Where the published dates stop ascending: the index each ascending run
+  /// starts at, oldest first. `[0]` for the ordinary feed, whose dates only
+  /// ever go forwards.
+  ///
+  /// **The dates are not guaranteed to ascend, and hls.js stopped hiding it.**
+  /// A playlist carrying one `#EXT-X-PROGRAM-DATE-TIME` at its head gives the
+  /// parser nothing to read for the rest of the window, so it derives each
+  /// later fragment from the one before it (`prevFrag.endProgramDateTime`).
+  /// The array was then ascending by construction, and a binary search over it
+  /// was safe by construction. With a tag on every segment — which the edge
+  /// emits since bilbycast-edge#143 — each date is `Date.parse` of that
+  /// segment's own tag, and whatever the publisher wrote arrives here intact.
+  ///
+  /// The edge does write one backwards. Its `FlowClock` steers the flow's
+  /// epoch towards the wall clock its samples imply, by at most
+  /// `EPOCH_SLEW_SECS` (5 ms) per segment — 2500 ppm. A source running faster
+  /// than that cannot be tracked, so the error grows until it crosses
+  /// `EPOCH_REANCHOR_SECS` (10 s) and the epoch snaps onto the sample; the
+  /// segment published across that snap is dated roughly `10 s - segment`
+  /// *earlier* than the segment before it. The snap carries
+  /// `#EXT-X-DISCONTINUITY`, which is precisely the case RFC 8216 §6.2.1 wants
+  /// a fresh date after — and nothing in the spec obliges the dates to ascend
+  /// across one, so a third-party publisher into this origin may do it too.
+  ///
+  /// Left unhandled, `mediaOn`'s binary search walks the wrong way at the step
+  /// and lands on a fragment minutes from the one asked for: a mark recalled
+  /// to the wrong picture, a scrub handover that throws the frame, and nothing
+  /// on screen to say so.
+  ///
+  /// Two memo slots because `main` and `proxy` are converted alternately —
+  /// `toMainTime` reads one, `fromMainTime` the other — so a single slot would
+  /// miss on every call and repay the whole O(n) pass each time, which is the
+  /// cost this exists to avoid: `renderFlags` and `markNear` call `mediaOn`
+  /// once per mark, inside a render, against a window that is 4500 rows at
+  /// three hours of 2 s segments. The list's length and end dates are compared
+  /// as well as its identity, so an in-place playlist merge cannot leave a
+  /// stale answer behind.
+  var dateRunsMemo = [];
+  function dateRuns(frags) {
+    var n = frags.length;
+    var head = frags[0].programDateTime, tail = frags[n - 1].programDateTime;
+    for (var k = 0; k < dateRunsMemo.length; k++) {
+      var m = dateRunsMemo[k];
+      if (m.frags === frags && m.n === n && m.head === head && m.tail === tail) {
+        return m.runs;
+      }
+    }
+    var runs = [0];
+    for (var i = 1; i < n; i++) {
+      // Negated rather than written as `<`, so a date that is not a number at
+      // all starts a run here instead of being swallowed: every comparison
+      // against it is false, and `coveringRow` refuses such a run outright.
+      if (!(frags[i].programDateTime >= frags[i - 1].programDateTime)) runs.push(i);
+    }
+    dateRunsMemo.unshift({ frags: frags, n: n, head: head, tail: tail, runs: runs });
+    if (dateRunsMemo.length > 2) dateRunsMemo.pop();
+    return runs;
+  }
+
+  /// The row of the ascending run `frags[first..last]` that covers `wallMs`,
+  /// as `{ frag, gap }` with `gap` 0 — or, when nothing covers it, whichever
+  /// of the two rows either side is nearer, with `gap` the distance in ms to
+  /// it, so a caller searching several runs can choose between their misses.
+  ///
+  /// A miss is not only a position outside the window. A re-anchor that moves
+  /// the dates *forward* leaves a hole in the middle of an otherwise ascending
+  /// run, and answering a position inside it with the live edge — which is
+  /// what falling through to the end of the list did — shows the operator a
+  /// picture from now while they are asking for one from minutes ago. Landing
+  /// beside the hole is off by the size of the hole; landing at the live edge
+  /// is off by the age of the window.
+  function coveringRow(frags, first, last, wallMs) {
+    var lo = first, hi = last;
     while (lo <= hi) {
       var mid = (lo + hi) >> 1;
       var g = frags[mid];
       if (typeof g.programDateTime !== "number") return null;
       if (wallMs < g.programDateTime) hi = mid - 1;
       else if (wallMs >= g.programDateTime + g.duration * 1000) lo = mid + 1;
-      else { f = g; break; }
+      else return { frag: g, gap: 0 };
     }
-    if (!f) f = wallMs < frags[0].programDateTime ? frags[0] : frags[frags.length - 1];
+    // `hi` is the last row ending before `wallMs` and `lo` the first starting
+    // after it. Either can have walked outside the run.
+    var before = hi >= first ? frags[hi] : null;
+    var after = lo <= last ? frags[lo] : null;
+    var dBefore = before
+      ? wallMs - (before.programDateTime + before.duration * 1000)
+      : Infinity;
+    var dAfter = after ? after.programDateTime - wallMs : Infinity;
+    if (dAfter < dBefore) return { frag: after, gap: dAfter };
+    return before ? { frag: before, gap: dBefore } : null;
+  }
+
+  /// Position on `v`'s **own** timeline, in seconds, for a wall clock in ms.
+  ///
+  /// Newest run first, so that when a backwards re-anchor leaves two rows
+  /// claiming the same wall clock the newer content wins. That is the content
+  /// the operator is looking at, and it is an answer the two renditions agree
+  /// on: both publish identical dates and identical discontinuities, so both
+  /// pick the same run and the scrub handover does not jump.
+  ///
+  /// One binary search per run — identical to the plain binary search this
+  /// replaces on the ordinary feed, which has exactly one run, and bounded by
+  /// the number of re-anchors rather than by the window on a feed that has
+  /// snapped.
+  function mediaOn(v, wallMs) {
+    var frags = fragsFor(v);
+    if (!frags || !isFinite(wallMs)) return null;
+    var runs = dateRuns(frags);
+    var best = null;
+    for (var r = runs.length - 1; r >= 0; r--) {
+      var last = (r + 1 < runs.length ? runs[r + 1] : frags.length) - 1;
+      var hit = coveringRow(frags, runs[r], last, wallMs);
+      // A run this player cannot read is not something to route around: the
+      // rest of the page treats a null here as "this feed has no clock" and
+      // falls back visibly, which beats converting through a date that is not
+      // there.
+      if (!hit) return null;
+      if (hit.gap === 0) { best = hit; break; }
+      if (!best || hit.gap < best.gap) best = hit;
+    }
+    if (!best) return null;
+    var f = best.frag;
     return f.start + (wallMs - f.programDateTime) / 1000;
   }
 
@@ -1334,7 +1470,17 @@
       return hls;
     }
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src; // Safari native HLS
+      // Safari native HLS. hls.js reports its failures through an event we
+      // subscribe to above; native playback has only the element's own
+      // `error`, and without this a refused credential or a missing manifest
+      // renders as a black rectangle with nothing said anywhere.
+      video.addEventListener("error", function () {
+        var code = video.error ? video.error.code : 0;
+        if (TOKEN) { failExpired(); }
+        else if (code === 4) { failNoToken(); }
+        else { fail("This feed could not be played."); }
+      });
+      video.src = src;
       return null;
     }
     fail("This browser cannot play HLS (no MSE and no native support).");
@@ -1356,7 +1502,7 @@
       // clock. The target travels on main's, and is converted when it lands.
       seekWhenReady(to, toMainTime(t, from));
     }
-    if (next === "jog" || next === "shuttle") { main.pause(); }
+    if (next === "shuttle") { main.pause(); }
     else { proxy.pause(); stopShuttle(); }
     document.body.dataset.live = (next === "live") ? "1" : "0";
     syncPicture();
@@ -1393,6 +1539,13 @@
   }
 
   // ── jog ────────────────────────────────────────────────────────────────
+  // One exact seek per step, on the MAIN rendition, at full resolution.
+  //
+  // The proxy exists for shuttle, not for this: measured against burnt-in
+  // timecode, long-GOP stepping is frame-exact as long as the seek names a
+  // frame *centre* (see `frameCentre`) — what broke stepping was landing on
+  // frame boundaries, not the GoP. An operator stepping frames is examining
+  // them, so they get the full-resolution picture.
   // One exact seek per step, on the all-intra proxy. On a long-GOP source
   // this would land on the nearest keyframe instead, which is the whole
   // reason the proxy exists.
@@ -1425,6 +1578,14 @@
   function startShuttle(r) {
     ensureProxy();
     setMode("shuttle");
+    // Whichever element is on screen. In `full` quality that is the proxy;
+    // in `low` and `balanced` there is no second element to drive — `main`
+    // already carries the all-intra rendition and `ensureProxy` deliberately
+    // attaches nothing. Driving `proxy` unconditionally stepped an element
+    // with no source while the visible one sat paused, so FF and REW did
+    // nothing at all in either reduced mode, with no error anywhere.
+    var v = activeVideo();
+    main.pause();
     proxy.pause();
     stopShuttle();
     rate = r;
@@ -1442,7 +1603,7 @@
       }
       // Hold position until the handover seek lands, or the loop would wind
       // away from 0 and then jump when it does.
-      if (awaitingSeek(proxy)) {
+      if (awaitingSeek(v)) {
         last = now;
         shuttleRAF = requestAnimationFrame(step);
         return;
@@ -1450,13 +1611,13 @@
       // Clamp so a stalled tab or a slow seek cannot produce one huge jump.
       var dt = Math.min((now - last) / 1000, 0.25);
       last = now;
-      var rng = range(proxy);
-      var t = proxy.currentTime + rate * dt;
+      var rng = range(v);
+      var t = v.currentTime + rate * dt;
       if (rng) {
         if (t <= rng.start) { t = rng.start; stopShuttle(); }
         if (t >= rng.end)   { stopShuttle(); goLive(); return; }
       }
-      try { proxy.currentTime = t; } catch (e) { /* mid-load */ }
+      try { v.currentTime = t; } catch (e) { /* mid-load */ }
       render();
       if (shuttleRAF !== null) shuttleRAF = requestAnimationFrame(step);
     };
@@ -1469,9 +1630,13 @@
 
   function setRate(r) {
     fail("");
-    if (r < 0) { startShuttle(r); syncRateButtons(); return; }
+    // A shuttle rate is a SEEK rate, and it is one in both directions. Routing
+    // only the negative ones here left `setRate(+4)` — which is what releasing
+    // the scrub bar mid-fast-forward asks for — assigning 4 to
+    // `main.playbackRate` and playing the feed at four times real speed.
+    if (r < 0 || Math.abs(r) > 1) { startShuttle(r); syncRateButtons(); return; }
     stopShuttle();
-    if (mode === "jog" || mode === "shuttle") setMode("scrub");
+    if (mode === "shuttle") setMode("scrub");
     rate = r;
     main.playbackRate = r;
     main.play().catch(function () {});
@@ -1560,15 +1725,23 @@
 
   function beginScrub() {
     if (scrubbing) return;
-    loadThumbs();
     scrubbing = true;
     ensureProxy();
     var v = activeVideo();
-    // `rate < 0` counts as playing: a reverse shuttle drives currentTime
-    // itself, so the element is paused even though the transport is running.
-    resumeAfterScrub = { playing: !v.paused || rate < 0, rate: rate };
+    // A shuttle counts as playing whichever way it runs: it drives
+    // `currentTime` itself and leaves BOTH elements paused, so asking the
+    // element is the wrong question. Testing `rate < 0` caught only reverse —
+    // scrubbing during a forward shuttle resumed nothing, leaving the
+    // transport dead and the picture on the paused low-res proxy.
+    resumeAfterScrub = { playing: !v.paused || shuttleRAF !== null, rate: rate };
     stopShuttle();
     v.pause();
+    // Only now, with the transport state recorded: fetching the preview index
+    // is the one thing in here that reaches the network, and a throw before
+    // `resumeAfterScrub` was set left the release with nothing to restore —
+    // the transport stayed dead and the picture stayed on the paused proxy.
+    // A preview must cost a preview and never the transport.
+    try { loadThumbs(); } catch (e) { /* no preview is not a transport failure */ }
     if (mode === "live") setMode("scrub");
     // Pin the view where it is: see `viewAnchor`.
     var pinned = viewRange();
@@ -1625,7 +1798,7 @@
     var st = resumeAfterScrub;
     resumeAfterScrub = null;
     if (st && st.playing) {
-      setRate(st.rate);   // restarts the shuttle loop when the rate is negative
+      setRate(st.rate);   // routes back to the shuttle when it was a seek rate
     } else {
       syncRateButtons();
     }
@@ -2396,6 +2569,13 @@
   /// that makes the entire bar previewable is 0.2 % of it.
   var SHEET_CACHE_BYTES = 24 * 1024 * 1024;
   var sheetBytes = 0;
+  /// Largest sheet seen, so the prefetcher can tell whether one more fits.
+  ///
+  /// Sheets vary with picture content, so a fixed guess would be wrong in
+  /// whichever direction cost more. Seeded above zero only after the first
+  /// sheet lands; until then the prefetcher runs, which is correct — an empty
+  /// cache has room.
+  var sheetBytesMax = 0;
 
   /// Drop least-recently-used sheets until the cache is inside its budget.
   function trimSheets() {
@@ -2430,6 +2610,7 @@
         entry.url = URL.createObjectURL(b);
         entry.bytes = b.size;
         sheetBytes += b.size;
+        if (b.size > sheetBytesMax) sheetBytesMax = b.size;
         trimSheets();
         // Repaint. Without this the first position on every sheet stays blank
         // until the thumb moves again: `sheetUrl` answers null while the
@@ -2493,7 +2674,14 @@
     prefetchTimer = null;
     // Never while the operator is dragging: their fetches are the ones with a
     // deadline.
-    if (!scrubbing) {
+    //
+    // And never once the cache is within one sheet of its budget. Past that
+    // point a prefetch necessarily evicts something, and `nextSheetToPrefetch`
+    // immediately picks the evicted sheet as the nearest one not held — so the
+    // pair loops forever, re-downloading the window at `PREFETCH_GAP_MS` and
+    // churning blob URLs for as long as the tab is open. Eviction is left to
+    // the operator's own fetches, which at least have a deadline behind them.
+    if (!scrubbing && sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES) {
       var uri = nextSheetToPrefetch();
       if (uri) sheetUrl(uri);   // the fetch, the cache and the trim are shared
     }
@@ -2585,13 +2773,29 @@
     });
   }
 
-  function render() {
+  function render(remeasure) {
     var v = activeVideo();
-    // Either element being attached means there are two clocks to relate.
-    // This used to test `proxyAttached` alone, which balanced mode never
-    // sets — so the offset was never sampled, stayed 0, and the hi-res still
-    // landed at an arbitrary point.
-    if (proxyAttached || stillAttached) measureTimelineOffset();
+    // Two independent conditions, and the offset needs both.
+    //
+    // *When*: only from the 200 ms tick. `OFFSET_SAMPLES` is sized as "~5 s at
+    // the render cadence"; sampling from the shuttle's requestAnimationFrame
+    // instead fills the same slots in about 0.4 s at 60 Hz, so the median
+    // stops spanning a segment boundary and the handover offset chases the
+    // sawtooth it exists to filter out.
+    //
+    // *Whether*: either element being attached means there are two clocks to
+    // relate. This used to test `proxyAttached` alone, which balanced mode
+    // never sets — so the offset was never sampled, stayed 0, and the hi-res
+    // still landed at an arbitrary point.
+    //
+    // The parentheses are load-bearing: `&&` binds tighter than `||`, so
+    // dropping them would let the shuttle's rAF resample on every frame once a
+    // still had ever attached — and `hideStill` never clears `stillAttached`,
+    // so that is the rest of the session. Neither attach path starves waiting
+    // for this tick; `ensureProxy` and `ensureStill` each prime the median from
+    // their own 60 ms burst on `loadedmetadata`, and this is the top-up that
+    // keeps it current as the live edge moves.
+    if (remeasure && (proxyAttached || stillAttached)) measureTimelineOffset();
     // Always present the window and the position on main's clock, so the
     // readout does not shift when the picture hands over to the proxy.
     var r = range(main);
@@ -2684,7 +2888,7 @@
       "graphics acceleration when available' off, then reload.",
     ].join("\n");
   }
-  setInterval(render, 200);
+  setInterval(function () { render(true); }, 200);
   requestAnimationFrame(tickLoop);
 
   // ── controls ───────────────────────────────────────────────────────────
@@ -2804,6 +3008,7 @@
       location.reload();
     });
   });
+  function closeSelftest() { document.body.dataset.selftest = "0"; }
   document.getElementById("optSelftest").addEventListener("click", function () {
     closeSettings();
     document.body.dataset.selftest = "1";
@@ -2866,7 +3071,14 @@
       case "m": case "M": addMark(); break;
       case "[": skipToMark(-1); break;
       case "]": skipToMark(1); break;
-      case "Escape": if (document.body.dataset.drawer === "1") closeDrawer(); else return; break;
+      // Innermost first. Escape is the reflex for "get this off my picture",
+      // and each of these covers it.
+      case "Escape":
+        if (document.body.dataset.selftest === "1") closeSelftest();
+        else if (document.body.dataset.settings === "1") closeSettings();
+        else if (document.body.dataset.drawer === "1") closeDrawer();
+        else return;
+        break;
       case " ":
         e.preventDefault();
         if (mode === "shuttle" || !activeVideo().paused) pauseTransport();
@@ -3196,9 +3408,15 @@
     dbg = document.getElementById("debug");
     document.body.dataset.debug = "1";
   }
+  // The listener is registered whatever the URL says, because the panel is
+  // also reachable from Settings — wired only under the flag, that entry
+  // opened a panel whose one button did nothing. What stays behind the flag
+  // is the panel being *shown* on load; what starts the run is still a
+  // deliberate tap, which is the property that matters.
+  document.getElementById("stRun").addEventListener("click", stRunAll);
+  document.getElementById("stClose").addEventListener("click", closeSelftest);
   if (qs.get("selftest") === "1") {
     document.body.dataset.selftest = "1";
-    document.getElementById("stRun").addEventListener("click", stRunAll);
   }
   scheduleRenewal();
   syncQualityBadge();   // setMode returns early at startup, so seed it here
@@ -3235,6 +3453,12 @@
   /// When both playlists carry `#EXT-X-PROGRAM-DATE-TIME` the conversion is
   /// exact and none of this applies — see `toMainTime`.
   var STILL_MIN_OFFSET_SAMPLES = 5;
+  /// `stillAttached` is never cleared: `hideStill` leaves it set, so once a
+  /// still has attached the 200 ms tick samples the offset for the rest of the
+  /// session. That is wanted, not a leak — it is the top-up that keeps the two
+  /// clocks related as the live edge moves, it costs nothing on a dated feed
+  /// (`measureTimelineOffset` returns at `pdtLinked`), and only `balanced` ever
+  /// attaches a still, `quality` being read once with a change forcing a reload.
   var stillAttached = false, stillShowing = false, stillTimer = null, stillWantAt = null;
   /// The position a pending settle timer is already waiting on.
   var stillPendingAt = null;
@@ -3242,20 +3466,6 @@
   /// noticed rather than left on screen.
   var stillOffsetUsed = null;
 
-  /// Stop hls.js managing the still element's buffer, and start it again.
-  ///
-  /// A stopped transport is not streaming: it wants one frame, and the segment
-  /// holding it is already decoded. But hls.js keeps running its loader
-  /// against `maxBufferLength`/`backBufferLength` and re-evaluates on every
-  /// seek, so a 40 ms frame step re-fetched a ~2 MB segment it was already
-  /// holding. Measured on the rig: alternate steps cost 695-1003 ms and 1.4 to
-  /// 4.6 MB, against 22 ms and nothing for the steps that happened to escape
-  /// it.
-  ///
-  /// So while a still is up, the loader stands down and stepping is pure seek
-  /// and decode across whatever is buffered — on this feed, ten seconds either
-  /// side, which is a couple of hundred frames rather than the ten AJ asked
-  /// for. It starts again the moment a position outside that is wanted.
   /// Do two positions on main's clock name the same frame?
   ///
   /// A tolerance in seconds cannot answer this: any value large enough to

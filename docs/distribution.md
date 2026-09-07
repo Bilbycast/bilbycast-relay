@@ -4,10 +4,24 @@ The **viewer-distribution** subsystem turns a relay into a public "distribution
 node" that reaches **browser viewers directly** — no external WHIP/WHEP server
 (mediamtx, LiveKit, Cloudflare Stream, …) and no ports opened on the NAT'd edge.
 
-It is **default-off** and gated behind the `viewer-distribution` Cargo feature,
-hard-isolated from the stateless opaque forwarder. A plain `cargo build`
-produces the pure forwarder with **zero** media-termination surface and no
-OpenSSL/str0m build dependency. Build a distribution-capable relay with:
+The **Cargo feature** is default-off and hard-isolated from the opaque
+forwarder: a plain `cargo build` produces the pure forwarder with **zero**
+media-termination surface and no OpenSSL/str0m build dependency.
+
+**The shipped `-distribution` artefact is a different matter, and the
+distinction matters operationally.** `DistributionConfig::default()` sets
+`enabled: true`, `main.rs` reads the block with `unwrap_or_default()`, and
+`install-relay.sh` writes a `relay.json` containing no `distribution` block at
+all — so a relay installed from that artefact comes up with the subsystem
+**ENABLED**, listening on `0.0.0.0:4485` and `[::]:4485` (HTTP signalling and
+the origin) plus `:4486` (ingest), whether or not the operator asked for it.
+That is deliberate — it is what lets the manager configure a distribution node
+with no config edits — but it means "default-off" describes the build, not the
+box. `install-relay.sh` installs the distribution artefact by default; pass
+`--variant default` for the lean forwarder, or set
+`"distribution": { "enabled": false }` in `relay.json`.
+
+Build a distribution-capable relay with:
 
 ```bash
 cargo build --release --features viewer-distribution
@@ -63,7 +77,7 @@ they are not either/or.
 | `POST` | `/whip/{stream}` | Edge pushes a stream in (SDP offer → answer) |
 | `DELETE` | `/whip/{stream}/{session}` | Stop an ingest |
 | `GET` | `/watch/{stream}` | Built-in minimal `<video>` + WHEP player page (live only) |
-| `GET` | `/dvr/{stream}` | Browser DVR player: live, 60-min scrub-back, frame jog, shuttle |
+| `GET` | `/dvr/{stream}` | Browser DVR player: live, scrub-back, frame jog, shuttle. How far back is whatever `origin_retention_secs` holds — **60 s by default**; a DVR surface needs it raised, per stream or node-wide |
 | `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |
@@ -103,13 +117,13 @@ datagram, so a reflection flood cannot amplify its own alarm.
 
 ### The advertised window must be one the origin can serve
 
-The origin store wipes its root on startup, because the manifests referencing
-those segments lived in memory and died with the process. That reasoning holds
-only if the **producer restarts too**. When the relay is restarted on its own
-the edge keeps running, and within a segment or two it re-publishes a manifest
-describing its whole window — naming thousands of files that were just deleted
-and, since each segment is PUT once as it is produced, will never be sent
-again.
+The origin store *used to* wipe its root on startup, on the reasoning that the
+manifests referencing those segments lived in memory and died with the
+process. That reasoning holds only if the **producer restarts too**. When the
+relay is restarted on its own the edge keeps running, and within a segment or
+two it re-publishes a manifest describing its whole window — naming thousands
+of files that had just been deleted and, since each segment is PUT once as it
+is produced, would never be sent again.
 
 Measured on the demo rig after a relay-only restart: **4500 segments
 advertised, 24 of 42 probed across the window 404'd**, on both renditions, and
@@ -119,9 +133,20 @@ the advertised window, so most of the bar addressed footage the origin could
 not serve — presenting as a badly skewed scrub and, separately, as a proxy
 rendition that would not load at all.
 
+That particular cause is gone — startup adopts the window now, see "A restart
+keeps the window" below — but the trim is not, because every other route to
+the same gap is still open. Retention shorter than the edge's `dvr_window_secs`
+evicts from the head while the manifest still names it; so does the per-stream
+byte cap, and so does the node-wide free-space floor. A cold start against an
+already-running edge has the same shape as the old restart. And adoption logs
+and skips a file it cannot index rather than failing, which leaves the store
+one segment short of what is on disk. In every one of those the manifest
+arrives naming objects the store does not hold, and the player calibrates its
+scrub bar on it regardless.
+
 So a media playlist is trimmed on the way *in*: leading entries naming
-segments the store does not hold are dropped, and `EXT-X-MEDIA-SEQUENCE` and
-`EXT-X-PROGRAM-DATE-TIME` move with them. Three deliberate limits:
+segments the store does not hold are dropped, and `EXT-X-MEDIA-SEQUENCE`
+advances by however many went. Three deliberate limits:
 
 * **Only the head.** A hole further in is a different fault, and closing it
   would report the window as contiguous when it is not — worse than a 404,
@@ -130,6 +155,29 @@ segments the store does not hold are dropped, and `EXT-X-MEDIA-SEQUENCE` and
 * **A playlist with nothing backed at all is left alone.** At cold start the
   manifest can arrive a beat before the first segment; rewriting that to empty
   turns a transient into a hard player error.
+
+**`EXT-X-PROGRAM-DATE-TIME` is not shifted.** It was once, and had to be: an
+older edge publishes a single tag at the playlist head standing for the whole
+window, so trimming the head moves the clock. Edges from #143 publish a tag per
+segment, each an independent absolute time read off the media timeline — and a
+tag that survives the trim already describes a segment that survived, so
+advancing it misdates the entire remaining window by the dropped duration. The
+relay serves both shapes and tells them apart by *position*, not by counting
+tags: #143 omits the tag on a segment whose time the media timeline does not
+give, so a per-segment playlist may carry fewer tags than segments. A tag past
+the trimmed run is passed through untouched; a tag inside it goes with the
+entry it described; and only where the first surviving entry brings no tag of
+its own is the last one carried forward and advanced onto it. That exception is
+what keeps a head-tag playlist's only clock, and it lands right because the run
+it advances across is exactly the run being removed.
+
+Getting this wrong is not confined to one stream's clock. Main and proxy are
+separate streams here with separate eviction, so they routinely hold different
+heads — and shifting each rendition's dates by its own dropped duration throws
+the two apart by the difference. The player relates their timelines *only*
+through these dates ("Relating the two renditions" below), so that difference
+is a per-rendition offset landing the still on the wrong frame: the failure
+edge#139 was fixed to stop, reintroduced downstream of the fix.
 
 ### The free-space floor
 
@@ -167,6 +215,26 @@ true until they change something.
 Verified on the rig by setting the floor 20 GiB above actual free space: the
 store went from 487 MB to 29 MB across two sweeps, keeping the newest
 segments, and said so both times.
+
+The floor itself is bounded: **`0`, or between 16 MiB and 1 TiB**. Both ends
+catch a unit slip, and a slip either way leaves a guard that reads as
+configured in the file while doing the wrong thing. Below 16 MiB — `5`, meant
+as 5 GiB — the floor is under a single segment, so nothing it could refuse ever
+happens and the guard is silently inert. Above 1 TiB — 5 GiB written with three
+digits too many — no plausible origin volume can satisfy it, so every sweep
+runs to the four-segment emergency keep on every stream and warns each pass,
+collapsing the DVR window to nothing while looking configured.
+
+A value outside those bounds is **fatal**. `RelayConfig::validate` rejects it
+before anything starts, naming `distribution.origin_min_free_bytes` and the
+value it got, and the relay does not boot — deliberately, rather than clamping:
+a clamp would leave the file saying one thing and the relay doing another,
+which is the same silence the bounds exist to end.
+
+It is a config-file knob only. `configure_distribution` carries retention, byte
+cap, minimum segments and idle grace, but not this one, because the disk it
+guards is the thing the manager cannot see — which is the whole reason the
+floor lives here rather than there.
 
 ### A restart keeps the window
 
@@ -285,15 +353,18 @@ sub-second but live-only, with no buffer, no seekable range and no
 `playbackRate` — `/dvr` plays the LL-HLS origin and can therefore seek back
 across the whole advertised window and step individual frames.
 
-It expects **two renditions** of the same source:
+It expects **two renditions** of the same source, plus an optional thumbnail
+track (the player no-ops without it):
 
 | Rendition | Origin path | Encoding | Used for |
 |---|---|---|---|
-| main | `{stream}` | long-GOP | live, 1x, 0.25–4x forward, frame jog, and the still after a scrub |
+| main | `{stream}` | long-GOP | live, the 33 / 50 / 100 % speed presets, **frame jog**, and the still after a scrub |
 | proxy | `{stream}-proxy` | low-res **all-intra** | shuttle, reverse, and the picture *while* a scrub thumb is held |
 | thumbnails | `thumbs-*.jpg` + `thumbs.vtt` | sprite sheets | the preview under the thumb while dragging |
 
-That split has moved twice on measurement and is worth reading as measured
+The main rendition plays at 1x and below, not above: the presets are 33 %, 50 %
+and 100 %, and anything faster is a *seek* rate, which is what the shuttle is
+for. That split has moved twice on measurement and is worth reading as measured
 rather than as designed — see **Which rendition does what, and why** below.
 
 Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`
@@ -580,6 +651,13 @@ for support. A softened picture with nothing to explain it becomes a support
 call, and "degraded but invisible" is a failure this player has produced more
 than once.
 
+**The transport drives whichever element is on screen.** In Low and Balanced
+the `main` element already carries the all-intra rendition and no second one is
+attached, so the shuttle steps `main`; in Full it steps the proxy. Written to
+step the proxy unconditionally, FF and REW paused the visible picture and drove
+an element with no source — dead transport buttons in both reduced modes, with
+nothing reported anywhere.
+
 Switching takes effect on reload: changing the stream mid-session means tearing
 down hls.js, re-seeking and re-deriving the clock, which a reload does correctly
 while keeping the token and the marks.
@@ -765,11 +843,22 @@ count is a guess about sheet size, and the twenty-slot version it replaced could
 be evicted end to end by a single drag, which is worse than useless once
 anything has been prefetched into it.
 
-### Self-test (`?selftest=1`)
+The background prefetcher stops once the cache is within one sheet of that
+budget, and never resumes until an eviction makes room. Past that point every
+prefetch necessarily evicts something, and the "nearest sheet not held" search
+immediately picks the sheet just evicted — so the two loop, re-downloading the
+window every few seconds for as long as the tab is open, on exactly the
+connections the prefetcher exists to be gentle with. Eviction is left to the
+operator's own drags, which have a deadline behind them.
+
+### Self-test (`?selftest=1`, or Settings → Run the player self-test)
 
 The player carries its own measurement, because the question "what can this
 device present?" cannot be answered from a workstation — and on this project the
-workstation's answer was the opposite of the tablet's. It runs on a tap and
+workstation's answer was the opposite of the tablet's. The query flag decides
+only whether the panel is *shown* on load; it is also reachable from Settings,
+and either way the run itself waits for a deliberate tap. Close it with its
+own **×** or with Escape — it covers the picture while it is open. It runs and
 prints plainly enough to photograph: shuttle rate main vs proxy, scrub preview
 coverage across the bar, the real drag path (including which element the picture
 ended up on), and a token renewal.
@@ -783,12 +872,35 @@ sliding window; if `origin_retention_secs` is shorter than the edge's
 `dvr_window_secs`, the manifest lists segments the origin has already evicted
 and a viewer seeking to the back of the window gets 404s.
 
-**Restart the edge whenever you restart the relay.** The origin is wiped on
-relay startup, but the manifest addressing it is produced by the *edge* and
-survives — so the playlist and the thumbnail index go on naming objects that
-have been deleted, until the window rolls over. At a 5-minute window that heals
-in 5 minutes; at the 2h30m window a whole-event DVR wants, it takes 2h30m, and
-the scrub bar looks broken throughout with nothing to say why. Tracked as #6.
+**A relay restart no longer needs an edge restart.** It used to: the origin
+wiped its root on startup while the manifest addressing it was produced by the
+*edge* and survived, so the playlist and the thumbnail index went on naming
+objects that had been deleted until the window rolled over — 2h30m of broken
+scrub bar for a 2h30m window, with nothing on screen to say why. That is #6,
+and this is what closes it: startup adopts the segments already on disk.
+
+What an operator should expect across a relay restart now is a gap of a
+segment or two, not of a window. Media segments survive it — they were on disk
+and readable throughout. Manifests and `init.mp4` do not: they are memory-only
+and die with the process, so until the edge re-publishes them (it does, within
+a segment or two) a viewer's manifest fetch 404s and the page does not start.
+Reloading after that heals it; the head-trim above keeps the playlist honest
+while the two catch up. Two things do still need care:
+
+* **Point `origin_storage_dir` at the same directory across the restart.**
+  Adoption is what makes the restart cheap, and it can only adopt what it
+  finds. Moving the root, or hand-clearing it between runs, restores exactly
+  the old failure — with the edge still running and still advertising the
+  window it deleted.
+* **Leave the `.bilbycast-origin` marker alone.** It is how the store tells a
+  root it owns — and may therefore adopt from, and evict within — from one an
+  operator pointed it at by mistake. A directory that exists, is not empty and
+  carries no marker is refused rather than adopted. That refusal is **not**
+  fatal to the relay: the forwarder comes up as normal and only the
+  distribution subsystem fails to start, saying so once at
+  `viewer-distribution subsystem stopped: origin storage dir … is not empty and
+  was not created by the relay`. So the symptom is a relay that looks healthy
+  serving no DVR at all, and the log line is the only place it is explained.
 
 **Sizing a whole-event window.** The window costs relay disk, not device
 memory — a viewer holds only `backBufferLength`, whatever the window. Measured
@@ -923,6 +1035,7 @@ See `../../testbed/configs/relay-distribution.json`:
     "origin_window_segments": 8,
     "origin_retention_secs": 60,
     "origin_max_bytes_per_stream": 8589934592,
+    "origin_min_free_bytes": 5368709120,
     "origin_storage_dir": "/var/lib/bilbycast/relay/origin"
   }
 }
@@ -943,6 +1056,11 @@ See `../../testbed/configs/relay-distribution.json`:
   elapsed. Hitting it evicts oldest-first and silently shortens the DVR window,
   so size it above what the retention window is expected to cost — roughly
   `bitrate × origin_retention_secs / 8`.
+- `origin_min_free_bytes` is the guard of last resort, and the only origin
+  knob the manager cannot override: it is read from the config file, never
+  from `configure_distribution`. Default 5 GiB; `0` disables it. Bounded at
+  `0` or 16 MiB to 1 TiB — outside that the relay **refuses to start**, naming
+  the field. See "The free-space floor" above for what each bound catches.
 - `origin_window_segments` is now a **floor**, not the window: the minimum
   number of recent segments kept whatever the other two say. It stops a stalled
   or very-low-bitrate stream having its whole window aged out from under a live
@@ -985,11 +1103,14 @@ See `../../testbed/configs/relay-distribution.json`:
   segments, bytes, idle seconds, and whether an override is in force — because
   `origin_bytes` alone says the node is full but not which stream filled it.
 
-- `origin_storage_dir` is **wiped on startup**. Segments from a previous run are
-  unaddressable anyway, because the manifests referencing them are held in
-  memory and die with the process. Point it at a volume with room for
-  `origin_max_bytes_per_stream` times the number of live streams; the default is
-  inside the packaged unit's `ReadWritePaths`.
+- `origin_storage_dir` is **adopted on startup**, not wiped: the segments left
+  by a previous run are indexed back into the window, so a relay restart costs
+  a segment or two rather than the whole DVR depth. Give it a directory of its
+  own — everything under it becomes evictable, and a non-empty directory
+  carrying no `.bilbycast-origin` marker is refused rather than adopted (the
+  relay still comes up; the distribution subsystem does not). Point it at a
+  volume with room for `origin_max_bytes_per_stream` times the number of live
+  streams; the default is inside the packaged unit's `ReadWritePaths`.
 
 A config block present on a plain (feature-off) build parses fine and is logged
 as ignored at startup.

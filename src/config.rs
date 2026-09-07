@@ -227,11 +227,19 @@ pub struct DistributionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
 
-    /// The viewer portal's URL, offered to a viewer whose token has expired.
+    /// The viewer portal's URL. Two jobs, and the second one is easy to miss.
     ///
-    /// Set here or pushed by the manager. Without it the player can only say
-    /// that access ended, because a viewer who arrived from the portal has a
-    /// dead token in their URL and reloading re-presents it.
+    /// 1. Offered to a viewer whose token has expired. Without it the player
+    ///    can only say that access ended, because a viewer who arrived from
+    ///    the portal has a dead token in their URL and reloading re-presents
+    ///    it.
+    /// 2. **It also gates token renewal.** The player's `scheduleRenewal()`
+    ///    returns immediately when the substituted `PORTAL_URL` is empty
+    ///    (`src/distribution/dvr.html`), so leaving this blank turns the
+    ///    three-hour token into a hard limit however `player_origins` is
+    ///    configured — silently, with nothing reported at either end.
+    ///
+    /// Set here or pushed by the manager.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portal_url: Option<String>,
 
@@ -308,6 +316,19 @@ pub struct DistributionConfig {
     #[serde(default = "default_origin_max_bytes_per_stream")]
     pub origin_max_bytes_per_stream: u64,
 
+    /// How long past `origin_retention_secs` a stream may sit without a PUT
+    /// before it is reclaimed outright — segments, manifest, init and
+    /// directory. Default 60.
+    ///
+    /// Here as well as on the pushed policy because it is one of the four
+    /// node-wide storage knobs, and the only one that used to have nowhere to
+    /// land: the manager could push it and the relay applied it, but
+    /// `persist_distribution_config` had no field to write it back to, so it
+    /// silently returned to 60 s on the next restart while its three siblings
+    /// survived.
+    #[serde(default = "default_origin_idle_grace_secs")]
+    pub origin_idle_grace_secs: u64,
+
     /// Never let the origin volume fall below this many bytes free.
     /// Default 5 GiB. Set 0 to disable.
     ///
@@ -320,13 +341,20 @@ pub struct DistributionConfig {
     ///
     /// On the demo rig it did, and took the manager's Postgres down with it.
     /// The relay owns the disk, so the relay is the one that has to refuse.
+    ///
+    /// Bounded in `DistributionConfig::validate`: `0`, or 16 MiB to 1 TiB.
+    /// A value outside that is fatal at startup rather than clamped — see the
+    /// unit slips it catches at the check itself.
     #[serde(default = "default_origin_min_free_bytes")]
     pub origin_min_free_bytes: u64,
 
     /// Directory the origin writes media segments under. Defaults to
     /// `/var/lib/bilbycast/relay/origin` (inside the packaged unit's
-    /// `ReadWritePaths`). Wiped on startup — segments from a previous run are
-    /// unaddressable, because the manifests referencing them are gone.
+    /// `ReadWritePaths`). **Adopted** on startup, not wiped: the segments left
+    /// there by a previous run are indexed back into the window, so a relay
+    /// restart no longer costs the DVR depth. Everything under it is evictable
+    /// either way, so give it a directory of its own — `OriginStore::new`
+    /// refuses a non-empty one that carries no `.bilbycast-origin` marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_storage_dir: Option<String>,
 
@@ -366,6 +394,7 @@ impl Default for DistributionConfig {
             require_origin_token: false,
             require_ingest_token: true,
             max_viewers_per_ip: default_max_viewers_per_ip(),
+            origin_idle_grace_secs: default_origin_idle_grace_secs(),
             origin_window_segments: default_origin_window_segments(),
             origin_retention_secs: default_origin_retention_secs(),
             origin_max_bytes_per_stream: default_origin_max_bytes_per_stream(),
@@ -397,6 +426,10 @@ fn default_origin_min_free_bytes() -> u64 {
 
 fn default_origin_max_bytes_per_stream() -> u64 {
     8 * 1024 * 1024 * 1024
+}
+
+fn default_origin_idle_grace_secs() -> u64 {
+    60
 }
 
 /// Default origin storage root. Under the packaged unit's data root, which is
@@ -479,11 +512,70 @@ impl DistributionConfig {
         if self.origin_retention_secs == 0 || self.origin_retention_secs > 86_400 {
             anyhow::bail!("distribution.origin_retention_secs must be in 1..=86400");
         }
+        if self.origin_idle_grace_secs > 86_400 {
+            anyhow::bail!("distribution.origin_idle_grace_secs must be <= 86400");
+        }
         if self.origin_max_bytes_per_stream < 16 * 1024 * 1024 {
             anyhow::bail!(
                 "distribution.origin_max_bytes_per_stream must be at least 16 MiB (got {})",
                 self.origin_max_bytes_per_stream
             );
+        }
+        // The free-space floor: `0` disables it, and anything else has to be
+        // large enough to actually be one. A slip like `5` (meaning 5 GiB)
+        // reads as configured in the file while a floor below a single
+        // segment can never be what refuses a write — the guard would be
+        // silently inert, which is precisely the failure it exists to end.
+        // The 16 MiB pairing is the same "at least a segment's worth" bound
+        // as the per-stream byte cap above. The 1 TiB ceiling catches the
+        // other unit slip: a floor no plausible origin volume can satisfy
+        // makes every sweep evict every stream down to its emergency keep,
+        // collapsing the DVR window to nothing while warning each pass.
+        if self.origin_min_free_bytes != 0 && self.origin_min_free_bytes < 16 * 1024 * 1024 {
+            anyhow::bail!(
+                "distribution.origin_min_free_bytes must be 0 (disabled) or at least 16 MiB (got {})",
+                self.origin_min_free_bytes
+            );
+        }
+        if self.origin_min_free_bytes > 1024 * 1024 * 1024 * 1024 {
+            anyhow::bail!(
+                "distribution.origin_min_free_bytes must be at most 1 TiB (got {})",
+                self.origin_min_free_bytes
+            );
+        }
+        // Everything under `origin_storage_dir` is evictable — the idle sweep
+        // `remove_dir_all`s a whole stream, and the free-space floor evicts
+        // across every stream it finds — so a typo here is destructive rather
+        // than merely wrong. The startup wipe these bounds were originally
+        // written for is gone (the window on disk is adopted now), which makes
+        // them matter more rather than less: adoption pulls whatever it finds
+        // *into* the store's bookkeeping, so the recursive delete moved from
+        // startup to the sweep rather than going away. These bounds reject the
+        // shapes a slip actually produces — a relative path, a filesystem
+        // root, a top-level directory — and `OriginStore::new` refuses to
+        // adopt a non-empty directory it cannot identify as its own.
+        if let Some(dir) = &self.origin_storage_dir {
+            let p = std::path::Path::new(dir);
+            if dir.trim().is_empty() || !p.is_absolute() {
+                anyhow::bail!(
+                    "distribution.origin_storage_dir must be an absolute path (got {dir:?})"
+                );
+            }
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                anyhow::bail!("distribution.origin_storage_dir must not contain '..' ({dir:?})");
+            }
+            let depth = p
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
+            if depth < 2 {
+                anyhow::bail!(
+                    "distribution.origin_storage_dir must be at least two levels deep — \
+                     everything under it is evictable, and {dir:?} is a system directory"
+                );
+            }
         }
         if self.cascade_sources.len() > 64 {
             anyhow::bail!("distribution.cascade_sources: at most 64 entries");
@@ -955,6 +1047,31 @@ mod tests {
         .expect("parses");
         assert!(c.udp_relay_enabled, "omitted field defaults to true");
         assert!(c.native_plane_accepts_unauthenticated());
+    }
+
+    /// The free-space floor is bounded like every other distribution knob:
+    /// `0` is the documented way to switch it off, but a non-zero value too
+    /// small to cover a segment would read as configured while guarding
+    /// nothing, and one no volume can satisfy would evict every stream on
+    /// every sweep.
+    #[test]
+    fn origin_min_free_bytes_is_bounded() {
+        let mut d = DistributionConfig::default();
+        assert!(d.validate().is_ok(), "the shipped default is valid");
+
+        d.origin_min_free_bytes = 0;
+        assert!(d.validate().is_ok(), "0 disables the floor");
+
+        d.origin_min_free_bytes = 5;
+        let err = d.validate().unwrap_err().to_string();
+        assert!(err.contains("origin_min_free_bytes"), "got {err}");
+
+        d.origin_min_free_bytes = 2 * 1024 * 1024 * 1024 * 1024;
+        let err = d.validate().unwrap_err().to_string();
+        assert!(err.contains("origin_min_free_bytes"), "got {err}");
+
+        d.origin_min_free_bytes = 5 * 1024 * 1024 * 1024;
+        assert!(d.validate().is_ok(), "5 GiB, the default, is in range");
     }
 
     #[test]

@@ -62,6 +62,9 @@ API_ADDR="0.0.0.0:4480"
 REQUIRE_BIND_AUTH=0
 UPGRADE_INSTALLER=0
 WITH_PORTAL=0
+# distribution | default. Today's behaviour is `distribution`; see the
+# artefact-selection block below for why that is not simply "the first one".
+VARIANT="${VARIANT:-distribution}"
 PORTAL_MANAGER_URL=""
 PORTAL_PLAYER_ORIGIN=""
 
@@ -89,10 +92,6 @@ Options:
   --upgrade-installer          Refresh service unit + install script,
                                leave config untouched
   --with-portal <manager-url>  Also install the viewer portal
-  --player-origin <origin>     Where the DVR player is served from, e.g.
-                               https://relay.example.com. Without it a viewer's
-                               token cannot be renewed and access ends after
-                               three hours, mid-event.
                                (bilbycast-portal), pointed at this
                                manager's https:// base URL. Only in the
                                distribution tarball. Installed but NOT
@@ -100,6 +99,10 @@ Options:
                                generate in the manager first, so
                                starting it would only fail every viewer.
                                See docs/portal.md.
+  --player-origin <origin>     Where the DVR player is served from, e.g.
+                               https://relay.example.com. Without it a viewer's
+                               token cannot be renewed and access ends after
+                               three hours, mid-event.
   -h, --help                   Show this message
 EOF
 }
@@ -115,26 +118,33 @@ while [[ $# -gt 0 ]]; do
         --channel) CHANNEL="$2"; shift 2;;
         --upgrade-installer) UPGRADE_INSTALLER=1; shift;;
         --with-portal) WITH_PORTAL=1; PORTAL_MANAGER_URL="$2"; shift 2;;
+        --variant) VARIANT="$2"; shift 2;;
         --player-origin) PORTAL_PLAYER_ORIGIN="$2"; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 1;;
     esac
 done
 
+# >>> portal-url-validation (lifted verbatim by test-portal-install.sh — keep
+# this block self-contained, and keep the markers)
 if [[ "${WITH_PORTAL}" -eq 1 ]]; then
     if [[ -z "${PORTAL_MANAGER_URL}" ]]; then
+        echo "reject-empty" >&2
         echo "--with-portal needs the manager's base URL, e.g. https://manager.example.com" >&2
         exit 1
     fi
     case "${PORTAL_MANAGER_URL}" in
         http://*|https://*) ;;
-        *) echo "--with-portal URL must start with http:// or https://" >&2; exit 1;;
+        *)
+            echo "reject-scheme" >&2
+            echo "--with-portal URL must start with http:// or https://" >&2
+            exit 1;;
     esac
 
     # Renewal is a cross-origin request carrying the viewer's session cookie, so
     # the portal answers only origins named here. Empty means nobody: safe, and
     # silent — the portal works, viewers sign in, and three hours later their
-    # access ends mid-event with nothing to say why. Hence the warning.
+    # access ends mid-event with nothing to say why. Hence the note below.
     PORTAL_ORIGINS_JSON=""
     if [[ -n "${PORTAL_PLAYER_ORIGIN}" ]]; then
         case "${PORTAL_PLAYER_ORIGIN}" in
@@ -148,11 +158,19 @@ if [[ "${WITH_PORTAL}" -eq 1 ]]; then
             */*) echo "--player-origin has a path; an origin is scheme://host[:port]" >&2; exit 1;;
         esac
         PORTAL_ORIGINS_JSON="\"${PORTAL_PLAYER_ORIGIN}\""
-    else
-        echo "note: no --player-origin given, so viewing tokens will not renew." >&2
-        echo "      Viewers lose access three hours after signing in." >&2
-        echo "      Add the player's origin to player_origins in portal.json." >&2
     fi
+fi
+# <<< portal-url-validation
+
+# Advice, not validation, and outside the block above on purpose: that block is
+# lifted verbatim and run by packaging/test-portal-install.sh, which reads its
+# FIRST line of output as the verdict. Anything printed there on the accepting
+# path is therefore read as a refusal — this note used to sit inside it and
+# turned two passing checks red.
+if [[ "${WITH_PORTAL}" -eq 1 && -z "${PORTAL_PLAYER_ORIGIN}" ]]; then
+    echo "note: no --player-origin given, so viewing tokens will not renew." >&2
+    echo "      Viewers lose access three hours after signing in." >&2
+    echo "      Add the player's origin to player_origins in portal.json." >&2
 fi
 
 # ── Pre-flight checks ─────────────────────────────────────────────────
@@ -295,12 +313,40 @@ if [[ "${CHANNEL_IN_MANIFEST}" != "${CHANNEL}" ]]; then
     exit 1
 fi
 
-# Relay manifests carry a single artefact per arch — no variant axis
-# (unlike the edge's default / full split).
-ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" \
-    '.artefacts[] | select(.arch == $arch) | .url' manifest.json | head -1)"
-ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" \
-    '.artefacts[] | select(.arch == $arch) | .sha256' manifest.json | head -1)"
+# Relay manifests carry TWO artefacts per arch — `distribution` (WHEP SFU
+# + LL-HLS origin + the viewer portal binary) and `default` (the lean
+# opaque forwarder). An earlier comment here claimed there was no variant
+# axis; there is, and this script has always installed `distribution`
+# purely because it sorts first in the manifest. Select it explicitly so
+# the answer no longer depends on artefact ORDER, and let `--variant`
+# override.
+#
+# The default is deliberately left as `distribution`, unchanged: switching
+# a fresh install to the lean forwarder is a behaviour change for everyone
+# who follows the README, and `--with-portal` needs the distribution
+# tarball to find `bilbycast-portal`. See docs/distribution.md for what
+# that means for listeners.
+ARTEFACT_URL=""
+ARTEFACT_SHA256=""
+if [[ -n "${VARIANT}" ]]; then
+    ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" --arg v "${VARIANT}" \
+        '.artefacts[] | select(.arch == $arch and .variant == $v) | .url' manifest.json | head -1)"
+    ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" --arg v "${VARIANT}" \
+        '.artefacts[] | select(.arch == $arch and .variant == $v) | .sha256' manifest.json | head -1)"
+    if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
+        echo "No '${VARIANT}' artefact for arch=${ARCH} in this manifest. Available:" >&2
+        jq -r '.artefacts[] | "  \(.arch) / \(.variant)"' manifest.json >&2
+        exit 1
+    fi
+fi
+# Older manifests carry no `variant` key at all; fall back to the rule
+# this script has always used.
+if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
+    ARTEFACT_URL="$(jq -r --arg arch "${ARCH}" \
+        '.artefacts[] | select(.arch == $arch) | .url' manifest.json | head -1)"
+    ARTEFACT_SHA256="$(jq -r --arg arch "${ARCH}" \
+        '.artefacts[] | select(.arch == $arch) | .sha256' manifest.json | head -1)"
+fi
 
 if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
     echo "No artefact for arch=${ARCH} in manifest." >&2
@@ -484,7 +530,9 @@ EOF
     if [[ ! -f "${PORTAL_ENV}" ]]; then
         cat > "${PORTAL_ENV}" <<'EOF'
 # Generate this in the manager: DVR Sessions -> Portal logins -> Generate a
-# token (super admin only). Shown once. Then: systemctl start bilbycast-portal
+# token (super admin only). Shown once. Then:
+#   systemctl enable --now bilbycast-portal
+# `enable` as well as `start`, or the portal is gone after the next reboot.
 BILBYCAST_PORTAL_TOKEN=
 EOF
         chmod 0600 "${PORTAL_ENV}"

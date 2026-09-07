@@ -77,8 +77,10 @@ fn viewer_and_ingest_tokens_are_scoped_and_expiring() {
     assert!(token::verify_ingest_token(secret, "show", &it).is_ok());
 }
 
-/// A store root that nothing else is using. `OriginStore::new` creates and
-/// wipes it, so it does not need to exist first.
+/// A store root that nothing else is using. `OriginStore::new` creates it, and
+/// the nanosecond stamp keeps every call's root to itself, so the adoption pass
+/// that runs at startup finds an empty directory and each test begins with the
+/// window it wrote itself.
 fn test_origin_config(min_segments: usize, max_bytes_per_stream: u64) -> OriginConfig {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -90,6 +92,12 @@ fn test_origin_config(min_segments: usize, max_bytes_per_stream: u64) -> OriginC
         retention: std::time::Duration::from_secs(3600),
         max_bytes_per_stream,
         min_segments,
+        // The free-space floor off: these tests are about the retention and
+        // byte policies, and the floor is the one bound whose trigger is the
+        // *host's* disk rather than anything the test wrote. Leaving it armed
+        // would make them pass or fail on how full the runner's volume
+        // happens to be. `0` is the disabled value the config layer defines.
+        min_free_bytes: 0,
         idle_grace: std::time::Duration::from_secs(60),
     }
 }

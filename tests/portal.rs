@@ -116,9 +116,18 @@ async fn harness() -> (String, Recorder) {
     harness_trusting(&["127.0.0.1"]).await
 }
 
+/// The same, with a player origin allow-listed, so `/api/renew` is reachable.
+async fn harness_with_player_origin(origin: &str) -> (String, Recorder) {
+    harness_cfg(&["127.0.0.1"], &[origin]).await
+}
+
 /// The same, with the trusted-proxy list under the test's control — the one
 /// thing that decides whether a username header means anything.
 async fn harness_trusting(trusted: &[&str]) -> (String, Recorder) {
+    harness_cfg(trusted, &[]).await
+}
+
+async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Recorder) {
     let rec: Recorder = Arc::new(Mutex::new(Seen {
         calls: Vec::new(),
         mint_status: 200,
@@ -140,7 +149,7 @@ async fn harness_trusting(trusted: &[&str]) -> (String, Recorder) {
         manager_token: SERVICE_TOKEN.into(),
         username_header: "remote-user".into(),
         trusted_proxies: trusted.iter().map(|s| s.parse().unwrap()).collect(),
-        player_origins: Vec::new(),
+        player_origins: player_origins.iter().map(|s| (*s).to_string()).collect(),
         logout_url: Some("https://auth.example/logout".into()),
     };
     cfg.normalise();
@@ -397,4 +406,126 @@ async fn health_needs_no_user() {
     let (base, _rec) = harness().await;
     let r = client().get(format!("{base}/healthz")).send().await.unwrap();
     assert_eq!(r.status(), 200);
+}
+
+/// Renewal answers only an allow-listed origin, and must not mint for others.
+///
+/// The request carries the viewer's session cookie cross-origin, which is
+/// exactly the shape a CSRF wants. The origin is therefore checked **before
+/// anything is done**, not before the answer is returned: an un-allowed origin
+/// must not be able to cause a mint at all, and asserting the recorder saw no
+/// manager call is the only way to tell "refused" from "refused after doing
+/// the work".
+#[tokio::test]
+async fn renewal_answers_only_an_allow_listed_origin() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+
+    let r = client()
+        .get(format!("{base}/api/renew?stream=match-feed"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "an unlisted origin was answered");
+    assert!(
+        rec.lock().unwrap().calls.is_empty(),
+        "an unlisted origin still caused the manager to be called"
+    );
+}
+
+/// The allow-listed player gets a fresh token, and the browser may read it.
+///
+/// Renewal goes through the manager exactly as the first mint did — that
+/// re-check is what keeps the three-hour expiry meaningful as revocation
+/// latency rather than a countdown, so the manager call is asserted, not just
+/// the answer. The CORS headers are asserted too: without them the browser
+/// discards a 200 the portal went to the trouble of producing.
+#[tokio::test]
+async fn an_allow_listed_player_is_given_a_fresh_token() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+
+    let r = client()
+        .get(format!("{base}/api/renew?stream=match-feed"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let h = r.headers().clone();
+    assert_eq!(
+        h.get("access-control-allow-origin").unwrap(),
+        "https://player.example"
+    );
+    assert_eq!(h.get("access-control-allow-credentials").unwrap(), "true");
+    assert_eq!(h.get("vary").unwrap(), "Origin");
+    // The body is a credential; nothing should be storing it.
+    assert_eq!(h.get("cache-control").unwrap(), "no-store");
+
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert!(
+        body["token"].as_str().is_some_and(|t| !t.is_empty()),
+        "no token in the renewal answer: {body}"
+    );
+
+    let calls = rec.lock().unwrap().calls.clone();
+    assert!(
+        calls.iter().any(|(p, a, _)| p == "/api/v1/dvr/portal/token"
+            && a == &format!("Bearer {SERVICE_TOKEN}")),
+        "renewal did not re-check entitlement through the manager: {calls:?}"
+    );
+}
+
+/// A feed the viewer is not entitled to is refused, and refused as CORS.
+///
+/// "Unentitled" and "no such feed" are deliberately the same answer, so a
+/// renewal cannot be used to enumerate feeds. The refusal still carries the
+/// CORS headers — the origin is already allow-listed by that point, so
+/// withholding them only turns a clear 403 into an opaque browser error.
+#[tokio::test]
+async fn a_feed_the_viewer_does_not_have_is_refused_without_leaking_that_it_exists() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+
+    let r = client()
+        .get(format!("{base}/api/renew?stream=someone-elses-feed"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(
+        r.headers().get("access-control-allow-origin").unwrap(),
+        "https://player.example",
+        "the refusal reaches the browser as an opaque CORS error"
+    );
+    let calls = rec.lock().unwrap().calls.clone();
+    assert!(
+        !calls.iter().any(|(p, _, _)| p == "/api/v1/dvr/portal/token"),
+        "a feed the viewer does not have was still minted: {calls:?}"
+    );
+}
+
+/// Renewal is off entirely when no player origin is configured.
+///
+/// Empty means nobody, on purpose: a portal that has not been told which
+/// player to trust does not offer renewal at all, rather than trusting
+/// whatever asks.
+#[tokio::test]
+async fn renewal_is_refused_when_no_player_origin_is_configured() {
+    let (base, rec) = harness().await;
+
+    let r = client()
+        .get(format!("{base}/api/renew?stream=match-feed"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert!(
+        rec.lock().unwrap().calls.is_empty(),
+        "renewal reached the manager with no player origin configured"
+    );
 }

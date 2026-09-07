@@ -1,7 +1,14 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Tier 1 — LL-HLS / CMAF HTTP origin + in-memory sliding-window cache.
+//! Tier 1 — LL-HLS / CMAF HTTP origin, disk-backed.
+//!
+//! Media segments are written to disk and retained by age, bounded by a
+//! per-stream byte cap and floored at a segment count. Manifests and init
+//! segments stay in memory: they are rewritten every segment and never
+//! evicted, so persisting them would be churn on the hottest objects here
+//! for no durability benefit — nothing reads them back after a restart,
+//! because the segments they reference are gone too.
 //!
 //! The edge's existing CMAF output PUTs browser-playable fMP4 segments +
 //! HLS/DASH manifests to `{ingest_url}/{file}`. Point that `ingest_url` at
@@ -161,6 +168,97 @@ pub struct StreamUsage {
 pub struct ObjectResponse {
     pub bytes: Bytes,
     pub content_type: &'static str,
+    /// Strong validator over the bytes.
+    ///
+    /// Everything here is served `must-revalidate`, because a name in a live
+    /// stream is not stable across restarts — but a revalidation with no
+    /// validator to compare is a full re-download every time. Scrubbing a
+    /// 60-minute DVR window re-fetches segments constantly, so the difference
+    /// is the whole window's bytes versus a few hundred 304s.
+    ///
+    /// Derived from the content, so a re-PUT under the same name changes it,
+    /// which is exactly the case a date-based validator would get wrong.
+    pub etag: String,
+}
+
+/// Is this object an HLS playlist, whose URIs a viewer will fetch next?
+fn is_hls_playlist(file: &str) -> bool {
+    file.ends_with(".m3u8")
+}
+
+/// Re-emit a playlist with `?token=` appended to every URI it names.
+///
+/// Two kinds of URI appear: a bare line (a media segment) and a quoted
+/// `URI="..."` attribute (`EXT-X-MAP`, `EXT-X-PART`, `EXT-X-PRELOAD-HINT`,
+/// `EXT-X-RENDITION-REPORT`). Both are relative, and both are fetched without
+/// the query the playlist itself arrived with.
+fn playlist_with_token(body: &[u8], token: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return body.to_vec(); // not a playlist after all; leave it alone
+    };
+    let enc = percent_encode_token(token);
+    let add = |uri: &str| -> String {
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        format!("{uri}{sep}token={enc}")
+    };
+
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let eol = &line[trimmed.len()..];
+        if trimmed.is_empty() {
+            out.push_str(line);
+        } else if let Some(rest) = trimmed.strip_prefix('#') {
+            // Rewrite each quoted URI attribute in place.
+            match rest.find("URI=\"") {
+                Some(i) => {
+                    let start = 1 + i + 5; // '#' + prefix + `URI="`
+                    match trimmed[start..].find('"') {
+                        Some(len) => {
+                            out.push_str(&trimmed[..start]);
+                            out.push_str(&add(&trimmed[start..start + len]));
+                            out.push_str(&trimmed[start + len..]);
+                        }
+                        None => out.push_str(trimmed),
+                    }
+                }
+                None => out.push_str(trimmed),
+            }
+            out.push_str(eol);
+        } else {
+            out.push_str(&add(trimmed));
+            out.push_str(eol);
+        }
+    }
+    out.into_bytes()
+}
+
+/// Percent-encode the characters a token can carry that are not safe to drop
+/// unescaped into a query. A multi-stream token carries `,`; nothing else in
+/// the alphabet (`0-9 a-z A-Z . - _ ,`) needs escaping.
+fn percent_encode_token(token: &str) -> String {
+    token.replace(',', "%2C")
+}
+
+/// RFC 9110 8.8.3.2: `If-None-Match` is `*` or a comma-separated list, and the
+/// comparison is weak — a `W/` prefix on either side still matches.
+fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
+    let strip = |t: &str| t.trim().trim_start_matches("W/").trim().to_string();
+    let want = strip(etag);
+    header_value
+        .split(',')
+        .any(|t| t.trim() == "*" || strip(t) == want)
+}
+
+/// A strong ETag over an object's bytes.
+fn etag_for(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    // Not a cryptographic digest: this distinguishes versions of an object the
+    // relay itself wrote, it is not a trust boundary. Length is mixed in so a
+    // hash collision also has to match the size.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("\"{:016x}-{:x}\"", h.finish(), bytes.len())
 }
 
 /// A small, hot object held in memory: manifests and init segments.
@@ -242,6 +340,11 @@ pub struct OriginStore {
     started: Instant,
 }
 
+/// Marker written into the origin root, so the store can tell a directory it
+/// owns — and may therefore adopt from, and evict within — from one an
+/// operator pointed it at by mistake.
+const ORIGIN_MARKER: &str = ".bilbycast-origin";
+
 impl OriginStore {
     /// Build the store, adopting whatever is already in `root`.
     ///
@@ -262,8 +365,45 @@ impl OriginStore {
     /// Manifests and `init.mp4` are memory-only and still die with the
     /// process. That is already handled: the edge re-publishes both, which is
     /// what `init_last_upload` exists for on that side.
+    ///
+    /// A directory that already exists, is not empty and carries no
+    /// `.bilbycast-origin` marker is refused rather than adopted: the root is
+    /// operator-supplied and everything under it becomes evictable, so a typo
+    /// naming a home directory must not enrol it into the sweep.
     pub fn new(cfg: OriginConfig) -> std::io::Result<Self> {
+        // Only ever adopt — and evict from — a directory this store made.
+        // `origin_storage_dir` is operator-supplied and everything under it
+        // becomes deletable: `remove_stream` does a `remove_dir_all` from the
+        // idle sweep, and the free-space floor evicts across every stream it
+        // finds. Pointed at a home directory or a mount point by a typo, the
+        // store would index whatever is there and then age it out. A
+        // directory that exists, is not empty, and has no marker is somebody
+        // else's.
+        //
+        // The startup wipe this guard was written for is gone — the window on
+        // disk is adopted now — but the guard matters more without it, not
+        // less: adoption pulls whatever it finds *into* the store's
+        // bookkeeping, so the recursive delete simply moved from here to the
+        // sweep.
+        let marker = cfg.root.join(ORIGIN_MARKER);
+        if cfg.root.exists() {
+            let empty = std::fs::read_dir(&cfg.root)?.next().is_none();
+            if !empty && !marker.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "origin storage dir {} is not empty and was not created by the relay \
+                         (no {ORIGIN_MARKER}); refusing to adopt or erase it — point \
+                         distribution.origin_storage_dir at a directory of its own",
+                        cfg.root.display()
+                    ),
+                ));
+            }
+        }
         std::fs::create_dir_all(&cfg.root)?;
+        // Re-written on every start: a marker lost to a hand clean-out must not
+        // turn the relay's own root into a foreign directory it then refuses.
+        std::fs::write(&marker, b"bilbycast-relay origin store\n")?;
         let policy = arc_swap::ArcSwap::from_pointee(cfg.policy());
         let store = Self {
             cfg,
@@ -343,7 +483,10 @@ impl OriginStore {
             if found.is_empty() {
                 continue;
             }
-            found.sort_by(|a, b| b.3.cmp(&a.3));
+            // Descending age, so the oldest segment is at the front — the end
+            // eviction drops from. `Reverse` reads backwards next to that:
+            // reversing the age *ordering* is what puts the largest age first.
+            found.sort_by_key(|f| std::cmp::Reverse(f.3));
 
             let origin = self.ensure(&stream);
             // `try_lock`, not `blocking_lock`: the store is constructed inside
@@ -472,6 +615,20 @@ impl OriginStore {
         out
     }
 
+    /// A stream name must resolve to exactly one ordinary directory under the
+    /// root — not `.`, not `..`, not a nested or absolute path.
+    ///
+    /// The HTTP handlers validate the name before it reaches here, but this
+    /// store's methods are `pub` and every one of them turns the name into a
+    /// filesystem path. `remove_stream` in particular does a
+    /// `remove_dir_all`, so a name of `..` would recursively delete the
+    /// origin root's *parent* — the relay's whole data directory.
+    fn safe_stream_name(stream: &str) -> bool {
+        let mut components = FsPath::new(stream).components();
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+    }
+
     fn ensure(&self, stream: &str) -> Arc<StreamOrigin> {
         if let Some(s) = self.streams.get(stream) {
             return s.clone();
@@ -494,16 +651,29 @@ impl OriginStore {
     /// index entry is published only once the bytes are in place, so a reader
     /// can never observe a half-written segment.
     pub async fn put(&self, stream: &str, file: &str, bytes: Bytes) -> std::io::Result<()> {
+        if !Self::safe_stream_name(stream) || !valid_object_name(file) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "origin: unsafe stream or object name",
+            ));
+        }
         let content_type = content_type_for(file);
         let origin = self.ensure(stream);
         origin.last_put_ms.store(self.now_ms(), Ordering::Relaxed);
 
         if !is_media_segment(file) {
             // A media playlist may not advertise segments this store cannot
-            // serve. See `trim_unbacked_head`: after a relay-only restart the
-            // still-running edge re-publishes its whole window, and everything
-            // older than the restart names a file that was wiped and will
-            // never be sent again.
+            // serve. See `trim_unbacked_head`.
+            //
+            // The producer's window and this store's holdings move
+            // independently. The edge re-publishes its whole window on every
+            // manifest refresh and PUTs each segment exactly once, as it is
+            // produced — while retention, the per-stream byte cap and the
+            // node-wide free-space floor all evict from the head here. So an
+            // entry this store has dropped names a file that will never arrive
+            // again, and the relay's window is free to be the shorter of the
+            // two. Trimming on every manifest PUT rather than once at startup
+            // is what keeps the advertised window meaning what it says.
             let bytes = if file.to_ascii_lowercase().ends_with(".m3u8") {
                 let segments = &origin.segments;
                 match trim_unbacked_head(&bytes, &|uri| segments.contains_key(uri)) {
@@ -523,8 +693,19 @@ impl OriginStore {
         let path = origin.dir.join(file);
         let tmp = origin.dir.join(format!("{file}.part"));
         tokio::fs::create_dir_all(&origin.dir).await?;
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        // A `.part` left behind is invisible to every bound in this file: it is
+        // in no index, counted in no byte total, and in no eviction queue, so
+        // nothing ever reclaims it. Clean up on the failure paths rather than
+        // waiting for the next restart's adoption pass to clear it, which on a
+        // long-lived relay may be months away.
+        if let Err(e) = tokio::fs::write(&tmp, &bytes).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
 
         let meta = Arc::new(SegmentMeta {
             path,
@@ -532,13 +713,29 @@ impl OriginStore {
             len,
             stored_at: Instant::now(),
         });
-        // Re-PUT under the same name must not double-count the bytes.
+        // Re-PUT under the same name must not double-count the bytes, and
+        // must not leave the name where it was in the queue.
+        //
+        // `evict` only ever inspects `order.front()` and stops as soon as that
+        // one is young enough, which is sound only while the queue is ordered
+        // by `stored_at`. A re-PUT refreshes `stored_at`; leaving the name at
+        // its old position puts a young entry in front of genuinely expired
+        // ones, and eviction then stops at it — retention and the byte bound
+        // both quietly stop being enforced for that stream.
+        //
+        // This is not hypothetical: segment numbering restarts at `seg-00000`
+        // every time the producing flow restarts, so the first segment after a
+        // restart is a re-PUT of the oldest name in the queue.
+        let mut order = origin.order.lock().await;
         if let Some(prev) = origin.segments.insert(file.to_string(), meta) {
             origin.bytes.fetch_sub(prev.len, Ordering::Relaxed);
             self.total_bytes.fetch_sub(prev.len, Ordering::Relaxed);
-        } else {
-            origin.order.lock().await.push_back(file.to_string());
+            if let Some(pos) = order.iter().position(|n| n == file) {
+                order.remove(pos);
+            }
         }
+        order.push_back(file.to_string());
+        drop(order);
         origin.bytes.fetch_add(len, Ordering::Relaxed);
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
 
@@ -598,9 +795,13 @@ impl OriginStore {
     /// absent rather than as an error — that is a normal race against
     /// retention, not a fault.
     pub async fn get(&self, stream: &str, file: &str) -> Option<ObjectResponse> {
+        if !Self::safe_stream_name(stream) || !valid_object_name(file) {
+            return None;
+        }
         let origin = self.streams.get(stream)?.clone();
         if let Some(kept) = origin.kept.get(file) {
             return Some(ObjectResponse {
+                etag: etag_for(&kept.bytes),
                 bytes: kept.bytes.clone(),
                 content_type: kept.content_type,
             });
@@ -608,6 +809,7 @@ impl OriginStore {
         let meta = origin.segments.get(file).map(|m| m.clone())?;
         match tokio::fs::read(&meta.path).await {
             Ok(b) => Some(ObjectResponse {
+                etag: etag_for(&b),
                 bytes: Bytes::from(b),
                 content_type: meta.content_type,
             }),
@@ -625,6 +827,9 @@ impl OriginStore {
     }
 
     pub async fn remove_stream(&self, stream: &str) {
+        if !Self::safe_stream_name(stream) {
+            return;
+        }
         let Some((_, origin)) = self.streams.remove(stream) else {
             return;
         };
@@ -766,17 +971,30 @@ impl OriginStore {
 
 /// Trim leading media-playlist entries whose segments the store does not hold.
 ///
-/// The store wipes its root on startup, on the reasoning that a manifest
-/// referencing those segments died with the process. That holds when the
-/// producer restarts too. It does **not** hold when the edge keeps running: it
-/// re-publishes a manifest describing its whole window within a segment or
-/// two, and every entry older than the restart names a file that was just
-/// deleted and will never be sent again — the edge PUTs each segment once, as
-/// it is produced.
+/// The edge re-publishes a manifest describing its **whole** window on every
+/// refresh, and PUTs each segment exactly once, as it is produced. So an entry
+/// this store no longer holds names a file that will never arrive: the two
+/// windows move independently, and the relay's is free to be the shorter one.
 ///
-/// Measured on the demo rig after a relay-only restart: the playlist
-/// advertised 4500 segments and **24 of 42 probed across the window 404'd**,
-/// for the 2h30m it takes the window to roll past the restart. To a player
+/// It routinely is. Retention, the per-stream byte cap and the node-wide
+/// free-space floor all evict from the head while the producer goes on
+/// advertising those entries, and the manager sizes the first two without
+/// being able to see this relay's disk at all — a window that does not fit the
+/// volume is a policy it will happily push, which is the whole reason
+/// `min_free_bytes` exists.
+///
+/// A relay-only restart is the acute case, and adopting the window rather than
+/// wiping it did not remove it, only shrink it. Adoption stamps each segment
+/// with its real file age, so anything already past retention is evicted by
+/// the first sweep — and the still-running edge advertises exactly those. It
+/// used to be the whole window, because the store deleted its root; now it is
+/// the expired head. Either way the manifest has to be trimmed to what can
+/// actually be served.
+///
+/// Measured on the demo rig while a restart still wiped the root — the worst
+/// case rather than the current one: the playlist advertised 4500 segments and
+/// **24 of 42 probed across the window 404'd**, for the 2h30m it takes the
+/// window to roll past the restart. To a player
 /// that is not a clean error — the scrub bar is calibrated on the advertised
 /// window, so more than half of it addressed footage the origin could not
 /// serve, and both renditions failed independently.
@@ -786,10 +1004,52 @@ impl OriginStore {
 /// still in flight, and dropping that would fight the producer.
 ///
 /// Returns `None` when nothing needs changing, which is the ordinary case.
+///
+/// ## Two playlist shapes, one rule for `#EXT-X-PROGRAM-DATE-TIME`
+///
+/// The relay serves whatever edge is pointed at it, and two date shapes are
+/// in service:
+///
+/// * **A tag per segment** (edge #143 onward), each one an independent
+///   absolute time read off the media timeline against a per-flow epoch.
+/// * **One tag at the playlist head** (older edges), standing for the whole
+///   window; the player derives every other segment's time by accumulating
+///   `EXTINF` forward from it.
+///
+/// They need opposite treatment, and the shape is not declared anywhere — so
+/// this reads it off *position* rather than counting tags. A tag belongs to
+/// the next entry that follows it, which is true of both shapes: the head tag
+/// is simply the degenerate case where that entry is the first one. That
+/// gives one rule:
+///
+/// * A tag after the trimmed run already describes a segment that survived,
+///   so it is **passed through untouched**. Advancing it — which is what the
+///   head-tag shape needs — misdates the entire remaining window by the
+///   dropped duration. On the 4500-segment case above that is up to ~9000 s,
+///   for the 2h30m the window takes to roll past.
+/// * A tag inside the trimmed run describes a segment that is gone, so it is
+///   **dropped** — except for the last one, which is kept and advanced by the
+///   dropped duration that follows it if, and only if, the first surviving
+///   entry carries no tag of its own. That single exception is what keeps a
+///   head-tag playlist's only clock, and it lands on exactly the right
+///   instant because the run it advances across is the run being removed.
+///
+/// Counting tags would not do: #143 omits the tag on any segment whose time
+/// the media timeline does not give, so a per-segment playlist can carry
+/// fewer tags than segments and still be that shape.
+///
+/// Why it matters beyond one stream's clock being wrong: main and proxy are
+/// separate streams here with separate eviction, so they routinely hold
+/// different heads. The DVR page relates their two timelines *only* through
+/// these dates — `wallOn` / `mediaOn` in `dvr.html` binary-search them as
+/// exact wall clock. Shifting each rendition's dates by its own dropped
+/// duration throws the two apart by the difference, which is the wrong-frame
+/// failure edge#139 was fixed to stop.
 fn trim_unbacked_head(body: &[u8], has: &dyn Fn(&str) -> bool) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(body).ok()?;
     let lines: Vec<&str> = text.lines().collect();
     let is_uri = |l: &str| !l.is_empty() && !l.starts_with('#');
+    let is_date = |l: &str| l.starts_with("#EXT-X-PROGRAM-DATE-TIME:");
 
     // Walk entries from the head, counting those that name a segment we do not
     // hold. Stop at the first one we do: a hole further in is a different
@@ -799,6 +1059,14 @@ fn trim_unbacked_head(body: &[u8], has: &dyn Fn(&str) -> bool) -> Option<Vec<u8>
     let mut dropped_secs = 0f64;
     let mut last_line = None;
     let mut extinf: Option<f64> = None;
+    // A date and the entry it belongs to are two separate lines, and only the
+    // entry says whether the pair is being dropped — so a date is held until
+    // its entry is reached. `carried` ends up holding the last date in the
+    // trimmed run, with the dropped duration that had accumulated *before*
+    // the entry it describes; the difference from the total is how far that
+    // date has to move to land on the first survivor.
+    let mut pending_date: Option<(usize, f64)> = None;
+    let mut carried: Option<(usize, f64)> = None;
     for (i, raw) in lines.iter().enumerate() {
         let l = raw.trim();
         if let Some(rest) = l.strip_prefix("#EXTINF:") {
@@ -807,10 +1075,15 @@ fn trim_unbacked_head(body: &[u8], has: &dyn Fn(&str) -> bool) -> Option<Vec<u8>
                 .next()
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .or(Some(0.0));
+        } else if is_date(l) {
+            pending_date = Some((i, dropped_secs));
         } else if is_uri(l) {
             let Some(secs) = extinf.take() else { continue };
             if has(l) {
                 break;
+            }
+            if let Some(d) = pending_date.take() {
+                carried = Some(d);
             }
             dropped += 1;
             dropped_secs += secs;
@@ -827,39 +1100,63 @@ fn trim_unbacked_head(body: &[u8], has: &dyn Fn(&str) -> bool) -> Option<Vec<u8>
         return None;
     }
 
+    // Does the first entry left standing bring its own clock? A date reached
+    // before any `EXTINF` or URI belongs to that entry; one reached after it
+    // belongs to a later one and cannot speak for the head of the window.
+    let first_survivor_dated = lines[last_line + 1..]
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| is_date(l) || l.starts_with("#EXTINF:") || is_uri(l))
+        .is_some_and(is_date);
+    // Nothing to carry forward when the survivor is already dated: every date
+    // in the trimmed run then describes a segment that is gone, and keeping
+    // one would leave it standing in front of a segment it does not describe.
+    // hls.js takes the last tag it saw, so that is not a redundant tag — it
+    // overrides the correct one.
+    let carried = if first_survivor_dated { None } else { carried };
+
     let mut out = String::with_capacity(text.len());
     for (i, raw) in lines.iter().enumerate() {
         let l = raw.trim();
-        // Two header tags describe *which* segment the playlist starts at, so
-        // both move by what was dropped. Everything else in the header stands.
+        // Says *which* segment the playlist starts at, so it moves by what was
+        // dropped. Everything else in the header stands.
         if let Some(rest) = l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             let n = rest.trim().parse::<u64>().unwrap_or(0);
-            out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}
-", n + dropped as u64));
+            out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", n + dropped as u64));
             continue;
         }
-        if let Some(rest) = l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
-            match chrono::DateTime::parse_from_rfc3339(rest.trim()) {
-                Ok(t) => out.push_str(&format!(
-                    "#EXT-X-PROGRAM-DATE-TIME:{}
-",
-                    (t + chrono::Duration::nanoseconds((dropped_secs * 1e9) as i64))
-                        .with_timezone(&chrono::Utc)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                )),
-                // An unparseable date is passed through rather than dropped: a
-                // wrong clock is recoverable, no clock at all is not.
-                Err(_) => out.push_str(&format!("{raw}
-")),
+        // Inside the dropped run, the entries go and the header stays. Dates
+        // are decided here rather than above this test, because a date's fate
+        // depends on which side of the run it sits on.
+        if i <= last_line {
+            if l.starts_with("#EXTINF:") || is_uri(l) {
+                continue;
             }
-            continue;
+            if let Some(rest) = l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+                let Some((keep_at, before)) = carried else { continue };
+                if i != keep_at {
+                    continue;
+                }
+                let shift = dropped_secs - before;
+                match chrono::DateTime::parse_from_rfc3339(rest.trim()) {
+                    Ok(t) => out.push_str(&format!(
+                        "#EXT-X-PROGRAM-DATE-TIME:{}\n",
+                        (t + chrono::Duration::nanoseconds((shift * 1e9) as i64))
+                            .with_timezone(&chrono::Utc)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    )),
+                    // An unparseable date is passed through rather than
+                    // dropped: a wrong clock is recoverable, no clock at all
+                    // is not.
+                    Err(_) => out.push_str(&format!("{raw}\n")),
+                }
+                continue;
+            }
         }
-        // Inside the dropped run, the entries go and the header stays.
-        if i <= last_line && (l.starts_with("#EXTINF:") || is_uri(l)) {
-            continue;
-        }
-        out.push_str(&format!("{raw}
-"));
+        // Past the run, a date is already an absolute statement about a
+        // segment that survived, so it needs no adjustment — and must not be
+        // given one.
+        out.push_str(&format!("{raw}\n"));
     }
     Some(out.into_bytes())
 }
@@ -1048,10 +1345,20 @@ async fn origin_get(
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
     let Some(stream) = super::sanitize_stream_id(&stream) else {
-        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CACHE_CONTROL, "no-store")],
+            "invalid stream id",
+        )
+            .into_response();
     };
     if !valid_object_name(&file) {
-        return (StatusCode::BAD_REQUEST, "invalid object name").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CACHE_CONTROL, "no-store")],
+            "invalid object name",
+        )
+            .into_response();
     }
     // Checked before the store is touched, so a rejected request cannot be
     // used to probe which streams or segments exist.
@@ -1061,7 +1368,28 @@ async fn origin_get(
         return resp;
     }
     match st.origin.get(&stream, &file).await {
-        Some(obj) => {
+        Some(mut obj) => {
+            // Carry a query-borne credential into the playlist's own URIs.
+            //
+            // Native HLS (Safari, iOS) cannot set a request header, which is
+            // why `?token=` exists — but HLS resolves a playlist's URIs
+            // against the playlist's URL *without* its query, so every segment
+            // fetch that follows an authenticated manifest fetch arrives with
+            // no credential and is refused. Gated playback was therefore
+            // impossible on native HLS: the manifest loaded and nothing after
+            // it did.
+            //
+            // Only for the query form. hls.js sets `Authorization` on every
+            // request of its own, and rewriting for it would put a credential
+            // into URLs it did not need there.
+            if st.control.load().require_origin_token
+                && is_hls_playlist(&file)
+                && let Some(tok) = super::token_from_query(query.as_deref())
+            {
+                let rewritten = playlist_with_token(&obj.bytes, &tok);
+                obj.etag = etag_for(&rewritten);
+                obj.bytes = Bytes::from(rewritten);
+            }
             // Nothing here may be cached immutably, because no filename in a
             // live stream is stable across restarts.
             //
@@ -1089,17 +1417,42 @@ async fn origin_get(
             } else {
                 "no-cache, no-store, must-revalidate"
             };
+            // `must-revalidate` with no validator to compare means every
+            // revalidation is a full re-download. Answer the client's
+            // `If-None-Match` so the check costs a header exchange.
+            if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+                && if_none_match_matches(inm, &obj.etag)
+            {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (header::CACHE_CONTROL, cache.to_string()),
+                        (header::ETAG, obj.etag),
+                    ],
+                )
+                    .into_response();
+            }
             (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, obj.content_type.to_string()),
                     (header::CACHE_CONTROL, cache.to_string()),
+                    (header::ETAG, obj.etag),
                 ],
                 obj.bytes,
             )
                 .into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        // A miss is not durable: a segment the player is a moment early for
+        // becomes available seconds later, and one just evicted never does.
+        // Without a directive a fronting CDN is free to pick its own
+        // heuristic freshness for the 404 and keep serving it after the object
+        // lands — the negative-caching twin of the immutable trap above.
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response(),
     }
 }
 
@@ -1311,6 +1664,84 @@ mod tests {
         assert_eq!((small.segments, small.bytes), (1, 100));
         assert!(big.policy_overridden, "an override must be visible to the operator");
         assert!(!small.policy_overridden);
+    }
+
+    /// A gated playlist must carry its credential into its own URIs.
+    ///
+    /// Native HLS cannot set a header, so `?token=` is how it authenticates —
+    /// but HLS resolves a playlist's URIs against the playlist URL *without*
+    /// its query, so without this every segment fetch after an authenticated
+    /// manifest fetch arrives bare and is refused.
+    #[test]
+    fn a_gated_playlist_carries_its_token_into_every_uri() {
+        let body = b"#EXTM3U\n\
+                     #EXT-X-VERSION:9\n\
+                     #EXT-X-MAP:URI=\"init.mp4\"\n\
+                     #EXTINF:2.000,\n\
+                     seg-00001.m4s\n\
+                     #EXT-X-PART:DURATION=0.5,URI=\"seg-00002.m4s?part=0\"\n\
+                     seg-00002.m4s\n";
+        let out = String::from_utf8(playlist_with_token(body, "1770000000.abc")).unwrap();
+
+        assert!(out.contains("#EXT-X-MAP:URI=\"init.mp4?token=1770000000.abc\""));
+        assert!(out.contains("\nseg-00001.m4s?token=1770000000.abc\n"));
+        // An existing query keeps it, and gets `&`.
+        assert!(out.contains("seg-00002.m4s?part=0&token=1770000000.abc"));
+        // Tags that name no URI are untouched.
+        assert!(out.contains("#EXT-X-VERSION:9\n"));
+        assert!(out.starts_with("#EXTM3U\n"));
+        // A comma in a multi-stream token has to survive the round trip.
+        let multi = String::from_utf8(playlist_with_token(body, "1770000000.a,b.abc")).unwrap();
+        assert!(multi.contains("seg-00001.m4s?token=1770000000.a%2Cb.abc"));
+        assert_eq!(
+            crate::distribution::token_from_query(Some("token=1770000000.a%2Cb.abc")).as_deref(),
+            Some("1770000000.a,b.abc"),
+            "the encoded form must decode back to the signed bytes"
+        );
+    }
+
+    /// A stream id names a directory under the origin root, so a name that is
+    /// a relative-path token escapes it. `remove_stream` does a
+    /// `remove_dir_all`, so `..` would recursively delete the relay's data
+    /// directory — the origin root's parent.
+    #[tokio::test]
+    async fn origin_refuses_stream_names_that_escape_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sibling = tmp.path().join("keep-me");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("important"), b"x").unwrap();
+        let s = store(&tmp, 8);
+
+        for escape in ["..", ".", "a/b", "/abs"] {
+            assert!(
+                s.put(escape, "seg0.m4s", Bytes::from_static(b"x")).await.is_err(),
+                "put accepted {escape:?}"
+            );
+            assert!(s.get(escape, "seg0.m4s").await.is_none(), "get accepted {escape:?}");
+            s.remove_stream(escape).await;
+        }
+
+        assert!(
+            sibling.join("important").exists(),
+            "a sibling of the origin root was deleted"
+        );
+        assert!(tmp.path().join("origin").exists(), "the origin root was deleted");
+        assert!(
+            !tmp.path().join("seg0.m4s").exists(),
+            "a segment was written outside the origin root"
+        );
+    }
+
+    /// The HTTP layer's own guard, which is what actually runs in production.
+    #[test]
+    fn stream_id_sanitiser_rejects_relative_path_tokens() {
+        use crate::distribution::sanitize_stream_id;
+        for bad in ["..", ".", "...", "....", " .. "] {
+            assert!(sanitize_stream_id(bad).is_none(), "accepted {bad:?}");
+        }
+        // Dots are still legal *inside* a real name.
+        assert_eq!(sanitize_stream_id("show.proxy").as_deref(), Some("show.proxy"));
+        assert_eq!(sanitize_stream_id("a").as_deref(), Some("a"));
     }
 
     #[tokio::test]
@@ -1652,13 +2083,17 @@ mod tests {
 
     /// The advertised window may not promise segments the store cannot serve.
     ///
-    /// The store wipes its root on startup. That is right when the producer
-    /// restarts too, but the edge usually does not: it re-publishes a manifest
-    /// describing its whole window within a segment or two, and every entry
-    /// older than the restart names a file that was just deleted and will
-    /// never be sent again.
+    /// The edge re-publishes its whole window on every manifest refresh and
+    /// PUTs each segment exactly once, so anything this store has evicted — by
+    /// retention, by the byte cap, or by the free-space floor — stays
+    /// advertised but unfetchable until the producer's own window rolls past
+    /// it. What this sets up, two of four segments held, is that state; it is
+    /// deliberately indifferent to *how* the store came to be missing the
+    /// other two, which is why it kept testing the right thing when the
+    /// startup wipe was replaced by adoption.
     ///
-    /// Measured on the demo rig after a relay-only restart: 4500 segments
+    /// Measured on the demo rig while a restart still wiped the root — the
+    /// worst case rather than the current one: 4500 segments
     /// advertised, **24 of 42 probed across the window 404'd**, and it stayed
     /// that way for the 2h30m the window takes to roll past. The player
     /// calibrates its scrub bar on the advertised window, so more than half
@@ -1714,6 +2149,306 @@ seg-4.m4s
         // The rest of the header is not this function's business.
         assert!(body.contains("#EXT-X-MAP:URI=\"init.mp4\""), "{body}");
         assert!(body.contains("#EXT-X-TARGETDURATION:2"), "{body}");
+    }
+    /// The absolute time this file's playlists give to `secs` past their epoch.
+    fn stamp(secs: u32) -> String {
+        format!("2026-08-27T00:00:{secs:02}.000Z")
+    }
+
+    /// The date belonging to segment `n`, which covers the two seconds
+    /// starting `2·(n-1)` past the epoch.
+    fn date_line(n: u32) -> String {
+        format!("#EXT-X-PROGRAM-DATE-TIME:{}\n", stamp(2 * (n - 1)))
+    }
+
+    /// A media playlist in the shape edge #143 publishes: one
+    /// `#EXT-X-PROGRAM-DATE-TIME` immediately before the `#EXTINF` it
+    /// describes, rather than one at the head standing for the whole window.
+    fn per_segment_dated(segments: &[u32]) -> String {
+        let mut m = String::from(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-MEDIA-SEQUENCE:1\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+        ));
+        for &n in segments {
+            m.push_str(&date_line(n));
+            m.push_str(&format!("#EXTINF:2.000,\nseg-{n}.m4s\n"));
+        }
+        m
+    }
+
+    /// The date a player would attach to `uri`: the last one it saw at or
+    /// before that segment. This mirrors hls.js rather than the spec — a
+    /// second tag with no segment between overrides the first — which is the
+    /// whole reason a stale tag left behind by a trim is not a cosmetic
+    /// defect.
+    fn date_a_player_reads(body: &str, uri: &str) -> Option<String> {
+        let mut last = None;
+        for l in body.lines().map(str::trim) {
+            if let Some(rest) = l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+                last = Some(rest.trim().to_string());
+            } else if l == uri {
+                return last;
+            }
+        }
+        None
+    }
+
+    /// Dates with no segment between them. Any at all is a date orphaned by
+    /// the trim: the entry it described is gone, so it now speaks for the
+    /// next surviving one and misdates it.
+    fn orphaned_dates(body: &str) -> usize {
+        let mut orphans = 0usize;
+        let mut pending = false;
+        for l in body.lines().map(str::trim) {
+            if l.starts_with("#EXT-X-PROGRAM-DATE-TIME:") {
+                if pending {
+                    orphans += 1;
+                }
+                pending = true;
+            } else if l.starts_with("#EXTINF:") {
+                pending = false;
+            }
+        }
+        orphans
+    }
+
+    /// Surviving per-segment dates are already right and must not be moved.
+    ///
+    /// This is the contract edge #143 shipped: every entry carries its own
+    /// absolute time, derived from the media timeline rather than sampled
+    /// from `Utc::now()` at publish. So a date that survives the trim is a
+    /// statement about a segment that also survived — trimming the head in
+    /// front of it changes nothing about when it happened.
+    ///
+    /// Advancing all of them by the dropped duration, which is what a
+    /// head-tag playlist needs, misdates the *whole* remaining window by that
+    /// amount. On the case `trim_unbacked_head` documents — a relay-only
+    /// restart against a 4500-segment window — that is up to ~9000 s, and it
+    /// persists for the 2h30m the window takes to roll past.
+    #[tokio::test]
+    async fn surviving_per_segment_dates_are_not_shifted_by_the_trim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        for n in 3..=6 {
+            s.put("s", &format!("seg-{n}.m4s"), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        s.put("s", "manifest.m3u8", Bytes::from(per_segment_dated(&[1, 2, 3, 4, 5, 6])))
+            .await
+            .unwrap();
+
+        let body =
+            String::from_utf8(s.get("s", "manifest.m3u8").await.unwrap().bytes.to_vec()).unwrap();
+
+        assert!(
+            !body.contains("seg-1.m4s") && !body.contains("seg-2.m4s"),
+            "still advertising segments the store does not hold:\n{body}"
+        );
+        // Each survivor keeps the time it was actually published at.
+        for (n, secs) in [(3, 4), (4, 6), (5, 8), (6, 10)] {
+            assert_eq!(
+                date_a_player_reads(&body, &format!("seg-{n}.m4s")).as_deref(),
+                Some(stamp(secs).as_str()),
+                "seg-{n} is not dated from its own position:\n{body}"
+            );
+        }
+        // The two dropped entries' dates go with them, rather than piling up
+        // in front of the first survivor.
+        assert_eq!(
+            body.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
+            4,
+            "one date per surviving segment, no more:\n{body}"
+        );
+        assert_eq!(orphaned_dates(&body), 0, "a date outlived its segment:\n{body}");
+        // The shifted values the old arithmetic produced. Naming them keeps
+        // this test failing loudly if the head-tag rule is ever reapplied to
+        // this shape.
+        for secs in [14, 16, 18, 20] {
+            assert!(
+                !body.contains(&stamp(secs)),
+                "a surviving date was advanced by the dropped duration:\n{body}"
+            );
+        }
+        assert!(body.contains("#EXT-X-MEDIA-SEQUENCE:3"), "{body}");
+    }
+
+    /// A trim that drops nothing changes nothing.
+    ///
+    /// The ordinary case, and worth pinning separately: the dates are the
+    /// part of a playlist a rewrite is most likely to disturb by accident,
+    /// and a byte-identical result is the only assertion that covers all of
+    /// them at once.
+    #[tokio::test]
+    async fn a_fully_backed_window_is_passed_through_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        for n in 1..=4 {
+            s.put("s", &format!("seg-{n}.m4s"), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let m = per_segment_dated(&[1, 2, 3, 4]);
+        s.put("s", "manifest.m3u8", Bytes::from(m.clone())).await.unwrap();
+
+        let body =
+            String::from_utf8(s.get("s", "manifest.m3u8").await.unwrap().bytes.to_vec()).unwrap();
+        assert_eq!(body, m, "a playlist needing no trim was rewritten anyway");
+    }
+
+    /// An edge that dates only the playlist head still gets its clock moved.
+    ///
+    /// The relay serves whatever edge is pointed at it, including one built
+    /// before #143, and that shape has exactly one clock: the player derives
+    /// every other segment's time by accumulating `EXTINF` from it. Dropping
+    /// it — which is right for a date belonging to a trimmed entry when a
+    /// survivor carries its own — would leave that playlist with no clock at
+    /// all, and the DVR page's scrub, marks and still all convert through it.
+    ///
+    /// So the head tag is kept and advanced by what was dropped, which is the
+    /// behaviour this file has always had. It is restated as its own case now
+    /// that a second shape shares the function.
+    #[tokio::test]
+    async fn an_older_edge_that_dates_only_the_head_keeps_a_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        s.put("s", "seg-3.m4s", Bytes::from_static(b"c")).await.unwrap();
+        s.put("s", "seg-4.m4s", Bytes::from_static(b"d")).await.unwrap();
+
+        let m = format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n{}\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:2.000,\nseg-1.m4s\n\
+             #EXTINF:2.000,\nseg-2.m4s\n\
+             #EXTINF:2.000,\nseg-3.m4s\n\
+             #EXTINF:2.000,\nseg-4.m4s\n",
+            date_line(1)
+        );
+        s.put("s", "manifest.m3u8", Bytes::from(m)).await.unwrap();
+
+        let body =
+            String::from_utf8(s.get("s", "manifest.m3u8").await.unwrap().bytes.to_vec()).unwrap();
+        assert_eq!(
+            body.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
+            1,
+            "the only clock in a head-tag playlist was dropped or duplicated:\n{body}"
+        );
+        assert_eq!(
+            date_a_player_reads(&body, "seg-3.m4s").as_deref(),
+            Some(stamp(4).as_str()),
+            "the head clock still points at a segment that is gone:\n{body}"
+        );
+    }
+
+    /// A survivor with no date of its own inherits a corrected one.
+    ///
+    /// #143 emits a tag per segment but omits it where the media timeline
+    /// gives no time (`an_undated_segment_is_left_undated`, edge-side), so
+    /// the first entry left standing may carry none. Dropping every date
+    /// belonging to a trimmed entry would then hand the player a window whose
+    /// head is undated and whose first date arrives some segments in — it
+    /// would accumulate backwards from that, or give up on wall clock.
+    ///
+    /// The last date in the trimmed run is therefore kept and advanced by the
+    /// dropped duration that follows it, which lands it exactly on the first
+    /// survivor. This is the same rule as the head-tag case above; that shape
+    /// is just the special case where the run's only date is the first one.
+    #[tokio::test]
+    async fn a_survivor_that_carries_no_date_is_given_the_corrected_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        s.put("s", "seg-3.m4s", Bytes::from_static(b"c")).await.unwrap();
+        s.put("s", "seg-4.m4s", Bytes::from_static(b"d")).await.unwrap();
+
+        // seg-3 is the undated one, and it is the first survivor.
+        let m = format!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n\
+             {}#EXTINF:2.000,\nseg-1.m4s\n\
+             {}#EXTINF:2.000,\nseg-2.m4s\n\
+             #EXTINF:2.000,\nseg-3.m4s\n\
+             {}#EXTINF:2.000,\nseg-4.m4s\n",
+            date_line(1),
+            date_line(2),
+            date_line(4)
+        );
+        s.put("s", "manifest.m3u8", Bytes::from(m)).await.unwrap();
+
+        let body =
+            String::from_utf8(s.get("s", "manifest.m3u8").await.unwrap().bytes.to_vec()).unwrap();
+        assert_eq!(
+            date_a_player_reads(&body, "seg-3.m4s").as_deref(),
+            Some(stamp(4).as_str()),
+            "the first survivor was left with a date belonging to a trimmed segment:\n{body}"
+        );
+        assert_eq!(
+            date_a_player_reads(&body, "seg-4.m4s").as_deref(),
+            Some(stamp(6).as_str()),
+            "seg-4's own date was disturbed:\n{body}"
+        );
+        assert_eq!(orphaned_dates(&body), 0, "a date outlived its segment:\n{body}");
+        assert_eq!(
+            body.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
+            2,
+            "expected one carried-forward date and seg-4's own:\n{body}"
+        );
+    }
+
+    /// Two renditions that lose different amounts of head still agree.
+    ///
+    /// This is the failure that matters operationally. Main and proxy are
+    /// separate streams in this store with separate eviction, so a restart or
+    /// a byte cap routinely leaves them holding different heads. The DVR page
+    /// relates the two timelines *only* through `#EXT-X-PROGRAM-DATE-TIME`
+    /// (`docs/distribution.md`, "Relating the two renditions"): `wallOn` and
+    /// `mediaOn` binary-search these dates as exact wall clock.
+    ///
+    /// Shifting every surviving date by that rendition's own dropped duration
+    /// therefore throws the two apart by the *difference* — a per-rendition
+    /// offset that lands the still on the wrong frame, which is precisely
+    /// what edge #139 was fixed to stop.
+    #[tokio::test]
+    async fn two_renditions_that_lose_different_heads_still_date_a_segment_alike() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 8);
+        // Same content, same epoch, different survivors: main keeps four,
+        // proxy keeps three.
+        for n in 3..=6 {
+            s.put("main", &format!("seg-{n}.m4s"), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        for n in 4..=6 {
+            s.put("proxy", &format!("seg-{n}.m4s"), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let m = per_segment_dated(&[1, 2, 3, 4, 5, 6]);
+        for stream in ["main", "proxy"] {
+            s.put(stream, "manifest.m3u8", Bytes::from(m.clone()))
+                .await
+                .unwrap();
+        }
+
+        let read = |body: Vec<u8>| String::from_utf8(body).unwrap();
+        let main = read(s.get("main", "manifest.m3u8").await.unwrap().bytes.to_vec());
+        let proxy = read(s.get("proxy", "manifest.m3u8").await.unwrap().bytes.to_vec());
+
+        let m4 = date_a_player_reads(&main, "seg-4.m4s");
+        let p4 = date_a_player_reads(&proxy, "seg-4.m4s");
+        assert_eq!(
+            m4, p4,
+            "the two renditions date the same content differently, by the \
+             difference in what each lost:\nmain:\n{main}\nproxy:\n{proxy}"
+        );
+        assert_eq!(
+            m4.as_deref(),
+            Some(stamp(6).as_str()),
+            "they agree, but on the wrong time:\n{main}"
+        );
+        assert_eq!(orphaned_dates(&main), 0, "{main}");
+        assert_eq!(orphaned_dates(&proxy), 0, "{proxy}");
     }
 
     /// A hole *inside* the window is left alone.
@@ -1771,6 +2506,10 @@ seg-1.m4s
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("origin");
         std::fs::create_dir_all(root.join("s")).unwrap();
+        // What a previous run of this store would have left behind: the
+        // marker, so the foreign-directory guard adopts this root rather
+        // than refusing it as somebody else's.
+        std::fs::write(root.join(ORIGIN_MARKER), b"x").unwrap();
         std::fs::write(root.join("s/seg-00001.m4s"), b"old").unwrap();
         std::fs::write(root.join("s/seg-00002.m4s"), b"newer").unwrap();
         // A PUT interrupted by the very restart being recovered from. It is
@@ -1795,6 +2534,9 @@ seg-1.m4s
         // And the bytes are accounted for, or the byte cap is blind to
         // everything recovered and the stream overruns its bound.
         assert_eq!(s.total_bytes(), 8, "adopted bytes are not accounted for");
+        // Re-written on every start, so a root an operator cleaned out by
+        // hand is not refused as somebody else's on the next one.
+        assert!(root.join(ORIGIN_MARKER).exists(), "marker must be re-written");
     }
 
     /// An adopted segment keeps its real age.
@@ -1808,6 +2550,9 @@ seg-1.m4s
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("origin");
         std::fs::create_dir_all(root.join("s")).unwrap();
+        // What a previous run of this store would have left behind, so the
+        // foreign-directory guard adopts this root instead of refusing it.
+        std::fs::write(root.join(ORIGIN_MARKER), b"x").unwrap();
         let old = root.join("s/seg-00001.m4s");
         std::fs::write(&old, b"xx").unwrap();
         let f = std::fs::File::options().write(true).open(&old).unwrap();
@@ -1842,6 +2587,9 @@ seg-1.m4s
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("origin");
         std::fs::create_dir_all(root.join("s")).unwrap();
+        // What a previous run of this store would have left behind, so the
+        // foreign-directory guard adopts this root instead of refusing it.
+        std::fs::write(root.join(ORIGIN_MARKER), b"x").unwrap();
         // The names run *opposite* to the ages on purpose. Sorted by name —
         // which is roughly what `read_dir` returns — the queue comes out
         // exactly backwards, so a missing sort cannot pass by luck. An earlier
@@ -1883,6 +2631,88 @@ seg-1.m4s
             s.get("s", "seg-00010.m4s").await.is_some(),
             "the newest segment was evicted instead"
         );
+    }
+
+    /// The origin root is an operator-supplied path, and every byte under
+    /// it is evictable: adoption enrols what is there and the sweep, the
+    /// byte cap and the free-space floor then delete it. The startup wipe
+    /// this guard was written for is gone, but a directory the relay did
+    /// not create must still be refused rather than taken over.
+    #[tokio::test]
+    async fn startup_refuses_a_directory_it_did_not_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("someones-data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("thesis.txt"), b"years of work").unwrap();
+
+        let err = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(60),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_millis(80),
+        })
+        .map(|_| ())
+        .expect_err("a foreign non-empty directory must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(root.join("thesis.txt").exists(), "the directory was erased");
+
+        // An empty directory is fine — that is a fresh install.
+        let fresh = tmp.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        assert!(
+            OriginStore::new(OriginConfig {
+                root: fresh,
+                retention: Duration::from_secs(60),
+                max_bytes_per_stream: 1 << 30,
+                min_segments: 8,
+                min_free_bytes: 0,
+                idle_grace: Duration::from_millis(80),
+            })
+            .map(|_| ())
+            .is_ok()
+        );
+    }
+
+    /// A root the relay created is adoptable by the relay's own next start.
+    ///
+    /// This is the other half of the guard above, and it had no test at all.
+    /// The three adoption tests each write `ORIGIN_MARKER` by hand — they have
+    /// to, or no store builds on a populated root — so not one of them can
+    /// tell whether `new` writes one. Nothing else covered it either: on a
+    /// fresh root the guard is skipped because the directory is empty, so a
+    /// relay that had stopped marking its root would install, run and restart
+    /// cleanly right up until it held its first segment. From then on the root
+    /// is non-empty and unmarked, which is precisely the shape reserved for
+    /// somebody else's directory — and the relay refuses to start, for good,
+    /// and only in the field.
+    ///
+    /// So it is asserted as the round trip rather than as a file existing:
+    /// build a store, PUT a segment, drop it, build a second store on the same
+    /// root, and require the window back. Nothing is written by hand in
+    /// between, so whatever the second start needs, the first has to have left
+    /// there.
+    #[tokio::test]
+    async fn a_root_the_relay_created_is_adopted_by_its_own_next_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = store(&tmp, 8);
+        let root = first.root().to_path_buf();
+        put_seg(&first, "s", "seg-00001.m4s", 64).await;
+        drop(first);
+
+        assert!(
+            root.join(ORIGIN_MARKER).exists(),
+            "the relay did not mark the root it created, so its own next start refuses it"
+        );
+        // `store` builds on the same root, and this is the call that would
+        // return the foreign-directory error rather than a store.
+        let second = store(&tmp, 8);
+        assert!(
+            second.get("s", "seg-00001.m4s").await.is_some(),
+            "the second start did not adopt the window the first one wrote"
+        );
+        assert_eq!(second.total_bytes(), 64, "adopted bytes are not accounted for");
     }
 
     /// The kept/evictable split still drives *how* an object is cached, but

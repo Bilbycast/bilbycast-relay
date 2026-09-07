@@ -30,3 +30,7 @@ certs/
 
 # Logs
 *.log
+
+# Opt-in jsdom harness for the DVR page (see src/distribution/tests/).
+node_modules/
+package-lock.json

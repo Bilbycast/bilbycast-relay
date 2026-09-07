@@ -126,7 +126,7 @@ pub async fn run_distribution(
         max_bytes_per_stream: config.origin_max_bytes_per_stream,
         min_segments: config.origin_window_segments,
         min_free_bytes: config.origin_min_free_bytes,
-        idle_grace: std::time::Duration::from_secs(60),
+        idle_grace: std::time::Duration::from_secs(config.origin_idle_grace_secs),
     };
     tracing::info!(
         root = %origin_cfg.root.display(),
@@ -148,7 +148,16 @@ pub async fn run_distribution(
         let mut rx = control.subscribe_origin();
         // The drop queue, taken once — the origin store is its only consumer.
         let mut drops = control.take_drops();
+        let retained = control.origin_policy_now();
         tokio::spawn(async move {
+            // `subscribe` marks the current value as seen, so a push that
+            // landed while the store was being built — plausible, since
+            // `OriginStore::new` walks the root, which on a deep DVR window is
+            // thousands of files — would never be delivered. Apply what is
+            // retained before waiting for the next change.
+            if retained.default.is_some() || retained.per_stream.is_some() {
+                origin.apply_policy_update(&retained);
+            }
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -361,19 +370,14 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Validate + normalize a stream id from the URL path. Streams are named by
-/// the manager; keep the character set tight to avoid path/URL abuse.
-pub fn sanitize_stream_id(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    if s.is_empty() || s.len() > 128 {
-        return None;
-    }
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
-        Some(s.to_string())
-    } else {
-        None
-    }
-}
+/// Validate + normalize a stream id from the URL path.
+///
+/// Lives in `distribution_control` because the manager client — which is not
+/// feature-gated — validates the stream ids in a storage-policy push against
+/// the very same rule the request path applies. Two copies would drift, and a
+/// key that passes the push but fails the request is an override that is
+/// stored, acked and matches nothing.
+pub use crate::distribution_control::sanitize_stream_id;
 
 /// `POST /whep/{stream_id}` — accept a viewer's SDP offer, return the answer.
 async fn whep_offer(
@@ -602,15 +606,51 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 /// The `?` is already stripped by axum's `RawQuery` extractor, so this takes
 /// the query body only.
 ///
-/// No percent-decoding: a viewer token is `"{exp}.{hmac}"` — decimal digits, a
-/// dot, and lowercase hex — and nothing in that set is percent-encoded by a
-/// conforming client. Decoding would only widen what we accept.
-fn token_from_query(raw: Option<&str>) -> Option<String> {
-    raw?.split('&')
+/// Percent-decoded, and `+` is treated as a space is NOT — a token contains
+/// neither.
+///
+/// This used to decode nothing, on the reasoning that a viewer token is
+/// `"{exp}.{hmac}"` — decimal digits, a dot and lowercase hex — none of which a
+/// conforming client encodes. That set has since widened: a multi-stream token
+/// is `"{exp}.{a,b}.{hmac}"` and carries commas and stream names, and
+/// `encodeURIComponent` turns a comma into `%2C`. Undecoded, the HMAC then
+/// covers a different string and a valid credential is refused as a forgery.
+///
+/// Decoding cannot widen what is accepted: whatever comes out still has to
+/// carry a signature over the exact bytes.
+pub(super) fn token_from_query(raw: Option<&str>) -> Option<String> {
+    let raw_value = raw?
+        .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(k, _)| *k == "token")
-        .map(|(_, v)| v.to_string())
-        .filter(|v| !v.is_empty())
+        .map(|(_, v)| v)?;
+    let decoded = percent_decode(raw_value);
+    Some(decoded).filter(|v| !v.is_empty())
+}
+
+/// Minimal `%XX` decoder. Anything that is not a well-formed escape is passed
+/// through unchanged, so a token that needed no decoding is untouched.
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Validate a viewer token supplied via `Authorization: Bearer` **or** the
@@ -723,10 +763,17 @@ async fn dvr_page(
         .unwrap_or_default();
     let html = include_str!("dvr.html")
         .replace("__STREAM_ID__", &stream_id)
-        .replace("__PORTAL_URL__", &portal);
+        .replace("__PORTAL_URL__", &portal)
+        .replace("__HLS_JS_VERSION__", HLS_JS_VERSION);
     // The page is an app shell that changes with the build. Without this a
     // browser will happily serve a cached copy after an upgrade, so a fixed
-    // player looks unfixed. (`/dvr/hls.js` stays immutable — it is versioned.)
+    // player looks unfixed.
+    //
+    // The page is also what versions `/dvr/hls.js`: it is served `immutable`,
+    // which is a promise about a URL, and `/dvr/hls.js` on its own is a URL
+    // whose bytes change on every hls.js bump. The `?v=` the page appends is
+    // what makes the promise true — a viewer who cached the old bundle for a
+    // year is asked for a different URL after an upgrade.
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -743,6 +790,12 @@ async fn dvr_page(
 /// deployed where viewers have no route to the public internet, and because a
 /// player that silently stops working when a CDN changes is not a broadcast
 /// tool. Android Chrome has no native HLS, so this is not optional there.
+/// The vendored bundle's version, appended to its URL by the page above.
+///
+/// Keep in step with `vendor/README.md`; the pair is what lets the response be
+/// `immutable` without pinning viewers to a superseded bundle.
+pub const HLS_JS_VERSION: &str = "1.6.16";
+
 async fn dvr_hls_js() -> Response {
     (
         [
@@ -842,6 +895,21 @@ mod tests {
         );
         // And the wall clock must come from the playlist's own absolute time,
         // not from anything the player invented.
+        //
+        // What this pins is the *field* `wallOn` reads, not how many
+        // `#EXT-X-PROGRAM-DATE-TIME` tags the playlist carries, which is why it
+        // still holds now that the edge writes one per segment
+        // (bilbycast-edge#143) rather than one at the head. hls.js publishes
+        // `frag.programDateTime` under both shapes: `Date.parse` of that
+        // segment's own tag when it has one, otherwise the previous fragment's
+        // end. Either way it is the playlist's absolute time, and neither is
+        // `currentTime` or `timelineOffset` — that substitution is what this
+        // refuses, and it is the one that puts two viewers minutes apart.
+        //
+        // It does not pin *which* fragment the date is read off: a
+        // head-anchored rewrite, summing `EXTINF` from the top of a three-hour
+        // window, would contain the word too. That property is a separate
+        // assertion in `the_two_renditions_are_related_by_their_published_clock`.
         let wall = js_fn(html, "wallOn");
         assert!(
             wall.contains("programDateTime"),
@@ -1093,7 +1161,7 @@ mod tests {
         // disabled until something else redrew the list. It also changes on
         // its own as the window rolls past a mark.
         assert!(
-            js_fn(html, "render()").contains("refreshMarkStates()"),
+            js_fn(html, "render(remeasure)").contains("refreshMarkStates()"),
             "reachability is decided once, when it cannot yet be known"
         );
         assert!(
@@ -1145,8 +1213,17 @@ mod tests {
         let html = include_str!("dvr.html");
         let step = js_fn(html, "prefetchStep");
         assert!(
-            step.contains("if (!scrubbing)"),
+            step.contains("!scrubbing"),
             "prefetching competes with the drag it exists to serve: {step}"
+        );
+        // And it must stop before it starts evicting. Past the budget every
+        // prefetch evicts a sheet that `nextSheetToPrefetch` then re-selects
+        // as the nearest one not held, so the two loop forever — the window
+        // re-downloaded every `PREFETCH_GAP_MS` for as long as the tab is
+        // open, on connections this feature exists to be gentle with.
+        assert!(
+            step.contains("sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES"),
+            "the prefetcher evicts, so it thrashes the cache forever: {step}"
         );
         assert!(
             step.contains("setTimeout(prefetchStep, PREFETCH_GAP_MS)"),
@@ -1297,9 +1374,24 @@ mod tests {
         );
         // And the sampling has to actually run in this mode. It was gated on
         // `proxyAttached`, which balanced never sets, so the offset stayed 0.
+        //
+        // The property, not the line. This pinned the whole `if` verbatim, and
+        // that condition has a second, unrelated tenant: `render(remeasure)`
+        // resamples only on the 200 ms tick, so the shuttle's rAF cannot refill
+        // a 5 s median window in 0.4 s. Adding that throttle left the behaviour
+        // this test is about completely intact and still turned the test red —
+        // twice over, since the two changes were written on different branches
+        // and the merge that unioned them correctly was the thing that broke
+        // it. What this has to know is only that a still-attached session
+        // reaches the sampler at all, whatever else the gate has picked up.
+        let render = js_fn(html, "render(remeasure)");
+        let gate = render
+            .lines()
+            .find(|l| l.contains("measureTimelineOffset()"))
+            .expect("render no longer samples the handover offset at all");
         assert!(
-            html.contains("if (proxyAttached || stillAttached) measureTimelineOffset();"),
-            "the offset is not sampled while a still is attached"
+            gate.contains("stillAttached"),
+            "the offset is not sampled while a still is attached: {gate}"
         );
         // A median that improves after the fact must move the still with it.
         assert!(
@@ -1572,6 +1664,81 @@ mod tests {
         );
     }
 
+    /// The wall-clock search does not assume the published dates ascend.
+    ///
+    /// A playlist carrying one `#EXT-X-PROGRAM-DATE-TIME` at its head leaves
+    /// hls.js nothing to read for the rest of the window, so it derives every
+    /// later fragment from the one before it and the array ascends by
+    /// construction — which is what made a plain binary search over it safe by
+    /// construction. The edge now writes a tag on every segment
+    /// (bilbycast-edge#143) and each is parsed verbatim, so whatever the
+    /// publisher wrote arrives intact.
+    ///
+    /// It can be backwards. The edge's `FlowClock` steers a flow's epoch
+    /// towards the wall clock its samples imply, by at most `EPOCH_SLEW_SECS`
+    /// (5 ms) per segment — 2500 ppm — so a source running faster than that
+    /// cannot be tracked and the error grows until it crosses
+    /// `EPOCH_REANCHOR_SECS` (10 s) and the epoch snaps onto the sample. The
+    /// segment published across the snap is dated about eight seconds *before*
+    /// its predecessor, carrying `#EXT-X-DISCONTINUITY`. Nothing in RFC 8216
+    /// obliges the dates to ascend across one either, so this holds for any
+    /// publisher into the origin and not only for our own edge.
+    ///
+    /// A binary search over that array walks the wrong way at the step and
+    /// answers with a fragment minutes from the one asked for: a mark recalled
+    /// to the wrong picture, a scrub handover that throws the frame, and
+    /// nothing on screen to say so.
+    #[test]
+    fn the_wall_clock_search_survives_dates_that_step_backwards() {
+        let html = include_str!("dvr.html");
+        let inv = js_fn(html, "mediaOn");
+        assert!(
+            inv.contains("dateRuns(frags)"),
+            "the inverse still assumes the dates ascend: {inv}"
+        );
+        // Newest run first. After a backwards snap two rows claim the same
+        // wall clock, and the newer content is the one being looked at — and
+        // the one both renditions land on, since they publish identical dates
+        // and identical discontinuities.
+        assert!(
+            inv.contains("for (var r = runs.length - 1; r >= 0; r--)"),
+            "the runs are not searched newest first: {inv}"
+        );
+
+        // Still a binary search per run rather than a scan. `renderFlags` and
+        // `markNear` call this once per mark from inside a render, against a
+        // window that is 4500 rows at three hours of 2 s segments, so a linear
+        // search here is marks x window every frame.
+        let run = js_fn(html, "coveringRow");
+        assert!(
+            run.contains("(lo + hi) >> 1"),
+            "the per-run search is no longer a binary search: {run}"
+        );
+        // And the split is computed once per playlist refresh, not once per
+        // lookup — with a slot for each rendition, because `toMainTime` reads
+        // one element and `fromMainTime` the other, so a single slot misses on
+        // every call and repays the whole pass each time.
+        let runs = js_fn(html, "dateRuns");
+        assert!(
+            runs.contains("dateRunsMemo"),
+            "the run split is recomputed on every lookup: {runs}"
+        );
+        assert!(
+            html.contains("if (dateRunsMemo.length > 2) dateRunsMemo.pop();"),
+            "the run-split memo cannot hold both renditions at once"
+        );
+
+        // `wallOn` is deliberately left alone, and the next reader should not
+        // "fix" it: it searches `start`, which hls.js builds by accumulating
+        // durations and which therefore ascends whatever the dates do. A date
+        // that steps backwards changes what it returns, never where it looks.
+        assert!(
+            js_fn(html, "wallOn").contains("fragAt(frags, t)"),
+            "the forward direction now searches something that can run backwards"
+        );
+    }
+
+
     /// A softened picture says so.
     ///
     /// This player has produced "degraded but invisible" more than once — a
@@ -1820,7 +1987,7 @@ mod tests {
     #[test]
     fn the_bar_spans_the_view_but_live_is_measured_against_the_whole_window() {
         let html = include_str!("dvr.html");
-        let render = js_fn(html, "render()");
+        let render = js_fn(html, "render(remeasure)");
         assert!(
             render.contains("viewRange()"),
             "the bar does not follow the view: {render}"
@@ -1930,7 +2097,7 @@ mod tests {
         // And that the loop is *started*. `tickLoop` re-arms itself, so the
         // call appears inside its own body and proves nothing on its own.
         assert!(
-            html.contains("setInterval(render, 200);
+            html.contains("setInterval(function () { render(true); }, 200);
   requestAnimationFrame(tickLoop);"),
             "the ruler loop is never started, so it only moves at render's 5 Hz"
         );
@@ -1977,7 +2144,7 @@ mod tests {
             2,
             "only one of the two view paths uses the smoothed edge: {vr}"
         );
-        let render = js_fn(html, "render()");
+        let render = js_fn(html, "render(remeasure)");
         assert!(
             render.contains(r#"tDur.textContent = "-" + fmt(Math.max(0, r.end - pos))"#),
             "`behind live` is reading the smoothed edge and would lag a segment"
@@ -2050,7 +2217,7 @@ mod tests {
 
         // Every place the position is shown must go through the same clock,
         // and every one must fall back rather than invent a time.
-        let render = js_fn(html, "render()");
+        let render = js_fn(html, "render(remeasure)");
         assert!(
             render.contains("wallClockAt(pos)") && render.contains("fmtTimeOfDay"),
             "the main readout does not show a time of day: {render}"
@@ -2118,24 +2285,38 @@ mod tests {
         );
     }
 
-    /// The self-test must be inert unless asked for.
+    /// The self-test must be inert unless asked for, and must be closable.
     ///
     /// It seeks both elements dozens of times and drives the preview by hand.
     /// Running any of that for an ordinary viewer would be a player that
-    /// jumps around on load, so the whole thing hangs off one query flag and
-    /// a deliberate tap.
+    /// jumps around on load, so what it hangs off is a deliberate tap.
+    ///
+    /// The query flag decides only whether the panel is *shown* on load, not
+    /// whether its button works: the panel is also reachable from Settings,
+    /// and gating the listener on the flag too gave that entry a panel whose
+    /// one button did nothing. The panel covers the picture, so it also needs
+    /// a way out — without one, opening it took the player off air until the
+    /// viewer thought to reload.
     #[test]
     fn the_self_test_runs_only_when_asked_for() {
         let html = include_str!("dvr.html");
         assert!(
             html.contains(r#"qs.get("selftest") === "1""#),
-            "the self-test is not behind a flag"
+            "the self-test panel is not behind a flag on load"
         );
-        // The only thing that starts it is the button, inside that guard.
+        // The only thing that starts it is the button.
         assert_eq!(
             html.matches("stRunAll").count(),
             2,
             "stRunAll is referenced somewhere other than its definition and its one listener"
+        );
+        assert!(
+            html.contains(r#"id="stClose""#) && html.contains(r#""stClose").addEventListener"#),
+            "the self-test panel covers the picture with no way to close it"
+        );
+        assert!(
+            js_fn(html, "closeSelftest").contains(r#"selftest = "0""#),
+            "closing the self-test does not actually hide it"
         );
         // And it must not be wired to anything that fires on load.
         for on_load in ["loadedmetadata\", stRunAll", "DOMContentLoaded\", stRunAll"] {
@@ -2389,9 +2570,9 @@ mod tests {
     #[test]
     fn the_shading_is_refreshed_by_the_render_loop() {
         assert!(
-            // `render()` with the parens: bare "render" also prefix-matches
+            // The full signature, not bare "render": that also prefix-matches
             // `renderCached` itself, which trivially contains its own name.
-            js_fn(include_str!("dvr.html"), "render()").contains("renderCached("),
+            js_fn(include_str!("dvr.html"), "render(remeasure)").contains("renderCached("),
             "nothing updates the shading after the first paint"
         );
     }
@@ -2529,6 +2710,22 @@ mod tests {
         assert!(
             expired[..expired.len().min(300)].contains("forgetToken"),
             "a refused token is kept, so the failure repeats on every reload"
+        );
+    }
+
+    /// `/dvr/hls.js` is served `immutable` for a year, which is a promise
+    /// about a URL. The page must therefore version the URL, or a viewer who
+    /// cached one bundle keeps it across every future upgrade — the same
+    /// same-URL-different-bytes trap the origin's own cache headers avoid.
+    #[test]
+    fn dvr_page_versions_the_immutable_hls_js_url() {
+        let html = include_str!("dvr.html")
+            .replace("__STREAM_ID__", "s")
+            .replace("__HLS_JS_VERSION__", HLS_JS_VERSION);
+        assert!(!html.contains("__HLS_JS_VERSION__"), "placeholder left in page");
+        assert!(
+            html.contains(&format!("/dvr/hls.js?v={HLS_JS_VERSION}")),
+            "hls.js is loaded from an unversioned URL while served immutable"
         );
     }
 

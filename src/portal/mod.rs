@@ -374,12 +374,17 @@ async fn renew(
         return (StatusCode::FORBIDDEN, "origin not permitted to renew").into_response();
     }
 
+    // Every exit past the origin check gets the CORS headers. The origin is
+    // already allow-listed by this point, so withholding them tells the caller
+    // nothing it may not have — it only makes the browser render a 401 or a
+    // failed upstream as an opaque CORS error, which is the least useful
+    // possible form of "your session ended, sign in again".
     let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
-        return unauthenticated();
+        return with_cors(&origin, unauthenticated());
     };
     let streams = match fetch_streams(&st, &username).await {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return with_cors(&origin, r),
     };
     // Unentitled and non-existent are the same answer, as everywhere else
     // here: a renewal must not become a way to enumerate feeds.
@@ -411,6 +416,13 @@ async fn renew(
 /// missed that would hand one player another's answer.
 fn with_cors(origin: &str, mut resp: Response) -> Response {
     let h = resp.headers_mut();
+    // The body carries a viewing token. `Vary: Origin` already stops a shared
+    // cache handing one origin another's answer, but nothing should be storing
+    // a credential at all — the portal's own pages already say `no-store`.
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
     if let Ok(v) = axum::http::HeaderValue::from_str(origin) {
         h.insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
     }

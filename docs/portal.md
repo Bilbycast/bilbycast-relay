@@ -231,9 +231,19 @@ working.
 the failure is otherwise silent: the portal installs, viewers sign in, and three
 hours later their access ends mid-event with nothing to say why.
 
-Renewal is **off until you name the player's origin**, because it is a
-cross-origin request carrying the viewer's session cookie — the shape a CSRF
-wants:
+Renewal needs **two** settings, on two different services, and the second is
+easy to miss.
+
+**On the relay: `distribution.portal_url` must be set.** The player's
+`scheduleRenewal()` returns immediately when it is empty, so a blank
+`portal_url` turns the three hours into a hard limit however the portal is
+configured. Nothing reports it at either end — the viewer simply loses access
+mid-event. The manager's Distribution tab labels the field "Optional", which is
+true of the sign-in-again link and false of renewal.
+
+**On the portal: renewal is off until you name the player's origin,** because it
+is a cross-origin request carrying the viewer's session cookie — the shape a
+CSRF wants:
 
 ```json
 "player_origins": ["https://relay.example.com"]
@@ -242,6 +252,12 @@ wants:
 Exact matches only, and `*` is refused at startup: a response carrying
 `Access-Control-Allow-Credentials` may not answer a wildcard origin, so a
 portal configured that way would look right and never renew.
+
+The origin is checked **before anything is done**, so an unlisted one cannot
+even cause a mint. Past that check every exit carries the CORS headers,
+including the refusals — the origin is already trusted by then, and withholding
+them only turns a clear 403 into an opaque browser error. The answer is
+`Cache-Control: no-store`: the body is a credential.
 
 Only a viewer who came through the portal can renew — they hold the session
 cookie. **A guest with a one-off link cannot, and should not:** their three
