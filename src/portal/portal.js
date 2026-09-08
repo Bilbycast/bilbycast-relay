@@ -119,18 +119,52 @@
    * The page exists to get someone watching. A relay too old to know about
    * clips, or one that cannot be reached, must not put an error in front of a
    * viewer whose feeds loaded perfectly well. */
-  function loadClips() {
+  /* While anything is still being cut, come back and look again.
+   *
+   * A cut takes seconds to a minute, and this page is where it lands — so
+   * loading once meant an operator who exported and stayed put never learned
+   * their clip was ready. They had to know to reload, which is knowledge the
+   * page should not require.
+   *
+   * Only while something is pending, and only for a bounded spell: a tab left
+   * open all day must not poll a relay for the rest of the afternoon. A clip
+   * that is still not ready after that is one the operator will find on their
+   * next visit, and the edge gives up long before it. */
+  var clipPollTimer = null;
+  var clipPollUntil = 0;
+  var CLIP_POLL_MS = 5000;
+  var CLIP_POLL_MAX_MS = 10 * 60 * 1000;
+
+  function loadClips(isPoll) {
+    if (!isPoll) clipPollUntil = Date.now() + CLIP_POLL_MAX_MS;
     fetch('/api/clips', { headers: { 'Accept': 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
-        if (!d || !d.clips || !d.clips.length) return;
-        var section = document.getElementById('clips');
-        var list = document.getElementById('cliplist');
-        list.textContent = '';
-        d.clips.forEach(function (c) { list.appendChild(clipRow(c, list)); });
-        section.hidden = false;
+        if (!d || !d.clips) return;
+        renderClips(d.clips);
+        /* Nothing pending means nothing to wait for. Note this is decided on
+         * the server's answer, not on what was drawn — a row removed by a
+         * delete must not keep the timer alive. */
+        var pending = d.clips.some(function (c) { return !c.ready && !c.failed; });
+        if (clipPollTimer) { clearTimeout(clipPollTimer); clipPollTimer = null; }
+        if (pending && Date.now() < clipPollUntil) {
+          clipPollTimer = setTimeout(function () { loadClips(true); }, CLIP_POLL_MS);
+        }
       })
       .catch(function () { /* nothing to say to the viewer */ });
+  }
+
+  function renderClips(clips) {
+    var section = document.getElementById('clips');
+    var list = document.getElementById('cliplist');
+    if (!clips.length) {
+      list.textContent = '';
+      section.hidden = true;
+      return;
+    }
+    list.textContent = '';
+    clips.forEach(function (c) { list.appendChild(clipRow(c, list)); });
+    section.hidden = false;
   }
 
   /* One clip, as a table row.
@@ -259,7 +293,7 @@
         return;
       }
       render(res.data);
-      loadClips();
+      loadClips(false);
     })
     .catch(function (e) {
       if (e && e.message === 'unauthenticated') return;

@@ -110,6 +110,7 @@ pub fn router(state: PortalState) -> Router {
         .route("/watch", get(watch_redirect))
         .route("/api/feeds", get(feeds))
         .route("/api/clips", get(clips).delete(delete_clip))
+        .route("/api/clips/download", get(download_clip))
         .route("/api/watch", post(watch))
         .route("/api/renew", get(renew))
         .with_state(state)
@@ -338,6 +339,23 @@ fn origin_root_and_token(watch_url: &str) -> Option<(String, String)> {
     Some((root, token))
 }
 
+/// Percent-encode a query-string value.
+///
+/// Clip names carry spaces and an operator's punctuation, and they travel as
+/// query parameters on this page's own download link.
+fn urlencode(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The page's content policy.
 ///
 /// A named constant so a test can assert against the policy actually served
@@ -371,24 +389,36 @@ async fn clips(
         Err(r) => return r,
     };
 
+    // One feed at a time was two sequential round-trips per feed — a mint to
+    // the manager, then a listing from the relay. At three feeds that is
+    // invisible; at thirty it is the page's load time, and the browser now
+    // polls this route while anything is being cut, so it is paid repeatedly.
+    //
+    // Concurrent, not cached. Minting per feed is what proves entitlement —
+    // the manager re-checks it on every mint, so a feed the viewer has lost
+    // access to yields nothing here without the portal reasoning about
+    // permissions itself. Holding a mint would trade that away for latency,
+    // which is the wrong side of the trade for a credential.
+    let per_feed = streams.iter().map(|s| {
+        let st = &st;
+        let username = &username;
+        async move {
+            let watch_url = mint(st, username, &s.session_id).await.ok()?;
+            let (root, token) = origin_root_and_token(&watch_url)?;
+            let list_url = format!("{root}/origin/{}/clips?token={token}", s.stream_id);
+            let listed: Vec<OriginClip> = match st.http.get(&list_url).send().await {
+                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+                // A relay too old to know about clips answers 404. That is not
+                // an error worth showing a viewer.
+                _ => return None,
+            };
+            Some((s, listed))
+        }
+    });
+    let results = futures_util::future::join_all(per_feed).await;
+
     let mut out: Vec<serde_json::Value> = Vec::new();
-    for s in &streams {
-        // Minting per feed is what proves entitlement: the manager re-checks it
-        // on every mint, so a feed the viewer has lost access to yields nothing
-        // here without the portal having to reason about permissions itself.
-        let Ok(watch_url) = mint(&st, &username, &s.session_id).await else {
-            continue;
-        };
-        let Some((root, token)) = origin_root_and_token(&watch_url) else {
-            continue;
-        };
-        let list_url = format!("{root}/origin/{}/clips?token={token}", s.stream_id);
-        let listed: Vec<OriginClip> = match st.http.get(&list_url).send().await {
-            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
-            // A relay too old to know about clips answers 404. That is not an
-            // error worth showing a viewer.
-            _ => continue,
-        };
+    for (s, listed) in results.into_iter().flatten() {
         for c in listed {
             out.push(serde_json::json!({
                 "feed": s.name,
@@ -405,13 +435,19 @@ async fn clips(
                 // The session the clip belongs to, so a delete can name it
                 // without the page holding a URL on another origin.
                 "session_id": s.session_id,
+                // Downloaded through this page, not straight from the origin.
+                //
+                // A viewer token in the href is a credential in the browser's
+                // history, in the referrer, and in the access log of anything
+                // between here and the relay — for a link a viewer is meant to
+                // right-click and save. Proxying costs the portal the bytes of
+                // a clip somebody actually downloads, which is a few tens of
+                // megabytes now and then, and hands out nothing.
                 "url": if c.ready {
-                    // The name is already restricted by the relay to characters
-                    // a path segment can carry, bar the space.
                     Some(format!(
-                        "{root}/origin/{}/clips/{}.mp4?token={token}",
-                        s.stream_id,
-                        c.name.replace(' ', "%20"),
+                        "/api/clips/download?session={}&name={}",
+                        urlencode(&s.session_id),
+                        urlencode(&c.name),
                     ))
                 } else {
                     None
@@ -566,6 +602,86 @@ fn with_cors(origin: &str, mut resp: Response) -> Response {
 #[derive(Debug, Deserialize)]
 pub struct WatchRequest {
     pub session_id: String,
+}
+
+/// What a download names.
+#[derive(Deserialize)]
+pub struct DownloadClipQuery {
+    pub session: String,
+    pub name: String,
+}
+
+/// `GET /api/clips/download` — hand a finished clip to the viewer.
+///
+/// **Why this proxies rather than redirecting.** The obvious cheaper answer is
+/// to mint a token and 302 to the origin, and it puts the credential straight
+/// back in the URL — in the browser's history, in the referrer, and in the
+/// access log of everything between here and the relay. For a link a viewer is
+/// meant to right-click and save, that is the wrong place for it.
+///
+/// The cost is the bytes of a clip somebody actually downloads, tens of
+/// megabytes now and then, and it is streamed rather than buffered so the
+/// portal's memory does not grow with the clip.
+///
+/// Entitlement is re-checked by the same mint the listing uses.
+async fn download_clip(
+    State(st): State<PortalState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<DownloadClipQuery>,
+) -> Response {
+    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
+        return unauthenticated();
+    };
+    let Ok(watch_url) = mint(&st, &username, &q.session).await else {
+        return (StatusCode::FORBIDDEN, "That feed is not yours.").into_response();
+    };
+    let (Some((root, token)), Some(stream)) = (
+        origin_root_and_token(&watch_url),
+        stream_id_from(&watch_url),
+    ) else {
+        return (StatusCode::BAD_GATEWAY, "Could not reach the feed's relay.").into_response();
+    };
+
+    let url = format!(
+        "{root}/origin/{stream}/clips/{}.mp4?token={token}",
+        q.name.replace(' ', "%20"),
+    );
+    let upstream = match st.http.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!(%username, clip = %q.name, status = r.status().as_u16(),
+                "portal: the relay would not serve the clip");
+            return (StatusCode::NOT_FOUND, "That clip is no longer available.").into_response();
+        }
+        Err(e) => {
+            tracing::warn!(%username, clip = %q.name, error = %e,
+                "portal: could not reach the relay for the clip");
+            return (StatusCode::BAD_GATEWAY, "Could not reach the feed's relay.").into_response();
+        }
+    };
+
+    let len = upstream.content_length();
+    // Streamed, not collected: a clip is tens of megabytes and the portal
+    // should not hold one per concurrent download.
+    let body = axum::body::Body::from_stream(upstream.bytes_stream());
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        // The name the operator was promised. Quoted, because it carries
+        // spaces and their own punctuation.
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.mp4\"", q.name.replace('"', "")),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    if let Some(n) = len {
+        resp.headers_mut()
+            .insert(header::CONTENT_LENGTH, n.into());
+    }
+    resp
 }
 
 /// What a delete names: the feed, and the clip within it.
@@ -736,6 +852,41 @@ async fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A viewer's credential does not travel in a link they are told to save.
+    ///
+    /// Downloads used to point straight at the origin with `?token=` on the
+    /// end, which puts the credential in the browser's history, in the
+    /// referrer, and in the access log of everything between the portal and
+    /// the relay — for a URL a viewer is meant to right-click and keep. The
+    /// portal proxies instead, so the link it hands out is its own.
+    #[test]
+    fn a_download_link_carries_no_credential() {
+        let js = include_str!("portal.js");
+        // The href comes from the API, so this is really a check on the
+        // shape the API is expected to return — asserted here because it is
+        // the page that puts it in front of a viewer.
+        assert!(
+            js.contains("a.href = c.url"),
+            "the download link is built some other way now; re-check this"
+        );
+
+        // And the value the API builds is same-origin and token-free.
+        let src = include_str!("mod.rs");
+        let built = src
+            .split("\"url\": if c.ready {")
+            .nth(1)
+            .expect("the download url is no longer built here");
+        let built = &built[..built.len().min(400)];
+        assert!(
+            built.contains("/api/clips/download"),
+            "downloads no longer go through the portal: {built}"
+        );
+        assert!(
+            !built.contains("token="),
+            "a viewer token is back in the download link: {built}"
+        );
+    }
 
     /// The page's own script may only talk to the page's own origin.
     ///
