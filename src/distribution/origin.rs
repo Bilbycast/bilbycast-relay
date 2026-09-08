@@ -926,9 +926,15 @@ impl OriginStore {
 
     /// Record what was asked for. The media follows later, from the edge.
     ///
-    /// An existing record is left alone rather than overwritten: re-requesting
-    /// a mark somebody has already exported must not throw away the clip that
-    /// is sitting there ready.
+    /// Re-requesting the **same mark** is idempotent: the existing record is
+    /// left alone, so asking again for something already cut does not throw
+    /// away the clip sitting there ready.
+    ///
+    /// A **different** mark that happens to produce the same name is a
+    /// different clip and gets a suffix. The name is built from a timecode and
+    /// a label, so two marks in the same second with the same label collide —
+    /// and silently dropping the second, which is what skipping on name alone
+    /// did, loses an export the operator asked for and reported nothing.
     pub fn record_clip_requests(
         &self,
         stream: &str,
@@ -939,23 +945,65 @@ impl OriginStore {
         let now = chrono::Utc::now().to_rfc3339();
         let mut out = Vec::new();
         for ask in &req.clips {
+            let Some(name) = self.free_clip_name(&dir, &ask.name, &ask.at)? else {
+                // Same mark, already recorded. Hand back what is there so the
+                // caller sees its real state rather than a fresh pending one.
+                if let Some(existing) = self
+                    .list_clips(stream)
+                    .into_iter()
+                    .find(|c| c.name == ask.name)
+                {
+                    out.push(existing);
+                }
+                continue;
+            };
             let rec = ClipRecord {
-                name: ask.name.clone(),
+                name,
                 at: ask.at.clone(),
-                pre_secs: req.pre_secs.min(MAX_CLIP_SECS),
-                post_secs: req.post_secs.min(MAX_CLIP_SECS),
+                pre_secs: req.pre_secs.min(MAX_CLIP_TOTAL_SECS),
+                post_secs: req.post_secs.min(MAX_CLIP_TOTAL_SECS),
                 requested_at: now.clone(),
                 bytes: 0,
                 ready: false,
+                failed: false,
+                error: None,
             };
-            let path = dir.join(format!("{}.json", rec.name));
-            if !path.exists() {
-                let body = serde_json::to_vec_pretty(&rec).map_err(std::io::Error::other)?;
-                std::fs::write(&path, body)?;
-            }
+            let body = serde_json::to_vec_pretty(&rec).map_err(std::io::Error::other)?;
+            std::fs::write(dir.join(format!("{}.json", rec.name)), body)?;
             out.push(rec);
         }
         Ok(out)
+    }
+
+    /// A name to file this request under, or `None` if this exact mark is
+    /// already recorded.
+    ///
+    /// Bounded: after a handful of collisions this gives up and reuses the
+    /// name, because an unbounded search is a way to spend a request's time on
+    /// a filesystem rather than a way to be correct.
+    fn free_clip_name(
+        &self,
+        dir: &std::path::Path,
+        wanted: &str,
+        at: &str,
+    ) -> std::io::Result<Option<String>> {
+        for n in 1..=9u32 {
+            let candidate = if n == 1 {
+                wanted.to_string()
+            } else {
+                format!("{wanted} ({n})")
+            };
+            let path = dir.join(format!("{candidate}.json"));
+            let Ok(raw) = std::fs::read(&path) else {
+                return Ok(Some(candidate)); // free
+            };
+            // Taken — by this same mark, or a different one?
+            match serde_json::from_slice::<ClipRecord>(&raw) {
+                Ok(existing) if existing.at == at => return Ok(None),
+                _ => continue,
+            }
+        }
+        Ok(Some(wanted.to_string()))
     }
 
     /// Every clip this stream knows about, ready or not.
@@ -1006,6 +1054,97 @@ impl OriginStore {
         let tmp = dir.join(format!("{name}.mp4.part"));
         tokio::fs::write(&tmp, body).await?;
         tokio::fs::rename(&tmp, dir.join(format!("{name}.mp4"))).await
+    }
+
+    /// The same, streamed to disk rather than buffered whole.
+    ///
+    /// A clip is up to 256 MiB, and holding one entirely in memory to write it
+    /// out again is a quarter-gigabyte spike per concurrent upload on a service
+    /// whose other objects are two-second segments. The bytes go to the `.part`
+    /// file as they arrive, so the peak is a chunk rather than a clip.
+    ///
+    /// The ceiling is enforced *while* reading: a body that lies about its
+    /// length, or sends none, would otherwise be bounded by nothing.
+    pub async fn put_clip_streaming(
+        &self,
+        stream: &str,
+        name: &str,
+        body: axum::body::Body,
+        max_bytes: u64,
+    ) -> std::io::Result<u64> {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let dir = self.clips_dir(stream);
+        tokio::fs::create_dir_all(&dir).await?;
+        let tmp = dir.join(format!("{name}.mp4.part"));
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        let mut written: u64 = 0;
+        let mut stream_body = body.into_data_stream();
+
+        while let Some(chunk) = stream_body.next().await {
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            written += chunk.len() as u64;
+            if written > max_bytes {
+                // Abandon the part file rather than leave a truncated clip that
+                // `list_clips` would never see but the disk would still hold.
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "clip exceeds the maximum size",
+                ));
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, dir.join(format!("{name}.mp4"))).await?;
+        Ok(written)
+    }
+
+    /// How many clips this stream holds, and how much disk they occupy.
+    ///
+    /// Counts records, not just finished media: a hundred pending requests are
+    /// a hundred clips' worth of edge work and disk on the way.
+    pub fn clip_usage(&self, stream: &str) -> (usize, u64) {
+        let listed = self.list_clips(stream);
+        let bytes = listed.iter().map(|c| c.bytes).sum();
+        (listed.len(), bytes)
+    }
+
+    /// Remove one clip — its media and its record.
+    ///
+    /// Clips outlive the sweep, so without this the only way to reclaim the
+    /// space was to end the session. Returns whether anything was there.
+    pub async fn delete_clip(&self, stream: &str, name: &str) -> bool {
+        let dir = self.clips_dir(stream);
+        let media = tokio::fs::remove_file(dir.join(format!("{name}.mp4")))
+            .await
+            .is_ok();
+        let record = tokio::fs::remove_file(dir.join(format!("{name}.json")))
+            .await
+            .is_ok();
+        media || record
+    }
+
+    /// Mark a clip as one the edge could not produce.
+    ///
+    /// Terminal by design: the exporter skips a failed record, so this is what
+    /// stops a clip that can never be cut from being attempted for the life of
+    /// the session. An operator who wants another go re-exports the mark, which
+    /// writes a fresh record.
+    pub fn fail_clip(&self, stream: &str, name: &str, reason: &str) -> std::io::Result<bool> {
+        let path = self.clips_dir(stream).join(format!("{name}.json"));
+        let Ok(raw) = std::fs::read(&path) else {
+            return Ok(false);
+        };
+        let mut rec: ClipRecord = serde_json::from_slice(&raw).map_err(std::io::Error::other)?;
+        rec.failed = true;
+        rec.error = Some(reason.chars().take(300).collect());
+        let body = serde_json::to_vec_pretty(&rec).map_err(std::io::Error::other)?;
+        std::fs::write(&path, body)?;
+        Ok(true)
     }
 
     pub async fn read_clip(&self, stream: &str, name: &str) -> Option<Vec<u8>> {
@@ -1470,6 +1609,16 @@ pub struct ClipRecord {
     pub bytes: u64,
     #[serde(default, skip_deserializing)]
     pub ready: bool,
+    /// Set when the edge has given up. A clip that cannot be produced must say
+    /// so: without this the record stays pending for ever, the exporter retries
+    /// it every five seconds until the session ends, and the viewer's page
+    /// reads "being cut" indefinitely for something that is never coming.
+    #[serde(default)]
+    pub failed: bool,
+    /// Why, in words an operator can act on — the window aged out, the clip was
+    /// too large, the recording had no media there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1487,8 +1636,41 @@ pub struct ClipAsk {
 
 /// One request may not ask for an unbounded amount of edge work.
 const MAX_CLIPS_PER_REQUEST: usize = 50;
-/// Matches the player's own clamp, and bounds how much media one clip covers.
-const MAX_CLIP_SECS: u32 = 600;
+
+/// How many clips one stream may hold at once.
+const MAX_CLIPS_PER_STREAM: usize = 100;
+
+/// How much disk one stream's clips may hold.
+///
+/// Clips are deliberately outside the retention sweep — that is the point of
+/// exporting one — but being outside the sweep is not the same as being free.
+/// When the free-space floor trips it evicts from the segment queue, which
+/// clips are not in, so without a bound of their own an operator exporting
+/// steadily would have the origin delete *recorded footage* to make room for
+/// clips: the DVR window silently shrinking to hold its own excerpts.
+///
+/// So clips get their own ceiling and are refused at it, rather than being
+/// paid for out of the window.
+const MAX_CLIP_BYTES_PER_STREAM: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The longest clip anyone may export, pre-roll and post-roll together.
+///
+/// A review clip is a moment, not a passage of play, and the length has to be
+/// bounded somewhere: the edge assembles a clip whole in memory and the relay
+/// holds it whole as a request body, so an unbounded length is an unbounded
+/// allocation on two machines. A minute is long enough for the thing an
+/// operator marked and short enough to stay a sane object.
+const MAX_CLIP_TOTAL_SECS: u32 = 60;
+
+/// The largest clip body the origin will accept.
+///
+/// Derived from [`MAX_CLIP_TOTAL_SECS`], not chosen freely: sixty seconds of
+/// source at 35 Mbit/s is about 260 MB, and the source is what a clip is cut
+/// from — not the 3 Mbit/s proxy. The segment limit cannot serve here, because
+/// a segment is two seconds and a clip is up to thirty times that; sharing one
+/// number meant every clip over roughly twenty seconds on a contribution feed
+/// failed the upload with a 413, stayed pending, and was retried forever.
+pub const MAX_CLIP_BYTES: usize = 256 * 1024 * 1024;
 
 /// A clip name becomes a filename, and it arrives from a browser.
 ///
@@ -1506,16 +1688,31 @@ fn valid_clip_name(name: &str) -> bool {
 }
 
 pub fn routes() -> Router<Arc<DistributionState>> {
-    Router::new()
+    // A clip is up to thirty segments of media in one object, so it cannot
+    // share the segment limit. Its own route carries its own bound rather than
+    // raising the limit for every PUT on the origin — a 256 MiB ceiling on
+    // segment ingest would turn a runaway encoder into a memory problem.
+    let clips = Router::new()
         // Static segments beat the `{file}` capture, so these do not shadow the
         // segment routes below.
         .route(
             "/origin/{stream}/clips",
             axum::routing::post(clips_request).get(clips_list),
         )
-        .route("/origin/{stream}/clips/{file}", put(clip_put).get(clip_get))
+        .route(
+            "/origin/{stream}/clips/{file}",
+            put(clip_put).get(clip_get).delete(clip_delete),
+        )
+        .route(
+            "/origin/{stream}/clips/{file}/failed",
+            axum::routing::post(clip_failed),
+        )
+        .layer(DefaultBodyLimit::max(MAX_CLIP_BYTES));
+
+    Router::new()
         .route("/origin/{stream}/{file}", put(origin_put).get(origin_get))
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
+        .merge(clips)
 }
 
 /// `PUT /origin/{stream}/{file}` — accept an edge CMAF/HLS upload.
@@ -1546,8 +1743,18 @@ async fn clips_request(
     if req.clips.len() > MAX_CLIPS_PER_REQUEST {
         return (StatusCode::BAD_REQUEST, "too many clips in one request").into_response();
     }
-    if req.pre_secs > MAX_CLIP_SECS || req.post_secs > MAX_CLIP_SECS {
-        return (StatusCode::BAD_REQUEST, "clip window too long").into_response();
+    // Checked on the total, not each end: two 40-second halves are an
+    // 80-second clip however they are split.
+    if req.pre_secs.saturating_add(req.post_secs) > MAX_CLIP_TOTAL_SECS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "a clip may be at most {MAX_CLIP_TOTAL_SECS} seconds long; \
+                 this one asks for {}",
+                req.pre_secs.saturating_add(req.post_secs)
+            ),
+        )
+            .into_response();
     }
     if req.pre_secs == 0 && req.post_secs == 0 {
         return (StatusCode::BAD_REQUEST, "a clip of zero seconds is not a clip").into_response();
@@ -1559,6 +1766,31 @@ async fn clips_request(
         if chrono::DateTime::parse_from_rfc3339(&ask.at).is_err() {
             return (StatusCode::BAD_REQUEST, "invalid clip timestamp").into_response();
         }
+    }
+
+    // Clips are outside the retention sweep, so they need a bound of their own
+    // or they are paid for out of the DVR window when the disk floor trips.
+    let (have, bytes) = st.origin.clip_usage(&stream);
+    if have + req.clips.len() > MAX_CLIPS_PER_STREAM {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "this feed already holds {have} clips, and the limit is \
+                 {MAX_CLIPS_PER_STREAM} — delete some before exporting more"
+            ),
+        )
+            .into_response();
+    }
+    if bytes >= MAX_CLIP_BYTES_PER_STREAM {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "this feed's clips already use {:.1} GB, which is the limit — \
+                 delete some before exporting more",
+                bytes as f64 / 1024.0 / 1024.0 / 1024.0
+            ),
+        )
+            .into_response();
     }
 
     match st.origin.record_clip_requests(&stream, &req) {
@@ -1577,6 +1809,37 @@ async fn clips_request(
     }
 }
 
+/// Who may READ from the origin: a viewer, or the edge that fills it.
+///
+/// Two callers with two credentials. A player or portal holds a viewer token.
+/// The edge holds the ingest token it pushes with — and it reads too, because
+/// cutting a clip means fetching the manifest and the segments that cover the
+/// moment. Gating reads on the viewer token alone locked the edge out of its
+/// own stream: the clip list 403'd, and so did every manifest fetch behind it.
+///
+/// Admitting ingest here grants nothing new. That token already authorises
+/// *writing* this stream's objects, so a holder that could not read them was
+/// an inconsistency, not a boundary.
+fn check_origin_read(
+    st: &Arc<DistributionState>,
+    stream: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<(), Response> {
+    let rt = st.control.load();
+    if !rt.require_origin_token {
+        return Ok(());
+    }
+    let ingest_ok = rt.token_secret.as_ref().is_some_and(|secret| {
+        super::bearer(headers)
+            .and_then(|t| token::verify_ingest_token(secret, stream, &t).ok())
+            .is_some()
+    });
+    if ingest_ok {
+        return Ok(());
+    }
+    super::check_viewer_token(st, stream, headers, query)
+}
 /// `GET /origin/{stream}/clips` — what has been asked for, and what is ready.
 async fn clips_list(
     State(st): State<Arc<DistributionState>>,
@@ -1587,9 +1850,7 @@ async fn clips_list(
     let Some(stream) = super::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
-    if st.control.load().require_origin_token
-        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
-    {
+    if let Err(resp) = check_origin_read(&st, &stream, &headers, query.as_deref()) {
         return resp;
     }
     (
@@ -1651,7 +1912,7 @@ async fn clip_put(
     State(st): State<Arc<DistributionState>>,
     Path((stream, file)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Response {
     let Some(stream) = super::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
@@ -1676,17 +1937,110 @@ async fn clip_put(
             return (StatusCode::UNAUTHORIZED, "ingest token required").into_response();
         }
     }
-    if body.len() > MAX_OBJECT_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "clip too large").into_response();
-    }
-    match st.origin.put_clip(&stream, name, &body).await {
-        Ok(()) => {
-            tracing::info!(stream = %stream, clip = %name, bytes = body.len(), "origin: clip stored");
+    match st
+        .origin
+        .put_clip_streaming(&stream, name, body, MAX_CLIP_BYTES as u64)
+        .await
+    {
+        Ok(bytes) => {
+            tracing::info!(stream = %stream, clip = %name, bytes, "origin: clip stored");
             (StatusCode::CREATED, "stored").into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            tracing::warn!(stream = %stream, clip = %name, "origin: clip exceeded the size limit");
+            (StatusCode::PAYLOAD_TOO_LARGE, "clip too large").into_response()
         }
         Err(e) => {
             tracing::warn!(stream = %stream, clip = %name, error = %e, "origin: clip write failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "could not store the clip").into_response()
+        }
+    }
+}
+
+/// `DELETE /origin/{stream}/clips/{file}` — remove a clip and its record.
+///
+/// Viewer-gated, like the download: clips belong to the session, so anyone who
+/// may watch the feed may tidy them. Without this the only way to reclaim clip
+/// space was to end the session, and clips are exempt from the sweep by design.
+async fn clip_delete(
+    State(st): State<Arc<DistributionState>>,
+    Path((stream, file)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let Some(stream) = super::sanitize_stream_id(&stream) else {
+        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+    };
+    let name = file.strip_suffix(".mp4").unwrap_or(&file);
+    if !valid_clip_name(name) {
+        return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
+    }
+    if st.control.load().require_origin_token
+        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
+    {
+        return resp;
+    }
+    if st.origin.delete_clip(&stream, name).await {
+        tracing::info!(stream = %stream, clip = %name, "origin: clip deleted");
+        (StatusCode::NO_CONTENT, [(header::CACHE_CONTROL, "no-store")]).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store")],
+            "no such clip",
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ClipFailure {
+    pub reason: String,
+}
+
+/// `POST /origin/{stream}/clips/{file}/failed` — the edge gave up on this one.
+///
+/// Ingest-gated like the upload: only whatever is cutting clips may declare one
+/// impossible. Without it a clip that can never be produced is retried every
+/// five seconds for the life of the session and shows as "being cut" for ever.
+async fn clip_failed(
+    State(st): State<Arc<DistributionState>>,
+    Path((stream, file)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ClipFailure>,
+) -> Response {
+    let Some(stream) = super::sanitize_stream_id(&stream) else {
+        return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
+    };
+    let name = file.strip_suffix(".mp4").unwrap_or(&file);
+    if !valid_clip_name(name) {
+        return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
+    }
+    let rt = st.control.load();
+    if rt.require_ingest_token {
+        let Some(ref secret) = rt.token_secret else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "ingest token gate misconfigured")
+                .into_response();
+        };
+        if super::bearer(&headers)
+            .and_then(|t| token::verify_ingest_token(secret, &stream, &t).ok())
+            .is_none()
+        {
+            return (StatusCode::UNAUTHORIZED, "ingest token required").into_response();
+        }
+    }
+    match st.origin.fail_clip(&stream, name, &body.reason) {
+        Ok(true) => {
+            tracing::warn!(
+                stream = %stream, clip = %name, reason = %body.reason,
+                "origin: clip marked as one the edge could not produce"
+            );
+            (StatusCode::OK, "recorded").into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, "no such clip request").into_response(),
+        Err(e) => {
+            tracing::warn!(stream = %stream, clip = %name, error = %e, "origin: could not record clip failure");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not record it").into_response()
         }
     }
 }
@@ -1785,9 +2139,7 @@ async fn origin_get(
     }
     // Checked before the store is touched, so a rejected request cannot be
     // used to probe which streams or segments exist.
-    if st.control.load().require_origin_token
-        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
-    {
+    if let Err(resp) = check_origin_read(&st, &stream, &headers, query.as_deref()) {
         return resp;
     }
     match st.origin.get(&stream, &file).await {
@@ -3189,6 +3541,121 @@ seg-1.m4s
         // And the clip is not counted as adopted media, or the byte cap would
         // evict segments to make room for something it must never evict.
         assert_eq!(s.total_bytes(), 2, "the clip was adopted as a segment");
+    }
+
+    /// A clip is bounded in length, and the bound is on the total.
+    ///
+    /// The edge assembles a clip whole in memory and this holds it whole as a
+    /// request body, so length is an allocation on two machines. Checking each
+    /// end separately would let two forty-second halves through as an
+    /// eighty-second clip.
+    #[test]
+    fn a_clip_may_not_exceed_a_minute_however_it_is_split() {
+        assert!(MAX_CLIP_TOTAL_SECS == 60);
+        // The body ceiling has to hold the longest clip the rule permits, at a
+        // contribution-feed rate — this pair is the whole reason clips do not
+        // share the segment limit.
+        let sixty_secs_at_35mbit = 60usize * 35_000_000 / 8;
+        assert!(
+            MAX_CLIP_BYTES >= sixty_secs_at_35mbit,
+            "MAX_CLIP_BYTES {MAX_CLIP_BYTES} cannot hold {sixty_secs_at_35mbit} bytes"
+        );
+        assert!(
+            MAX_CLIP_BYTES > MAX_OBJECT_BYTES,
+            "a clip is up to thirty segments; it cannot share the segment limit"
+        );
+    }
+
+    /// A failed clip is terminal, and says why.
+    #[tokio::test]
+    async fn a_clip_the_edge_gave_up_on_stops_being_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 10,
+                post_secs: 20,
+                clips: vec![ClipAsk {
+                    at: "2026-09-07T23:06:53.200Z".into(),
+                    name: "gone".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(!s.list_clips("feed")[0].failed);
+
+        assert!(s.fail_clip("feed", "gone", "the window aged out").unwrap());
+        let listed = s.list_clips("feed");
+        assert!(listed[0].failed, "the record must carry the failure");
+        assert_eq!(listed[0].error.as_deref(), Some("the window aged out"));
+        assert!(!listed[0].ready);
+
+        // Nothing to mark for a clip nobody asked for.
+        assert!(!s.fail_clip("feed", "never-requested", "x").unwrap());
+    }
+
+    /// Two different marks that produce the same name are two clips.
+    ///
+    /// The name is a timecode plus a label, so two marks in the same second
+    /// with the same label collide. Skipping on the name alone silently
+    /// discarded the second export and reported success for it.
+    #[tokio::test]
+    async fn a_second_mark_with_the_same_name_is_not_swallowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        let ask = |at: &str| ClipRequest {
+            pre_secs: 5,
+            post_secs: 5,
+            clips: vec![ClipAsk {
+                at: at.into(),
+                name: "10-00-00-00 - Goal".into(),
+            }],
+        };
+
+        let first = s.record_clip_requests("feed", &ask("2026-09-07T10:00:00Z")).unwrap();
+        assert_eq!(first[0].name, "10-00-00-00 - Goal");
+
+        // A different moment, same derived name.
+        let second = s.record_clip_requests("feed", &ask("2026-09-07T11:30:00Z")).unwrap();
+        assert_eq!(second[0].name, "10-00-00-00 - Goal (2)", "the second export was lost");
+        assert_eq!(s.list_clips("feed").len(), 2);
+
+        // The same moment again is the same clip, not a third.
+        let again = s.record_clip_requests("feed", &ask("2026-09-07T10:00:00Z")).unwrap();
+        assert_eq!(again[0].name, "10-00-00-00 - Goal");
+        assert_eq!(s.list_clips("feed").len(), 2, "re-requesting a mark duplicated it");
+    }
+
+    /// Clips can be given back, and the space with them.
+    ///
+    /// They are exempt from the sweep by design, so without a delete the only
+    /// way to reclaim their disk was to end the session.
+    #[tokio::test]
+    async fn a_clip_can_be_deleted_and_stops_being_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 5,
+                post_secs: 5,
+                clips: vec![ClipAsk {
+                    at: "2026-09-07T10:00:00Z".into(),
+                    name: "spare".into(),
+                }],
+            },
+        )
+        .unwrap();
+        s.put_clip("feed", "spare", &vec![0u8; 2048]).await.unwrap();
+
+        let (count, bytes) = s.clip_usage("feed");
+        assert_eq!((count, bytes), (1, 2048));
+
+        assert!(s.delete_clip("feed", "spare").await);
+        assert_eq!(s.clip_usage("feed"), (0, 0));
+        assert!(s.read_clip("feed", "spare").await.is_none());
+        assert!(!s.delete_clip("feed", "spare").await, "deleting twice must not claim success");
     }
 
     /// A clip name becomes a filename and arrives from a browser.
