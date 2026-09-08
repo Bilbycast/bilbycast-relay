@@ -109,6 +109,7 @@ pub fn router(state: PortalState) -> Router {
         // they are, so "find your feed again" is a step nobody needs.
         .route("/watch", get(watch_redirect))
         .route("/api/feeds", get(feeds))
+        .route("/api/clips", get(clips))
         .route("/api/watch", post(watch))
         .route("/api/renew", get(renew))
         .with_state(state)
@@ -298,6 +299,112 @@ async fn feeds(
         "logout_url": st.cfg.logout_url,
     }))
     .into_response()
+}
+
+/// One exported clip, as the relay's origin describes it.
+///
+/// Declared here rather than reusing `distribution::origin::ClipRecord`: the
+/// portal builds independently of `viewer-distribution` on purpose — it hands
+/// out links to a relay, which need not be this one — and borrowing that type
+/// would tie the two features together for the sake of four fields.
+#[derive(Debug, Deserialize)]
+struct OriginClip {
+    name: String,
+    #[serde(default)]
+    at: String,
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    bytes: u64,
+}
+
+/// Split a minted watch URL into the origin root and the token it carries.
+///
+/// The manager mints a player URL — `https://relay/dvr/<stream>?token=…` — and
+/// the clips live on the same relay under `/origin/…`. Deriving one from the
+/// other keeps the portal from needing a second piece of manager plumbing just
+/// to learn an address it has already been handed.
+fn origin_root_and_token(watch_url: &str) -> Option<(String, String)> {
+    let (before_query, query) = watch_url.split_once('?')?;
+    let token = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("token="))?
+        .to_string();
+    // Everything up to `/dvr/` is the relay's root.
+    let root = before_query.split("/dvr/").next()?.to_string();
+    if root.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some((root, token))
+}
+
+/// `GET /api/clips` — finished clips for the feeds this viewer may watch.
+///
+/// Clips belong to the **session**, not to whoever exported them: anyone
+/// entitled to the feed sees them. That is what their retention already says —
+/// kept as long as the session, cleaned up with it — and it means a reviewer
+/// can hand a colleague a clip without re-exporting it.
+///
+/// Ones still being cut are listed too, marked not ready, so an operator who
+/// has just pressed Export sees that something is happening rather than an
+/// empty page.
+async fn clips(
+    State(st): State<PortalState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
+        return unauthenticated();
+    };
+    let streams = match fetch_streams(&st, &username).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for s in &streams {
+        // Minting per feed is what proves entitlement: the manager re-checks it
+        // on every mint, so a feed the viewer has lost access to yields nothing
+        // here without the portal having to reason about permissions itself.
+        let Ok(watch_url) = mint(&st, &username, &s.session_id).await else {
+            continue;
+        };
+        let Some((root, token)) = origin_root_and_token(&watch_url) else {
+            continue;
+        };
+        let list_url = format!("{root}/origin/{}/clips?token={token}", s.stream_id);
+        let listed: Vec<OriginClip> = match st.http.get(&list_url).send().await {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+            // A relay too old to know about clips answers 404. That is not an
+            // error worth showing a viewer.
+            _ => continue,
+        };
+        for c in listed {
+            out.push(serde_json::json!({
+                "feed": s.name,
+                "name": c.name,
+                "at": c.at,
+                "ready": c.ready,
+                "bytes": c.bytes,
+                "url": if c.ready {
+                    // The name is already restricted by the relay to characters
+                    // a path segment can carry, bar the space.
+                    Some(format!(
+                        "{root}/origin/{}/clips/{}.mp4?token={token}",
+                        s.stream_id,
+                        c.name.replace(' ', "%20"),
+                    ))
+                } else {
+                    None
+                },
+            }));
+        }
+    }
+
+    // Newest first: an operator exporting during an event wants what they just
+    // asked for at the top, not the first clip of the morning.
+    out.sort_by(|a, b| b["at"].as_str().cmp(&a["at"].as_str()));
+    Json(serde_json::json!({ "clips": out })).into_response()
 }
 
 #[derive(Debug, Deserialize)]

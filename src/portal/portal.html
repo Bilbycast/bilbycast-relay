@@ -73,6 +73,15 @@
     here and open it again.
   </p>
   <div id="body"><div class="msg">Loading…</div></div>
+
+  <!-- Only appears once there is something in it: a viewer who never exports
+       a clip should not be shown an empty shelf every time they sign in. -->
+  <section id="clips" hidden>
+    <h2>Your clips</h2>
+    <p class="note">Exported from the Marks panel while watching. Kept for as
+       long as the feed they came from, then removed with it.</p>
+    <div id="cliplist"></div>
+  </section>
 </main>
 <script src="/portal.js"></script>
 </body>

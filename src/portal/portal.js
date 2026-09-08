@@ -105,6 +105,59 @@
     });
   }
 
+  /* Clips are fetched after the feeds, and their failure is silent.
+   *
+   * The page exists to get someone watching. A relay too old to know about
+   * clips, or one that cannot be reached, must not put an error in front of a
+   * viewer whose feeds loaded perfectly well. */
+  function loadClips() {
+    fetch('/api/clips', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d || !d.clips || !d.clips.length) return;
+        var section = document.getElementById('clips');
+        var list = document.getElementById('cliplist');
+        list.textContent = '';
+        d.clips.forEach(function (c) {
+          var row = document.createElement('div');
+          row.className = 'row';
+
+          var label = document.createElement('div');
+          var name = document.createElement('b');
+          name.textContent = c.name;
+          label.appendChild(name);
+          var from = document.createElement('span');
+          from.className = 'from';
+          from.textContent = ' — ' + c.feed;
+          label.appendChild(from);
+          row.appendChild(label);
+
+          if (c.ready && c.url) {
+            var a = document.createElement('a');
+            a.className = 'btn';
+            a.href = c.url;
+            /* The filename the operator was promised, not the URL's last
+             * segment: browsers percent-decode inconsistently. */
+            a.setAttribute('download', c.name + '.mp4');
+            a.textContent = c.bytes
+              ? 'Download (' + (c.bytes / 1048576).toFixed(1) + ' MB)'
+              : 'Download';
+            row.appendChild(a);
+          } else {
+            /* Said plainly rather than hidden: somebody who has just pressed
+             * Export should see that it is happening. */
+            var pending = document.createElement('span');
+            pending.className = 'pending';
+            pending.textContent = 'Being cut…';
+            row.appendChild(pending);
+          }
+          list.appendChild(row);
+        });
+        section.hidden = false;
+      })
+      .catch(function () { /* nothing to say to the viewer */ });
+  }
+
   fetch('/api/feeds', { headers: { 'Accept': 'application/json' } })
     .then(function (r) {
       if (r.status === 401) {
@@ -122,6 +175,7 @@
         return;
       }
       render(res.data);
+      loadClips();
     })
     .catch(function (e) {
       if (e && e.message === 'unauthenticated') return;
