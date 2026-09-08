@@ -57,8 +57,8 @@
        wrong when the window resizes. */
     transform-origin: 0 0;
   }
-  body[data-zoom="1"] #pic { cursor: grab; }
-  body[data-zoom="1"] #pic:active { cursor: grabbing; }
+  body[data-pic-zoom="1"] #pic { cursor: grab; }
+  body[data-pic-zoom="1"] #pic:active { cursor: grabbing; }
   /* Shown only while zoomed: says how far in, and resets on a tap. Sits under
      the live badge, where nothing else can collide with it. */
   #zoomBadge {
@@ -69,7 +69,7 @@
     background: rgba(20,26,32,.8); color: var(--fg);
     backdrop-filter: blur(6px); cursor: pointer;
   }
-  body[data-zoom="1"] #zoomBadge { display: block; }
+  body[data-pic-zoom="1"] #zoomBadge { display: block; }
   #proxy { display: none; }
   body[data-picture="proxy"] #proxy { display: block; }
   body[data-picture="proxy"] #main  { display: none; }
@@ -431,6 +431,17 @@
     min-width: 38px; min-height: 38px; padding: 0; font-size: 17px;
     background: transparent; border-color: transparent; color: var(--dim);
   }
+  /* Exported. Sits between the colour swatch and delete, in the accent so it
+     reads at a glance down the column, and sized to the row rather than to a
+     touch target — there is nothing here to press. */
+  #markList .done {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; flex: 0 0 auto; color: var(--accent);
+  }
+  #markList .done svg {
+    width: 16px; height: 16px; fill: none; stroke: currentColor;
+    stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round;
+  }
   #markEmpty { color: var(--dim); font-size: 12px; padding: 14px; margin: 0; }
   body[data-marks="0"] #markList { display: none; }
   body[data-marks="1"] #markEmpty { display: none; }
@@ -489,6 +500,11 @@
 
   <!-- top left: view controls, least often touched, so smallest and quietest -->
   <div id="tools">
+    <!-- Back to the sign-in page. Hidden unless the portal told us where it
+         is, because a button that goes nowhere is worse than no button. -->
+    <button id="btnFeeds" class="icon" hidden title="Back to your feeds" aria-label="Back to your feeds">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6l-6 6 6 6M4 12h11a5 5 0 0 0 5-5V5"/></svg>
+    </button>
     <button id="btnFull" class="icon" aria-pressed="false" title="Full screen (F)" aria-label="Full screen">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     </button>
@@ -616,12 +632,13 @@
       <legend>Clip export</legend>
       <label class="opt num">
         <span>Seconds <b>before</b> the mark</span>
-        <input type="number" id="clipPre" min="0" max="600" step="1" value="10">
+        <input type="number" id="clipPre" min="0" max="60" step="1" value="3">
       </label>
       <label class="opt num">
         <span>Seconds <b>after</b> the mark</span>
-        <input type="number" id="clipPost" min="0" max="600" step="1" value="20">
+        <input type="number" id="clipPost" min="0" max="60" step="1" value="5">
       </label>
+      <p class="note" id="clipLen"></p>
     </fieldset>
     <p class="note">Applied to every clip exported from the Marks panel, and
        kept on this device like the marks themselves. A clip is cut on the edge,
@@ -646,7 +663,6 @@
   <ol id="markList"></ol>
   <p id="markEmpty">Nothing marked yet. Press <b>MARK</b>, or <b>M</b>, to mark
      the moment you are looking at.</p>
-  <p class="note">Kept on this device, for this feed.</p>
   <!-- Export lives at the foot of the panel, and only turns the list into a
        selectable thing once asked. A list that is always full of checkboxes
        reads as a form; the common act here is still "go to that mark". -->
@@ -803,6 +819,7 @@
   var btnPause = document.getElementById("btnPause");
   var btnMute = document.getElementById("btnMute");
   var btnFull = document.getElementById("btnFull");
+  var btnFeeds = document.getElementById("btnFeeds");
   var btnMark = document.getElementById("btnMark");
   var btnPrevMark = document.getElementById("btnPrevMark");
   var btnNextMark = document.getElementById("btnNextMark");
@@ -2010,6 +2027,9 @@
       // rejected: a mark is worth keeping even if its colour is not.
       if (!isMarkColour(m.colour)) m.colour = MARK_COLOUR_DEFAULT;
       if (typeof m.id !== "number") m.id = ++markSeq;
+      // Anything truthy in storage means exported; normalised to a boolean so
+      // the badge test below is not at the mercy of what was written.
+      m.exported = !!m.exported;
       markSeq = Math.max(markSeq, m.id);
     });
     sortMarks();
@@ -2132,7 +2152,14 @@
   // whole contract is that it does not.
   var CLIP_PRE_KEY = "bilbycast.dvr.clip.pre";
   var CLIP_POST_KEY = "bilbycast.dvr.clip.post";
-  var CLIP_PRE_DEFAULT = 10, CLIP_POST_DEFAULT = 20, CLIP_MAX = 600;
+  // A clip is capped at a minute, pre-roll and post-roll together.
+  //
+  // Not a UI nicety: the edge assembles a clip whole in memory and the relay
+  // holds it whole as a request body, so length is an allocation on two
+  // machines. The origin enforces the same total and refuses anything longer,
+  // so a clamp here is the courtesy of saying so before the request rather
+  // than the only thing standing between a operator and a 400.
+  var CLIP_PRE_DEFAULT = 3, CLIP_POST_DEFAULT = 5, CLIP_MAX_TOTAL = 60;
   var exportMode = false, exportPicked = {}, exportBusy = false;
 
   var btnExport = document.getElementById("btnExport");
@@ -2143,12 +2170,13 @@
   var exportNote = document.getElementById("exportNote");
   var clipPreInput = document.getElementById("clipPre");
   var clipPostInput = document.getElementById("clipPost");
+  var clipLen = document.getElementById("clipLen");
 
   function clipSecs(key, dflt) {
     var raw = null;
     try { raw = window.localStorage.getItem(key); } catch (e) { /* blocked */ }
     var n = parseInt(raw, 10);
-    if (!isFinite(n) || n < 0 || n > CLIP_MAX) return dflt;
+    if (!isFinite(n) || n < 0 || n > CLIP_MAX_TOTAL) return dflt;
     return n;
   }
   function clipPre() { return clipSecs(CLIP_PRE_KEY, CLIP_PRE_DEFAULT); }
@@ -2221,10 +2249,32 @@
         say("This relay cannot cut clips yet — it is running a build without clip export.");
         return null;
       }
-      if (!r.ok) { say("The relay refused the export (" + r.status + ")."); return null; }
+      // A refusal that says why. The caps (too many clips held, too much disk
+      // used) come back with a sentence naming the limit, and a bare status
+      // code leaves the operator with nothing to act on.
+      // A refusal that says why. The caps come back as a plain sentence
+      // naming the limit — not JSON — and a bare status code would leave the
+      // operator with nothing to act on. Anything unreasonably long is not a
+      // message meant for a human, so the status code stands in.
+      if (!r.ok) {
+        return r.text().catch(function () { return ""; }).then(function (t) {
+          t = (t || "").trim();
+          say(t && t.length < 300
+            ? t
+            : "The relay refused the export (" + r.status + ").");
+          return null;
+        });
+      }
       return r.json().catch(function () { return {}; });
     }).then(function (d) {
       if (!d) return;
+      // Marked exported on acceptance, not on the clip appearing: the cut
+      // happens on the edge over the following seconds and this page is not
+      // told when it lands. Acceptance is the last thing here that is
+      // certain, and the portal is where a failure is reported.
+      picked.forEach(function (m) { m.exported = true; });
+      saveMarks();
+      renderMarks();
       say(picked.length + (picked.length === 1 ? " clip is" : " clips are") +
           " being cut. They appear on your sign-in page when ready.");
       setTimeout(function () { setExportMode(false); }, 2500);
@@ -2243,14 +2293,30 @@
   // Settings: seed the inputs from storage, and write back as they change.
   clipPreInput.value = clipPre();
   clipPostInput.value = clipPost();
-  [[clipPreInput, CLIP_PRE_KEY, CLIP_PRE_DEFAULT], [clipPostInput, CLIP_POST_KEY, CLIP_POST_DEFAULT]]
-    .forEach(function (pair) {
-      pair[0].addEventListener("change", function () {
-        var n = parseInt(pair[0].value, 10);
+  showClipLength();
+
+  function showClipLength() {
+    var total = clipPre() + clipPost();
+    clipLen.textContent = total <= 0
+      ? "A clip of zero seconds is not a clip — give it a second either side."
+      : "Each clip will be " + total + " seconds long. The most is "
+        + CLIP_MAX_TOTAL + ".";
+  }
+
+  [[clipPreInput, CLIP_PRE_KEY, clipPostInput], [clipPostInput, CLIP_POST_KEY, clipPreInput]]
+    .forEach(function (trio) {
+      var input = trio[0], key = trio[1], other = trio[2];
+      input.addEventListener("change", function () {
+        var n = parseInt(input.value, 10);
         if (!isFinite(n) || n < 0) n = 0;
-        if (n > CLIP_MAX) n = CLIP_MAX;
-        pair[0].value = n;
-        try { window.localStorage.setItem(pair[1], String(n)); } catch (e) { /* blocked */ }
+        // Clamp against what is left, not against the cap: the field the
+        // operator just touched is the one they meant, so the other keeps its
+        // value and this one gives way.
+        var room = CLIP_MAX_TOTAL - (parseInt(other.value, 10) || 0);
+        if (n > room) n = Math.max(0, room);
+        input.value = n;
+        try { window.localStorage.setItem(key, String(n)); } catch (e) { /* blocked */ }
+        showClipLength();
       });
     });
 
@@ -2329,6 +2395,24 @@
         var open = li.classList.toggle("picking");
         swatch.setAttribute("aria-expanded", open ? "true" : "false");
       });
+
+      // Exported already. Worth showing because the drawer is the only place
+      // that knows: the clip itself appears on the portal, on another page,
+      // and without this a mark exported ten minutes ago looks exactly like
+      // one that never was — so it gets exported twice.
+      //
+      // A static mark rather than a control: there is nothing to press, and
+      // the clip is undone from the portal, not from here.
+      if (m.exported) {
+        var done = document.createElement("span");
+        done.className = "done";
+        done.title = "Exported — the clip is on your sign-in page";
+        done.setAttribute("aria-label", "Exported");
+        done.innerHTML =
+          '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+          '<path d="M20 7L10 17l-5-5"/></svg>';
+        li.appendChild(done);
+      }
 
       var del = document.createElement("button");
       del.className = "del";
@@ -3195,14 +3279,14 @@
     else if (top + sh < h) zoomY += h - (top + sh);
   }
 
-  function applyZoom() {
+  function applyPicZoom() {
     clampZoom();
     var t = "translate(" + zoomX.toFixed(2) + "px," + zoomY.toFixed(2) + "px) " +
             "scale(" + zoomScale.toFixed(4) + ")";
     main.style.transform = t;
     proxy.style.transform = t;
     var on = zoomScale > ZOOM_MIN + 1e-3;
-    document.body.dataset.zoom = on ? "1" : "0";
+    document.body.dataset.picZoom = on ? "1" : "0";
     if (zoomBadge) zoomBadge.textContent = zoomScale.toFixed(1) + "×";
   }
 
@@ -3215,10 +3299,10 @@
     zoomX = px - (px - zoomX) * (next / zoomScale);
     zoomY = py - (py - zoomY) * (next / zoomScale);
     zoomScale = next;
-    applyZoom();
+    applyPicZoom();
   }
 
-  function resetZoom() { zoomScale = ZOOM_MIN; zoomX = 0; zoomY = 0; applyZoom(); }
+  function resetZoom() { zoomScale = ZOOM_MIN; zoomX = 0; zoomY = 0; applyPicZoom(); }
 
   /// Keyboard zoom has no cursor to zoom about, so it uses the middle of the
   /// picture — which is also where an operator looking at the whole frame is.
@@ -3262,13 +3346,13 @@
     if (zoomPts.size === 1) {
       if (zoomScale <= ZOOM_MIN + 1e-3) return;
       zoomX += dx; zoomY += dy;
-      applyZoom();
+      applyPicZoom();
     } else if (zoomPts.size === 2) {
       var s = pinchState();
       zoomAt(s.mid.x, s.mid.y, s.dist / (pinchDist || s.dist));
       // The midpoint travels as well as spreads, and a pinch that only scaled
       // would feel pinned to the spot the fingers first landed.
-      if (pinchMid) { zoomX += s.mid.x - pinchMid.x; zoomY += s.mid.y - pinchMid.y; applyZoom(); }
+      if (pinchMid) { zoomX += s.mid.x - pinchMid.x; zoomY += s.mid.y - pinchMid.y; applyPicZoom(); }
       pinchDist = s.dist; pinchMid = s.mid;
     }
   });
@@ -3296,7 +3380,7 @@
   });
 
   // A resize changes the letterbox, so the clamp has to run against the new one.
-  window.addEventListener("resize", function () { if (zoomScale > ZOOM_MIN) applyZoom(); });
+  window.addEventListener("resize", function () { if (zoomScale > ZOOM_MIN) applyPicZoom(); });
 
   function fullscreenNow() {
     return document.fullscreenElement || document.webkitFullscreenElement || null;
@@ -3325,6 +3409,29 @@
   if (document.documentElement.requestFullscreen ||
       document.documentElement.webkitRequestFullscreen) {
     btnFull.addEventListener("click", toggleFullscreen);
+
+    // Back to the sign-in page, which is where the clips they just exported
+    // appear. The player is served from the origin and the portal is a
+    // different host and port, so it cannot be derived — the portal names
+    // itself in `?from=` when it sends the viewer here.
+    //
+    // Validated before it is used, and deliberately: this value arrives in the
+    // URL, so navigating to it unchecked would honour a `javascript:` scheme
+    // from anyone who could get a crafted link opened. Only http(s) is taken,
+    // and anything else leaves the button hidden rather than pointing
+    // somewhere surprising.
+    var from = (function () {
+      var raw = new URLSearchParams(location.search).get("from");
+      if (!raw) return null;
+      try {
+        var u = new URL(raw, location.href);
+        return (u.protocol === "https:" || u.protocol === "http:") ? u.href : null;
+      } catch (e) { return null; }
+    })();
+    if (from) {
+      btnFeeds.hidden = false;
+      btnFeeds.addEventListener("click", function () { location.href = from; });
+    }
     document.addEventListener("fullscreenchange", syncFullscreenButton);
     document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
   } else {

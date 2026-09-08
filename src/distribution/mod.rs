@@ -1972,6 +1972,125 @@ mod tests {
         assert!(!html.contains("data-zoom="), "the VIEW preset buttons are still present");
     }
 
+    /// Two functions of the same name in one scope, and one of them is dead.
+    ///
+    /// The player is a single script, so a second `function foo()` hoists over
+    /// the first with no error anywhere — not at parse, not at run. Picture
+    /// zoom shipped an `applyZoom` that silently replaced the timeline's, and
+    /// the zoom slider stopped doing anything: the listener bound the wrong
+    /// body. Nothing caught it, because there was nothing to catch.
+    #[test]
+    fn no_two_declarations_in_the_player_share_a_name() {
+        let html = include_str!("dvr.html");
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for line in html.lines() {
+            // Top-level only: two locals of the same name in different
+            // functions are ordinary, and shadowing is not the bug here.
+            let Some(rest) = line.strip_prefix("  ") else { continue };
+            if rest.starts_with(' ') {
+                continue;
+            }
+            for kw in ["function ", "var ", "const ", "let "] {
+                let Some(tail) = rest.strip_prefix(kw) else { continue };
+                let name = tail
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                    .next()
+                    .unwrap_or("");
+                if !name.is_empty() {
+                    *seen.entry(name).or_default() += 1;
+                }
+            }
+        }
+        let dupes: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| *k).collect();
+        assert!(
+            dupes.is_empty(),
+            "declared twice at the top level of the player, so the second wins \
+             and the first is dead code: {dupes:?}"
+        );
+    }
+
+    /// A viewer sent to the player must have a way back to their clips.
+    ///
+    /// The player is served from the origin and the portal is a different host
+    /// and port, so the way back cannot be derived — the portal names itself in
+    /// `?from=`. And that value arrives in the URL, so it is checked before it
+    /// is navigated to: unchecked, a crafted link would make the button honour
+    /// a `javascript:` scheme.
+    #[test]
+    fn the_way_back_to_the_portal_is_checked_before_it_is_used() {
+        let html = include_str!("dvr.html");
+        assert!(html.contains("id=\"btnFeeds\""), "there is no way back to the feeds page");
+
+        let js = &html[html.find("btnFull.addEventListener").expect("wiring block")..];
+        let js = &js[..js.len().min(1400)];
+        assert!(
+            js.contains("\"from\""),
+            "the button does not read where the portal said it was: {js}"
+        );
+        assert!(
+            js.contains("u.protocol === \"https:\"") && js.contains("u.protocol === \"http:\""),
+            "the destination is navigated to without checking its scheme: {js}"
+        );
+        // Hidden by default in the markup, so a player opened without a `from`
+        // shows no button rather than one that goes nowhere.
+        let btn = &html[html.find("id=\"btnFeeds\"").unwrap()..];
+        assert!(
+            btn[..btn.find('>').unwrap()].contains("hidden"),
+            "the button is shown even when nothing told the player where to go"
+        );
+    }
+
+    /// An exported mark says so, and still says so after a reload.
+    ///
+    /// The clip lands on the portal — a different page — so the drawer is the
+    /// only place that can tell you a mark has already been sent. Without the
+    /// badge, one exported ten minutes ago looks exactly like one that never
+    /// was, and gets exported a second time.
+    ///
+    /// The flag has to survive the round trip through `localStorage` as well
+    /// as be set: written but not read back, the badge would vanish on the
+    /// next reload and the duplicate export comes back with it.
+    #[test]
+    fn a_mark_that_has_been_exported_is_marked_as_such() {
+        let html = include_str!("dvr.html");
+
+        let export = js_fn(html, "exportSelected");
+        assert!(
+            export.contains("m.exported = true"),
+            "exporting does not record that it happened: {export}"
+        );
+        assert!(
+            export.contains("saveMarks()"),
+            "the flag is set but never persisted, so a reload loses it: {export}"
+        );
+
+        let load = js_fn(html, "loadMarks");
+        assert!(
+            load.contains("m.exported"),
+            "a stored mark comes back without its exported flag: {load}"
+        );
+
+        let render = js_fn(html, "renderMarks");
+        assert!(
+            render.contains("if (m.exported)") && render.contains("\"done\""),
+            "nothing in the row shows that the mark was exported: {render}"
+        );
+    }
+
+    /// The drawer does not explain itself with a line of standing text.
+    ///
+    /// "Kept on this device, for this feed" was true and, sitting under every
+    /// list forever, was read once and then became furniture. Removed on
+    /// request; asserted so it does not drift back in.
+    #[test]
+    fn the_marks_drawer_carries_no_standing_note() {
+        let html = include_str!("dvr.html");
+        assert!(
+            !html.contains("Kept on this device"),
+            "the standing note is back in the marks drawer"
+        );
+    }
+
     /// The bar spans the view; live is still measured against the whole window.
     ///
     /// Zooming trades reach for granularity — at 30 s across a 1000-step bar a
@@ -2672,14 +2791,48 @@ mod tests {
         // a new preference is welcome and a new secret is not. Comments are
         // skipped — this section explains itself in prose, and prose stores
         // nothing.
-        const NON_SECRET_KEYS: [&str; 3] = ["MARKS_KEY", "LOWRES_KEY", "QUALITY_KEY"];
+        const NON_SECRET_KEYS: [&str; 5] = [
+            "MARKS_KEY",
+            "LOWRES_KEY",
+            "QUALITY_KEY",
+            "CLIP_PRE_KEY",
+            "CLIP_POST_KEY",
+        ];
         for line in html.lines().filter(|l| {
             let t = l.trim_start();
             l.contains("localStorage") && !t.starts_with("//") && !t.starts_with("*")
         }) {
+            // A helper parameterised on `key` names no constant, so the
+            // line-level check cannot clear it. Deferring to the call sites
+            // below is the honest reading: a bare `key` is only as safe as
+            // what is passed to it, which is what the next assertion pins.
+            let via_parameter = line.contains("getItem(key")
+                || line.contains("setItem(key,")
+                || line.contains("removeItem(key");
             assert!(
-                NON_SECRET_KEYS.iter().any(|k| line.contains(k)),
+                via_parameter || NON_SECRET_KEYS.iter().any(|k| line.contains(k)),
                 "localStorage used for a key that is not on the non-secret list: {line}"
+            );
+        }
+        // Which makes the declaration the thing to defend. Every storage key
+        // in the file has to be one this test has considered, so adding a new
+        // one is a deliberate act rather than something that rides in on an
+        // existing helper — and the token's key must never be among them.
+        for line in html.lines().filter(|l| l.contains("_KEY = ")) {
+            let name = line.trim_start().trim_start_matches("var ");
+            let name = name.split(' ').next().unwrap_or("");
+            assert!(
+                NON_SECRET_KEYS.contains(&name) || name == "TOKEN_KEY",
+                "a storage key this test has never seen: {name} — add it to the \
+                 non-secret list if it holds a preference, and think hard first \
+                 if it does not"
+            );
+        }
+        // And the credential's key belongs to the per-tab store alone.
+        for line in html.lines().filter(|l| l.contains("TOKEN_KEY")) {
+            assert!(
+                !line.contains("localStorage"),
+                "the token's key reached localStorage: {line}"
             );
         }
         // Every access wrapped: a browser with site data blocked throws on
