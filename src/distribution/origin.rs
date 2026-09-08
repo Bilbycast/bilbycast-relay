@@ -1660,6 +1660,23 @@ const MAX_CLIP_BYTES_PER_STREAM: u64 = 4 * 1024 * 1024 * 1024;
 /// holds it whole as a request body, so an unbounded length is an unbounded
 /// allocation on two machines. A minute is long enough for the thing an
 /// operator marked and short enough to stay a sane object.
+/// The body ceiling has to hold the longest clip the rule permits, at a
+/// contribution-feed rate. This pair is the whole reason clips do not share
+/// the segment limit, and it is checked at compile time because both sides are
+/// constants: a change that breaks the relationship should not build, rather
+/// than fail a test somebody has to run.
+const _: () = {
+    let sixty_secs_at_35mbit = 60usize * 35_000_000 / 8;
+    assert!(
+        MAX_CLIP_BYTES >= sixty_secs_at_35mbit,
+        "MAX_CLIP_BYTES cannot hold a minute of 35 Mbit/s contribution feed"
+    );
+    assert!(
+        MAX_CLIP_BYTES > MAX_OBJECT_BYTES,
+        "a clip is up to thirty segments; it cannot share the segment limit"
+    );
+};
+
 const MAX_CLIP_TOTAL_SECS: u32 = 60;
 
 /// The largest clip body the origin will accept.
@@ -3541,29 +3558,6 @@ seg-1.m4s
         // And the clip is not counted as adopted media, or the byte cap would
         // evict segments to make room for something it must never evict.
         assert_eq!(s.total_bytes(), 2, "the clip was adopted as a segment");
-    }
-
-    /// A clip is bounded in length, and the bound is on the total.
-    ///
-    /// The edge assembles a clip whole in memory and this holds it whole as a
-    /// request body, so length is an allocation on two machines. Checking each
-    /// end separately would let two forty-second halves through as an
-    /// eighty-second clip.
-    #[test]
-    fn a_clip_may_not_exceed_a_minute_however_it_is_split() {
-        assert!(MAX_CLIP_TOTAL_SECS == 60);
-        // The body ceiling has to hold the longest clip the rule permits, at a
-        // contribution-feed rate — this pair is the whole reason clips do not
-        // share the segment limit.
-        let sixty_secs_at_35mbit = 60usize * 35_000_000 / 8;
-        assert!(
-            MAX_CLIP_BYTES >= sixty_secs_at_35mbit,
-            "MAX_CLIP_BYTES {MAX_CLIP_BYTES} cannot hold {sixty_secs_at_35mbit} bytes"
-        );
-        assert!(
-            MAX_CLIP_BYTES > MAX_OBJECT_BYTES,
-            "a clip is up to thirty segments; it cannot share the segment limit"
-        );
     }
 
     /// A failed clip is terminal, and says why.
