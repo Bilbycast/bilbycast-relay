@@ -109,7 +109,7 @@ pub fn router(state: PortalState) -> Router {
         // they are, so "find your feed again" is a step nobody needs.
         .route("/watch", get(watch_redirect))
         .route("/api/feeds", get(feeds))
-        .route("/api/clips", get(clips))
+        .route("/api/clips", get(clips).delete(delete_clip))
         .route("/api/watch", post(watch))
         .route("/api/renew", get(renew))
         .with_state(state)
@@ -132,11 +132,7 @@ async fn page() -> impl IntoResponse {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             // `script-src 'self'` is why the script is its own route rather
             // than an inline block.
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-                 img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
-            ),
+            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::CACHE_CONTROL, "no-store"),
         ],
@@ -316,6 +312,10 @@ struct OriginClip {
     ready: bool,
     #[serde(default)]
     bytes: u64,
+    #[serde(default)]
+    failed: bool,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 /// Split a minted watch URL into the origin root and the token it carries.
@@ -337,6 +337,16 @@ fn origin_root_and_token(watch_url: &str) -> Option<(String, String)> {
     }
     Some((root, token))
 }
+
+/// The page's content policy.
+///
+/// A named constant so a test can assert against the policy actually served
+/// rather than a copy of it. `connect-src 'self'` in particular is load-bearing
+/// for `portal.js`: every fetch it makes has to be same-origin, and one that is
+/// not fails inside the browser with nothing reaching any server.
+const PAGE_CSP: &str = "default-src 'self'; script-src 'self'; \
+                        style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+                        connect-src 'self'; frame-ancestors 'none'";
 
 /// `GET /api/clips` — finished clips for the feeds this viewer may watch.
 ///
@@ -386,6 +396,15 @@ async fn clips(
                 "at": c.at,
                 "ready": c.ready,
                 "bytes": c.bytes,
+                "failed": c.failed,
+                // Passed through as the edge worded it. These are operator
+                // facts — the window aged out, the clip was too large — and
+                // rewording them here would only put distance between what
+                // happened and what the viewer is told.
+                "error": c.error,
+                // The session the clip belongs to, so a delete can name it
+                // without the page holding a URL on another origin.
+                "session_id": s.session_id,
                 "url": if c.ready {
                     // The name is already restricted by the relay to characters
                     // a path segment can carry, bar the space.
@@ -549,6 +568,102 @@ pub struct WatchRequest {
     pub session_id: String,
 }
 
+/// What a delete names: the feed, and the clip within it.
+#[derive(serde::Deserialize)]
+pub struct DeleteClipRequest {
+    pub session_id: String,
+    pub name: String,
+}
+
+/// `DELETE /api/clips` — remove one clip, on the viewer's behalf.
+///
+/// **Why the portal does this rather than the browser.** This page carries
+/// `connect-src 'self'`, so a `fetch` to the origin — a different host and
+/// port — never leaves the browser. The delete button therefore failed every
+/// time, before any request was made, with the relay perfectly willing and no
+/// sign of it in any log. Downloads were unaffected because a link is a
+/// navigation, not a fetch.
+///
+/// Widening the policy to name the origin would have worked and is the worse
+/// trade: it opens the page to a whole host for one button, and hands the
+/// browser a credential it only needs because it is doing the relay's talking.
+/// Going through here keeps the policy tight and the token server-side.
+///
+/// Entitlement is re-checked the same way a listing is — by minting against
+/// the manager, which refuses a session this viewer may not see.
+async fn delete_clip(
+    State(st): State<PortalState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteClipRequest>,
+) -> Response {
+    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
+        return unauthenticated();
+    };
+
+    // The mint is the permission check. A session the viewer has lost access
+    // to yields nothing here, so there is no separate rule to keep in step.
+    let Ok(watch_url) = mint(&st, &username, &req.session_id).await else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "That feed is not yours to change." })),
+        )
+            .into_response();
+    };
+    let Some((root, token)) = origin_root_and_token(&watch_url) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "Could not reach the feed's relay." })),
+        )
+            .into_response();
+    };
+    let Some(stream) = stream_id_from(&watch_url) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "Could not reach the feed's relay." })),
+        )
+            .into_response();
+    };
+
+    let url = format!(
+        "{root}/origin/{stream}/clips/{}.mp4?token={token}",
+        req.name.replace(' ', "%20"),
+    );
+    match st.http.delete(&url).send().await {
+        // 404 is success from where the viewer stands: the clip is gone, which
+        // is what they asked for. Anything else is reported.
+        Ok(r) if r.status().is_success() || r.status() == StatusCode::NOT_FOUND => {
+            tracing::info!(%username, clip = %req.name, "portal: clip deleted");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(r) => {
+            tracing::warn!(%username, clip = %req.name, status = r.status().as_u16(),
+                "portal: the relay would not delete the clip");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "The relay would not delete that clip." })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(%username, clip = %req.name, error = %e,
+                "portal: could not reach the relay to delete the clip");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "Could not reach the feed's relay." })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// The stream a watch URL points at — `…/dvr/{stream}?token=…`.
+fn stream_id_from(watch_url: &str) -> Option<String> {
+    let before_query = watch_url.split('?').next()?;
+    let last = before_query.rsplit('/').next()?;
+    (!last.is_empty()).then(|| last.to_string())
+}
+
 /// `POST /api/watch` — mint a viewing link for one feed.
 ///
 /// The portal does not decide whether this is allowed; the manager re-checks
@@ -621,6 +736,51 @@ async fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page's own script may only talk to the page's own origin.
+    ///
+    /// `connect-src 'self'` is deliberate, and it means every `fetch` in
+    /// `portal.js` must be same-origin. The Delete button reached for the
+    /// relay directly and was blocked by the browser before a request was
+    /// made: it failed every time, no log anywhere recorded an attempt, and
+    /// the relay was perfectly willing all along. Downloads were unaffected
+    /// because a link is a navigation, not a fetch.
+    ///
+    /// So this pins both halves — the policy, and the script honouring it.
+    #[test]
+    fn the_portal_script_only_fetches_its_own_origin() {
+        let html = include_str!("portal.html");
+        let js = include_str!("portal.js");
+
+        assert!(
+            PAGE_CSP.contains("connect-src 'self'"),
+            "the policy this test defends has been relaxed; if that was deliberate,              this test should be reconsidered rather than deleted"
+        );
+        let _ = html;
+
+        // Every fetch target must be a same-origin path. An absolute URL is
+        // the failure mode: it looks reasonable in review and cannot work.
+        let mut rest = js;
+        let mut checked = 0;
+        while let Some(i) = rest.find("fetch(") {
+            rest = &rest[i + "fetch(".len()..];
+            let arg = rest.trim_start();
+            assert!(
+                arg.starts_with('\'') || arg.starts_with('"'),
+                "a fetch target that is not a literal cannot be checked here: {}",
+                &arg[..arg.len().min(80)]
+            );
+            let quote = arg.as_bytes()[0] as char;
+            let end = arg[1..].find(quote).expect("unterminated fetch target") + 1;
+            let target = &arg[1..end];
+            assert!(
+                target.starts_with('/') && !target.starts_with("//"),
+                "portal.js fetches '{target}', which the page's own CSP forbids —                  route it through the portal instead"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 3, "only {checked} fetches found; the scan is not working");
+    }
     use std::collections::HashSet;
 
     fn cfg(trusted: &[&str]) -> PortalConfig {

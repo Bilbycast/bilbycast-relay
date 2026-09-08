@@ -184,6 +184,33 @@ manager's own UI:
 * Only sessions that are **on air** appear in the portal. A feed that is not
   running is simply absent, rather than offering a link to a black screen.
 
+## Clips
+
+A viewer marks a moment in the DVR player and asks for a clip; it is cut on the
+edge and lands here, under the feed list, once it is ready. Each row offers a
+**Download** and a **Delete**.
+
+**Entitlement is the same one that governs watching.** `GET /api/clips` asks the
+manager which sessions the signed-in user may watch and lists the clips of
+those, so a clip is visible to everyone entitled to the feed it came from — not
+only whoever pressed export. That is deliberate: clips are a working artefact of
+an event, and a gallery only its author can see is the wrong shape for a crew.
+
+**Failure is shown, not hidden.** A clip the edge cannot produce reads *"Could
+not be cut — "* and the reason, rather than sitting as "Being cut…" for ever.
+The common one is a mark that spans a recorder restart, where the media either
+side is two separate timelines; the message says to move the mark.
+
+**Delete is offered on failed clips too.** Clips are exempt from the relay's
+retention sweep — they are removed with the session, not with the window they
+came from — so nothing else reclaims their space, and a failed export still
+holds a record until somebody clears it.
+
+**The list is best-effort.** A relay too old to know about clips, or one that
+cannot be reached, leaves the section hidden rather than putting an error in
+front of a viewer whose feeds loaded perfectly well. The page exists to get
+someone watching.
+
 ## Signing out
 
 The portal cannot end a session — it never authenticated anyone. Authelia holds
@@ -276,4 +303,5 @@ the outer bound on how long a withdrawal takes to bite.
 | `GET /portal.js` | Its script — a separate route so the page can carry `script-src 'self'`. |
 | `GET /api/feeds` | What the signed-in user may watch. |
 | `POST /api/watch` | Mint a link for one feed. The body names the *session*; the username comes from the header and can never be supplied by the browser. |
+| `GET /api/clips` | Clips cut from the feeds this user may watch, with a download link for each. |
 | `GET /healthz` | Liveness. Deliberately needs no user — a health check that required one would be reporting on the proxy. |
