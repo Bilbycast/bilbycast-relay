@@ -97,12 +97,183 @@
             : 'Could not open that feed. Try again in a moment.', true);
         return;
       }
-      window.location.href = res.data.watch_url;
+      // Tell the player where to send them back to.
+      //
+      // The player is served from the origin — a different host and port to
+      // this page — so it has no way to work out where the portal is. This
+      // page does: it is running on it. Without this the viewer reaches the
+      // player and has no route back to the page their clips appear on.
+      var url = res.data.watch_url;
+      url += (url.indexOf("?") === -1 ? "?" : "&")
+           + "from=" + encodeURIComponent(window.location.origin);
+      window.location.href = url;
     }).catch(function () {
       btn.disabled = false;
       btn.textContent = 'Watch';
       msg('Could not open that feed. Try again in a moment.', true);
     });
+  }
+
+  /* Clips are fetched after the feeds, and their failure is silent.
+   *
+   * The page exists to get someone watching. A relay too old to know about
+   * clips, or one that cannot be reached, must not put an error in front of a
+   * viewer whose feeds loaded perfectly well. */
+  /* While anything is still being cut, come back and look again.
+   *
+   * A cut takes seconds to a minute, and this page is where it lands — so
+   * loading once meant an operator who exported and stayed put never learned
+   * their clip was ready. They had to know to reload, which is knowledge the
+   * page should not require.
+   *
+   * Only while something is pending, and only for a bounded spell: a tab left
+   * open all day must not poll a relay for the rest of the afternoon. A clip
+   * that is still not ready after that is one the operator will find on their
+   * next visit, and the edge gives up long before it. */
+  var clipPollTimer = null;
+  var clipPollUntil = 0;
+  var CLIP_POLL_MS = 5000;
+  var CLIP_POLL_MAX_MS = 10 * 60 * 1000;
+
+  function loadClips(isPoll) {
+    if (!isPoll) clipPollUntil = Date.now() + CLIP_POLL_MAX_MS;
+    fetch('/api/clips', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d || !d.clips) return;
+        renderClips(d.clips);
+        /* Nothing pending means nothing to wait for. Note this is decided on
+         * the server's answer, not on what was drawn — a row removed by a
+         * delete must not keep the timer alive. */
+        var pending = d.clips.some(function (c) { return !c.ready && !c.failed; });
+        if (clipPollTimer) { clearTimeout(clipPollTimer); clipPollTimer = null; }
+        if (pending && Date.now() < clipPollUntil) {
+          clipPollTimer = setTimeout(function () { loadClips(true); }, CLIP_POLL_MS);
+        }
+      })
+      .catch(function () { /* nothing to say to the viewer */ });
+  }
+
+  function renderClips(clips) {
+    var section = document.getElementById('clips');
+    var list = document.getElementById('cliplist');
+    if (!clips.length) {
+      list.textContent = '';
+      section.hidden = true;
+      return;
+    }
+    list.textContent = '';
+    clips.forEach(function (c) { list.appendChild(clipRow(c, list)); });
+    section.hidden = false;
+  }
+
+  /* One clip, as a table row.
+   *
+   * Built with createElement + textContent rather than innerHTML: a clip name
+   * is an operator's free text, and it reaches this page having been round a
+   * filename. */
+  function clipRow(c, list) {
+    var tr = document.createElement('tr');
+
+    var name = document.createElement('td');
+    name.className = 'name';
+    name.textContent = c.name;
+    tr.appendChild(name);
+
+    var feed = document.createElement('td');
+    feed.className = 'feed';
+    feed.textContent = c.feed;
+    tr.appendChild(feed);
+
+    /* Size, or what is standing in for it. A clip still being cut has no size
+     * yet and one that failed never will, so the column says which. */
+    var size = document.createElement('td');
+    size.className = 'num';
+    if (c.ready && c.bytes) {
+      size.textContent = (c.bytes / 1048576).toFixed(1) + ' MB';
+    } else if (c.failed) {
+      size.className = 'num failed';
+      size.textContent = 'Failed';
+    } else {
+      size.className = 'num pending';
+      size.textContent = 'Cutting…';
+    }
+    tr.appendChild(size);
+
+    var act = document.createElement('td');
+    act.className = 'act';
+    if (c.ready && c.url) {
+      var a = document.createElement('a');
+      a.className = 'btn';
+      a.href = c.url;
+      /* The filename the operator was promised, not the URL's last segment:
+       * browsers percent-decode inconsistently. */
+      a.setAttribute('download', c.name + '.mp4');
+      a.textContent = 'Download';
+      act.appendChild(a);
+    }
+
+    /* Clips sit outside the retention sweep, so nothing reclaims their space
+     * until the session ends. Offered on failed ones too — that is exactly
+     * what somebody wants to clear.
+     *
+     * Deleted through THIS page, not by reaching for the relay: the portal
+     * carries `connect-src 'self'`, so a cross-origin fetch never leaves the
+     * browser and the button failed every time with nothing in any log. */
+    var del = document.createElement('button');
+    del.className = 'btn quiet';
+    del.textContent = 'Delete';
+    del.addEventListener('click', function () {
+      del.disabled = true;
+      del.textContent = 'Deleting…';
+      fetch('/api/clips', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: c.session_id, name: c.name })
+      }).then(function (r) {
+        if (r.ok) {
+          var reason = tr.nextSibling;
+          if (reason && reason.classList && reason.classList.contains('reasonrow')) {
+            reason.remove();
+          }
+          tr.remove();
+          /* The last one going takes the empty table with it. */
+          if (!list.children.length) document.getElementById('clips').hidden = true;
+          return;
+        }
+        del.disabled = false;
+        del.textContent = 'Delete';
+        return r.json().catch(function () { return null; }).then(function (e) {
+          msg(e && e.error ? e.error : 'Could not delete that clip.', true);
+        });
+      }).catch(function () {
+        del.disabled = false;
+        del.textContent = 'Delete';
+        msg('Could not delete that clip.', true);
+      });
+    });
+    act.appendChild(del);
+    tr.appendChild(act);
+
+    /* The reason a clip failed gets its own row underneath, full width. It is
+     * a sentence, not a cell, and squeezing it into the size column would
+     * either truncate it or wreck the table. */
+    if (!c.failed || !c.error) return tr;
+
+    var extra = document.createElement('tr');
+    extra.className = 'reasonrow';
+    var td = document.createElement('td');
+    td.className = 'reason';
+    td.colSpan = 4;
+    td.textContent = c.error;
+    extra.appendChild(td);
+
+    /* Both rows go back together in a fragment, so the reason cannot end up
+     * anywhere but directly under the clip it belongs to. */
+    var pair = document.createDocumentFragment();
+    pair.appendChild(tr);
+    pair.appendChild(extra);
+    return pair;
   }
 
   fetch('/api/feeds', { headers: { 'Accept': 'application/json' } })
@@ -122,6 +293,7 @@
         return;
       }
       render(res.data);
+      loadClips(false);
     })
     .catch(function (e) {
       if (e && e.message === 'unauthenticated') return;

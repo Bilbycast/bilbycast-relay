@@ -81,6 +81,12 @@ they are not either/or.
 | `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |
+| `POST` | `/origin/{stream}/clips` | Player asks for one or more clips around marked moments |
+| `GET` | `/origin/{stream}/clips` | List this stream's clips and their state (the edge's work queue, and the portal's listing) |
+| `PUT` | `/origin/{stream}/clips/{name}.mp4` | Edge uploads a finished clip |
+| `GET` | `/origin/{stream}/clips/{name}.mp4` | Download a finished clip |
+| `DELETE` | `/origin/{stream}/clips/{name}.mp4` | Remove a clip and reclaim its disk |
+| `POST` | `/origin/{stream}/clips/{name}.mp4/failed` | Edge reports one it cannot produce |
 | `GET` | `/distribution/health` | Liveness |
 
 **The signaling + origin listener is plain HTTP.** Browsers require a secure
@@ -278,7 +284,14 @@ scope  ∈ { "viewer", "ingest" }
 - `require_ingest_token` (default **true**) gates the write surfaces (WHIP + origin PUT).
 - `require_viewer_token` (default false → public streams) gates WHEP.
 - `require_origin_token` (default false) gates `GET /origin/{stream}/{file}` —
-  the CMAF / LL-HLS tier — with the same `viewer`-scope credential.
+  the CMAF / LL-HLS tier — and the clip list, accepting **either** a `viewer`
+  or an `ingest` credential for that stream. Two kinds of caller read the
+  origin: a player or portal, which holds a viewer token, and the *edge*, which
+  holds the ingest token it pushes with and reads back to cut clips. Admitting
+  ingest grants nothing new — that token already authorises writing the same
+  objects, so a holder that could not read them was an inconsistency rather
+  than a boundary. Gating reads on the viewer token alone locked the edge out
+  of its own stream and no clip was ever cut.
 - Viewers pass the token as `?token=…` or `Authorization: Bearer`. The built-in
   player reads `?token=` off the `/watch/{stream}` URL and forwards it as a
   Bearer header; `/whep` accepts the query form directly too, as a convenience
@@ -608,6 +621,48 @@ sitting next to you — that needs somewhere server-side to put them, which does
 not exist yet. Note the viewing token deliberately uses `sessionStorage`
 instead: a credential has no business outliving its tab, and a test asserts the
 two do not get confused.
+
+### Clip export
+
+`EXPORT` at the foot of the marks drawer turns the list into a selection: a
+checkbox appears beside every reachable mark, and `EXPORT n` sends them. The
+clips are cut asynchronously and appear on the viewer's portal sign-in page —
+not here — because a clip takes seconds to produce and a browser tab is the
+wrong place to wait for one.
+
+**How much either side is a setting, not a per-clip prompt.** Settings carries
+`seconds before` / `seconds after`, defaulting to 3 and 5, stored per device
+in `localStorage`. An operator marking goals wants the same handles every time,
+and asking twice per clip during a match is the wrong shape.
+
+**The pair is capped at 60 seconds total.** Checked on the sum rather than each
+end — two 40-second halves are an 80-second clip however they are split — and
+enforced again at the origin, which answers `400` with a sentence naming the
+limit. The player shows that sentence verbatim rather than a status code,
+because the caps (too many clips held, too much disk used) are things an
+operator can act on. Typing into one field clamps against *what is left*, so
+the field just touched keeps its value and the other gives way.
+
+**Names are `<Marker TC> - <Marker name>`.** The readout's colons cannot go in a
+filename on Windows and are awkward everywhere else, so they become dashes here
+rather than in the browser — every viewer then gets the same name for the same
+clip instead of one that varies by platform. Two different marks that produce
+the same name are two clips: the second becomes `… (2)`. Re-requesting the
+*same* mark is idempotent and does not.
+
+**A request is a job, not a file.** `POST /origin/{stream}/clips` answers `202`
+and records each clip as pending; the edge polls the list, cuts, and `PUT`s the
+result. A clip it cannot produce is reported `failed` with a reason, so it stops
+reading as "still being cut" — the portal shows the reason. See the edge's
+[replay.md](../../bilbycast-edge/docs/replay.md#clip-export) for how the cut is
+made and what it will not do.
+
+**Clips are exempt from the retention sweep.** They live in a `clips/`
+subdirectory of the stream's origin store and are removed with the session, not
+with the window that produced them — a clip cut from a moment that has since
+rolled out of the DVR window is exactly the clip worth keeping. Bounded instead
+by a count and a byte ceiling per stream, and offered a Delete on the portal so
+the space can be reclaimed without ending the session.
 
 ### Picture modes
 

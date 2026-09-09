@@ -860,3 +860,285 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         ]
     }
 }
+
+/// The whole clip lifecycle, over HTTP, through the real router.
+///
+/// Every other clip test drives `OriginStore` directly, which cannot see the
+/// two things most likely to break here. The first is route ordering:
+/// `/origin/{stream}/clips` and `/origin/{stream}/{file}` both match that
+/// path, and if the object route wins, asking for the clip list serves a 404
+/// for a segment named "clips" — with the store perfectly correct underneath.
+/// The second is that the clips live on their own router with their own body
+/// limit, merged into the object router; a merge that drops them leaves every
+/// helper green and every endpoint gone.
+#[tokio::test]
+async fn the_clip_lifecycle_works_over_http() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{build_router, DistributionState};
+
+    let cancel = CancellationToken::new();
+    let hub = Arc::new(Hub::new());
+    let (events, _rx) = event_channel();
+    let cfg = DistributionConfig {
+        require_viewer_token: false,
+        require_ingest_token: false,
+        ..Default::default()
+    };
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
+    let state = DistributionState::new(hub, origin, cfg, control, cancel.clone(), events);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ =
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+
+    /// Returns (status, body). Written by hand rather than with a client crate
+    /// so the test depends on nothing the relay does not already carry.
+    async fn req(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        content_type: &str,
+    ) -> (u16, String) {
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
+        if let Some(b) = body {
+            head.push_str(&format!(
+                "Content-Type: {content_type}\r\nContent-Length: {}\r\n",
+                b.len()
+            ));
+        }
+        head.push_str("\r\n");
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(head.as_bytes()).await.unwrap();
+        if let Some(b) = body {
+            s.write_all(b).await.unwrap();
+        }
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        // Split head from body on the blank line; the body may be binary, and
+        // lossy is fine because every assertion below is on ASCII.
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    const ASK: &str = r#"{"pre_secs":10,"post_secs":20,"clips":[
+        {"at":"2026-09-07T10:00:00Z","name":"10-00-00-00 - Goal"}]}"#;
+
+    // 1. Requesting a clip is accepted, and this is the route-ordering check:
+    //    a POST that fell through to the object route could not answer 200.
+    let (st, _) = req(addr, "POST", "/origin/feed/clips", Some(ASK.as_bytes()), "application/json").await;
+    assert_eq!(st, 202, "POST /origin/feed/clips was not routed to the clip handler");
+
+    // 2. It lists, unfinished. A `clips` swallowed by `{file}` would 404 here.
+    let (st, body) = req(addr, "GET", "/origin/feed/clips", None, "").await;
+    assert_eq!(st, 200, "GET /origin/feed/clips did not reach the list handler: {body}");
+    assert!(body.contains("10-00-00-00 - Goal"), "the requested clip is not listed: {body}");
+    assert!(body.contains("\"ready\":false"), "a clip nothing has cut yet reads as ready: {body}");
+
+    // 3. The edge uploads the cut. Percent-encoded, as a browser would send it.
+    let (st, _) = req(
+        addr,
+        "PUT",
+        "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4",
+        Some(b"ftypisomMOOVDATA"),
+        "video/mp4",
+    )
+    .await;
+    assert_eq!(st, 201, "the edge could not upload a finished clip");
+
+    // 4. Now it is ready, and carries its size.
+    let (_, body) = req(addr, "GET", "/origin/feed/clips", None, "").await;
+    assert!(body.contains("\"ready\":true"), "an uploaded clip still reads as pending: {body}");
+    assert!(body.contains("\"bytes\":16"), "the clip's size was not recorded: {body}");
+
+    // 5. And downloads byte for byte.
+    let (st, body) = req(addr, "GET", "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4", None, "").await;
+    assert_eq!(st, 200, "a finished clip would not download");
+    assert_eq!(body, "ftypisomMOOVDATA", "the download is not what was uploaded");
+
+    // 6. Deleting it reclaims the space, and it stops being served.
+    let (st, _) = req(addr, "DELETE", "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4", None, "").await;
+    assert_eq!(st, 204, "a clip could not be deleted");
+    let (st, _) = req(addr, "GET", "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4", None, "").await;
+    assert_eq!(st, 404, "a deleted clip is still being served");
+
+    // 7. A clip the edge gives up on says so, rather than pending for ever.
+    let (st, _) = req(addr, "POST", "/origin/feed/clips", Some(ASK.as_bytes()), "application/json").await;
+    assert_eq!(st, 202);
+    let (st, _) = req(
+        addr,
+        "POST",
+        "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4/failed",
+        Some(br#"{"reason":"that moment is no longer in the window"}"#),
+        "application/json",
+    )
+    .await;
+    assert_eq!(st, 200, "the edge could not report a clip it cannot cut");
+    let (_, body) = req(addr, "GET", "/origin/feed/clips", None, "").await;
+    assert!(body.contains("\"failed\":true"), "a given-up clip does not read as failed: {body}");
+    assert!(
+        body.contains("no longer in the window"),
+        "the reason the operator needs is not in the listing: {body}"
+    );
+
+    // 8. The one-minute ceiling is enforced at the door, with a sentence that
+    //    names the limit — the player shows this text verbatim.
+    let too_long = r#"{"pre_secs":40,"post_secs":40,"clips":[
+        {"at":"2026-09-07T10:00:00Z","name":"long"}]}"#;
+    let (st, body) = req(addr, "POST", "/origin/feed/clips", Some(too_long.as_bytes()), "application/json").await;
+    assert_eq!(st, 400, "an 80-second clip was accepted");
+    assert!(body.contains("60 seconds"), "the refusal does not name the limit: {body}");
+}
+
+/// The edge must be able to read its own work queue.
+///
+/// Two different callers poll `GET /origin/{stream}/clips` holding two
+/// different credentials: a viewer's portal, which has a viewer token, and the
+/// edge that does the cutting, which is an ingest client and carries the
+/// ingest token it pushes segments with. Gating on the viewer token alone
+/// admitted the portal and locked out the edge — every poll 403'd, no clip was
+/// ever cut, and the poller's `Err(_) => continue` meant not one line of log
+/// said so. The feature was inert end to end and every unit test was green.
+#[tokio::test]
+async fn the_clip_list_admits_the_edge_as_well_as_a_viewer() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{build_router, token, DistributionState};
+    use bilbycast_relay::distribution_control::DistUpdate;
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    let cancel = CancellationToken::new();
+    let hub = Arc::new(Hub::new());
+    let (events, _rx) = event_channel();
+    let cfg = DistributionConfig::default();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
+    let state = DistributionState::new(hub, origin, cfg, control.clone(), cancel.clone(), events);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ =
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+
+    // The gate only exists once the manager turns it on, which is how the
+    // demo runs and how this went unnoticed in an ungated test.
+    control.apply(DistUpdate {
+        token_secret: Some(SECRET.into()),
+        require_origin_token: Some(true),
+        ..Default::default()
+    });
+
+    async fn list(addr: SocketAddr, bearer: Option<&str>) -> u16 {
+        let auth = bearer
+            .map(|t| format!("Authorization: Bearer {t}
+"))
+            .unwrap_or_default();
+        let req = format!(
+            "GET /origin/feed/clips HTTP/1.1
+Host: x
+{auth}Connection: close
+
+"
+        );
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+
+    assert_eq!(list(addr, None).await, 401, "the list must still need a credential");
+
+    let viewer = token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+    assert_eq!(list(addr, Some(&viewer)).await, 200, "a viewer cannot see their own clips");
+
+    let ingest = token::mint_ingest_token(SECRET, "feed", exp).unwrap();
+    assert_eq!(
+        list(addr, Some(&ingest)).await,
+        200,
+        "the edge cannot read its own work queue, so nothing will ever be cut"
+    );
+
+    // A token for someone else's stream is still no good, either way round.
+    let wrong = token::mint_ingest_token(SECRET, "other", exp).unwrap();
+    assert_ne!(list(addr, Some(&wrong)).await, 200, "a token for another stream was accepted");
+
+    // The same applies to the objects themselves. Cutting a clip from whole
+    // segments means fetching the manifest and the segments that cover the
+    // moment, so an edge locked out of those cannot fall back either — which
+    // is exactly what happened once the list was fixed and this was not.
+    async fn get_obj(addr: SocketAddr, path: &str, bearer: Option<&str>) -> u16 {
+        let auth = bearer
+            .map(|t| format!("Authorization: Bearer {t}
+"))
+            .unwrap_or_default();
+        let req =
+            format!("GET {path} HTTP/1.1
+Host: x
+{auth}Connection: close
+
+");
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+    // 404, not 401/403: the credential was accepted and the object simply is
+    // not there. Asserting "not refused" is the point.
+    assert_eq!(
+        get_obj(addr, "/origin/feed/manifest.m3u8", Some(&ingest)).await,
+        404,
+        "the edge cannot read the manifest it needs to cut a clip from segments"
+    );
+    assert_eq!(
+        get_obj(addr, "/origin/feed/manifest.m3u8", Some(&wrong)).await,
+        403,
+        "an ingest token for another stream must not open this one"
+    );
+}
