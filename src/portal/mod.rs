@@ -87,6 +87,11 @@ struct ManagerStream {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     watch_url: String,
+    /// The opaque id of the device that now holds this login, when the mint
+    /// claimed or renewed one. Absent for a mint that was only a permission
+    /// check.
+    #[serde(default)]
+    holder: Option<String>,
     #[serde(default)]
     expires_in_secs: u64,
 }
@@ -231,19 +236,63 @@ async fn fetch_streams(st: &PortalState, username: &str) -> Result<Vec<ManagerSt
 }
 
 /// Ask the manager to mint, returning the URL to send the viewer to.
+/// Mint purely as a permission check — listing clips, downloading one,
+/// deleting one. Claims nothing, so it cannot displace the viewer's own
+/// player, which matters because the clip list is polled while a cut runs.
 async fn mint(st: &PortalState, username: &str, session_id: &str) -> Result<String, Response> {
+    mint_inner(st, username, session_id, None, None, false).await
+}
+
+/// Mint, saying whether this is a renewal and where the viewer is.
+///
+/// `holder` is the opaque id the player was given when it took the login. Its
+/// presence is what tells the manager this is a renewal rather than a fresh
+/// watch — a fresh watch *claims* the login and displaces whatever held it,
+/// where a renewal has to still hold it. Sending it on both would let two
+/// devices take the feed back off each other indefinitely, each succeeding.
+///
+/// An id rather than the token, because two tokens minted in the same second
+/// for the same streams are byte-identical and so cannot tell two devices
+/// apart — which is exactly the case this exists to catch.
+async fn mint_inner(
+    st: &PortalState,
+    username: &str,
+    session_id: &str,
+    holder: Option<&str>,
+    viewer_ip: Option<String>,
+    claim: bool,
+) -> Result<String, Response> {
     let url = format!("{}/api/v1/dvr/portal/token", st.cfg.manager_url);
     let resp = st
         .http
         .post(&url)
         .bearer_auth(&st.cfg.manager_token)
-        .json(&serde_json::json!({ "username": username, "session_id": session_id }))
+        .json(&serde_json::json!({
+            "username": username,
+            "session_id": session_id,
+            "holder": holder,
+            "viewer_ip": viewer_ip,
+            "claim": claim,
+        }))
         .send()
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "portal: manager token mint failed");
             upstream_unavailable()
         })?;
+
+    // Someone else took the login. Its own answer, and its own words: nothing
+    // expired, so telling a viewer their access ran out would send them
+    // looking for the wrong fix.
+    if resp.status() == StatusCode::CONFLICT {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "This login is being used on another device.                           Only one at a time — sign in again here to take it back."
+            })),
+        )
+            .into_response());
+    }
 
     // The manager answers one uniform refusal whether the user is not
     // entitled, the session does not exist, or it is not running — so this
@@ -267,7 +316,16 @@ async fn mint(st: &PortalState, username: &str, session_id: &str) -> Result<Stri
         tracing::warn!(error = %e, "portal: unreadable mint response");
         upstream_unavailable()
     })?;
-    Ok(body.watch_url)
+    // The holder id rides on the URL, so it reaches the player by the same
+    // route the token does and needs no second channel. The player keeps it
+    // and presents it on renewal; it is not a credential and grants nothing.
+    Ok(match body.holder {
+        Some(h) if !h.is_empty() => {
+            let sep = if body.watch_url.contains('?') { '&' } else { '?' };
+            format!("{}{sep}hold={h}", body.watch_url)
+        }
+        _ => body.watch_url,
+    })
 }
 
 /// `GET /api/feeds` — what the signed-in user may watch.
@@ -467,6 +525,32 @@ pub struct WatchQuery {
     /// The relay's stream id, not the session id — the player knows which
     /// stream it is showing and nothing else about the session behind it.
     pub stream: String,
+    /// On a renewal, the holder id the player was given.
+    ///
+    /// Its presence is what distinguishes "I am still watching" from "I am
+    /// starting to watch": the first must still hold the login, the second
+    /// takes it. A player that omits it is treated as starting.
+    #[serde(default)]
+    pub held: Option<String>,
+}
+
+/// The address to record for a viewer.
+///
+/// Every request arrives from the authenticating proxy on loopback, so the
+/// peer address says nothing about the viewer. `X-Forwarded-For`'s first hop is
+/// the client as the proxy saw it — trustworthy here for the same reason the
+/// username is: the peer has already been checked against `trusted_proxies`,
+/// and an untrusted peer never reaches this code.
+///
+/// Recorded for the access log, never for a decision.
+fn viewer_address(peer: IpAddr, headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| Some(peer.to_string()))
 }
 
 /// `GET /watch?stream=…` — mint for the signed-in viewer and send them back.
@@ -496,7 +580,16 @@ async fn watch_redirect(
         return Redirect::to("/").into_response();
     };
 
-    match mint(&st, &username, &hit.session_id).await {
+    match mint_inner(
+        &st,
+        &username,
+        &hit.session_id,
+        None,
+        viewer_address(peer.ip(), &headers),
+        true,
+    )
+    .await
+    {
         Ok(url) => Redirect::to(&url).into_response(),
         Err(_) => Redirect::to("/").into_response(),
     }
@@ -554,18 +647,38 @@ async fn renew(
         return with_cors(&origin, (StatusCode::FORBIDDEN, "no such feed").into_response());
     };
 
-    match mint(&st, &username, &hit.session_id).await {
+    match mint_inner(
+        &st,
+        &username,
+        &hit.session_id,
+        // Absent when an older player renews without saying what it holds. It
+        // is then treated as a fresh watch, which is the forgiving reading:
+        // the viewer keeps their feed and simply retakes the login.
+        q.held.as_deref(),
+        viewer_address(peer.ip(), &headers),
+        // A renewal that arrives without saying what it holds is treated as a
+        // fresh watch, so an older player keeps its feed by retaking the login.
+        q.held.is_none(),
+    )
+    .await
+    {
         Ok(url) => {
-            let token = url
-                .split_once("token=")
-                .map(|(_, t)| t.to_string())
-                .unwrap_or_default();
+            let field = |k: &str| {
+                url.split_once(&format!("{k}="))
+                    .map(|(_, t)| t.split('&').next().unwrap_or("").to_string())
+                    .unwrap_or_default()
+            };
+            let token = field("token");
             if token.is_empty() {
                 return with_cors(&origin, upstream_unavailable());
             }
+            // The holder can change on a renewal only when the player had none
+            // to present and was therefore treated as starting to watch — so
+            // it is handed back either way and the player keeps the latest.
             with_cors(
                 &origin,
-                Json(serde_json::json!({ "token": token })).into_response(),
+                Json(serde_json::json!({ "token": token, "holder": field("hold") }))
+                    .into_response(),
             )
         }
         Err(r) => with_cors(&origin, r),
@@ -804,6 +917,11 @@ async fn watch(
         .json(&serde_json::json!({
             "username": username,
             "session_id": req.session_id,
+            // Pressing Watch is starting to watch, so this takes the login —
+            // displacing whatever held it. The routes that mint only to check
+            // a permission deliberately do not.
+            "claim": true,
+            "viewer_ip": viewer_address(peer.ip(), &headers),
         }))
         .send()
         .await;
@@ -843,7 +961,16 @@ async fn watch(
         }
     };
     Json(serde_json::json!({
-        "watch_url": body.watch_url,
+        // The holder id rides on the URL beside the token, so the player picks
+        // both up the same way and can prove on renewal that it is still the
+        // device holding this login.
+        "watch_url": match body.holder.as_deref() {
+            Some(h) if !h.is_empty() => {
+                let sep = if body.watch_url.contains('?') { '&' } else { '?' };
+                format!("{}{sep}hold={h}", body.watch_url)
+            }
+            _ => body.watch_url.clone(),
+        },
         "expires_in_secs": body.expires_in_secs,
     }))
     .into_response()

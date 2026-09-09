@@ -766,6 +766,30 @@
   // strict privacy settings should still be able to watch — they just lose the
   // reload.
   var TOKEN_KEY = "bilbycast.dvr.token." + STREAM;
+
+  /* The opaque id of the device holding this login.
+   *
+   * Handed out with the token and presented on renewal, so the portal can tell
+   * "still watching" from "somebody else signed in with the same account". Not
+   * a credential: it opens nothing, and is only ever compared against the row
+   * that records who holds the feed. It cannot be the token, because two
+   * tokens minted in the same second for the same streams are byte-identical
+   * and so cannot tell two devices apart.
+   *
+   * Same lifetime as the token — per tab, gone when the tab closes. */
+  var HOLD_KEY = "bilbycast.dvr.hold." + STREAM;
+  var HOLDER = "";
+  function rememberHolder(h) {
+    HOLDER = h || "";
+    try {
+      if (HOLDER) window.sessionStorage.setItem(HOLD_KEY, HOLDER);
+      else window.sessionStorage.removeItem(HOLD_KEY);
+    } catch (e) { /* blocked */ }
+  }
+  function recallHolder() {
+    try { return window.sessionStorage.getItem(HOLD_KEY) || ""; }
+    catch (e) { return ""; }
+  }
   function rememberToken(t) {
     try { window.sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* blocked */ }
   }
@@ -785,13 +809,21 @@
     TOKEN = recallToken();
   }
 
+  // The holder id arrives with the token and is kept the same way.
+  HOLDER = qs.get("hold") || "";
+  if (HOLDER) rememberHolder(HOLDER);
+  else HOLDER = recallHolder();
+
   // With MSE we can send the token as a request header, so it never has to
   // sit in a URL -- out of the address bar, the history, and any Referer.
   // Native HLS (iOS Safari) hands the URL straight to the media stack and
   // cannot set headers, so there the query form is the only option.
   var TOKEN_IN_HEADER = !!(window.Hls && window.Hls.isSupported());
-  if (qs.get("token") && window.history && history.replaceState) {
+  if ((qs.get("token") || qs.get("hold")) && window.history && history.replaceState) {
     qs.delete("token");
+    // Out of the address bar with the token: it is per-tab state, not
+    // something to be copied out of a URL along with the credential.
+    qs.delete("hold");
     var q = qs.toString();
     history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
   }
@@ -3281,11 +3313,27 @@
 
   function applyPicZoom() {
     clampZoom();
-    var t = "translate(" + zoomX.toFixed(2) + "px," + zoomY.toFixed(2) + "px) " +
-            "scale(" + zoomScale.toFixed(4) + ")";
+    var on = zoomScale > ZOOM_MIN + 1e-3;
+
+    // At rest the transform is REMOVED, not set to an identity.
+    //
+    // `scale(1)` is not free: any transform on a `<video>` promotes it to a
+    // composited layer, and on a good many GPU and driver combinations that
+    // takes it off the hardware video overlay and pushes every frame through
+    // the compositor instead. The picture then stalls while the audio and the
+    // media clock carry on — frames decoded and never presented, which reads
+    // as the video freezing a second at a time and is worst on the
+    // full-resolution rendition, because that is the expensive one to push.
+    //
+    // So the cost is paid only while somebody is actually zoomed in. An empty
+    // string clears the inline property rather than overriding it with an
+    // identity that still promotes the layer.
+    var t = on || Math.abs(zoomX) > 0.5 || Math.abs(zoomY) > 0.5
+      ? "translate(" + zoomX.toFixed(2) + "px," + zoomY.toFixed(2) + "px) " +
+        "scale(" + zoomScale.toFixed(4) + ")"
+      : "";
     main.style.transform = t;
     proxy.style.transform = t;
-    var on = zoomScale > ZOOM_MIN + 1e-3;
     document.body.dataset.picZoom = on ? "1" : "0";
     if (zoomBadge) zoomBadge.textContent = zoomScale.toFixed(1) + "×";
   }
@@ -3884,16 +3932,47 @@
     renewTimer = setTimeout(renewNow, ms);
   }
 
+  /* Someone signed in with this login somewhere else, and took the feed.
+   *
+   * Deliberately NOT the expired wording. Nothing ran out: the viewer is being
+   * told a fact about their account, and sending them to "sign in again to
+   * keep watching" would describe the wrong problem. The way back is the same
+   * link, though — opening the feed again takes the login back, because the
+   * newest device wins. */
+  function takenOver() {
+    forgetToken();
+    try { main.pause(); proxy.pause(); } catch (e) {}
+    failWith("This login is in use on another device. Only one at a time. ",
+             "Open the feed again to take it back",
+             "Open the feed again from your sign-in page to take it back.");
+  }
+
   function renewNow() {
     renewTimer = null;
+    // Say which token we hold. That is what tells the portal this is a
+    // renewal rather than somebody starting to watch — a renewal has to still
+    // hold the login, where starting to watch takes it. Without this a second
+    // device and this one would take the feed off each other indefinitely,
+    // both succeeding, and one login would serve any number of people.
     var url = PORTAL_URL.replace(/\/+$/, "") + "/api/renew?stream=" +
-              encodeURIComponent(STREAM);
+              encodeURIComponent(STREAM) +
+              (HOLDER ? "&held=" + encodeURIComponent(HOLDER) : "");
     fetch(url, { credentials: "include" })
-      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (r) {
+        // Someone else signed in with this login. Not an expiry — nothing ran
+        // out — so it gets its own answer rather than the renewal backoff,
+        // which would keep asking for something it will never be given.
+        if (r.status === 409) {
+          takenOver();
+          throw new Error("taken over");
+        }
+        return r.ok ? r.json() : null;
+      })
       .then(function (body) {
         if (!body || !body.token) throw new Error("no token");
         TOKEN = body.token;
         rememberToken(TOKEN);
+        if (body.holder) rememberHolder(body.holder);
         renewFailures = 0;
         // hls.js reads `TOKEN` inside `xhrSetup` at request time, and so does
         // every sprite-sheet fetch, so there is nothing to re-attach.

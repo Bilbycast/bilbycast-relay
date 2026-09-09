@@ -2091,6 +2091,39 @@ mod tests {
         );
     }
 
+    /// A picture at rest carries no transform at all.
+    ///
+    /// `scale(1)` is not a no-op. Any transform on a `<video>` promotes it to
+    /// a composited layer, which on many GPU and driver combinations takes it
+    /// off the hardware video overlay and pushes every frame through the
+    /// compositor. The symptom is distinctive and was reported from the demo:
+    /// the picture freezes for a second at a time while the audio and the
+    /// media clock carry on, worst on the full-resolution rendition, and it
+    /// happens in already-buffered material — so it is nothing to do with
+    /// delivery.
+    ///
+    /// The zoom feature therefore has to clear the property when it is not in
+    /// use, rather than write an identity into it.
+    #[test]
+    fn the_picture_carries_no_transform_until_it_is_zoomed() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "applyPicZoom");
+        assert!(
+            f.contains(": \"\";") || f.contains(": \"\"
+"),
+            "the transform is always written, so the video is always composited: {f}"
+        );
+        assert!(
+            f.contains("zoomScale > ZOOM_MIN"),
+            "nothing decides whether the picture is at rest: {f}"
+        );
+        // And a pan with no scale still needs one, or dragging does nothing.
+        assert!(
+            f.contains("Math.abs(zoomX)") && f.contains("Math.abs(zoomY)"),
+            "a panned but unscaled picture would lose its offset: {f}"
+        );
+    }
+
     /// The bar spans the view; live is still measured against the whole window.
     ///
     /// Zooming trades reach for granularity — at 30 s across a 1000-step bar a
@@ -2821,19 +2854,29 @@ mod tests {
         for line in html.lines().filter(|l| l.contains("_KEY = ")) {
             let name = line.trim_start().trim_start_matches("var ");
             let name = name.split(' ').next().unwrap_or("");
+            // Three kinds, and the distinction is the point: preferences in
+            // localStorage, the credential, and the id of the device holding
+            // the login — not a credential, but per-tab state like the token.
             assert!(
-                NON_SECRET_KEYS.contains(&name) || name == "TOKEN_KEY",
+                NON_SECRET_KEYS.contains(&name)
+                    || name == "TOKEN_KEY"
+                    || name == "HOLD_KEY",
                 "a storage key this test has never seen: {name} — add it to the \
                  non-secret list if it holds a preference, and think hard first \
                  if it does not"
             );
         }
-        // And the credential's key belongs to the per-tab store alone.
-        for line in html.lines().filter(|l| l.contains("TOKEN_KEY")) {
-            assert!(
-                !line.contains("localStorage"),
-                "the token's key reached localStorage: {line}"
-            );
+        // And the two per-tab keys belong to the per-tab store alone. The
+        // holder id is not a credential — it opens nothing — but a device that
+        // kept it across tabs would go on claiming to be the one watching
+        // after the tab that took the feed had closed.
+        for key in ["TOKEN_KEY", "HOLD_KEY"] {
+            for line in html.lines().filter(|l| l.contains(key)) {
+                assert!(
+                    !line.contains("localStorage"),
+                    "{key} reached localStorage: {line}"
+                );
+            }
         }
         // Every access wrapped: a browser with site data blocked throws on
         // read rather than returning null, and that must not take the player
