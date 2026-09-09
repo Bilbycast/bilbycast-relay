@@ -2,13 +2,15 @@
 
 > 🌐 Learn more at **[bilbycast.com](https://bilbycast.com)** — the official website for the Bilbycast broadcast media transport suite.
 
-Stateless relay server that provides NAT traversal for bilbycast-edge nodes. It is a generic, **opaque per-path forwarder**: it pairs the two ends of each path by tunnel ID and forwards encrypted traffic between them, with no ability to read the payload (end-to-end ChaCha20-Poly1305 encryption lives on the edges — the relay sees only `[16-byte tunnel_id][AEAD ciphertext]`). It carries every path type the same way:
+NAT-traversal relay server for bilbycast-edge nodes. The forwarder is **stateless** and generic — an **opaque per-path forwarder**: it pairs the two ends of each path by tunnel ID and forwards encrypted traffic between them, with no ability to read the payload (end-to-end ChaCha20-Poly1305 encryption lives on the edges — the relay sees only `[16-byte tunnel_id][AEAD ciphertext]`). It carries every path type the same way:
 
 - **QUIC tunnels** — TCP streams + UDP datagrams over QUIC/TLS 1.3 (`:4433`).
 - **Native SRT/RIST over relay** — plain UDP, no QUIC (`:4434`), so SRT/RIST run their own ARQ + congestion control without QUIC's per-packet overhead or a second congestion controller fighting theirs.
 - **Individual bond legs** — a relayed bond leg is just a native plain-UDP tunnel as far as the relay is concerned. The relay forwards each leg's packets opaquely; bond aggregation, cross-leg ARQ, FEC, and reordering all run end-to-end edge↔edge. **The relay never terminates or combines a bond** — there is no "bond bridge".
 
 Each path can go direct or over any relay, in any combination (and a path may use a primary + backup relay), and both ends can be behind NAT — both edges dial out.
+
+A **`-distribution`** build is not stateless, and `install-relay.sh` installs that artefact by default. It keeps a DVR origin under `origin_storage_dir` — startup **adopts** the segments already on disk rather than rebuilding the window — and it persists manager-pushed distribution config back into `relay.json`. See [Viewer Distribution](#viewer-distribution-optional).
 
 ## Quick Start
 
@@ -142,13 +144,23 @@ All fields are optional. Defaults are used for any omitted field.
 Built with `--features viewer-distribution` (the `*-linux-distribution` release
 binary), a relay can also reach **browser viewers directly** — a **WHEP SFU**
 for sub-second WebRTC plus an **LL-HLS/CMAF origin** for CDN-scale audiences —
-with no external streaming server and no ports opened on the edge. It's a
-separate, **default-off** capability, hard-isolated from the opaque forwarder;
-this binary stays a pure forwarder unless you add a `distribution` block.
+with no external streaming server and no ports opened on the edge. The **Cargo
+feature** is default-off and hard-isolated from the opaque forwarder — but the
+shipped `-distribution` artefact comes up with the subsystem **enabled**:
+`DistributionConfig::default()` sets `enabled: true` and `main.rs` reads the
+block with `unwrap_or_default()`, so it binds `0.0.0.0:4485` / `[::]:4485`
+(signalling + origin) and `:4486` (ingest) with no `distribution` block in
+`relay.json` at all. `install-relay.sh` installs that artefact by default; for
+the lean forwarder pass `--variant default` at install, or set
+`"distribution": { "enabled": false }`.
 
 Point the edge's existing WebRTC (WHIP) output at `http(s)://<relay>/whip/<stream>`,
 then share `http(s)://<relay>/watch/<stream>`. Front the HTTP listener (`:4485`)
 with a TLS-terminating proxy for the browser secure context.
+
+`http(s)://<relay>/dvr/<stream>` is the scrub-back player (live, frame jog,
+shuttle), and the optional `bilbycast-portal` binary is the sign-in front door
+that lands entitled viewers in it — see [`docs/portal.md`](docs/portal.md).
 
 ```json
 {
@@ -209,14 +221,14 @@ sudo ./packaging/upgrade-relay.sh --dry-run             # download + verify only
 sudo ./packaging/upgrade-relay.sh --target-version 0.8.0   # pin to a specific release tag
 ```
 
-The relay is stateless — a restart drops connected edges, which all reconnect automatically. For zero-disruption upgrades, run multiple relay instances behind a load balancer and roll them through one at a time. Pass `--help` for every flag.
+The opaque forwarder is stateless — a restart drops connected edges, which all reconnect automatically. For zero-disruption upgrades, run multiple relay instances behind a load balancer and roll them through one at a time. A **distribution** relay carries state across the restart: point it at the same `origin_storage_dir` and startup adopts the DVR window already on disk instead of rebuilding it — a fresh or moved directory costs the whole window (see [`docs/distribution.md`](docs/distribution.md) § "A restart keeps the window"). Pass `--help` for every flag.
 
 ## REST API
 
 | Endpoint | Auth | Description |
 |----------|------|-------------|
-| `GET /health` | Public | Health check (always unauthenticated). Includes `udp_sessions_total` / `udp_sessions_active` for the native SRT/RIST plane |
-| `GET /metrics` | Token | Prometheus metrics |
+| `GET /health` | Public | Health check (always unauthenticated). Includes `udp_sessions_total` / `udp_sessions_active` for the native SRT/RIST plane, plus a `manager` object (`connected`, `disconnected_secs`, `reconnecting`) when a manager is configured — the only unauthenticated way to alert on a lost manager link |
+| `GET /metrics` | Token | Prometheus metrics. Includes `bilbycast_relay_manager_connected` (gauge, 1 = link up, 0 = down) and `bilbycast_relay_manager_disconnected_seconds` (gauge, 0 while connected), both emitted only when a manager is configured |
 | `GET /api/v1/tunnels` | Token | List active QUIC tunnels |
 | `DELETE /api/v1/tunnels/{id}` | Token (required) | Administrative teardown of a QUIC tunnel when the manager is unavailable. **Fail-closed**: returns `403` unless `api_token` is set |
 | `GET /api/v1/udp-sessions` | Token | List native SRT/RIST plain-UDP relay sessions |

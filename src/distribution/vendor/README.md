@@ -11,6 +11,21 @@
 - **Served at**: `GET /dvr/hls.js`, via `include_str!` from
   `distribution::dvr_hls_js`.
 
+### Attribution obligation (currently unmet)
+
+Vendoring makes this a redistribution: the bytes are compiled into the
+relay binary and served verbatim to every DVR viewer, so Apache-2.0 §4's
+attribution has to travel with them. Today it does not. The relay repo has
+no `NOTICE` file (only `LICENSE` + `LICENSE.commercial`), and the release
+tarball packs `LICENSE`, `LICENSE.commercial`, `README.md`,
+`relay-config.example.json` and the `packaging/` units — not this file
+(`.github/workflows/nightly-release.yml`, "Package release tarball"). The
+only attribution for hls.js in the tree is this source-tree README, which
+ships nowhere. bilbycast-edge, by contrast, ships `NOTICE` and
+`NOTICE.full`. Closing it means adding a relay `NOTICE` naming hls.js
+1.6.16 / Apache-2.0 and copying it into the staged tarball alongside
+`LICENSE`.
+
 ### Why vendored rather than a CDN reference
 
 Two reasons, both load-bearing rather than stylistic:
@@ -40,6 +55,8 @@ the vendoring auditable without network access:
 ```
 sha256sum src/distribution/vendor/hls.min.js
 curl -sL https://cdn.jsdelivr.net/npm/hls.js@<version>/dist/hls.min.js | sha256sum
-``` Check the upstream changelog for
+```
+
+Check the upstream changelog for
 breaking changes to `Hls.Events` / the config keys used in `dvr.html`
 (`backBufferLength`, `maxBufferLength`, `lowLatencyMode`).

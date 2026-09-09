@@ -369,7 +369,12 @@ rather than as designed — see **Which rendition does what, and why** below.
 
 Override either with `?main=` / `?proxy=`. Other query parameters: `?token=`
 (one token covers both renditions — see above; required only when
-`require_origin_token` is on) and `?fps=` (frame-step size; defaults to 25).
+`require_origin_token` is on), `?fps=` (frame-step size; defaults to 25) and
+`?debug=1`, which opens the debug overlay — readyState, decoded and dropped
+frame counts, buffered and seekable ranges, the main/proxy skew, the last hls.js
+error and the thumbnail-index state. That is the panel that separates a decode
+or compositing fault from a stream fault, and it is also reachable from
+Settings, so an operator can be talked into it without editing the URL.
 
 The player does not leave the credential in the URL. Under MSE it attaches it
 with hls.js's `xhrSetup` as a Bearer header and scrubs the query parameter via
@@ -867,6 +872,10 @@ The instrument is `requestVideoFrameCallback` — frames actually put on screen 
 not `droppedVideoFrames`, which counts only what was discarded and reads clean
 while the picture is frozen.
 
+For a *reported* scrub or handover fault, ask for the **debug overlay**
+(`?debug=1`, or Settings) before this: it is a static readout of what the player
+already knows, where the self-test actually drives the player.
+
 **Retention must exceed the window the edge advertises.** The playlist is a
 sliding window; if `origin_retention_secs` is shorter than the edge's
 `dvr_window_secs`, the manifest lists segments the origin has already evicted
@@ -936,6 +945,32 @@ The same figures ride to the manager on the health payload's `distribution`
 object, and the per-stream `StreamSnapshot` carries `offpath_sessions` too. A
 relay is headless: `offpath_sessions` has no other local channel, and it is the
 counter to look at first when a viewer reports going black.
+
+### Capability bits
+
+The same health payload carries a `capabilities` array of up to three strings.
+The two distribution bits are the ones the manager gates on; `udp-relay`
+belongs to the opaque forwarder and no manager code reads it today.
+
+| Bit | Set when | What it gates |
+|---|---|---|
+| `udp-relay` | `udp_relay_enabled` (default true) | The native SRT/RIST plain-UDP plane — unrelated to distribution |
+| `viewer-distribution` | the subsystem has published a telemetry sample | The WHEP SFU + LL-HLS/CMAF origin surfaces |
+| `origin-policy` | same condition as `viewer-distribution` | That this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` arrived later (v0.13.0) and is not covered by the bit, nor gated on it |
+
+The last one exists because the failure it prevents is silent. A relay that
+predates those keys advertises `viewer-distribution` exactly the same, and
+**ACKs the push anyway** — unknown keys are ignored — so the manager would
+record an origin gate or a retention window as applied when nothing was. Because
+the origin gate fails *open*, that reads as a session gated for WHEP and open
+for CMAF. So the manager **refuses rather than warns** on both paths that push
+storage policy: the DVR reconciler, and the Configure-distribution API handler,
+which returns `409` with `error_code: relay_lacks_origin_policy`. An operator
+who hits that message is being told to upgrade the relay.
+
+Both distribution bits appear only once `RelayStats::distribution_snapshot()`
+returns a sample — that is, once the subsystem is actually running, not merely
+once the feature is compiled in — which matches the `/metrics` series above.
 
 ## Scaling beyond one relay
 
@@ -1026,6 +1061,7 @@ See `../../testbed/configs/relay-distribution.json`:
     "http_addrs": ["0.0.0.0:4485", "[::]:4485"],
     "public_ip": "203.0.113.10",
     "public_base_url": "https://relay.example.com",
+    "portal_url": "https://viewer.example.com",
     "ingest_addrs": ["0.0.0.0:4486", "[::]:4486"],
     "token_secret": "<64 hex chars, shared with the manager>",
     "require_viewer_token": false,
@@ -1034,6 +1070,7 @@ See `../../testbed/configs/relay-distribution.json`:
     "max_viewers_per_ip": 256,
     "origin_window_segments": 8,
     "origin_retention_secs": 60,
+    "origin_idle_grace_secs": 60,
     "origin_max_bytes_per_stream": 8589934592,
     "origin_min_free_bytes": 5368709120,
     "origin_storage_dir": "/var/lib/bilbycast/relay/origin"
@@ -1046,11 +1083,22 @@ See `../../testbed/configs/relay-distribution.json`:
   connect the media socket.
 - `token_secret` must be the **same** 64-hex value the manager holds so its
   minted tokens validate.
+- `portal_url` is where the DVR player renews a viewer token. Leaving it blank
+  disables renewal outright — `scheduleRenewal()` returns immediately — which
+  turns the token's lifetime into a hard limit, silently. It is also pushable
+  from the manager. Full account under
+  [Renewing without signing in again](portal.md#renewing-without-signing-in-again)
+  in `portal.md` — the portal end needs `player_origins` set as well.
 - `origin_retention_secs` sets **DVR depth** — how far back a browser can seek.
   Size it to the window the edge advertises in its playlist **plus headroom**.
   The playlist is a sliding window, so retaining less than the edge advertises
   produces 404s on seek for anyone parked mid-window. 60 s is a live-only
   default; a scrub-back surface wants minutes to hours.
+- `origin_idle_grace_secs` is how long past `origin_retention_secs` a stream may
+  sit without a PUT before it is reclaimed outright — segments, manifest, init
+  and directory. Default 60. It is the fourth node-wide storage knob, and unlike
+  `origin_min_free_bytes` the manager **can** override it live (`origin_policy`'s
+  `idle_grace_secs`), which the relay then persists back here.
 - `origin_max_bytes_per_stream` is the safety bound, not the policy. A bitrate
   spike must not fill the volume just because the retention window has not
   elapsed. Hitting it evicts oldest-first and silently shortens the DVR window,
@@ -1102,6 +1150,33 @@ See `../../testbed/configs/relay-distribution.json`:
   Health reports the result per stream on `distribution.origin_streams[]` —
   segments, bytes, idle seconds, and whether an override is in force — because
   `origin_bytes` alone says the node is full but not which stream filled it.
+
+- **`drop_origin_streams` retires streams outright, and is destructive.** The
+  same `configure_distribution` action takes an array of stream names:
+
+  ```jsonc
+  { "drop_origin_streams": ["match-feed", "match-feed-proxy"] }
+  ```
+
+  Each name is queued on an unbounded channel the origin task drains, calling
+  `remove_stream`: the stream leaves the registry, its bytes are subtracted from
+  the node total, and its directory is `remove_dir_all`'d — segments, manifest
+  and init together, immediately, not aged out. There is no undo, and nothing
+  re-adopts the directory on the next restart because it is gone.
+
+  Applied **after** `origin_policy` / `origin_stream_policies` in the same push,
+  so a manager that both re-states the override set and retires a session's
+  streams gets those in the order it meant them. A name that fails the origin's
+  own stream-id check is dropped silently, as is a name for a stream this relay
+  does not hold.
+
+  It is the delete counterpart to `origin_stream_policies`, whose empty-object
+  form only clears overrides. Deleting a DVR session is what sends it: without
+  it, a deleted session holds its disk until the *node default* retention
+  expires — a window that has nothing to do with the one that session asked for
+  (2h40m on the demo rig, for streams an operator deleted to reclaim space). The
+  manager sends it best-effort from the session-delete path, so an unreachable
+  relay simply ages those streams out on the node default instead.
 
 - `origin_storage_dir` is **adopted on startup**, not wiped: the segments left
   by a previous run are indexed back into the window, so a relay restart costs

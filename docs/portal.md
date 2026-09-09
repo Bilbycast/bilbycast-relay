@@ -118,9 +118,24 @@ Start from `portal-config.example.json`, installed at `/etc/bilbycast/portal.jso
   "listen_addr": "127.0.0.1:8088",
   "manager_url": "https://manager.example.com",
   "username_header": "Remote-User",
-  "trusted_proxies": ["127.0.0.1", "::1"]
+  "logout_url": "https://auth.example.com/logout",
+  "trusted_proxies": ["127.0.0.1", "::1"],
+  "player_origins": ["https://relay.example.com"]
 }
 ```
+
+`player_origins` is the one that bites if you drop it. It defaults to an empty
+list, which is accepted at startup and means *nobody may renew* — viewers lose
+access three hours in with nothing logged at either end. See
+[renewal](#renewing-without-signing-in-again) below.
+
+A `manager_url` on plain `http://` is refused at startup unless
+`BILBYCAST_ALLOW_INSECURE=1` is set: the portal sends its manager token on every
+request to that URL, so plaintext hands out its service identity.
+
+The binary takes `--config <path>` (default `portal-config.json`, which is why
+the packaged unit passes `--config /etc/bilbycast/portal.json`) and `--listen
+<addr>` to override `listen_addr` without editing the file.
 
 The service token goes in the environment, not the file — the file is what gets
 copied between hosts while someone is debugging:
@@ -276,4 +291,6 @@ the outer bound on how long a withdrawal takes to bite.
 | `GET /portal.js` | Its script — a separate route so the page can carry `script-src 'self'`. |
 | `GET /api/feeds` | What the signed-in user may watch. |
 | `POST /api/watch` | Mint a link for one feed. The body names the *session*; the username comes from the header and can never be supplied by the browser. |
+| `GET /watch?stream=…` | One tap back to a feed whose credential ran out — re-mints and redirects. This is where the player's expired-access link points, not the front page. |
+| `GET /api/renew?stream=…` | Background renewal before the three hours are up. Cross-origin, so it answers only origins named in `player_origins`; an empty list means no renewal at all. |
 | `GET /healthz` | Liveness. Deliberately needs no user — a health check that required one would be reporting on the proxy. |
