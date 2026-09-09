@@ -1157,16 +1157,25 @@ impl OriginStore {
         if !Self::safe_stream_name(stream) {
             return;
         }
-        let Some((_, origin)) = self.streams.remove(stream) else {
-            return;
+        // A stream that is not tracked can still have a directory, and that is
+        // the normal case for the one removal that matters most: a retired
+        // stream is already out of the map, so returning early here left its
+        // clips on disk for ever — neither the session being deleted nor the
+        // 24-hour expiry sweep could reach them. Found by the healthcheck,
+        // which noticed a stream directory serving an empty window.
+        let dir = match self.streams.remove(stream) {
+            Some((_, origin)) => {
+                self.total_bytes
+                    .fetch_sub(origin.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                origin.dir.clone()
+            }
+            None => self.cfg.root.join(stream),
         };
-        self.total_bytes
-            .fetch_sub(origin.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-        if let Err(e) = tokio::fs::remove_dir_all(&origin.dir).await
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
-                dir = %origin.dir.display(),
+                dir = %dir.display(),
                 error = %e,
                 "origin: could not remove stream directory"
             );
@@ -3712,6 +3721,56 @@ seg-1.m4s
         assert_eq!(s.clip_usage("feed"), (0, 0));
         assert!(s.read_clip("feed", "spare").await.is_none());
         assert!(!s.delete_clip("feed", "spare").await, "deleting twice must not claim success");
+    }
+
+    /// A retired stream can still be removed, clips and all.
+    ///
+    /// `retire_stream` takes the stream out of the tracking map and leaves its
+    /// `clips/` directory behind. Every later removal — the operator deleting
+    /// the session, and the 24-hour expiry sweep — therefore arrives at a
+    /// stream the store no longer tracks. Returning early on that left the
+    /// clips on disk for ever, which is to say the retention this feature
+    /// exists to implement never actually expired anything.
+    ///
+    /// Found on the rig by a healthcheck noticing a stream directory that
+    /// served an empty window; 38 MB of clips belonging to a session deleted
+    /// half an hour earlier.
+    #[tokio::test]
+    async fn a_retired_stream_is_still_removable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+
+        s.put("feed", "seg-00000.m4s", axum::body::Bytes::from_static(b"media"))
+            .await
+            .unwrap();
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 3,
+                post_secs: 5,
+                clips: vec![ClipAsk { at: "2026-09-09T10:00:00Z".into(), name: "goal".into() }],
+            },
+        )
+        .unwrap();
+        s.put_clip("feed", "goal", &vec![7u8; 64]).await.unwrap();
+
+        let dir = tmp.path().join("origin").join("feed");
+        assert!(dir.exists(), "the stream should exist to begin with");
+
+        // The game ends: media goes, clips stay, and the store stops tracking it.
+        s.retire_stream("feed").await;
+        assert!(dir.join("clips").exists(), "retiring took the clips with it");
+        assert!(
+            !dir.join("seg-00000.m4s").exists(),
+            "retiring left the media behind"
+        );
+
+        // Retention runs out. This is the call that used to do nothing.
+        s.remove_stream("feed").await;
+        assert!(
+            !dir.exists(),
+            "a retired stream's directory survived removal, so its clips would              never expire"
+        );
     }
 
     /// A clip name becomes a filename and arrives from a browser.
