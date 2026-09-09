@@ -210,11 +210,29 @@ fn upstream_unavailable() -> Response {
 /// Shared by the JSON route the page calls and the redirect the player links
 /// to, so the two cannot drift about which streams a viewer has.
 async fn fetch_streams(st: &PortalState, username: &str) -> Result<Vec<ManagerStream>, Response> {
+    fetch_streams_for(st, username, None).await
+}
+
+/// The feeds this viewer may act on, for a given purpose.
+///
+/// `for=clips` asks the wider question: a finished game cannot be watched, and
+/// the clips exported from it are still wanted for a day afterwards. Watching
+/// asks the narrower one, so a stopped session never offers a link to a black
+/// screen.
+async fn fetch_streams_for(
+    st: &PortalState,
+    username: &str,
+    purpose: Option<&str>,
+) -> Result<Vec<ManagerStream>, Response> {
     let url = format!("{}/api/v1/dvr/portal/streams", st.cfg.manager_url);
+    let mut query = vec![("username", username)];
+    if let Some(p) = purpose {
+        query.push(("for", p));
+    }
     let resp = st
         .http
         .get(&url)
-        .query(&[("username", username)])
+        .query(&query)
         .bearer_auth(&st.cfg.manager_token)
         .send()
         .await
@@ -442,7 +460,9 @@ async fn clips(
     let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
         return unauthenticated();
     };
-    let streams = match fetch_streams(&st, &username).await {
+    // Clips outlive their game by a day, so this asks for feeds whose clips
+    // are still reachable rather than only those on air.
+    let streams = match fetch_streams_for(&st, &username, Some("clips")).await {
         Ok(s) => s,
         Err(r) => return r,
     };

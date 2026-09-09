@@ -1173,6 +1173,68 @@ impl OriginStore {
         }
     }
 
+    /// The session is over, but its clips are not.
+    ///
+    /// Removes the media — segments, manifests, init — and keeps `clips/`.
+    /// Clips outlive the game they came from by design: somebody exports a
+    /// moment near full time and the broadcast ends minutes later, so tearing
+    /// the whole directory down with the session took the export away before
+    /// anyone could use it.
+    ///
+    /// The stream stops being served as a feed either way; what remains is a
+    /// directory of finished files the portal still hands out. When the
+    /// retention the manager set runs out it sends the stream to
+    /// [`remove_stream`](Self::remove_stream) instead, and the lot goes.
+    pub async fn retire_stream(&self, stream: &str) {
+        if !Self::safe_stream_name(stream) {
+            return;
+        }
+        let Some((_, origin)) = self.streams.remove(stream) else {
+            return;
+        };
+        self.total_bytes
+            .fetch_sub(origin.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        let mut kept = 0usize;
+        match tokio::fs::read_dir(&origin.dir).await {
+            Ok(mut rd) => {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    if entry.file_name() == std::ffi::OsStr::new(CLIPS_DIR) {
+                        kept += 1;
+                        continue;
+                    }
+                    let path = entry.path();
+                    let res = match entry.file_type().await {
+                        Ok(t) if t.is_dir() => tokio::fs::remove_dir_all(&path).await,
+                        _ => tokio::fs::remove_file(&path).await,
+                    };
+                    if let Err(e) = res
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            path = %path.display(), error = %e,
+                            "origin: could not remove a retired stream's media"
+                        );
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                dir = %origin.dir.display(), error = %e,
+                "origin: could not read a retired stream's directory"
+            ),
+        }
+        // Nothing kept means nothing to keep it for: leave no empty shell
+        // behind for the store-shape check to puzzle over on the next start.
+        if kept == 0 {
+            let _ = tokio::fs::remove_dir(&origin.dir).await;
+        }
+        tracing::info!(
+            stream = %stream, clips_kept = kept > 0,
+            "origin: stream retired; its media is gone and its clips remain"
+        );
+    }
+
     /// Apply retention to every stream, whether or not it is still ingesting.
     ///
     /// Eviction is otherwise driven entirely by arriving segments, which means

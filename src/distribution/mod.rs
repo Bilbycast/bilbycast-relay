@@ -173,6 +173,16 @@ pub async fn run_distribution(
                             None => std::future::pending().await,
                         }
                     } => {
+                        // A retirement takes the media and leaves the clips —
+                        // the session is over, what somebody exported from it
+                        // is not. A plain drop takes the lot, which is what
+                        // happens once the clips' own retention runs out.
+                        if let Some(name) =
+                            stream.strip_prefix(crate::distribution_control::RETIRE_PREFIX)
+                        {
+                            origin.retire_stream(name).await;
+                            continue;
+                        }
                         origin.remove_stream(&stream).await;
                         tracing::info!(
                             stream = %stream,

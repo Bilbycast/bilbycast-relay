@@ -750,6 +750,15 @@ fn apply_configure_distribution(
         }
     }
 
+    // Streams whose session is over but whose clips are not. The media goes,
+    // the clips stay until the manager sends the stream to
+    // `drop_origin_streams` at the end of their own retention.
+    if let Some(list) = action.get("retire_origin_streams").and_then(|v| v.as_array()) {
+        for name in list.iter().filter_map(|v| v.as_str()) {
+            control.retire_stream(name);
+        }
+    }
+
     tracing::info!("configure_distribution applied from manager");
     Ok(())
 }

@@ -102,6 +102,11 @@ pub struct OriginPolicyUpdate {
 }
 
 /// Shared, lock-free runtime config + a cascade-source change channel.
+/// Marks a stream name on the drop channel as a retirement rather than a
+/// deletion. A stream id cannot contain it — `sanitize_stream_id` admits only
+/// alphanumerics, `_`, `-` and `.` — so it cannot be forged by a stream name.
+pub const RETIRE_PREFIX: &str = "retire:";
+
 pub struct DistributionControl {
     cfg: ArcSwap<RuntimeDistConfig>,
     cascade_tx: watch::Sender<Vec<CascadeSource>>,
@@ -162,6 +167,15 @@ impl DistributionControl {
     /// expires, which has nothing to do with the window that session asked
     /// for: on the demo rig, 2h40m for a session the operator deleted to
     /// reclaim space.
+    /// Retire a stream: its media goes, its clips stay.
+    ///
+    /// Carried on the same channel as a drop, distinguished by a prefix, so
+    /// the origin's single receiver does not have to grow a second one for a
+    /// message that arrives at the same rate as the first (rarely).
+    pub fn retire_stream(&self, stream: &str) {
+        let _ = self.drop_tx.send(format!("{RETIRE_PREFIX}{stream}"));
+    }
+
     pub fn drop_stream(&self, stream: &str) {
         let _ = self.drop_tx.send(stream.to_string());
     }
