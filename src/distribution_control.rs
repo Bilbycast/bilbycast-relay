@@ -101,12 +101,12 @@ pub struct OriginPolicyUpdate {
     pub per_stream: Option<Vec<(String, OriginPolicyPatch)>>,
 }
 
-/// Shared, lock-free runtime config + a cascade-source change channel.
 /// Marks a stream name on the drop channel as a retirement rather than a
 /// deletion. A stream id cannot contain it — `sanitize_stream_id` admits only
 /// alphanumerics, `_`, `-` and `.` — so it cannot be forged by a stream name.
 pub const RETIRE_PREFIX: &str = "retire:";
 
+/// Shared, lock-free runtime config + a cascade-source change channel.
 pub struct DistributionControl {
     cfg: ArcSwap<RuntimeDistConfig>,
     cascade_tx: watch::Sender<Vec<CascadeSource>>,
@@ -158,15 +158,6 @@ impl DistributionControl {
         self.drop_rx.lock().ok().and_then(|mut g| g.take())
     }
 
-    /// Ask the origin to drop a stream's storage outright.
-    ///
-    /// Distinct from retention. Retention answers "how much history is worth
-    /// keeping"; this answers "nothing is going to want this again" — a
-    /// session deleted, its streams never to be written to. Without it a
-    /// deleted session holds its disk until the *node default* retention
-    /// expires, which has nothing to do with the window that session asked
-    /// for: on the demo rig, 2h40m for a session the operator deleted to
-    /// reclaim space.
     /// Retire a stream: its media goes, its clips stay.
     ///
     /// Carried on the same channel as a drop, distinguished by a prefix, so
@@ -176,6 +167,15 @@ impl DistributionControl {
         let _ = self.drop_tx.send(format!("{RETIRE_PREFIX}{stream}"));
     }
 
+    /// Ask the origin to drop a stream's storage outright.
+    ///
+    /// Distinct from retention. Retention answers "how much history is worth
+    /// keeping"; this answers "nothing is going to want this again" — a
+    /// session deleted, its streams never to be written to. Without it a
+    /// deleted session holds its disk until the *node default* retention
+    /// expires, which has nothing to do with the window that session asked
+    /// for: on the demo rig, 2h40m for a session the operator deleted to
+    /// reclaim space.
     pub fn drop_stream(&self, stream: &str) {
         let _ = self.drop_tx.send(stream.to_string());
     }
