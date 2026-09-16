@@ -3043,6 +3043,13 @@ mod tests {
         .expect("store should build")
     }
 
+    /// Backdate a file, so a test can reach a grace period measured in hours.
+    fn age(path: &std::path::Path, by: Duration) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::now() - by;
+        f.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
+    }
+
     async fn put_seg(s: &OriginStore, stream: &str, name: &str, len: usize) {
         s.put(stream, name, Bytes::from(vec![0u8; len]))
             .await
@@ -4326,6 +4333,228 @@ seg-1.m4s
             s.get("feed", "seg-00000.m4s").await.is_none(),
             "the media should still be reclaimed — only the clips survive"
         );
+    }
+
+    /// An abandoned upload leaves nothing behind.
+    ///
+    /// Only the over-size branch used to remove the temp file. A body stream
+    /// that errors — which is what the edge's sixty-second client timeout looks
+    /// like from here — returned through `?` and left up to 256 MiB in
+    /// `clips/`, where it is in no listing (which walks `*.json`), no byte
+    /// total, no eviction queue, is skipped by the restart debris sweep and
+    /// untouched by `delete_clip`. The disk still holds it, so the free-space
+    /// floor pays for it out of recorded footage.
+    #[tokio::test]
+    async fn an_abandoned_clip_upload_leaves_no_part_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        let dir = tmp.path().join("origin").join("feed").join(CLIPS_DIR);
+
+        let failing = axum::body::Body::from_stream(futures_util::stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::other("the client went away"))
+        }));
+        let err = s
+            .put_clip_streaming("feed", "goal", failing, 1 << 20)
+            .await
+            .expect_err("a broken body must not report success");
+        assert!(err.to_string().contains("client went away"));
+
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "the abandoned upload left {left:?} behind");
+
+        // And the size ceiling still cleans up, which is the one path that
+        // always did.
+        let big = axum::body::Body::from_stream(futures_util::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from(vec![0u8; 64]))
+        }));
+        let _ = s.put_clip_streaming("feed", "goal", big, 8).await.unwrap_err();
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "the over-size upload left {left:?} behind");
+    }
+
+    /// The relay reclaims the clip debris only it can see.
+    ///
+    /// Three kinds, none of which anything else in this file can reach: a
+    /// `.part` from an upload nobody is making any more, media with no record
+    /// beside it (a viewer deleting a record mid-cut used to produce one per
+    /// cancelled clip), and — as a backstop under a manager that never comes
+    /// back with its `drop_origin_streams` — anything at all past
+    /// `CLIP_MAX_AGE`. A live clip must survive all three passes.
+    #[tokio::test]
+    async fn the_relay_reclaims_clip_debris_it_alone_can_see() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 5,
+                post_secs: 5,
+                clips: vec![ClipAsk { at: "2026-09-09T10:00:00Z".into(), name: "goal".into() }],
+            },
+        )
+        .unwrap();
+        s.put_clip("feed", "goal", b"kept").await.unwrap();
+
+        let dir = tmp.path().join("origin").join("feed").join(CLIPS_DIR);
+        let stale_part = dir.join("interrupted.7-0.mp4.part");
+        let orphan = dir.join("cancelled.mp4");
+        let ancient = dir.join("forgotten.json");
+        std::fs::write(&stale_part, b"half an upload").unwrap();
+        std::fs::write(&orphan, b"nobody asked").unwrap();
+        std::fs::write(&ancient, b"{}").unwrap();
+        // Backdated rather than waited for: the grace is an hour and the
+        // backstop a week.
+        age(&stale_part, PART_GRACE * 2);
+        age(&orphan, PART_GRACE * 2);
+        age(&ancient, CLIP_MAX_AGE * 2);
+
+        s.reclaim_clip_debris().await;
+
+        assert!(!stale_part.exists(), "a stale .part was not reclaimed");
+        assert!(!orphan.exists(), "clip media with no record was not reclaimed");
+        assert!(!ancient.exists(), "a clip past the backstop was not reclaimed");
+        assert!(
+            s.read_clip("feed", "goal").await.is_some(),
+            "the reclaim took a live clip with the debris"
+        );
+        assert_eq!(s.list_clips("feed").len(), 1);
+    }
+
+    /// A clips-only directory nobody is ingesting is not permanent.
+    ///
+    /// `clips_dir` never `ensure`s the stream, and both `sweep` and
+    /// `enforce_free_space` iterate the tracked map, which such a directory
+    /// never joins — and adoption skips it on every restart. Without a pass
+    /// over the root it was the store's one unreclaimable shape.
+    #[tokio::test]
+    async fn an_emptied_clip_directory_is_not_left_on_disk_for_ever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 5,
+                post_secs: 5,
+                clips: vec![ClipAsk { at: "2026-09-09T10:00:00Z".into(), name: "goal".into() }],
+            },
+        )
+        .unwrap();
+        assert!(s.delete_clip("feed", "goal").await);
+
+        let stream_dir = tmp.path().join("origin").join("feed");
+        assert!(stream_dir.exists(), "fixture: the directory should still be there");
+        s.reclaim_clip_debris().await;
+        assert!(
+            !stream_dir.exists(),
+            "an emptied, untracked clip directory was left behind"
+        );
+    }
+
+    /// A batch in flight is charged against the budget that admits the next.
+    ///
+    /// The ceiling was tested as `bytes >= limit` against bytes already on
+    /// disk, and `list_clips` reports a pending record as zero bytes — so a
+    /// batch already commissioned was invisible to the check meant to decide
+    /// whether another could be, and the comparison could not fire until the
+    /// limit had already been crossed. Two permitted fifty-mark requests put
+    /// 25 GiB on a stream whose stated ceiling is 4 GiB, and clips are outside
+    /// the eviction queue, so the free-space floor then paid for them by
+    /// deleting recorded footage across every other stream on the relay —
+    /// verbatim the outcome this constant exists to prevent.
+    #[tokio::test]
+    async fn clips_asked_for_but_not_yet_cut_still_count_against_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+
+        fn batch(n: usize) -> ClipRequest {
+            ClipRequest {
+                pre_secs: 30,
+                post_secs: 30,
+                clips: (0..n)
+                    .map(|i| ClipAsk {
+                        at: format!("2026-09-09T10:{i:02}:00Z"),
+                        name: format!("mark {i}"),
+                    })
+                    .collect(),
+            }
+        }
+
+        // A full-length clip is charged the per-clip ceiling, so the budget is
+        // this many of them and no more.
+        let per_clip = estimated_clip_bytes(30, 30);
+        let fits = (MAX_CLIP_BYTES_PER_STREAM / per_clip) as usize;
+        assert!(fits > 1 && fits < MAX_CLIPS_PER_STREAM, "fixture: {fits} is not a useful bound");
+
+        s.admit_clips("feed", &batch(fits)).expect("a batch inside the budget must be admitted");
+        // Nothing has been cut, so the *landed* total is still zero — which is
+        // exactly what used to make the next request look free.
+        assert_eq!(s.clip_usage("feed").1, 0, "fixture: nothing should have landed yet");
+        assert!(s.clip_budget_used("feed") >= MAX_CLIP_BYTES_PER_STREAM - per_clip);
+
+        match s.admit_clips("feed", &batch(1)) {
+            Err(ClipRefusal::OverBudget { would_use, limit }) => {
+                assert!(would_use > limit, "refused without being over: {would_use} vs {limit}");
+            }
+            Err(other) => panic!("refused for the wrong reason: {other:?}"),
+            Ok(_) => panic!("a stream already at its clip budget admitted another full-length clip"),
+        }
+    }
+
+    /// A name collision is refused, not resolved by overwriting.
+    ///
+    /// After nine suffixes the search used to fall back to the bare name — one
+    /// it had just proved belonged to a different mark — and the write replaced
+    /// that mark's record while its `.mp4` stayed put. The new record then read
+    /// as ready with the old clip's bytes: one export silently lost, and the
+    /// other offered to the operator under the wrong label, with the exporter
+    /// skipping it for ever because it already read as done.
+    #[tokio::test]
+    async fn a_name_that_cannot_be_freed_is_refused_rather_than_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+
+        // Ten distinct marks, one label. The first nine take `Goal` and
+        // `Goal (2)`..`Goal (9)`.
+        for i in 0..9 {
+            s.record_clip_requests(
+                "feed",
+                &ClipRequest {
+                    pre_secs: 5,
+                    post_secs: 5,
+                    clips: vec![ClipAsk {
+                        at: format!("2026-09-09T1{i}:00:00Z"),
+                        name: "Goal".into(),
+                    }],
+                },
+            )
+            .expect("the first nine have somewhere to go");
+        }
+        s.put_clip("feed", "Goal", b"the first mark's media").await.unwrap();
+
+        let err = s
+            .record_clip_requests(
+                "feed",
+                &ClipRequest {
+                    pre_secs: 5,
+                    post_secs: 5,
+                    clips: vec![ClipAsk { at: "2026-09-09T23:00:00Z".into(), name: "Goal".into() }],
+                },
+            )
+            .expect_err("a tenth mark on a full name must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        // And the first mark's record is exactly as it was.
+        let first = s
+            .list_clips("feed")
+            .into_iter()
+            .find(|c| c.name == "Goal")
+            .expect("the first record must still be there");
+        assert_eq!(first.at, "2026-09-09T10:00:00Z", "the first mark's record was overwritten");
+        assert!(first.ready);
     }
 
     /// ...but they do not outlive the session.
