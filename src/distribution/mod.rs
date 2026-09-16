@@ -2019,34 +2019,120 @@ mod tests {
         );
     }
 
-    /// A viewer sent to the player must have a way back to their clips.
+    /// A viewer sent to the player must have a way back to their clips, and it
+    /// must go where the relay says rather than where the URL says.
     ///
-    /// The player is served from the origin and the portal is a different host
-    /// and port, so the way back cannot be derived — the portal names itself in
-    /// `?from=`. And that value arrives in the URL, so it is checked before it
-    /// is navigated to: unchecked, a crafted link would make the button honour
-    /// a `javascript:` scheme.
+    /// `/dvr/{stream}` is a plain `get(dvr_page)` — no token, no grant, no
+    /// check of any kind — so the page shell renders for anyone handed the
+    /// link. A "Back to your feeds" button built from `?from=` and validated
+    /// only on its scheme is therefore an open redirect on an unauthenticated
+    /// route: `…?from=https://portal-evil.example` draws a trusted-looking
+    /// control that navigates the viewer to a look-alike sign-in. `https://` is
+    /// not a statement about who owns the other end.
+    ///
+    /// The destination is `PORTAL_URL`, substituted by the relay from its own
+    /// config. `?from=` is honoured only when it names that same origin.
+    ///
+    /// This test is anchored on `btnFeeds`, not on the fullscreen wiring it
+    /// used to sit inside: slicing from `btnFull.addEventListener` inspected
+    /// the inside of a capability branch, so it passed just as happily when the
+    /// whole block was unreachable on the one platform — iPhone Safari — that
+    /// takes the `else` arm.
     #[test]
     fn the_way_back_to_the_portal_is_checked_before_it_is_used() {
         let html = include_str!("dvr.html");
         assert!(html.contains("id=\"btnFeeds\""), "there is no way back to the feeds page");
 
-        let js = &html[html.find("btnFull.addEventListener").expect("wiring block")..];
-        let js = &js[..js.len().min(1400)];
+        let js = &html[html.find("var backToFeeds").expect("the wiring block has moved")..];
+        let js = &js[..js.len().min(1800)];
         assert!(
-            js.contains("\"from\""),
-            "the button does not read where the portal said it was: {js}"
+            js.contains("u.origin === home.origin"),
+            "the destination is not checked against the configured portal: {js}"
         );
         assert!(
             js.contains("u.protocol === \"https:\"") && js.contains("u.protocol === \"http:\""),
             "the destination is navigated to without checking its scheme: {js}"
         );
-        // Hidden by default in the markup, so a player opened without a `from`
-        // shows no button rather than one that goes nowhere.
+        assert!(
+            js.contains("if (!PORTAL_URL) return null;"),
+            "with no portal configured there is nothing to check a `from` against: {js}"
+        );
+
+        // And it is wired at top level. Nesting it in the fullscreen branch
+        // left iPhone Safari — the platform the sibling `else` exists for —
+        // with a button that was never given a listener.
+        let wiring = html
+            .find("btnFeeds.addEventListener")
+            .expect("btnFeeds is no longer wired at all");
+        let line_start = html[..wiring].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let indent = html[line_start..wiring].len();
+        assert!(
+            indent <= 4,
+            "the way back is nested {indent} levels deep, so it is conditional on \
+             something; it has nothing to do with fullscreen or any other capability"
+        );
+
+        // Hidden by default in the markup, so a player served by a relay with
+        // no portal configured shows no button rather than one that goes
+        // nowhere...
         let btn = &html[html.find("id=\"btnFeeds\"").unwrap()..];
         assert!(
             btn[..btn.find('>').unwrap()].contains("hidden"),
             "the button is shown even when nothing told the player where to go"
+        );
+        // ...and `hidden` on this page actually hides, which it did not until
+        // the stylesheet stopped letting `button { display: inline-flex }` beat
+        // the user-agent rule.
+        assert!(
+            html.contains("[hidden] { display: none !important; }"),
+            "every `hidden` attribute in the player is decorative without this"
+        );
+    }
+
+    /// The name the player builds is one the origin will accept.
+    ///
+    /// `valid_clip_name` on the origin takes ASCII alphanumerics plus space,
+    /// dash, underscore and round or square brackets — nothing else — and
+    /// `clips_request` refuses the **whole batch** on the first name outside
+    /// it, before any clip work, with a message that names no mark. Stripping
+    /// only the Windows-illegal set left an apostrophe, a comma, a full stop,
+    /// `#`, `&`, an em-dash and every accented letter to pass the browser and
+    /// come back as one 400: twelve marks selected, zero clips cut, and nothing
+    /// on screen suggesting the name was ever the problem. `Keeper's save` is
+    /// an ordinary thing to type.
+    #[test]
+    fn a_clip_name_the_player_builds_is_one_the_origin_takes() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "clipFileName");
+        // A whitelist, not a blacklist: the alphabet has to be stated as what
+        // survives, or the next character nobody thought of goes through.
+        assert!(
+            f.contains("[^A-Za-z0-9 _()\\[\\]-]"),
+            "the clip name is filtered by what is forbidden rather than by what \
+             the origin accepts: {f}"
+        );
+        assert!(
+            f.contains("180"),
+            "nothing bounds the name against the origin's 180-byte limit: {f}"
+        );
+
+        // And the server's own predicate has not moved out from under it.
+        let origin = include_str!("origin.rs");
+        let pred = origin
+            .split("fn valid_clip_name(")
+            .nth(1)
+            .expect("valid_clip_name has moved; re-check the player's alphabet");
+        let pred: String = pred.chars().take(400).collect();
+        let pred = pred.as_str();
+        for ch in ["' '", "'-'", "'_'", "'('", "')'", "'['", "']'"] {
+            assert!(
+                pred.contains(ch),
+                "the origin's clip alphabet changed and the player was not told: {pred}"
+            );
+        }
+        assert!(
+            pred.contains("name.len() <= 180"),
+            "the origin's length limit changed and the player was not told: {pred}"
         );
     }
 

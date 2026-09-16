@@ -21,6 +21,14 @@
     --hud: 138px;
   }
   * { box-sizing: border-box; }
+  /* The UA sheet's `[hidden] { display: none }` is a *normal* declaration in
+     the user-agent origin, so any author `display` rule below beats it whatever
+     its specificity. `button { display: inline-flex }` and `#exportBar
+     { display: flex }` both did, so `#btnExport`, `#exportBar` and `#btnFeeds`
+     were all drawn regardless of their `hidden` attribute — which put both
+     halves of the two-state export control on screen at once from first paint
+     and made Cancel look like it did nothing. */
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; overflow: hidden; }
   body {
     background: #000; color: var(--fg);
@@ -2112,7 +2120,13 @@
 
   function deleteMark(id) {
     marks = marks.filter(function (m) { return m.id !== id; });
+    /* A mark that is gone cannot be exported. Leaving it ticked left the bar
+     * reading "1 selected" with Export enabled over an empty selection, and
+     * pressing it hit `if (!picked.length) return;` — no fetch, no message,
+     * nothing on screen at all. */
+    delete exportPicked[id];
     saveMarks();
+    syncExportBar();
     renderMarks();
   }
 
@@ -2220,17 +2234,44 @@
   /// everywhere else, so they become dashes. Doing it here rather than leaving
   /// it to the browser means every viewer gets the same name for the same
   /// clip, instead of one that varies by platform.
+  /* Reduced to exactly the alphabet the origin accepts, not merely to what
+   * Windows permits.
+   *
+   * `valid_clip_name` on the relay takes ASCII alphanumerics plus space, dash,
+   * underscore and round or square brackets — nothing else — and
+   * `clips_request` refuses the WHOLE batch on the first name outside it,
+   * before any clip work. Stripping only `\ / : * ? " < > |` left an
+   * apostrophe, a comma, a full stop, `#`, `&`, an em-dash and every accented
+   * letter to sail through the browser and come back as one 400 that names no
+   * mark: twelve marks selected, zero clips cut, and nothing on screen ever
+   * suggesting the name was the problem. `Keeper's save` and `Goal — Müller`
+   * are ordinary things to type. */
   function clipFileName(m) {
     var tc = fmtTimeOfDay(m.at).replace(/:/g, "-");
     var name = String(m.name || "Mark").trim()
-      .replace(/[\\/:*?"<>|]+/g, " ")
-      .replace(/\s+/g, " ");
-    return tc + " - " + (name || "Mark");
+      .replace(/[^A-Za-z0-9 _()\[\]-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    var out = tc + " - " + (name || "Mark");
+    /* And the length. The server's ceiling is 180 bytes and the field that
+     * feeds this one has no maxlength, so a long label is the same silent 400
+     * by another route. The timecode is at the front because it is what makes
+     * the name unique. */
+    return out.length > 180 ? out.slice(0, 180).replace(/\s+$/, "") : out;
+  }
+
+  /* Counted from what `exportSelected` would actually send, not from the tick
+   * boxes. `markIsReachable` is evaluated at render time and `renderMarks` is
+   * on no timer, so a ticked mark that slid out of the seekable window stayed
+   * ticked and counted while it had already stopped being exportable. */
+  function exportPickedReachable() {
+    return marks.filter(function (m) {
+      return exportPicked[m.id] && markIsReachable(m);
+    });
   }
 
   function syncExportBar() {
-    var n = 0;
-    for (var k in exportPicked) if (Object.prototype.hasOwnProperty.call(exportPicked, k)) n++;
+    var n = exportPickedReachable().length;
     exportCount.textContent = n === 0 ? "none selected"
       : n === 1 ? "1 selected" : n + " selected";
     btnExportGo.disabled = (n === 0) || exportBusy;
@@ -2249,8 +2290,11 @@
   function say(msg) { exportNote.textContent = msg; exportNote.hidden = false; }
 
   function exportSelected() {
-    var picked = marks.filter(function (m) { return exportPicked[m.id] && markIsReachable(m); });
-    if (!picked.length) return;
+    var picked = exportPickedReachable();
+    if (!picked.length) {
+      say("Nothing left to export — those marks have gone or aged out.");
+      return;
+    }
     exportBusy = true;
     syncExportBar();
     say("Requesting " + picked.length + (picked.length === 1 ? " clip…" : " clips…"));
@@ -3380,9 +3424,23 @@
     };
   }
 
+  /* Re-seed whenever the set becomes two, not only when it goes from one to
+   * two. A third finger landing, or one of the original two lifting, leaves a
+   * different pair of pointers against anchors measured from the old pair — so
+   * the next move computes `dist / pinchDist` and `mid - pinchMid` across the
+   * interlude and the picture jumps in scale and position. Easy to reach: the
+   * picture sets `touch-action: none`, so every concurrent touch is delivered
+   * here. */
+  function seedPinch() {
+    if (zoomPts.size !== 2) return;
+    var s = pinchState();
+    pinchDist = s.dist;
+    pinchMid = s.mid;
+  }
+
   pic.addEventListener("pointerdown", function (e) {
     zoomPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (zoomPts.size === 2) { var s = pinchState(); pinchDist = s.dist; pinchMid = s.mid; }
+    seedPinch();
     try { pic.setPointerCapture(e.pointerId); } catch (err) {}
   });
 
@@ -3408,6 +3466,8 @@
   function endZoomPointer(e) {
     zoomPts.delete(e.pointerId);
     if (zoomPts.size < 2) { pinchDist = 0; pinchMid = null; }
+    // Three fingers down to two is a *new* pair, and it wants new anchors.
+    else seedPinch();
   }
   pic.addEventListener("pointerup", endZoomPointer);
   pic.addEventListener("pointercancel", endZoomPointer);
@@ -3454,32 +3514,54 @@
     btnFull.title = on ? "Leave full screen (F)" : "Full screen (F)";
   }
 
+  // Back to the sign-in page, which is where the clips they just exported
+  // appear.
+  //
+  // The destination is PORTAL_URL — substituted by the relay from its own
+  // config, never from the request. `?from=` is honoured only when it names
+  // that same origin, which lets the portal send the viewer back to a
+  // particular page of its own and nothing else.
+  //
+  // A scheme check alone was not enough, and this is the route where that
+  // matters most: `/dvr/{stream}` is registered as a plain `get(dvr_page)`
+  // with no token or grant check of any kind, so the page shell renders for
+  // anyone handed the URL. `…/dvr/anything?from=https://portal-evil.example`
+  // therefore drew a trusted-looking control in the tool column that
+  // navigated the viewer to a look-alike Authelia sign-in. `https://` is not
+  // a statement about who owns the other end.
+  //
+  // With no portal configured there is nothing to check against and nowhere
+  // to go, so the button stays hidden — which it now actually does, the
+  // stylesheet having gained a `[hidden]` rule.
+  var backToFeeds = (function () {
+    if (!PORTAL_URL) return null;
+    var home;
+    try { home = new URL(PORTAL_URL); } catch (e) { return null; }
+    var raw = new URLSearchParams(location.search).get("from");
+    if (raw) {
+      try {
+        var u = new URL(raw, location.href);
+        if ((u.protocol === "https:" || u.protocol === "http:") &&
+            u.origin === home.origin) {
+          return u.href;
+        }
+      } catch (e) { /* fall through to the configured portal */ }
+    }
+    return home.href;
+  })();
+  // Wired at top level, not inside the fullscreen branch it used to sit in.
+  // The two conditions have nothing to do with each other, and the platform
+  // that fails the fullscreen test is iPhone Safari — the one this player
+  // already special-cases, and the one where a viewer most needs a tap back to
+  // the page their clips land on.
+  if (backToFeeds) {
+    btnFeeds.hidden = false;
+    btnFeeds.addEventListener("click", function () { location.href = backToFeeds; });
+  }
+
   if (document.documentElement.requestFullscreen ||
       document.documentElement.webkitRequestFullscreen) {
     btnFull.addEventListener("click", toggleFullscreen);
-
-    // Back to the sign-in page, which is where the clips they just exported
-    // appear. The player is served from the origin and the portal is a
-    // different host and port, so it cannot be derived — the portal names
-    // itself in `?from=` when it sends the viewer here.
-    //
-    // Validated before it is used, and deliberately: this value arrives in the
-    // URL, so navigating to it unchecked would honour a `javascript:` scheme
-    // from anyone who could get a crafted link opened. Only http(s) is taken,
-    // and anything else leaves the button hidden rather than pointing
-    // somewhere surprising.
-    var from = (function () {
-      var raw = new URLSearchParams(location.search).get("from");
-      if (!raw) return null;
-      try {
-        var u = new URL(raw, location.href);
-        return (u.protocol === "https:" || u.protocol === "http:") ? u.href : null;
-      } catch (e) { return null; }
-    })();
-    if (from) {
-      btnFeeds.hidden = false;
-      btnFeeds.addEventListener("click", function () { location.href = from; });
-    }
     document.addEventListener("fullscreenchange", syncFullscreenButton);
     document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
   } else {
@@ -3939,7 +4021,19 @@
    * keep watching" would describe the wrong problem. The way back is the same
    * link, though — opening the feed again takes the login back, because the
    * newest device wins. */
+  /* Latched, so the 409 path is genuinely terminal.
+   *
+   * Without it the `throw` two lines below landed in the shared `.catch`, which
+   * is the renewal backoff — the exact thing the comment there says it is
+   * avoiding. With `RENEW_LEAD_SECS` at 600 the test `left > backoff + 5`
+   * passes for 30, 60, 120 and 240, so one takeover became five 409s over
+   * about seven and a half minutes, each re-running `takenOver()` — pausing a
+   * viewer who had pressed the still-live Play button — and each writing
+   * another `dvr_viewer_displaced` row in the manager's access log. */
+  var wasTakenOver = false;
+
   function takenOver() {
+    wasTakenOver = true;
     forgetToken();
     try { main.pause(); proxy.pause(); } catch (e) {}
     failWith("This login is in use on another device. Only one at a time. ",
@@ -3979,6 +4073,9 @@
         scheduleRenewal();
       })
       .catch(function () {
+        // A displaced login is not a failed request: nothing will ever grant
+        // this renewal, so asking again is only noise in an audit log.
+        if (wasTakenOver) return;
         // Retry with a widening gap, but never past the expiry itself: after
         // that the existing expired-access path is the honest answer, and it
         // offers a way back that actually works.
