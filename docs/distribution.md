@@ -81,12 +81,12 @@ they are not either/or.
 | `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |
-| `POST` | `/origin/{stream}/clips` | Player asks for one or more clips around marked moments |
-| `GET` | `/origin/{stream}/clips` | List this stream's clips and their state (the edge's work queue, and the portal's listing) |
-| `PUT` | `/origin/{stream}/clips/{name}.mp4` | Edge uploads a finished clip |
-| `GET` | `/origin/{stream}/clips/{name}.mp4` | Download a finished clip |
-| `DELETE` | `/origin/{stream}/clips/{name}.mp4` | Remove a clip and reclaim its disk |
-| `POST` | `/origin/{stream}/clips/{name}.mp4/failed` | Edge reports one it cannot produce |
+| `POST` | `/origin/{stream}/clips` | Player asks for one or more clips around marked moments (viewer or ingest token, always) |
+| `GET` | `/origin/{stream}/clips` | List this stream's clips and their state — the edge's work queue, and the portal's listing (viewer or ingest token, always) |
+| `PUT` | `/origin/{stream}/clips/{name}.mp4` | Edge uploads a finished clip (ingest token, always; refused if no record asked for it) |
+| `GET` | `/origin/{stream}/clips/{name}.mp4` | Download a finished clip — streamed, `Range` supported (viewer or ingest token, always) |
+| `DELETE` | `/origin/{stream}/clips/{name}.mp4` | Remove a clip and reclaim its disk (viewer or ingest token, always) |
+| `POST` | `/origin/{stream}/clips/{name}.mp4/failed` | Edge reports one it cannot produce (ingest token, always) |
 | `GET` | `/distribution/health` | Liveness |
 
 **The signaling + origin listener is plain HTTP.** Browsers require a secure
@@ -284,14 +284,25 @@ scope  ∈ { "viewer", "ingest" }
 - `require_ingest_token` (default **true**) gates the write surfaces (WHIP + origin PUT).
 - `require_viewer_token` (default false → public streams) gates WHEP.
 - `require_origin_token` (default false) gates `GET /origin/{stream}/{file}` —
-  the CMAF / LL-HLS tier — and the clip list, accepting **either** a `viewer`
-  or an `ingest` credential for that stream. Two kinds of caller read the
-  origin: a player or portal, which holds a viewer token, and the *edge*, which
-  holds the ingest token it pushes with and reads back to cut clips. Admitting
-  ingest grants nothing new — that token already authorises writing the same
-  objects, so a holder that could not read them was an inconsistency rather
-  than a boundary. Gating reads on the viewer token alone locked the edge out
-  of its own stream and no clip was ever cut.
+  the CMAF / LL-HLS tier — accepting **either** a `viewer` or an `ingest`
+  credential for that stream. Two kinds of caller read the origin: a player or
+  portal, which holds a viewer token, and the *edge*, which holds the ingest
+  token it pushes with and reads back to cut clips. Admitting ingest grants
+  nothing new — that token already authorises writing the same objects, so a
+  holder that could not read them was an inconsistency rather than a boundary.
+  Gating reads on the viewer token alone locked the edge out of its own stream
+  and no clip was ever cut.
+- **The clip routes are gated by none of these three, and are never open.**
+  Every verb under `/origin/{stream}/clips` demands a credential whatever the
+  flags say, and refuses outright when no `token_secret` is configured. The
+  list, the request, the download and the delete take a viewer *or* an ingest
+  token; the upload and the failure report take an ingest token only. That is
+  deliberate rather than tidy: `POST` commissions decode-and-encode work on
+  whichever edge fills the stream, and `DELETE` destroys an operator's exported
+  footage, so neither may ride a read flag whose documented default is off
+  "to preserve the CDN case" — nor `require_ingest_token`, whose "off" is a
+  statement about segments and must not silently open a surface that stores
+  operator-owned media under viewer-chosen names.
 - Viewers pass the token as `?token=…` or `Authorization: Bearer`. The built-in
   player reads `?token=` off the `/watch/{stream}` URL and forwards it as a
   Bearer header; `/whep` accepts the query form directly too, as a convenience
@@ -665,9 +676,25 @@ made and what it will not do.
 **Clips are exempt from the retention sweep.** They live in a `clips/`
 subdirectory of the stream's origin store and are removed with the session, not
 with the window that produced them — a clip cut from a moment that has since
-rolled out of the DVR window is exactly the clip worth keeping. Bounded instead
-by a count and a byte ceiling per stream, and offered a Delete on the portal so
-the space can be reclaimed without ending the session.
+rolled out of the DVR window is exactly the clip worth keeping. An ingest gap
+does not count as the session ending: a stream idle past `retention +
+idle_grace` is *retired* (media gone, clips kept), not removed, because an edge
+restart or a satellite drop is exactly when an operator most wants the clip
+they cut before it.
+
+Bounded instead by a count and a byte ceiling per stream, and offered a Delete
+on the portal so the space can be reclaimed without ending the session. The
+byte ceiling charges clips that have been asked for but not yet cut at an
+estimate for their requested length — otherwise a batch in flight is invisible
+to the check that decides whether the next batch may be admitted — and is
+enforced again on upload, where the real size is known.
+
+**What the relay reclaims on its own.** Clip retention is the manager's: it
+holds the expiry and sends `drop_origin_streams` when it lapses. The relay's
+sweep additionally clears what only it can see — an abandoned `.part`, media
+with no record beside it, an emptied stream directory — and holds a seven-day
+backstop, an order of magnitude above any expiry the manager sets, so a manager
+that never comes back does not leave clips for ever.
 
 ### Picture modes
 

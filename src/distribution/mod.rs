@@ -2932,9 +2932,13 @@ mod tests {
             l.contains("localStorage") && !t.starts_with("//") && !t.starts_with("*")
         }) {
             // A helper parameterised on `key` names no constant, so the
-            // line-level check cannot clear it. Deferring to the call sites
-            // below is the honest reading: a bare `key` is only as safe as
-            // what is passed to it, which is what the next assertion pins.
+            // line-level check cannot clear it. A bare `key` is only as safe
+            // as what is passed to it — so the escape is paid for by the
+            // call-site check further down, which is the one that forbids a
+            // credential key being handed to any helper at all. (The
+            // declaration whitelist in between is a different guard: it makes
+            // a *new* storage key a deliberate act, and it deliberately
+            // permits TOKEN_KEY, so it pins nothing about arguments.)
             let via_parameter = line.contains("getItem(key")
                 || line.contains("setItem(key,")
                 || line.contains("removeItem(key");
@@ -2972,6 +2976,23 @@ mod tests {
                     !line.contains("localStorage"),
                     "{key} reached localStorage: {line}"
                 );
+                // Nor by proxy. A key-parameterised storage helper is cleared
+                // by `via_parameter` above and its call site names no
+                // `localStorage`, so passing a credential key into one would
+                // slip past both halves of the line scan — which is exactly
+                // what that escape costs if nothing checks the arguments.
+                // A line that names the storage itself is not a proxy: it is a
+                // direct access, and the assertion above has already judged it.
+                if line.contains("Storage") {
+                    continue;
+                }
+                for opener in ["(", ", "] {
+                    assert!(
+                        !line.contains(&format!("{opener}{key}")),
+                        "{key} is being passed to a function; a storage helper \
+                         would then write the credential where no line names it: {line}"
+                    );
+                }
             }
         }
         // Every access wrapped: a browser with site data blocked throws on
