@@ -3752,7 +3752,7 @@ seg-1.m4s
             },
         )
         .unwrap();
-        s.put_clip("feed", "goal", &vec![7u8; 64]).await.unwrap();
+        s.put_clip("feed", "goal", &[7u8; 64]).await.unwrap();
 
         let dir = tmp.path().join("origin").join("feed");
         assert!(dir.exists(), "the stream should exist to begin with");
