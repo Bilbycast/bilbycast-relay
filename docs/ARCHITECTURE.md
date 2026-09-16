@@ -43,7 +43,8 @@ The relay carries three logically distinct path types, all forwarded the same op
 +===========================================================================+
 |                          bilbycast-relay process                          |
 |                                                                           |
-|  tokio::select! { quic_server, udp_relay(:4434), rest_api, manager, ctrl_c }|
+|  tokio::select! { quic_server, udp_relay(:4434), rest_api, manager,       |
+|                   distribution(:4485 + :4486), ctrl_c }                   |
 |                                                                           |
 |  +----------------------------------+   +-----------------------------+  |
 |  |        QUIC Server (:4433)       |   |     REST API (:4480)        |  |
@@ -117,6 +118,14 @@ The relay carries three logically distinct path types, all forwarded the same op
 |  +-------------------------------+                                       |
 +===========================================================================+
 ```
+
+The `distribution` task is `#[cfg(feature = "viewer-distribution")]` and is
+only spawned when `distribution.enabled` is true — which it is by default, so
+the shipped `-distribution` artefact comes up as a distribution node with no
+config edits. A plain forwarder build has no `distribution` module at all
+(`lib.rs` gates it, and the select arm degrades to a future that never
+resolves) and warns at startup if a config asks for the role. See [Viewer Distribution](#viewer-distribution-optional-role)
+below.
 
 ## Connection Flow (Optional Bind Authentication)
 
@@ -292,6 +301,56 @@ Bind failures on `:4434` are non-fatal — the relay logs, drops the `udp-relay`
 capability, and continues QUIC-only, so an upgrade never bricks a relay over a
 busy port.
 
+## Viewer Distribution (optional role)
+
+Everything above is the opaque forwarder, and a plain `cargo build` is exactly
+that. The `viewer-distribution` feature adds a **second, deliberately stateful**
+role on the same process: a WHEP SFU for sub-second WebRTC to browsers, plus an
+LL-HLS/CMAF origin on disk with a DVR window. It is isolated behind the feature
+so the lean forwarder never links str0m, never binds `:4485` / `:4486`, and
+terminates nothing.
+
+```
+  +===========================================================================+
+  |            Viewer distribution (feature = "viewer-distribution")          |
+  |                                                                           |
+  |  Ingest (the edge feeds it, two ways)                                     |
+  |    QUIC ES ingest  :4486  ALPN bilbycast-distribution  ingest.rs          |
+  |      Hello + [kind][flags][pts_90k][len][payload] elementary frames       |
+  |    WHIP push       :4485  POST /whip/{stream}       whip_ingest.rs        |
+  |    Cascade pull    (client) upstream WHEP -> local hub  cascade.rs        |
+  |                              |                                            |
+  |                              v                                            |
+  |    DistributionHub (hub.rs) - one tokio::broadcast per stream,            |
+  |      drop-on-lag, plus an ArcSwapOption keyframe cache for late joiners   |
+  |            |                                    |                         |
+  |            v                                    v                         |
+  |  +----------------------------+   +-----------------------------------+  |
+  |  |  WHEP SFU (whep.rs) :4485  |   |  LL-HLS / CMAF origin (origin.rs) |  |
+  |  |    POST /whep/{stream}     |   |    PUT/GET /origin/{stream}/{file}|  |
+  |  |    DELETE /whep/{s}/{sess} |   |    on-disk segment window,        |  |
+  |  |    /watch/{stream} player  |   |      evicted oldest-first         |  |
+  |  |    one str0m PC per viewer |   |    /dvr/{stream} scrub-back page  |  |
+  |  +----------------------------+   +-----------------------------------+  |
+  +===========================================================================+
+```
+
+Default binds are `:4485` for the HTTP surface (WHEP signalling, the built-in
+`/watch` and `/dvr` player pages, and the origin) and `:4486` for the QUIC ES
+ingest — both dual-stack, both overridable via `distribution.http_addrs` /
+`distribution.ingest_addrs`. The origin's segment root defaults to
+`/var/lib/bilbycast/relay/origin` (`distribution.origin_storage_dir`) and is
+re-adopted on restart rather than wiped. Full reference:
+[`distribution.md`](distribution.md).
+
+**The viewer portal is a separate binary and a separate process.** `bilbycast-portal`
+(`src/portal_bin.rs`) is gated on the `portal` Cargo feature, which is deliberately
+**independent of `viewer-distribution`** — a distribution build does not produce a
+portal, and a portal can front a relay that is not this one. It ships with its own
+systemd unit and its own `bilbycast-portal` system user, precisely so a bug in the
+public-facing portal cannot reach the relay's config or manager secret on the same
+box. See [`portal.md`](portal.md).
+
 ## Security Layers
 
 ```
@@ -354,9 +413,18 @@ Security is defense-in-depth: end-to-end encryption protects payload confidentia
   |
   +-- Ctrl+C handler ------------ graceful shutdown
 
-  Zero locks:
+  Zero locks on the forwarding path:
     - DashMap for concurrent maps (lock-free sharded HashMap)
     - AtomicU64 for stats counters
     - Arc for shared ownership
-    - No Mutex, no RwLock anywhere
+    - No RwLock anywhere; no lock taken per packet
 ```
+
+Three `Mutex`es exist, all off the forwarding path — do not read the bullet
+above as "`RelayStats` is lock-free in whole":
+
+| Site | Build | Cadence |
+|------|-------|---------|
+| `RelayStats::prev_sample` — the bandwidth sampler's previous reading (`stats.rs`) | every build, including the lean forwarder | the manager stats tick (1 s) and each `/api/v1/stats` request — never per datagram |
+| `OriginStore::order` — the eviction queue (`distribution/origin.rs`) | `viewer-distribution` only | per stored segment, held for queue surgery only, never across file I/O |
+| `DistributionControl::drop_rx` — one-shot handoff of the drop-queue receiver (`distribution_control.rs`) | compiled into every build — `lib.rs` gates `distribution` but not `distribution_control`, so the non-gated manager client can hold a handle; only ever *constructed* on a distribution build | once, at subscribe |

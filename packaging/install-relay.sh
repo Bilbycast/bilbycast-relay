@@ -103,6 +103,15 @@ Options:
                                https://relay.example.com. Without it a viewer's
                                token cannot be renewed and access ends after
                                three hours, mid-event.
+  --variant <name>             Which release artefact to install:
+                               distribution or default, defaulting to
+                               distribution. The lean default build is the
+                               opaque forwarder only; distribution also
+                               ships bilbycast-portal and comes up with the
+                               WHEP / LL-HLS listeners already enabled,
+                               unless the config sets
+                               distribution.enabled = false. --with-portal
+                               needs the distribution tarball.
   -h, --help                   Show this message
 EOF
 }

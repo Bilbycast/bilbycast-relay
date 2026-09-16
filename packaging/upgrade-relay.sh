@@ -53,14 +53,23 @@
 # zero-disruption upgrades should run multiple relay instances behind a
 # load balancer and rolling-upgrade them one at a time.
 #
-# **A distribution relay is NOT stateless.** `OriginStore::new` clears the
-# origin root at every start (src/distribution/origin.rs), so this restart
-# discards the whole DVR window. The feeding edge keeps publishing a
-# playlist — and a thumbnail index — naming segments that no longer exist,
-# so viewers get 404s on seek until the window rolls over: at the 3600 s
-# the manager provisions by default, that is an hour. Restart the edge in
-# step with the relay. This script warns when it detects that case; see
-# relay issues #6 and #8 for the underlying wipe.
+# **A distribution relay carries state, but a restart no longer costs the
+# DVR window.** `OriginStore::new` adopts whatever is already in the origin
+# root (src/distribution/origin.rs): the eviction queue is rebuilt from the
+# segments' mtimes, oldest first, and the byte counters from their sizes, so
+# the window survives the swap. Two things must stay true across it —
+# `distribution.origin_storage_dir` still points at the same directory, and
+# the `.bilbycast-origin` marker in it is left alone, because a non-empty
+# root carrying no marker is refused at startup rather than adopted.
+# The residual gap is manifests and `init.mp4`, which are held in memory and
+# die with the process. The edge re-publishes both, but not at the same
+# rate: a manifest goes up on every chunk emission, while `init.mp4` rides a
+# 30 s timer (`INIT_REPUBLISH_INTERVAL` in the edge's `engine::cmaf`, which
+# only drops to 1 s once an init PUT has itself failed). Until it lands, a
+# playlist names an `#EXT-X-MAP` the origin does not have, so a player
+# cannot start or seek — up to half a minute after the relay is back. No
+# edge restart is needed. This script reports the held window before the
+# swap; see relay issues #6 and #8.
 
 set -euo pipefail
 
@@ -386,26 +395,36 @@ cp "${NEW_BIN}" "${NEW_STAGED}"
 chown "${ORIG_OWNER}" "${NEW_STAGED}"
 chmod "${ORIG_MODE}" "${NEW_STAGED}"
 
-# The restart discards the DVR window. Say so before doing it, because
-# the symptom (viewers getting 404s on seek for the next hour) points at
-# the edge rather than at this upgrade.
+# The restart keeps the DVR window — it is adopted, not wiped. Say what is
+# on disk anyway, because the one thing that can still lose it is a swap
+# that moves the origin root or clears its marker.
 #
-# Warn, never block: this script is a published release asset that is
+# Report, never block: this script is a published release asset that is
 # curled and run non-interactively, and a prompt here would hang an
 # unattended upgrade. Every probe is `|| true`-guarded — `set -euo
 # pipefail` is active, and an operator whose relay.json cannot be parsed
 # must still get their upgrade rather than an exit 1 from a warning.
 if [[ "${DETECTED}" == "distribution" ]] || \
    grep -qa '/whep/' "${BINARY_PATH}" 2>/dev/null; then
-    ORIGIN_ROOT="$(jq -r '.distribution.origin_root // "/var/lib/bilbycast-relay/origin"' \
-        /etc/bilbycast/relay.json 2>/dev/null || echo /var/lib/bilbycast-relay/origin)"
-    SEG_COUNT="$(find "${ORIGIN_ROOT}" -type f -name '*.m4s' 2>/dev/null | wc -l || echo 0)"
+    ORIGIN_ROOT="$(jq -r '.distribution.origin_storage_dir // "/var/lib/bilbycast/relay/origin"' \
+        /etc/bilbycast/relay.json 2>/dev/null || echo /var/lib/bilbycast/relay/origin)"
+    # Every extension `is_media_segment` accepts, not just `.m4s` — a `.ts`,
+    # CMAF or thumbnail window would otherwise report as an empty origin.
+    # `init.mp4` is excluded there and here: it lives in memory, not on disk.
+    SEG_COUNT="$(find "${ORIGIN_ROOT}" -type f \
+        \( -iname '*.m4s' -o -iname '*.ts' -o -iname '*.cmfv' -o -iname '*.cmfa' \
+           -o -iname '*.cmf' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \
+           -o -iname '*.png' -o \( -iname '*.mp4' -a -not -iname '*init*' \) \) \
+        2>/dev/null | wc -l || echo 0)"
     echo
-    echo "  !! This is a distribution relay. Restarting it CLEARS the DVR origin"
-    echo "     at ${ORIGIN_ROOT} (${SEG_COUNT} segment(s) held right now)."
-    echo "     The feeding edge keeps publishing a playlist naming those segments,"
-    echo "     so viewers get 404s on seek until the window rolls over. Restart the"
-    echo "     edge in step with this relay. See relay issues #6 and #8."
+    echo "  This is a distribution relay. The DVR origin at ${ORIGIN_ROOT}"
+    echo "  holds ${SEG_COUNT} segment(s), and they are ADOPTED across the restart,"
+    echo "  not cleared. Leave that directory and its .bilbycast-origin marker in"
+    echo "  place — a non-empty root with no marker is refused at startup rather"
+    echo "  than adopted. Manifests and init.mp4 are memory-only: the edge puts a"
+    echo "  manifest back on the next chunk, but init.mp4 on a 30 s timer, and"
+    echo "  until it lands players cannot start or seek."
+    echo "  No edge restart needed. See relay issues #6 and #8."
     echo
 fi
 

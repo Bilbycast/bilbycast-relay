@@ -1,8 +1,5 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
-// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Tunnel routing: pairs ingress and egress edges by tunnel ID and forwards data.
 

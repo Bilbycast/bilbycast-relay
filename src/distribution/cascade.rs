@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Cascade: a downstream (regional) relay pulls a stream from an upstream
 //! relay's WHEP and re-fans-it-out to its own viewers.

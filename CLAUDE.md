@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-bilbycast-relay is a stateless relay server written in Rust that provides NAT traversal between edge nodes. It is a generic, **opaque per-path forwarder**: it pairs the two ends of each path by tunnel ID and forwards data between them, never inspecting, terminating, or combining the streams it carries (it sees only `[16-byte tunnel_id][AEAD ciphertext]`). It carries three logically distinct path types, all forwarded the same opaque way:
+bilbycast-relay is a **stateless** relay server written in Rust that provides NAT traversal between edge nodes — stateless *as a forwarder*; the optional, default-off viewer-distribution role described below deliberately is not, since it re-indexes its on-disk origin window at startup (`OriginStore::adopt_existing`) and writes the manager-pushed `distribution` block back into the config file (`persist_distribution_config`), so both survive a restart. It is a generic, **opaque per-path forwarder**: it pairs the two ends of each path by tunnel ID and forwards data between them, never inspecting, terminating, or combining the streams it carries (it sees only `[16-byte tunnel_id][AEAD ciphertext]`). It carries three logically distinct path types, all forwarded the same opaque way:
 
 - **QUIC tunnels** — TCP streams + UDP datagrams over QUIC/TLS 1.3 (`:4433`, `server.rs` + `session.rs`).
 - **Native SRT/RIST over relay** — plain UDP, no QUIC (`:4434`, `udp_relay.rs`), so SRT/RIST keep their own ARQ + congestion control without QUIC's per-packet overhead or a second congestion controller.
@@ -75,7 +75,7 @@ A relayed bond leg is therefore not a special relay concept — it is just one o
 | **`api.rs`** | Axum REST routes: `/health` (public), `/metrics`, `/api/v1/tunnels`, `/api/v1/udp-sessions`, `/api/v1/edges`, `/api/v1/stats` (read-only), plus `DELETE /api/v1/tunnels/{id}` and `DELETE /api/v1/udp-sessions/{id}` (administrative teardown, fail-closed — both refuse with `403` unless `api_token` is set). Optional Bearer token auth middleware if `api_token` is configured |
 | **`config.rs`** | `RelayConfig` + `ManagerConfig` (JSON, with serde defaults). Fields: `quic_addr`, `quic_addrs` (`Option<Vec<String>>` — dual-stack list, default `["0.0.0.0:4433", "[::]:4433"]` on fresh install), `api_addr`, `api_addrs` (same shape, default `["0.0.0.0:4480", "[::]:4480"]`), `public_quic_addr` (advertised dial address for remote edges — distinct from the bind list; rejected if unspecified `0.0.0.0`/`[::]`; flows through to the manager via health and surfaces in the tunnel-creation dropdown), `udp_relay_enabled` (bool, default `true` — enable the native plain-UDP plane), `udp_relay_addrs` (`Option<Vec<String>>`, default `["0.0.0.0:4434", "[::]:4434"]`), `public_udp_addr` (advertised dial address for the native plane — same rules as `public_quic_addr`; manager falls back to `public_quic_addr`'s host + the UDP port when unset), `tls_cert_path`, `tls_key_path`, `api_token` (optional, 32-128 chars), `require_bind_auth` (bool, default `false`), `max_connections_per_ip` (u32, default `64` — DoS mitigation, per-IP simultaneous QUIC connection cap), `max_tunnels_per_connection` (u32, default `100` — DoS mitigation, per-connection tunnel-bind cap), `manager` (optional), `logging` (optional `LoggingConfig` — structured-JSON log shipper for SIEM/NMS pickup; stdout/file/syslog targets, raw/splunk/dataminer formats; mirrors the edge's shape). v6 entries get `IPV6_V6ONLY=1` on bind via `socket2` so they coexist with v4 listeners on the same port. Resolvers: `RelayConfig::effective_quic_addrs` / `effective_api_addrs` / `effective_udp_relay_addrs`. CLI overrides: `--quic-addr` / `--api-addr` (legacy single-addr) plus `--quic-addrs` / `--api-addrs` (comma-separated dual-stack), `--public-quic-addr`, `--udp-relay-addrs`, `--public-udp-addr`, and `--no-udp-relay` (disable the native plane). |
 | **`stats.rs`** | Atomic (`AtomicU64`) per-tunnel and global stats — lock-free counters for bytes, streams, datagrams, plus global `RelayStats` with peak watermarks (tunnels, edges), connection count, and bandwidth estimation |
-| **`manager/client.rs`** | WebSocket client to bilbycast-manager: auth (registration token or node_id/secret), stats/health streaming, operational events, command handling (get_config, disconnect_edge, close_tunnel, list_tunnels, list_edges, authorize_tunnel, revoke_tunnel). Health advertises `public_quic_addr`, `public_udp_addr`, `udp_sessions_total` / `udp_sessions_active`, and a `capabilities` array (`"udp-relay"` when the native plane is enabled) |
+| **`manager/client.rs`** | WebSocket client to bilbycast-manager: auth (registration token or node_id/secret), stats/health streaming, operational events, command handling — eleven actions: get_config, rotate_secret, configure_distribution, disconnect_edge, close_tunnel, list_tunnels, list_edges, list_udp_sessions, close_udp_session, authorize_tunnel, revoke_tunnel. Health advertises `public_quic_addr`, `public_udp_addr`, `udp_sessions_total` / `udp_sessions_active`, and a `capabilities` array of up to three bits (`"udp-relay"` when `udp_relay_enabled`; `"viewer-distribution"` + `"origin-policy"` together once the distribution subsystem has published a telemetry sample) |
 | **`manager/events.rs`** | `EventSender`/`EventSeverity`/`Event` types and the event channel for forwarding operational events to the manager. See `docs/events-and-alarms.md` for the full event reference |
 
 ### Protocol Messages
@@ -109,8 +109,8 @@ If `manager` is configured in `RelayConfig`, the relay maintains a persistent ou
 1. Connects to manager WebSocket URL, sends auth (registration_token or node_id + node_secret, plus `software_version` and `protocol_version` for compatibility detection)
 2. On first connect: receives `register_ack` with credentials, persists to config file
 3. Sends stats every 1 second: tunnels array, connected edges, total bandwidth/throughput (bps), peak watermarks, active TCP streams, uptime
-4. Sends health every 15 seconds: status, version, tunnel/edge counts, total bytes forwarded, peaks, connections total, `api_addr`, `quic_addr` (bind), `public_quic_addr` (advertised dial address; manager UI prefers this when set, falls back to `quic_addr` only when it isn't listen-only), `public_udp_addr` (advertised dial address for the native plane), native-UDP session counts (`udp_sessions_total` / `udp_sessions_active`), and a `capabilities` array (includes `"udp-relay"` when the native plane is enabled — the manager UI gates the native-relay surface on this bit)
-5. Handles commands: `get_config`, `disconnect_edge`, `close_tunnel`, `list_tunnels`, `list_edges`, `authorize_tunnel`, `revoke_tunnel`
+4. Sends health every 15 seconds: status, version, tunnel/edge counts, total bytes forwarded, peaks, connections total, `api_addr`, `quic_addr` (bind), `public_quic_addr` (advertised dial address; manager UI prefers this when set, falls back to `quic_addr` only when it isn't listen-only), `public_udp_addr` (advertised dial address for the native plane), native-UDP session counts (`udp_sessions_total` / `udp_sessions_active`), and a `capabilities` array carrying up to three bits: `"udp-relay"` when `udp_relay_enabled` (the manager's tunnel model names it as the precondition for a `transport: "udp"` tunnel, but no manager code reads the bit today — that surface gates on the relay's `public_udp_addr` instead), plus `"viewer-distribution"` and `"origin-policy"` together whenever `RelayStats::distribution_snapshot()` returns a sample — i.e. once the distribution subsystem has published telemetry, not merely once the feature is compiled in. `"origin-policy"` says this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` is **not** covered by the bit: it landed later, in v0.13.0, and nothing gates it. A relay predating the three keys still advertises `"viewer-distribution"` and still ACKs the push while ignoring them, so the manager refuses rather than record a gate or a retention window as applied when nothing was (`api/distribution.rs`, `dvr_reconciler.rs`)
+5. Handles eleven commands: `get_config`, `rotate_secret`, `configure_distribution`, `disconnect_edge`, `close_tunnel`, `list_tunnels`, `list_edges`, `list_udp_sessions`, `close_udp_session`, `authorize_tunnel`, `revoke_tunnel`. `list_udp_sessions` / `close_udp_session` are the native-UDP-plane twins of `list_tunnels` / `close_tunnel` — they enumerate and tear down `UdpSessionRouter` rendezvous slots, which the QUIC-tunnel commands never touch. `configure_distribution` carries the whole manager-owned distribution control surface; see [`docs/distribution.md`](docs/distribution.md) for its keys
 6. Reconnects with a **fixed 5 s backoff** (not exponential) on disconnection, rotating to the next configured URL on each failure. The backoff constant is `Duration::from_secs(5)` (`let fixed_backoff = Duration::from_secs(5);` in `manager/client.rs`); `cursor` advances by one (`cursor.wrapping_add(1)`) after every connection close/error so successive attempts cycle through `urls[]`. The backoff is *not* reset on success — there is simply no delay while connected; the 5 s sleep only runs between attempts.
 
 **Tunnel bind authentication commands**: `authorize_tunnel` pre-registers expected HMAC-SHA256 bind tokens (ingress + egress) for a tunnel UUID. `revoke_tunnel` removes authorization. When authorized, edges must include a valid `bind_token` in their `TunnelBind` message. Old per-edge commands (`authorize_edge`, `revoke_edge`, `list_authorized_edges`) were removed in favor of this per-tunnel approach.
@@ -132,7 +132,7 @@ Each edge connection spawns an independent tokio task. Within each session, thre
 
 This separation prevents head-of-line blocking between control, TCP, and UDP planes. The native plain-UDP plane (`udp_relay.rs`) runs as a separate task family outside the QUIC session model: one `recv_loop` per bound socket sharing a lock-free `UdpSessionRouter`, plus an idle-session reaper — no per-edge connection task, since plain UDP has no connection.
 
-**Concurrency primitives used (zero locks):**
+**Concurrency primitives used (no locks on the opaque forwarding path):**
 
 | Primitive | Usage |
 |-----------|-------|
@@ -143,7 +143,16 @@ This separation prevents head-of-line blocking between control, TCP, and UDP pla
 | `tokio::join!` | Bidirectional TCP copy (both directions concurrent) |
 | `tokio::spawn` | Per-connection and per-stream task isolation |
 
-No `Mutex` or `RwLock` is used anywhere in the codebase.
+No `RwLock` anywhere, and no lock on the opaque forwarding path. Three `Mutex`
+fields exist in the runtime code, and two of them are in always-compiled modules
+— so this is not a distribution-only exception: `RelayStats::prev_sample`
+(`std::sync`, `stats.rs`) is taken only inside `compute_bandwidth_bps`, on the
+1 s stats tick and on a REST `/api/v1/stats` read; `DistributionControl::drop_rx`
+(`std::sync`, `distribution_control.rs`) is a one-shot handoff of the drop-queue
+receiver to the origin task; and `StreamOrigin::order`, the **per-stream**
+eviction queue (`tokio::sync`, `distribution/origin.rs`, `viewer-distribution`
+builds only), is held for queue surgery on the CMAF segment PUT/evict path and
+dropped before the file I/O it schedules.
 
 ### Security Architecture
 
@@ -321,14 +330,23 @@ reported as a gateway failure rather than as the viewer not being signed in.
 Test coverage: tunnel state transitions (waiting/active), bidirectional TCP forwarding, UDP datagram forwarding, ping/pong keepalive.
 
 **CI** (`.github/workflows/ci.yml`, added for issue #3): `cargo check` + `cargo
-clippy -D warnings` + `cargo test` on **both** feature configurations — default
-(the opaque forwarder) and `viewer-distribution`. The second half is not
-optional coverage: the feature is off by default, so a default-only run compiles
-right past `src/distribution/` entirely. Before this workflow the only thing that
-ever built that code was the release job's `cargo build --release`, which
-compiles no test targets and runs no lint — which is how
-`tampered_signature_rejected` sat failing roughly one run in sixteen without
-anyone seeing it.
+clippy -D warnings` + `cargo test` on **three** feature configurations — default
+(the opaque forwarder), `viewer-distribution` and `portal`. The two extra passes
+are not optional coverage: both features are off by default, so a default-only
+run compiles right past `src/distribution/` entirely, and past `src/portal/`,
+`src/portal_bin.rs` and `tests/portal.rs` too — the portal is a *second* binary
+gated on `required-features = ["portal"]`, with `tests/portal.rs` gated the same
+way. The only other thing that compiles either subsystem is the release job's
+`cargo build --release --features viewer-distribution-vendored,portal`, which
+builds no test targets and runs no lint — so `tests/portal.rs` is built by
+nothing else at all, and that is how `tampered_signature_rejected` sat failing
+roughly one run in sixteen without anyone seeing it. `portal` gets its own
+configuration rather than being folded in with `viewer-distribution` because it
+is deliberately independent of it (it links neither str0m nor OpenSSL), and
+running the two together would stop proving that. The job then `bash -n`s the three packaging scripts
+(`install-relay.sh` / `upgrade-relay.sh` / `uninstall-relay.sh`) and runs
+`packaging/test-portal-install.sh` against staged tarballs — shell that is
+otherwise only ever run for real, against a signed release, on somebody's server.
 
 The accepted-lint set lives in `[lints.clippy]` in `Cargo.toml`, one documented
 reason per entry, so CI runs `-D warnings` with no inline `-A` flags to drift out

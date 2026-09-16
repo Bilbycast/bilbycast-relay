@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Per-viewer WHEP session: SDP answer + the send loop that fans one
 //! stream's elementary frames out to one browser over DTLS/SRTP.

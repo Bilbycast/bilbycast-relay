@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! WHIP ingest: an edge (or any WHIP client) pushes a browser-ready
 //! H.264 + Opus WebRTC stream **into** the relay, which terminates DTLS/SRTP,
