@@ -511,19 +511,28 @@ impl Drop for PartFile {
 /// Does this directory look like a store an older relay wrote?
 ///
 /// Used only when the marker is absent, to tell "our own store, from before
-/// the marker existed" from "somebody else's directory". The guard exists for
-/// the home directory or mount point somebody names by typo, and that must
-/// still be refused — so this is deliberately narrow:
+/// the marker existed" from "somebody else's directory". Everything under the
+/// root becomes evictable and the idle sweep ends in `remove_dir_all`, so a
+/// false positive is an operator's data deleted about two minutes after the
+/// relay starts. The evidence demanded is therefore evidence a tree this relay
+/// did not write is unlikely to have:
 ///
 /// * every top-level entry is a directory (a home directory has files in it);
-/// * every file inside those is a segment, a thumbnail or an interrupted PUT;
-/// * and at least one is a `.m4s` segment.
+/// * inside those, nothing but segments, thumbnails, init segments,
+///   interrupted PUTs, and the one `clips/` subdirectory;
+/// * every directory that holds files holds at least one segment named the way
+///   **this system's** packager names them — `seg-00042.m4s` / `aud-00042.m4s`
+///   (bilbycast-edge `engine::cmaf::manifest::segment_file_name`);
+/// * and there are at least two such segments in the tree.
 ///
-/// That last clause is what keeps a photo library out. Thumbnails are `.jpg`,
-/// so folders-of-jpgs would otherwise pass — and this store ages its contents
-/// out, which makes a false positive expensive.
+/// The naming clause is what the earlier "at least one `.m4s` anywhere" test
+/// lacked. Another packager's CMAF or DASH output — `<event>/*.m4s` beside an
+/// `init.mp4` — is exactly the shape of a relay store, and a media archive
+/// holding a single stray `.m4s` beside folders of `.mp4` and `.jpg` passed
+/// too. A window is hundreds of segments, so requiring two of them under their
+/// real names costs a genuine upgrade nothing.
 fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
-    let mut saw_segment = false;
+    let mut segments = 0usize;
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         if entry.file_name() == std::ffi::OsStr::new(ORIGIN_MARKER) {
@@ -532,6 +541,8 @@ fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
         if !entry.file_type()?.is_dir() {
             return Ok(false);
         }
+        let mut files_here = 0usize;
+        let mut segments_here = 0usize;
         for f in std::fs::read_dir(entry.path())? {
             let f = f?;
             // Exported clips live in their own subdirectory of the stream, so a
@@ -547,15 +558,41 @@ fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
             }
             let name = f.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(".m4s") {
-                saw_segment = true;
-            } else if !(name.ends_with(".mp4") || name.ends_with(".jpg") || name.ends_with(".part"))
+            files_here += 1;
+            if is_packager_segment(&name) {
+                segments_here += 1;
+                segments += 1;
+            } else if !(name.ends_with(".m4s")
+                || name.ends_with(".mp4")
+                || name.ends_with(".jpg")
+                || name.ends_with(PART_SUFFIX))
             {
                 return Ok(false);
             }
         }
+        // A directory holding files but no segments of ours is not a stream of
+        // ours. One holding no files at all — a stream retired down to its
+        // clips — proves nothing either way and is allowed to pass.
+        if files_here > 0 && segments_here == 0 {
+            return Ok(false);
+        }
     }
-    Ok(saw_segment)
+    Ok(segments >= 2)
+}
+
+/// `seg-00042.m4s` / `aud-00042.m4s` — the names bilbycast-edge's CMAF
+/// packager produces, and the only ones this store is ever filled with.
+fn is_packager_segment(name: &str) -> bool {
+    let Some(rest) = name.strip_suffix(".m4s") else {
+        return false;
+    };
+    let Some(digits) = rest
+        .strip_prefix("seg-")
+        .or_else(|| rest.strip_prefix("aud-"))
+    else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 impl OriginStore {
@@ -580,9 +617,11 @@ impl OriginStore {
     /// what `init_last_upload` exists for on that side.
     ///
     /// A directory that already exists, is not empty and carries no
-    /// `.bilbycast-origin` marker is refused rather than adopted: the root is
+    /// `.bilbycast-origin` marker is refused rather than adopted — the root is
     /// operator-supplied and everything under it becomes evictable, so a typo
-    /// naming a home directory must not enrol it into the sweep.
+    /// naming a home directory must not enrol it into the sweep — unless it
+    /// carries the shape of a store written before the marker existed, which
+    /// [`looks_like_origin_store`] describes and deliberately reads narrowly.
     pub fn new(cfg: OriginConfig) -> std::io::Result<Self> {
         // Only ever adopt — and evict from — a directory this store made.
         // `origin_storage_dir` is operator-supplied and everything under it
@@ -591,7 +630,8 @@ impl OriginStore {
         // finds. Pointed at a home directory or a mount point by a typo, the
         // store would index whatever is there and then age it out. A
         // directory that exists, is not empty, and has no marker is somebody
-        // else's.
+        // else's — unless it carries the shape of a store written before the
+        // marker existed, which `looks_like_origin_store` reads narrowly.
         //
         // The startup wipe this guard was written for is gone — the window on
         // disk is adopted now — but the guard matters more without it, not
@@ -1504,7 +1544,20 @@ impl OriginStore {
             Ok(mut rd) => {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     if entry.file_name() == std::ffi::OsStr::new(CLIPS_DIR) {
-                        kept += 1;
+                        // Kept only if it is holding something. Counting the
+                        // directory entry itself meant a `clips/` a viewer had
+                        // emptied through the portal read as "clips kept", and
+                        // retirement then left exactly the empty shell the
+                        // cleanup below exists to avoid.
+                        let holds_anything = match tokio::fs::read_dir(entry.path()).await {
+                            Ok(mut inner) => matches!(inner.next_entry().await, Ok(Some(_))),
+                            Err(_) => false,
+                        };
+                        if holds_anything {
+                            kept += 1;
+                        } else {
+                            let _ = tokio::fs::remove_dir(entry.path()).await;
+                        }
                         continue;
                     }
                     let path = entry.path();
@@ -4224,6 +4277,57 @@ seg-1.m4s
         assert!(s.list_clips("feed")[0].ready);
     }
 
+    /// And they outlive an ingest gap, which is not the same test.
+    ///
+    /// `clips_are_not_evicted_with_the_segments` exercises `evict`. The branch
+    /// that actually deleted clips is in `sweep`: a stream idle past
+    /// `retention + idle_grace` had its segment queue drained and was then
+    /// handed to `remove_stream`, a `remove_dir_all` of the whole stream
+    /// directory — `clips/` with it. Nothing about that requires the session to
+    /// be over: an edge restart, a stopped flow or a satellite drop longer than
+    /// the window is enough, and a clip write does not refresh `last_put_ms`,
+    /// so exporting cannot keep the stream alive either. The operator loses the
+    /// export with one `tracing::info!` and no event.
+    #[tokio::test]
+    async fn an_idle_sweep_retires_a_stream_without_taking_its_clips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 5,
+                post_secs: 5,
+                clips: vec![ClipAsk {
+                    at: "2026-09-07T23:06:53.200Z".into(),
+                    name: "goal".into(),
+                }],
+            },
+        )
+        .unwrap();
+        s.put_clip("feed", "goal", b"clip").await.unwrap();
+        put_seg(&s, "feed", "seg-00000.m4s", 64).await;
+
+        // Short enough that one sleep puts the stream past retention + grace.
+        s.set_default_policy(OriginPolicy {
+            retention: Duration::from_millis(5),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 0,
+            idle_grace: Duration::from_millis(5),
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        s.sweep().await;
+
+        assert!(
+            s.read_clip("feed", "goal").await.is_some(),
+            "the idle sweep deleted an exported clip"
+        );
+        assert_eq!(s.list_clips("feed").len(), 1, "the clip's record went with it");
+        assert!(
+            s.get("feed", "seg-00000.m4s").await.is_none(),
+            "the media should still be reclaimed — only the clips survive"
+        );
+    }
+
     /// ...but they do not outlive the session.
     #[tokio::test]
     async fn dropping_a_stream_takes_its_clips_too() {
@@ -4451,7 +4555,12 @@ seg-1.m4s
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("origin");
         std::fs::create_dir_all(root.join("feed-a")).unwrap();
+        // Two, because the shape check wants two: a window is hundreds of
+        // segments, and "one `.m4s` somewhere" was what let another packager's
+        // output through.
         std::fs::write(root.join("feed-a/seg-00001.m4s"), b"xx").unwrap();
+        std::fs::write(root.join("feed-a/seg-00002.m4s"), b"yy").unwrap();
+        std::fs::write(root.join("feed-a/init.mp4"), b"i").unwrap();
         std::fs::write(root.join("feed-a/thumb-1.jpg"), b"j").unwrap();
         assert!(!root.join(ORIGIN_MARKER).exists(), "fixture must have no marker");
 
@@ -4473,6 +4582,73 @@ seg-1.m4s
             root.join(ORIGIN_MARKER).exists(),
             "the marker must be written, so the next start needs no shape check"
         );
+    }
+
+    /// Another packager's output is the shape of a store, and is not one.
+    ///
+    /// `/srv/www/dash/<event>/` holding `init.mp4` beside numbered `.m4s`
+    /// segments passes every structural test — all directories at the top, only
+    /// media extensions below — and the "at least one `.m4s`" clause it used to
+    /// end on was satisfied by the first file it found. Adopting it enrols
+    /// every file with its real mtime, so the first sweep evicts everything
+    /// already past retention and the idle sweep `remove_dir_all`s the rest
+    /// about two minutes after the relay starts.
+    ///
+    /// What separates the two is the file names: this store is only ever
+    /// filled by bilbycast-edge's packager, which writes `seg-%05d.m4s`.
+    #[tokio::test]
+    async fn another_packagers_cmaf_tree_is_not_mistaken_for_a_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dash");
+        std::fs::create_dir_all(root.join("cup-final")).unwrap();
+        std::fs::write(root.join("cup-final/init.mp4"), b"init").unwrap();
+        std::fs::write(root.join("cup-final/chunk-stream0-00001.m4s"), b"aa").unwrap();
+        std::fs::write(root.join("cup-final/chunk-stream0-00002.m4s"), b"bb").unwrap();
+
+        let err = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(60),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_millis(80),
+        })
+        .map(|_| ())
+        .expect_err("a foreign CMAF tree must not be adopted");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(root.join("cup-final/chunk-stream0-00001.m4s").exists());
+        assert!(!root.join(ORIGIN_MARKER).exists(), "a refused directory must not be claimed");
+    }
+
+    /// A media archive with one stray segment in it is the same trap.
+    ///
+    /// Folders of `.mp4` and `.jpg` beside a single grab that happens to be an
+    /// `.m4s`: every extension is on the permitted list and the old clause
+    /// needed exactly one of them. Requiring every file-bearing directory to
+    /// carry a segment of ours refuses it on the two that do not.
+    #[tokio::test]
+    async fn a_media_archive_with_one_stray_segment_still_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("media");
+        std::fs::create_dir_all(root.join("clips-2024")).unwrap();
+        std::fs::create_dir_all(root.join("stills")).unwrap();
+        std::fs::create_dir_all(root.join("grabs")).unwrap();
+        std::fs::write(root.join("clips-2024/wedding.mp4"), b"m").unwrap();
+        std::fs::write(root.join("stills/one.jpg"), b"j").unwrap();
+        std::fs::write(root.join("grabs/seg-00001.m4s"), b"s").unwrap();
+
+        let err = OriginStore::new(OriginConfig {
+            root: root.clone(),
+            retention: Duration::from_secs(60),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_millis(80),
+        })
+        .map(|_| ())
+        .expect_err("a media archive must not be adopted");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(root.join("clips-2024/wedding.mp4").exists());
     }
 
     /// ...but shape is not a licence to adopt anything.

@@ -354,7 +354,8 @@ pub struct DistributionConfig {
     /// there by a previous run are indexed back into the window, so a relay
     /// restart no longer costs the DVR depth. Everything under it is evictable
     /// either way, so give it a directory of its own — `OriginStore::new`
-    /// refuses a non-empty one that carries no `.bilbycast-origin` marker.
+    /// refuses a non-empty one that carries no `.bilbycast-origin` marker and
+    /// does not carry the shape of a store written before that marker existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_storage_dir: Option<String>,
 
