@@ -181,7 +181,9 @@ required-features = ["portal"]
 version = "0.13.4"
 optional = true
 default-features = false
-features = ["json", "query", "rustls-no-provider", "http2"]
+# `stream` is for the clip download proxy: a clip is tens of megabytes and the
+# portal passes it through rather than holding one per concurrent download.
+features = ["json", "query", "rustls-no-provider", "http2", "stream"]
 
 [features]
 # OFF by default: a plain `cargo build` produces the pure opaque forwarder with

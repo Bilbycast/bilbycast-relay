@@ -32,15 +32,44 @@
 
   /* ── the picture ────────────────────────────────────────────────────── */
   #stage { position: fixed; inset: 0; background: #000; overflow: hidden; }
-  /* An explicit height, not an inset. `<video>` is a *replaced* element: with
+  /* The picture area — and the only thing zoom and pan ever move.
+     An explicit height, not an inset. `<video>` is a *replaced* element: with
      `height: auto` the browser takes its intrinsic height and quietly ignores
      the `bottom` inset, which left the picture running the full height and
-     the controls sitting on top of moving video. */
-  #stage video {
-    position: absolute; top: 0; left: 0; width: 100%;
+     the controls sitting on top of moving video.
+     `overflow: hidden` is what keeps a zoomed picture inside its own window
+     instead of spilling under the transport. */
+  #pic {
+    position: absolute; top: 0; left: 0; right: 0;
     height: calc(100% - var(--hud));
-    object-fit: contain; background: #000;
+    overflow: hidden;
+    /* The browser must not pan or pinch-zoom the page here, because this
+       element handles those gestures itself. Deliberately not set anywhere
+       else: everything outside the picture keeps the platform's own zoom,
+       which is somebody's accessibility setting and not ours to disable. */
+    touch-action: none;
   }
+  #stage video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; background: #000;
+    /* Origin at the top-left keeps the transform arithmetic a plain
+       `screen = picture * scale + offset`, with no half-size terms to get
+       wrong when the window resizes. */
+    transform-origin: 0 0;
+  }
+  body[data-pic-zoom="1"] #pic { cursor: grab; }
+  body[data-pic-zoom="1"] #pic:active { cursor: grabbing; }
+  /* Shown only while zoomed: says how far in, and resets on a tap. Sits under
+     the live badge, where nothing else can collide with it. */
+  #zoomBadge {
+    display: none; position: absolute; top: 44px; left: 50%;
+    transform: translateX(-50%); z-index: 3;
+    padding: 4px 11px; border-radius: 999px; border: 0;
+    font-family: inherit; font-size: 11px; font-weight: 700; letter-spacing: .09em;
+    background: rgba(20,26,32,.8); color: var(--fg);
+    backdrop-filter: blur(6px); cursor: pointer;
+  }
+  body[data-pic-zoom="1"] #zoomBadge { display: block; }
   #proxy { display: none; }
   body[data-picture="proxy"] #proxy { display: block; }
   body[data-picture="proxy"] #main  { display: none; }
@@ -336,6 +365,35 @@
   #settings .note.bar b { color: var(--accent); }
   #settings .foot { border-top: 1px solid var(--line); padding: 12px 14px; margin: auto 0 0; line-height: 1.7; }
 
+  /* A number beside its label, rather than the checkbox row's layout. */
+  #settings .opt.num { justify-content: space-between; gap: 14px; }
+  #settings .opt.num input {
+    width: 5.5em; height: auto; padding: 6px 8px; text-align: right;
+    background: var(--panel2, rgba(255,255,255,.06)); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; font: inherit;
+  }
+  #settings .clips { border: 0; margin: 6px 0 0; padding: 0; }
+  #settings .clips legend { padding: 0 0 4px; font-size: 12px; color: var(--dim);
+    text-transform: uppercase; letter-spacing: .08em; }
+
+  /* Export controls sit at the foot of the marks panel. */
+  #markExport { border-top: 1px solid var(--line); padding: 10px 12px; }
+  #markExport button {
+    font: inherit; padding: 8px 12px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--line); background: rgba(255,255,255,.06); color: var(--fg);
+  }
+  #markExport button[disabled] { opacity: .45; cursor: default; }
+  #markExport button.quiet { background: none; }
+  #btnExportGo { background: var(--accent); color: #04241c; border-color: transparent; font-weight: 600; }
+  #exportBar { display: flex; align-items: center; gap: 8px; }
+  #exportBar .grow { flex: 1; }
+  #exportCount { font-size: 13px; color: var(--dim); }
+  /* The selector only exists while exporting, so the list is a list the rest
+     of the time. */
+  #markList li input.pick {
+    width: 20px; height: 20px; accent-color: var(--accent);
+    flex: 0 0 auto; margin: 0; cursor: pointer;
+  }
   #markList { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
   #markList li {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -373,6 +431,17 @@
     min-width: 38px; min-height: 38px; padding: 0; font-size: 17px;
     background: transparent; border-color: transparent; color: var(--dim);
   }
+  /* Exported. Sits between the colour swatch and delete, in the accent so it
+     reads at a glance down the column, and sized to the row rather than to a
+     touch target — there is nothing here to press. */
+  #markList .done {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; flex: 0 0 auto; color: var(--accent);
+  }
+  #markList .done svg {
+    width: 16px; height: 16px; fill: none; stroke: currentColor;
+    stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round;
+  }
   #markEmpty { color: var(--dim); font-size: 12px; padding: 14px; margin: 0; }
   body[data-marks="0"] #markList { display: none; }
   body[data-marks="1"] #markEmpty { display: none; }
@@ -409,8 +478,13 @@
 <body data-mode="live" data-live="1" data-picture="main">
 
 <div id="stage">
-  <video id="main" playsinline muted></video>
-  <video id="proxy" playsinline muted></video>
+  <!-- The picture and nothing else. Everything below is a sibling, not a
+       child, which is what keeps the controls the same size at every zoom
+       level: the transform applies here and stops here. -->
+  <div id="pic">
+    <video id="main" playsinline muted></video>
+    <video id="proxy" playsinline muted></video>
+  </div>
 
   <!-- The gradient the controls sit on. Purely a legibility surface: the
        picture underneath is the thing being watched, so it fades to nothing
@@ -420,11 +494,17 @@
 
   <div id="badge">live</div>
   <div id="qbadge" aria-hidden="true"></div>
+  <button id="zoomBadge" type="button" title="Reset zoom (0)">1.0&times;</button>
   <div id="status">—</div>
   <pre id="debug"></pre>
 
   <!-- top left: view controls, least often touched, so smallest and quietest -->
   <div id="tools">
+    <!-- Back to the sign-in page. Hidden unless the portal told us where it
+         is, because a button that goes nowhere is worse than no button. -->
+    <button id="btnFeeds" class="icon" hidden title="Back to your feeds" aria-label="Back to your feeds">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6l-6 6 6 6M4 12h11a5 5 0 0 0 5-5V5"/></svg>
+    </button>
     <button id="btnFull" class="icon" aria-pressed="false" title="Full screen (F)" aria-label="Full screen">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     </button>
@@ -548,6 +628,23 @@
        the frame you are looking at is sharp without paying for sharpness while
        it moves. Shuttle and scrub work in all three, because the
        low-resolution rendition is all-intra. Takes effect on reload.</p>
+    <fieldset class="clips">
+      <legend>Clip export</legend>
+      <label class="opt num">
+        <span>Seconds <b>before</b> the mark</span>
+        <input type="number" id="clipPre" min="0" max="60" step="1" value="3">
+      </label>
+      <label class="opt num">
+        <span>Seconds <b>after</b> the mark</span>
+        <input type="number" id="clipPost" min="0" max="60" step="1" value="5">
+      </label>
+      <p class="note" id="clipLen"></p>
+    </fieldset>
+    <p class="note">Applied to every clip exported from the Marks panel, and
+       kept on this device like the marks themselves. A clip is cut on the edge,
+       so the in and out points land where you asked rather than on a segment
+       boundary. It appears on your sign-in page when it is ready, and is
+       cleaned up with the session.</p>
     <button id="optSelftest" type="button">Run the player self-test</button>
     <p class="note">Measures what this device can actually present — shuttle
        rate, scrub preview coverage, token renewal. About a minute.</p>
@@ -566,7 +663,19 @@
   <ol id="markList"></ol>
   <p id="markEmpty">Nothing marked yet. Press <b>MARK</b>, or <b>M</b>, to mark
      the moment you are looking at.</p>
-  <p class="note">Kept on this device, for this feed.</p>
+  <!-- Export lives at the foot of the panel, and only turns the list into a
+       selectable thing once asked. A list that is always full of checkboxes
+       reads as a form; the common act here is still "go to that mark". -->
+  <div id="markExport">
+    <button id="btnExport" type="button">Export clips&hellip;</button>
+    <div id="exportBar" hidden>
+      <span id="exportCount">none selected</span>
+      <span class="grow"></span>
+      <button id="btnExportCancel" type="button" class="quiet">Cancel</button>
+      <button id="btnExportGo" type="button" disabled>Export</button>
+    </div>
+    <p id="exportNote" class="note" hidden></p>
+  </div>
 </aside>
 
 <script src="/dvr/hls.js?v=__HLS_JS_VERSION__"></script>
@@ -657,6 +766,30 @@
   // strict privacy settings should still be able to watch — they just lose the
   // reload.
   var TOKEN_KEY = "bilbycast.dvr.token." + STREAM;
+
+  /* The opaque id of the device holding this login.
+   *
+   * Handed out with the token and presented on renewal, so the portal can tell
+   * "still watching" from "somebody else signed in with the same account". Not
+   * a credential: it opens nothing, and is only ever compared against the row
+   * that records who holds the feed. It cannot be the token, because two
+   * tokens minted in the same second for the same streams are byte-identical
+   * and so cannot tell two devices apart.
+   *
+   * Same lifetime as the token — per tab, gone when the tab closes. */
+  var HOLD_KEY = "bilbycast.dvr.hold." + STREAM;
+  var HOLDER = "";
+  function rememberHolder(h) {
+    HOLDER = h || "";
+    try {
+      if (HOLDER) window.sessionStorage.setItem(HOLD_KEY, HOLDER);
+      else window.sessionStorage.removeItem(HOLD_KEY);
+    } catch (e) { /* blocked */ }
+  }
+  function recallHolder() {
+    try { return window.sessionStorage.getItem(HOLD_KEY) || ""; }
+    catch (e) { return ""; }
+  }
   function rememberToken(t) {
     try { window.sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* blocked */ }
   }
@@ -676,13 +809,21 @@
     TOKEN = recallToken();
   }
 
+  // The holder id arrives with the token and is kept the same way.
+  HOLDER = qs.get("hold") || "";
+  if (HOLDER) rememberHolder(HOLDER);
+  else HOLDER = recallHolder();
+
   // With MSE we can send the token as a request header, so it never has to
   // sit in a URL -- out of the address bar, the history, and any Referer.
   // Native HLS (iOS Safari) hands the URL straight to the media stack and
   // cannot set headers, so there the query form is the only option.
   var TOKEN_IN_HEADER = !!(window.Hls && window.Hls.isSupported());
-  if (qs.get("token") && window.history && history.replaceState) {
+  if ((qs.get("token") || qs.get("hold")) && window.history && history.replaceState) {
     qs.delete("token");
+    // Out of the address bar with the token: it is per-tab state, not
+    // something to be copied out of a URL along with the credential.
+    qs.delete("hold");
     var q = qs.toString();
     history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
   }
@@ -710,6 +851,7 @@
   var btnPause = document.getElementById("btnPause");
   var btnMute = document.getElementById("btnMute");
   var btnFull = document.getElementById("btnFull");
+  var btnFeeds = document.getElementById("btnFeeds");
   var btnMark = document.getElementById("btnMark");
   var btnPrevMark = document.getElementById("btnPrevMark");
   var btnNextMark = document.getElementById("btnNextMark");
@@ -1917,6 +2059,9 @@
       // rejected: a mark is worth keeping even if its colour is not.
       if (!isMarkColour(m.colour)) m.colour = MARK_COLOUR_DEFAULT;
       if (typeof m.id !== "number") m.id = ++markSeq;
+      // Anything truthy in storage means exported; normalised to a boolean so
+      // the badge test below is not at the mercy of what was written.
+      m.exported = !!m.exported;
       markSeq = Math.max(markSeq, m.id);
     });
     sortMarks();
@@ -2027,6 +2172,186 @@
     for (; n < flagPool.length; n++) flagPool[n].style.display = "none";
   }
 
+  // ── clip export ──────────────────────────────────────────────────────────
+  //
+  // A clip is a window around a mark: so many seconds before it, so many
+  // after. The two numbers live in settings and on this device, next to the
+  // marks they apply to — the marks are already local, so a clip length that
+  // followed the account around would be the odd one out.
+  //
+  // The cut happens on the edge, which is the only component with a decoder:
+  // asking the relay to do it would mean parsing media in a service whose
+  // whole contract is that it does not.
+  var CLIP_PRE_KEY = "bilbycast.dvr.clip.pre";
+  var CLIP_POST_KEY = "bilbycast.dvr.clip.post";
+  // A clip is capped at a minute, pre-roll and post-roll together.
+  //
+  // Not a UI nicety: the edge assembles a clip whole in memory and the relay
+  // holds it whole as a request body, so length is an allocation on two
+  // machines. The origin enforces the same total and refuses anything longer,
+  // so a clamp here is the courtesy of saying so before the request rather
+  // than the only thing standing between a operator and a 400.
+  var CLIP_PRE_DEFAULT = 3, CLIP_POST_DEFAULT = 5, CLIP_MAX_TOTAL = 60;
+  var exportMode = false, exportPicked = {}, exportBusy = false;
+
+  var btnExport = document.getElementById("btnExport");
+  var exportBar = document.getElementById("exportBar");
+  var exportCount = document.getElementById("exportCount");
+  var btnExportGo = document.getElementById("btnExportGo");
+  var btnExportCancel = document.getElementById("btnExportCancel");
+  var exportNote = document.getElementById("exportNote");
+  var clipPreInput = document.getElementById("clipPre");
+  var clipPostInput = document.getElementById("clipPost");
+  var clipLen = document.getElementById("clipLen");
+
+  function clipSecs(key, dflt) {
+    var raw = null;
+    try { raw = window.localStorage.getItem(key); } catch (e) { /* blocked */ }
+    var n = parseInt(raw, 10);
+    if (!isFinite(n) || n < 0 || n > CLIP_MAX_TOTAL) return dflt;
+    return n;
+  }
+  function clipPre() { return clipSecs(CLIP_PRE_KEY, CLIP_PRE_DEFAULT); }
+  function clipPost() { return clipSecs(CLIP_POST_KEY, CLIP_POST_DEFAULT); }
+
+  /// `<Marker TC> - <MarkerName>`.
+  ///
+  /// The readout's colons cannot go in a filename on Windows and are awkward
+  /// everywhere else, so they become dashes. Doing it here rather than leaving
+  /// it to the browser means every viewer gets the same name for the same
+  /// clip, instead of one that varies by platform.
+  function clipFileName(m) {
+    var tc = fmtTimeOfDay(m.at).replace(/:/g, "-");
+    var name = String(m.name || "Mark").trim()
+      .replace(/[\\/:*?"<>|]+/g, " ")
+      .replace(/\s+/g, " ");
+    return tc + " - " + (name || "Mark");
+  }
+
+  function syncExportBar() {
+    var n = 0;
+    for (var k in exportPicked) if (Object.prototype.hasOwnProperty.call(exportPicked, k)) n++;
+    exportCount.textContent = n === 0 ? "none selected"
+      : n === 1 ? "1 selected" : n + " selected";
+    btnExportGo.disabled = (n === 0) || exportBusy;
+  }
+
+  function setExportMode(on) {
+    exportMode = on;
+    exportPicked = {};
+    btnExport.hidden = on;
+    exportBar.hidden = !on;
+    if (!on) { exportNote.hidden = true; exportNote.textContent = ""; }
+    syncExportBar();
+    renderMarks();
+  }
+
+  function say(msg) { exportNote.textContent = msg; exportNote.hidden = false; }
+
+  function exportSelected() {
+    var picked = marks.filter(function (m) { return exportPicked[m.id] && markIsReachable(m); });
+    if (!picked.length) return;
+    exportBusy = true;
+    syncExportBar();
+    say("Requesting " + picked.length + (picked.length === 1 ? " clip…" : " clips…"));
+
+    var body = {
+      pre_secs: clipPre(),
+      post_secs: clipPost(),
+      // The mark's wall-clock instant is the one thing both ends agree on:
+      // the player holds marks against it, and the edge dates its segments
+      // from the same published clock.
+      clips: picked.map(function (m) {
+        return { at: new Date(m.at).toISOString(), name: clipFileName(m) };
+      })
+    };
+
+    // Where hls.js is in play the token rides in a header and `url()` leaves
+    // the query off, so a request that only set Content-Type would arrive
+    // unauthenticated. Both carriers, same as every other fetch here.
+    var headers = { "Content-Type": "application/json" };
+    if (TOKEN_IN_HEADER && TOKEN) headers.Authorization = "Bearer " + TOKEN;
+
+    fetch(url(STREAM, "clips"), {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (r.status === 404 || r.status === 405) {
+        say("This relay cannot cut clips yet — it is running a build without clip export.");
+        return null;
+      }
+      // A refusal that says why. The caps (too many clips held, too much disk
+      // used) come back with a sentence naming the limit, and a bare status
+      // code leaves the operator with nothing to act on.
+      // A refusal that says why. The caps come back as a plain sentence
+      // naming the limit — not JSON — and a bare status code would leave the
+      // operator with nothing to act on. Anything unreasonably long is not a
+      // message meant for a human, so the status code stands in.
+      if (!r.ok) {
+        return r.text().catch(function () { return ""; }).then(function (t) {
+          t = (t || "").trim();
+          say(t && t.length < 300
+            ? t
+            : "The relay refused the export (" + r.status + ").");
+          return null;
+        });
+      }
+      return r.json().catch(function () { return {}; });
+    }).then(function (d) {
+      if (!d) return;
+      // Marked exported on acceptance, not on the clip appearing: the cut
+      // happens on the edge over the following seconds and this page is not
+      // told when it lands. Acceptance is the last thing here that is
+      // certain, and the portal is where a failure is reported.
+      picked.forEach(function (m) { m.exported = true; });
+      saveMarks();
+      renderMarks();
+      say(picked.length + (picked.length === 1 ? " clip is" : " clips are") +
+          " being cut. They appear on your sign-in page when ready.");
+      setTimeout(function () { setExportMode(false); }, 2500);
+    }).catch(function () {
+      say("Could not reach the relay to request the export.");
+    }).then(function () {
+      exportBusy = false;
+      syncExportBar();
+    });
+  }
+
+  btnExport.addEventListener("click", function () { setExportMode(true); });
+  btnExportCancel.addEventListener("click", function () { setExportMode(false); });
+  btnExportGo.addEventListener("click", exportSelected);
+
+  // Settings: seed the inputs from storage, and write back as they change.
+  clipPreInput.value = clipPre();
+  clipPostInput.value = clipPost();
+  showClipLength();
+
+  function showClipLength() {
+    var total = clipPre() + clipPost();
+    clipLen.textContent = total <= 0
+      ? "A clip of zero seconds is not a clip — give it a second either side."
+      : "Each clip will be " + total + " seconds long. The most is "
+        + CLIP_MAX_TOTAL + ".";
+  }
+
+  [[clipPreInput, CLIP_PRE_KEY, clipPostInput], [clipPostInput, CLIP_POST_KEY, clipPreInput]]
+    .forEach(function (trio) {
+      var input = trio[0], key = trio[1], other = trio[2];
+      input.addEventListener("change", function () {
+        var n = parseInt(input.value, 10);
+        if (!isFinite(n) || n < 0) n = 0;
+        // Clamp against what is left, not against the cap: the field the
+        // operator just touched is the one they meant, so the other keeps its
+        // value and this one gives way.
+        var room = CLIP_MAX_TOTAL - (parseInt(other.value, 10) || 0);
+        if (n > room) n = Math.max(0, room);
+        input.value = n;
+        try { window.localStorage.setItem(key, String(n)); } catch (e) { /* blocked */ }
+        showClipLength();
+      });
+    });
+
   function renderMarks() {
     document.body.dataset.marks = marks.length ? "1" : "0";
     markList.textContent = "";
@@ -2034,6 +2359,27 @@
       var li = document.createElement("li");
       var reachable = markIsReachable(m);
       if (!reachable) li.className = "gone";
+
+      // Only while exporting: the rest of the time this is a list you press to
+      // go somewhere, and a permanent column of checkboxes would say otherwise.
+      if (exportMode) {
+        var pick = document.createElement("input");
+        pick.type = "checkbox";
+        pick.className = "pick";
+        pick.checked = !!exportPicked[m.id];
+        // A mark that has aged out of the window has no media behind it, so
+        // there is nothing to cut. Saying so here beats a failed export.
+        pick.disabled = !reachable;
+        pick.title = reachable
+          ? "Include this mark in the export"
+          : "Past the end of the window — nothing left to cut";
+        pick.addEventListener("change", function () {
+          if (pick.checked) exportPicked[m.id] = true;
+          else delete exportPicked[m.id];
+          syncExportBar();
+        });
+        li.appendChild(pick);
+      }
 
       var at = document.createElement("button");
       at.className = "at";
@@ -2081,6 +2427,24 @@
         var open = li.classList.toggle("picking");
         swatch.setAttribute("aria-expanded", open ? "true" : "false");
       });
+
+      // Exported already. Worth showing because the drawer is the only place
+      // that knows: the clip itself appears on the portal, on another page,
+      // and without this a mark exported ten minutes ago looks exactly like
+      // one that never was — so it gets exported twice.
+      //
+      // A static mark rather than a control: there is nothing to press, and
+      // the clip is undone from the portal, not from here.
+      if (m.exported) {
+        var done = document.createElement("span");
+        done.className = "done";
+        done.title = "Exported — the clip is on your sign-in page";
+        done.setAttribute("aria-label", "Exported");
+        done.innerHTML =
+          '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+          '<path d="M20 7L10 17l-5-5"/></svg>';
+        li.appendChild(done);
+      }
 
       var del = document.createElement("button");
       del.className = "del";
@@ -2900,6 +3264,172 @@
   // On a tablet the address bar and the system bar take a serious bite out of
   // a 1080p picture. Prefixed calls are here for Safari; where neither exists
   // the button is removed rather than left to do nothing when pressed.
+  // ── zoom and pan ─────────────────────────────────────────────────────────
+  //
+  // Only the picture moves. The transport, the corner controls and the badges
+  // are siblings of `#pic` rather than children, so they keep their size and
+  // position at every zoom level. That is the whole point: an operator zooms
+  // in to read a number on a shirt, not to make the scrub bar unusable — which
+  // is what the browser's own page zoom does here.
+  //
+  // Both video elements carry the same transform. Balanced mode swaps which
+  // one is displayed, sometimes mid-gesture, and a transform on only the
+  // visible element would make the picture jump at the handover.
+  var ZOOM_MIN = 1, ZOOM_MAX = 8;
+  var zoomScale = 1, zoomX = 0, zoomY = 0;
+  var pic = document.getElementById("pic");
+  var zoomBadge = document.getElementById("zoomBadge");
+
+  /// Where the picture actually sits inside `#pic`, in unzoomed pixels.
+  ///
+  /// `object-fit: contain` letterboxes, so the element box is not the picture.
+  /// Clamping to the element box would let the operator drag the picture off
+  /// its own window and leave a black margin they cannot get rid of.
+  function pictureBox() {
+    var w = pic.clientWidth, h = pic.clientHeight;
+    var v = activeVideo();
+    var vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) return { x: 0, y: 0, w: w, h: h };
+    var s = Math.min(w / vw, h / vh);
+    var pw = vw * s, ph = vh * s;
+    return { x: (w - pw) / 2, y: (h - ph) / 2, w: pw, h: ph };
+  }
+
+  /// Keep the picture covering its window: no dragging it into the void.
+  function clampZoom() {
+    if (zoomScale <= ZOOM_MIN) { zoomScale = ZOOM_MIN; zoomX = 0; zoomY = 0; return; }
+    var box = pictureBox(), w = pic.clientWidth, h = pic.clientHeight;
+    var sw = box.w * zoomScale, sh = box.h * zoomScale;
+    var left = zoomX + box.x * zoomScale, top = zoomY + box.y * zoomScale;
+    // Narrower than the window in an axis: centre it, because there is no
+    // position in that axis the operator could want more than the middle.
+    if (sw <= w) zoomX = (w - sw) / 2 - box.x * zoomScale;
+    else if (left > 0) zoomX -= left;
+    else if (left + sw < w) zoomX += w - (left + sw);
+    if (sh <= h) zoomY = (h - sh) / 2 - box.y * zoomScale;
+    else if (top > 0) zoomY -= top;
+    else if (top + sh < h) zoomY += h - (top + sh);
+  }
+
+  function applyPicZoom() {
+    clampZoom();
+    var on = zoomScale > ZOOM_MIN + 1e-3;
+
+    // At rest the transform is REMOVED, not set to an identity.
+    //
+    // `scale(1)` is not free: any transform on a `<video>` promotes it to a
+    // composited layer, and on a good many GPU and driver combinations that
+    // takes it off the hardware video overlay and pushes every frame through
+    // the compositor instead. The picture then stalls while the audio and the
+    // media clock carry on — frames decoded and never presented, which reads
+    // as the video freezing a second at a time and is worst on the
+    // full-resolution rendition, because that is the expensive one to push.
+    //
+    // So the cost is paid only while somebody is actually zoomed in. An empty
+    // string clears the inline property rather than overriding it with an
+    // identity that still promotes the layer.
+    var t = on || Math.abs(zoomX) > 0.5 || Math.abs(zoomY) > 0.5
+      ? "translate(" + zoomX.toFixed(2) + "px," + zoomY.toFixed(2) + "px) " +
+        "scale(" + zoomScale.toFixed(4) + ")"
+      : "";
+    main.style.transform = t;
+    proxy.style.transform = t;
+    document.body.dataset.picZoom = on ? "1" : "0";
+    if (zoomBadge) zoomBadge.textContent = zoomScale.toFixed(1) + "×";
+  }
+
+  /// Zoom about a point on screen, leaving whatever is under it where it is.
+  function zoomAt(clientX, clientY, factor) {
+    var r = pic.getBoundingClientRect();
+    var px = clientX - r.left, py = clientY - r.top;
+    var next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomScale * factor));
+    if (Math.abs(next - zoomScale) < 1e-6) return;
+    zoomX = px - (px - zoomX) * (next / zoomScale);
+    zoomY = py - (py - zoomY) * (next / zoomScale);
+    zoomScale = next;
+    applyPicZoom();
+  }
+
+  function resetZoom() { zoomScale = ZOOM_MIN; zoomX = 0; zoomY = 0; applyPicZoom(); }
+
+  /// Keyboard zoom has no cursor to zoom about, so it uses the middle of the
+  /// picture — which is also where an operator looking at the whole frame is.
+  function zoomCentre(factor) {
+    var r = pic.getBoundingClientRect();
+    zoomAt(r.left + r.width / 2, r.top + r.height / 2, factor);
+  }
+
+  pic.addEventListener("wheel", function (e) {
+    // Taken unconditionally: ctrl+wheel is the desktop pinch, and a bare wheel
+    // has nothing else to do here — there is nothing on this page to scroll.
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+  }, { passive: false });
+
+  // One finger pans, two pinch. Panning is refused at 1x so an un-zoomed
+  // picture still behaves like a picture rather than sliding under the thumb.
+  var zoomPts = new Map(), pinchDist = 0, pinchMid = null;
+
+  function pinchState() {
+    var a = null, b = null;
+    zoomPts.forEach(function (p) { if (!a) a = p; else if (!b) b = p; });
+    var dx = b.x - a.x, dy = b.y - a.y;
+    return {
+      dist: Math.sqrt(dx * dx + dy * dy) || 1,
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+    };
+  }
+
+  pic.addEventListener("pointerdown", function (e) {
+    zoomPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (zoomPts.size === 2) { var s = pinchState(); pinchDist = s.dist; pinchMid = s.mid; }
+    try { pic.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+
+  pic.addEventListener("pointermove", function (e) {
+    var prev = zoomPts.get(e.pointerId);
+    if (!prev) return;
+    var dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+    zoomPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (zoomPts.size === 1) {
+      if (zoomScale <= ZOOM_MIN + 1e-3) return;
+      zoomX += dx; zoomY += dy;
+      applyPicZoom();
+    } else if (zoomPts.size === 2) {
+      var s = pinchState();
+      zoomAt(s.mid.x, s.mid.y, s.dist / (pinchDist || s.dist));
+      // The midpoint travels as well as spreads, and a pinch that only scaled
+      // would feel pinned to the spot the fingers first landed.
+      if (pinchMid) { zoomX += s.mid.x - pinchMid.x; zoomY += s.mid.y - pinchMid.y; applyPicZoom(); }
+      pinchDist = s.dist; pinchMid = s.mid;
+    }
+  });
+
+  function endZoomPointer(e) {
+    zoomPts.delete(e.pointerId);
+    if (zoomPts.size < 2) { pinchDist = 0; pinchMid = null; }
+  }
+  pic.addEventListener("pointerup", endZoomPointer);
+  pic.addEventListener("pointercancel", endZoomPointer);
+
+  // Double-tap: in to 2x on the spot, or straight back out if already in.
+  pic.addEventListener("dblclick", function (e) {
+    e.preventDefault();
+    if (zoomScale > ZOOM_MIN + 1e-3) resetZoom();
+    else zoomAt(e.clientX, e.clientY, 2);
+  });
+
+  if (zoomBadge) zoomBadge.addEventListener("click", resetZoom);
+
+  // iOS Safari does not hand a pinch over as two pointers; it fires these and
+  // zooms the whole page if they are not taken.
+  ["gesturestart", "gesturechange", "gestureend"].forEach(function (n) {
+    pic.addEventListener(n, function (e) { e.preventDefault(); }, { passive: false });
+  });
+
+  // A resize changes the letterbox, so the clamp has to run against the new one.
+  window.addEventListener("resize", function () { if (zoomScale > ZOOM_MIN) applyPicZoom(); });
+
   function fullscreenNow() {
     return document.fullscreenElement || document.webkitFullscreenElement || null;
   }
@@ -2927,6 +3457,29 @@
   if (document.documentElement.requestFullscreen ||
       document.documentElement.webkitRequestFullscreen) {
     btnFull.addEventListener("click", toggleFullscreen);
+
+    // Back to the sign-in page, which is where the clips they just exported
+    // appear. The player is served from the origin and the portal is a
+    // different host and port, so it cannot be derived — the portal names
+    // itself in `?from=` when it sends the viewer here.
+    //
+    // Validated before it is used, and deliberately: this value arrives in the
+    // URL, so navigating to it unchecked would honour a `javascript:` scheme
+    // from anyone who could get a crafted link opened. Only http(s) is taken,
+    // and anything else leaves the button hidden rather than pointing
+    // somewhere surprising.
+    var from = (function () {
+      var raw = new URLSearchParams(location.search).get("from");
+      if (!raw) return null;
+      try {
+        var u = new URL(raw, location.href);
+        return (u.protocol === "https:" || u.protocol === "http:") ? u.href : null;
+      } catch (e) { return null; }
+    })();
+    if (from) {
+      btnFeeds.hidden = false;
+      btnFeeds.addEventListener("click", function () { location.href = from; });
+    }
     document.addEventListener("fullscreenchange", syncFullscreenButton);
     document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
   } else {
@@ -3071,6 +3624,9 @@
       case "m": case "M": addMark(); break;
       case "[": skipToMark(-1); break;
       case "]": skipToMark(1); break;
+      case "0": resetZoom(); break;
+      case "+": case "=": zoomCentre(1.25); break;
+      case "-": case "_": zoomCentre(1 / 1.25); break;
       // Innermost first. Escape is the reflex for "get this off my picture",
       // and each of these covers it.
       case "Escape":
@@ -3376,16 +3932,47 @@
     renewTimer = setTimeout(renewNow, ms);
   }
 
+  /* Someone signed in with this login somewhere else, and took the feed.
+   *
+   * Deliberately NOT the expired wording. Nothing ran out: the viewer is being
+   * told a fact about their account, and sending them to "sign in again to
+   * keep watching" would describe the wrong problem. The way back is the same
+   * link, though — opening the feed again takes the login back, because the
+   * newest device wins. */
+  function takenOver() {
+    forgetToken();
+    try { main.pause(); proxy.pause(); } catch (e) {}
+    failWith("This login is in use on another device. Only one at a time. ",
+             "Open the feed again to take it back",
+             "Open the feed again from your sign-in page to take it back.");
+  }
+
   function renewNow() {
     renewTimer = null;
+    // Say which token we hold. That is what tells the portal this is a
+    // renewal rather than somebody starting to watch — a renewal has to still
+    // hold the login, where starting to watch takes it. Without this a second
+    // device and this one would take the feed off each other indefinitely,
+    // both succeeding, and one login would serve any number of people.
     var url = PORTAL_URL.replace(/\/+$/, "") + "/api/renew?stream=" +
-              encodeURIComponent(STREAM);
+              encodeURIComponent(STREAM) +
+              (HOLDER ? "&held=" + encodeURIComponent(HOLDER) : "");
     fetch(url, { credentials: "include" })
-      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (r) {
+        // Someone else signed in with this login. Not an expiry — nothing ran
+        // out — so it gets its own answer rather than the renewal backoff,
+        // which would keep asking for something it will never be given.
+        if (r.status === 409) {
+          takenOver();
+          throw new Error("taken over");
+        }
+        return r.ok ? r.json() : null;
+      })
       .then(function (body) {
         if (!body || !body.token) throw new Error("no token");
         TOKEN = body.token;
         rememberToken(TOKEN);
+        if (body.holder) rememberHolder(body.holder);
         renewFailures = 0;
         // hls.js reads `TOKEN` inside `xhrSetup` at request time, and so does
         // every sprite-sheet fetch, so there is nothing to re-attach.
