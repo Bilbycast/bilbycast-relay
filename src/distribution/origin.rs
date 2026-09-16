@@ -338,6 +338,10 @@ pub struct OriginStore {
     total_bytes: AtomicU64,
     /// Anchor for `last_put_ms`, so idle time needs no wall clock.
     started: Instant,
+    /// Serialises clip admission — see [`admit_clips`](OriginStore::admit_clips).
+    /// One lock for the store, not one per stream: admission happens when an
+    /// operator presses Export, so there is nothing here to contend for.
+    clip_admission: std::sync::Mutex<()>,
 }
 
 /// Marker written into the origin root, so the store can tell a directory it
@@ -358,6 +362,151 @@ const ORIGIN_MARKER: &str = ".bilbycast-origin";
 /// same rate as the media it was cut from would vanish while the session that
 /// owns it is still running.
 const CLIPS_DIR: &str = "clips";
+
+/// Why a clip request was not admitted.
+///
+/// Every arm is something an operator can act on, and the handler turns each
+/// into a sentence the player shows verbatim — which is why the store reports
+/// the numbers rather than a status code.
+#[derive(Debug)]
+pub enum ClipRefusal {
+    /// The stream is at its clip count.
+    TooMany { have: usize, limit: usize },
+    /// The batch would take the stream past its clip disk budget.
+    OverBudget { would_use: u64, limit: u64 },
+    /// Every candidate name for one mark is held by a different mark.
+    NamesExhausted(String),
+    Io(std::io::Error),
+}
+
+/// Where a clip request can be filed.
+enum ClipSlot {
+    /// Nothing holds this name; file the new record under it.
+    Free(String),
+    /// This exact mark is already recorded, under this name.
+    Taken(String),
+    /// Every candidate name is held by a *different* mark.
+    Exhausted,
+}
+
+/// A name to file this request under.
+///
+/// Re-requesting the same mark is idempotent, so a candidate already holding
+/// this mark's instant answers [`ClipSlot::Taken`]. A candidate holding a
+/// different mark is a different clip and the search moves on to a suffix.
+///
+/// Bounded, and it **refuses** at the bound rather than reusing the base name.
+/// Falling back to `wanted` handed back a name it had just proved was taken,
+/// and the write that followed replaced the earlier mark's record in place —
+/// while its `.mp4` stayed put, so the new record immediately read as ready
+/// with the old clip's bytes: one export silently lost, and the other offered
+/// to the operator under the wrong label. A refusal the caller can turn into a
+/// sentence is the only honest answer at a collision ceiling.
+fn free_clip_name(
+    existing: &std::collections::HashMap<String, ClipRecord>,
+    wanted: &str,
+    at: &str,
+) -> ClipSlot {
+    for n in 1..=9u32 {
+        let candidate = if n == 1 {
+            wanted.to_string()
+        } else {
+            format!("{wanted} ({n})")
+        };
+        match existing.get(&candidate) {
+            None => return ClipSlot::Free(candidate),
+            Some(rec) if rec.at == at => return ClipSlot::Taken(candidate),
+            Some(_) => continue,
+        }
+    }
+    ClipSlot::Exhausted
+}
+
+/// Write a clip record, whole or not at all.
+///
+/// `std::fs::write` truncates first, so a crash inside it leaves a record that
+/// parses as nothing: invisible to the listing, un-deletable from the portal,
+/// and still holding its name against every later request for that mark.
+/// Temp-then-rename is what the media path already does.
+fn write_record(dir: &std::path::Path, rec: &ClipRecord) -> std::io::Result<()> {
+    let body = serde_json::to_vec_pretty(rec).map_err(std::io::Error::other)?;
+    let tmp = dir.join(format!("{}.json{PART_SUFFIX}", rec.name));
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, dir.join(format!("{}.json", rec.name))) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Suffix on the temporary file a clip upload is written to.
+const PART_SUFFIX: &str = ".part";
+
+/// How long a `.part` — or a clip with no record — is given before the relay
+/// decides nobody is coming back for it. The edge allows a clip upload sixty
+/// seconds, so an hour is generous by a wide margin and still bounded.
+const PART_GRACE: Duration = Duration::from_secs(3600);
+
+/// The longest the relay will hold a clip on its own account.
+///
+/// Not the retention: the manager owns that and its clock is a day past the
+/// session. This is the floor under a manager that never comes back, an order
+/// of magnitude above any expiry it sets, so it can only ever fire on clips
+/// whose owner has forgotten them entirely.
+const CLIP_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// A half-written clip that removes itself unless it is committed.
+///
+/// Every early return in the upload loop used to leave the temp file behind,
+/// and a `.part` inside `clips/` is invisible to every bound in this file: it
+/// is in no listing (which walks `*.json`), counted in no byte total, in no
+/// eviction queue, skipped by the restart debris sweep, and untouched by
+/// `delete_clip`. The disk still holds it, so the free-space floor pays for it
+/// out of *recorded footage* — the one outcome `MAX_CLIP_BYTES_PER_STREAM`
+/// exists to prevent.
+///
+/// The cleanup is in `Drop`, and synchronous, because the case that matters
+/// most cannot be handled any other way: when the client disconnects, the
+/// handler future is dropped where it stands and an `async` unlink would never
+/// be polled.
+///
+/// The name carries a per-upload nonce so two PUTs for one clip cannot share an
+/// inode. `File::create` truncates, so a retry landing on top of an upload
+/// still in flight produced a file with a hole in it — which renames in,
+/// lists as ready, and is never re-cut.
+struct PartFile {
+    path: PathBuf,
+    file: tokio::fs::File,
+    committed: bool,
+}
+
+impl PartFile {
+    async fn create(dir: &std::path::Path, name: &str) -> std::io::Result<Self> {
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "{name}.{}-{n}.mp4{PART_SUFFIX}",
+            std::process::id()
+        ));
+        let file = tokio::fs::File::create(&path).await?;
+        Ok(Self { path, file, committed: false })
+    }
+
+    /// Put the finished bytes where readers look for them, and disarm.
+    async fn commit(mut self, dest: PathBuf) -> std::io::Result<()> {
+        tokio::fs::rename(&self.path, &dest).await?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 /// Does this directory look like a store an older relay wrote?
 ///
@@ -493,6 +642,7 @@ impl OriginStore {
             streams: DashMap::new(),
             total_bytes: AtomicU64::new(0),
             started: Instant::now(),
+            clip_admission: std::sync::Mutex::new(()),
         };
         store.adopt_existing();
         Ok(store)
@@ -920,8 +1070,34 @@ impl OriginStore {
         }
     }
 
-    fn clips_dir(&self, stream: &str) -> PathBuf {
-        self.cfg.root.join(stream).join(CLIPS_DIR)
+    /// The clips directory for a stream, or `None` if the name is not one.
+    ///
+    /// Gated on the same [`safe_stream_name`](Self::safe_stream_name) as `put`
+    /// and `remove_stream`, not because the HTTP handlers let anything else
+    /// through — they run `sanitize_stream_id` first — but because this store's
+    /// methods are `pub` and the codebase already depends on the store
+    /// validating its own names on a path that is not HTTP: `manager::client`
+    /// forwards manager-supplied stream names straight into `drop_stream` with
+    /// the comment "the origin sanitises its own stream ids; this only
+    /// forwards". This branch adds a second manager verb beside that one; the
+    /// clip surface has to hold the same line.
+    fn clips_dir(&self, stream: &str) -> Option<PathBuf> {
+        Self::safe_stream_name(stream).then(|| self.cfg.root.join(stream).join(CLIPS_DIR))
+    }
+
+    /// The same, for a method that also turns `name` into a filename.
+    ///
+    /// Both halves or neither: every clip method interpolates the name into
+    /// `{name}.mp4` / `{name}.json`, so validating the stream and trusting the
+    /// name would leave the invariant half-kept.
+    fn clip_dir_for(&self, stream: &str, name: &str) -> std::io::Result<PathBuf> {
+        match self.clips_dir(stream) {
+            Some(dir) if valid_clip_name(name) => Ok(dir),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "origin: unsafe stream or clip name",
+            )),
+        }
     }
 
     /// Record what was asked for. The media follows later, from the edge.
@@ -935,75 +1111,119 @@ impl OriginStore {
     /// a label, so two marks in the same second with the same label collide —
     /// and silently dropping the second, which is what skipping on name alone
     /// did, loses an export the operator asked for and reported nothing.
+    /// Check this stream's clip budget and file the request, as one operation.
+    ///
+    /// The two were separate calls with nothing held between them, so two
+    /// viewers of one feed — a link grant and a portal login, both legitimate —
+    /// each read the same count, each passed, and both wrote: a stated ceiling
+    /// of a hundred clips overshot by a batch per concurrent request. One lock
+    /// for the whole store is enough, because admission happens when an
+    /// operator presses Export, not on any hot path.
+    pub fn admit_clips(
+        &self,
+        stream: &str,
+        req: &ClipRequest,
+    ) -> Result<Vec<ClipRecord>, ClipRefusal> {
+        let _admitting = self.clip_admission.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (have, _landed) = self.clip_usage(stream);
+        if have + req.clips.len() > MAX_CLIPS_PER_STREAM {
+            return Err(ClipRefusal::TooMany { have, limit: MAX_CLIPS_PER_STREAM });
+        }
+        // Projected, not landed, and tested against what this request would
+        // add. `bytes >= limit` on already-stored bytes could not fire until
+        // the ceiling had been crossed, and it could not see a batch in flight
+        // at all — so the budget was never actually enforced.
+        let used = self.clip_budget_used(stream);
+        let asking = (req.clips.len() as u64)
+            .saturating_mul(estimated_clip_bytes(req.pre_secs, req.post_secs));
+        let would_use = used.saturating_add(asking);
+        if would_use > MAX_CLIP_BYTES_PER_STREAM {
+            return Err(ClipRefusal::OverBudget {
+                would_use,
+                limit: MAX_CLIP_BYTES_PER_STREAM,
+            });
+        }
+        self.record_clip_requests(stream, req).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                ClipRefusal::NamesExhausted(e.to_string())
+            } else {
+                ClipRefusal::Io(e)
+            }
+        })
+    }
+
     pub fn record_clip_requests(
         &self,
         stream: &str,
         req: &ClipRequest,
     ) -> std::io::Result<Vec<ClipRecord>> {
-        let dir = self.clips_dir(stream);
+        let Some(dir) = self.clips_dir(stream) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "origin: unsafe stream name",
+            ));
+        };
+        if let Some(bad) = req.clips.iter().find(|a| !valid_clip_name(&a.name)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("origin: unsafe clip name '{}'", bad.name),
+            ));
+        }
         std::fs::create_dir_all(&dir)?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut out = Vec::new();
+        // One listing for the whole request. It used to be re-read per
+        // collision — a fresh `read_dir` plus a `read` and a `stat` per record,
+        // inside the per-ask loop — so re-sending a batch of fifty against a
+        // stream holding fifty records cost thousands of blocking file
+        // operations to answer a question one scan already had.
+        //
+        // Doubling as the collision map also fixes the within-request case:
+        // reading each candidate off disk meant fifty asks sharing one name all
+        // saw the same free slot and all wrote to it, and forty-nine requested
+        // exports vanished.
+        let mut existing: std::collections::HashMap<String, ClipRecord> = self
+            .list_clips(stream)
+            .into_iter()
+            .map(|c| (c.name.clone(), c))
+            .collect();
         for ask in &req.clips {
-            let Some(name) = self.free_clip_name(&dir, &ask.name, &ask.at)? else {
-                // Same mark, already recorded. Hand back what is there so the
-                // caller sees its real state rather than a fresh pending one.
-                if let Some(existing) = self
-                    .list_clips(stream)
-                    .into_iter()
-                    .find(|c| c.name == ask.name)
-                {
-                    out.push(existing);
+            match free_clip_name(&existing, &ask.name, &ask.at) {
+                ClipSlot::Taken(name) => {
+                    // Same mark, already recorded. Hand back what is there so
+                    // the caller sees its real state rather than a fresh
+                    // pending one — and by the name it was actually filed
+                    // under, which is not `ask.name` once a suffix was needed.
+                    if let Some(rec) = existing.get(&name) {
+                        out.push(rec.clone());
+                    }
                 }
-                continue;
-            };
-            let rec = ClipRecord {
-                name,
-                at: ask.at.clone(),
-                pre_secs: req.pre_secs.min(MAX_CLIP_TOTAL_SECS),
-                post_secs: req.post_secs.min(MAX_CLIP_TOTAL_SECS),
-                requested_at: now.clone(),
-                bytes: 0,
-                ready: false,
-                failed: false,
-                error: None,
-            };
-            let body = serde_json::to_vec_pretty(&rec).map_err(std::io::Error::other)?;
-            std::fs::write(dir.join(format!("{}.json", rec.name)), body)?;
-            out.push(rec);
-        }
-        Ok(out)
-    }
-
-    /// A name to file this request under, or `None` if this exact mark is
-    /// already recorded.
-    ///
-    /// Bounded: after a handful of collisions this gives up and reuses the
-    /// name, because an unbounded search is a way to spend a request's time on
-    /// a filesystem rather than a way to be correct.
-    fn free_clip_name(
-        &self,
-        dir: &std::path::Path,
-        wanted: &str,
-        at: &str,
-    ) -> std::io::Result<Option<String>> {
-        for n in 1..=9u32 {
-            let candidate = if n == 1 {
-                wanted.to_string()
-            } else {
-                format!("{wanted} ({n})")
-            };
-            let path = dir.join(format!("{candidate}.json"));
-            let Ok(raw) = std::fs::read(&path) else {
-                return Ok(Some(candidate)); // free
-            };
-            // Taken — by this same mark, or a different one?
-            match serde_json::from_slice::<ClipRecord>(&raw) {
-                Ok(existing) if existing.at == at => return Ok(None),
-                _ => continue,
+                ClipSlot::Exhausted => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("too many clips already named '{}'", ask.name),
+                    ));
+                }
+                ClipSlot::Free(name) => {
+                    let rec = ClipRecord {
+                        name,
+                        at: ask.at.clone(),
+                        pre_secs: req.pre_secs.min(MAX_CLIP_TOTAL_SECS),
+                        post_secs: req.post_secs.min(MAX_CLIP_TOTAL_SECS),
+                        requested_at: now.clone(),
+                        bytes: 0,
+                        ready: false,
+                        failed: false,
+                        error: None,
+                    };
+                    write_record(&dir, &rec)?;
+                    existing.insert(rec.name.clone(), rec.clone());
+                    out.push(rec);
+                }
             }
         }
-        Ok(Some(wanted.to_string()))
+        Ok(out)
     }
 
     /// Every clip this stream knows about, ready or not.
@@ -1012,7 +1232,9 @@ impl OriginStore {
     /// record: a record that claimed ready without the bytes behind it would
     /// offer the portal a download that 404s.
     pub fn list_clips(&self, stream: &str) -> Vec<ClipRecord> {
-        let dir = self.clips_dir(stream);
+        let Some(dir) = self.clips_dir(stream) else {
+            return Vec::new();
+        };
         let Ok(rd) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
@@ -1049,7 +1271,7 @@ impl OriginStore {
     /// Written to `.part` and renamed, so a half-uploaded clip is never
     /// visible as ready — `list_clips` decides on the media file existing.
     pub async fn put_clip(&self, stream: &str, name: &str, body: &[u8]) -> std::io::Result<()> {
-        let dir = self.clips_dir(stream);
+        let dir = self.clip_dir_for(stream, name)?;
         tokio::fs::create_dir_all(&dir).await?;
         let tmp = dir.join(format!("{name}.mp4.part"));
         tokio::fs::write(&tmp, body).await?;
@@ -1065,6 +1287,14 @@ impl OriginStore {
     ///
     /// The ceiling is enforced *while* reading: a body that lies about its
     /// length, or sends none, would otherwise be bounded by nothing.
+    ///
+    /// The `.part` is **unique per upload** and removed on every way out,
+    /// including an abandoned request — see [`PartFile`]. A fixed
+    /// `{name}.mp4.part` opened `O_TRUNC` let a second PUT for the same clip
+    /// truncate a first one's file underneath it, and the only error path that
+    /// cleaned up was the size check, so a client that timed out mid-body (the
+    /// edge gives a clip upload sixty seconds) left up to 256 MiB on disk that
+    /// no listing, no byte total, no eviction queue and no restart could see.
     pub async fn put_clip_streaming(
         &self,
         stream: &str,
@@ -1075,10 +1305,9 @@ impl OriginStore {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
 
-        let dir = self.clips_dir(stream);
+        let dir = self.clip_dir_for(stream, name)?;
         tokio::fs::create_dir_all(&dir).await?;
-        let tmp = dir.join(format!("{name}.mp4.part"));
-        let mut file = tokio::fs::File::create(&tmp).await?;
+        let mut part = PartFile::create(&dir, name).await?;
         let mut written: u64 = 0;
         let mut stream_body = body.into_data_stream();
 
@@ -1086,20 +1315,28 @@ impl OriginStore {
             let chunk = chunk.map_err(std::io::Error::other)?;
             written += chunk.len() as u64;
             if written > max_bytes {
-                // Abandon the part file rather than leave a truncated clip that
-                // `list_clips` would never see but the disk would still hold.
-                drop(file);
-                let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "clip exceeds the maximum size",
                 ));
             }
-            file.write_all(&chunk).await?;
+            part.file.write_all(&chunk).await?;
         }
-        file.flush().await?;
-        drop(file);
-        tokio::fs::rename(&tmp, dir.join(format!("{name}.mp4"))).await?;
+        // `flush` drains tokio's userspace buffer into the kernel and stops
+        // there. The rename that follows is a metadata operation a journalling
+        // filesystem may well commit while the delayed-allocation data blocks
+        // are still unwritten, and `list_clips` decides `ready` on the media
+        // file existing — so an unclean shutdown in that window leaves a clip
+        // that reads as finished, downloads as holes, and is never re-cut
+        // because the exporter skips anything already ready.
+        part.file.flush().await?;
+        part.file.sync_all().await?;
+        part.commit(dir.join(format!("{name}.mp4"))).await?;
+        // And the directory entry itself, for the same reason: a synced file
+        // under a rename that was never committed is a clip that vanishes.
+        if let Ok(d) = tokio::fs::File::open(&dir).await {
+            let _ = d.sync_all().await;
+        }
         Ok(written)
     }
 
@@ -1113,12 +1350,53 @@ impl OriginStore {
         (listed.len(), bytes)
     }
 
+    /// The disk this stream's clips hold **or are going to hold**.
+    ///
+    /// `clip_usage` reports what has landed, which is the wrong number to gate
+    /// the next batch on: a pending record has no media yet and so counts as
+    /// zero, so fifty cuts already commissioned were invisible to the check
+    /// meant to decide whether fifty more could be. Two permitted batches
+    /// therefore put 25 GiB on a stream whose stated ceiling is 4 GiB.
+    ///
+    /// A record that has not been cut yet is charged
+    /// [`estimated_clip_bytes`] for its requested length instead.
+    pub fn clip_budget_used(&self, stream: &str) -> u64 {
+        self.list_clips(stream)
+            .iter()
+            .map(|c| {
+                if c.ready {
+                    c.bytes
+                } else if c.failed {
+                    // Nothing is coming for this one, and it holds no media.
+                    0
+                } else {
+                    estimated_clip_bytes(c.pre_secs, c.post_secs)
+                }
+            })
+            .sum()
+    }
+
+    /// Is there a record for this clip — i.e. did anyone ask for it?
+    ///
+    /// The upload is the second half of a request the origin recorded, and a
+    /// `.mp4` with no `.json` beside it is an orphan: `list_clips` walks the
+    /// records, so it is in no listing, counted in no byte total, deletable
+    /// from no portal, and reclaimed only when the whole stream directory goes.
+    /// A viewer cancelling a cut the edge has already started produced exactly
+    /// that, once per cancelled clip.
+    pub fn clip_record_exists(&self, stream: &str, name: &str) -> bool {
+        self.clip_dir_for(stream, name)
+            .is_ok_and(|dir| dir.join(format!("{name}.json")).is_file())
+    }
+
     /// Remove one clip — its media and its record.
     ///
     /// Clips outlive the sweep, so without this the only way to reclaim the
     /// space was to end the session. Returns whether anything was there.
     pub async fn delete_clip(&self, stream: &str, name: &str) -> bool {
-        let dir = self.clips_dir(stream);
+        let Ok(dir) = self.clip_dir_for(stream, name) else {
+            return false;
+        };
         let media = tokio::fs::remove_file(dir.join(format!("{name}.mp4")))
             .await
             .is_ok();
@@ -1135,22 +1413,39 @@ impl OriginStore {
     /// the session. An operator who wants another go re-exports the mark, which
     /// writes a fresh record.
     pub fn fail_clip(&self, stream: &str, name: &str, reason: &str) -> std::io::Result<bool> {
-        let path = self.clips_dir(stream).join(format!("{name}.json"));
-        let Ok(raw) = std::fs::read(&path) else {
+        let dir = self.clip_dir_for(stream, name)?;
+        let Ok(raw) = std::fs::read(dir.join(format!("{name}.json"))) else {
             return Ok(false);
         };
         let mut rec: ClipRecord = serde_json::from_slice(&raw).map_err(std::io::Error::other)?;
         rec.failed = true;
         rec.error = Some(reason.chars().take(300).collect());
-        let body = serde_json::to_vec_pretty(&rec).map_err(std::io::Error::other)?;
-        std::fs::write(&path, body)?;
+        write_record(&dir, &rec)?;
         Ok(true)
     }
 
     pub async fn read_clip(&self, stream: &str, name: &str) -> Option<Vec<u8>> {
-        tokio::fs::read(self.clips_dir(stream).join(format!("{name}.mp4")))
-            .await
-            .ok()
+        let dir = self.clip_dir_for(stream, name).ok()?;
+        tokio::fs::read(dir.join(format!("{name}.mp4"))).await.ok()
+    }
+
+    /// The clip as an open file and its length, for streaming it out.
+    ///
+    /// The counterpart to [`put_clip_streaming`](Self::put_clip_streaming), and
+    /// for the same reason: `read_clip` buffers a whole clip — up to
+    /// `MAX_CLIP_BYTES` — into a `Vec` before a byte reaches the network, and
+    /// holds it until the response is fully written. That is a quarter-gigabyte
+    /// of resident memory per concurrent download, on the process that is also
+    /// forwarding live contribution, and the download side has far more callers
+    /// than the upload side ever did.
+    pub async fn open_clip(&self, stream: &str, name: &str) -> Option<(tokio::fs::File, u64)> {
+        let path = self
+            .clip_dir_for(stream, name)
+            .ok()?
+            .join(format!("{name}.mp4"));
+        let file = tokio::fs::File::open(&path).await.ok()?;
+        let len = file.metadata().await.ok()?.len();
+        Some((file, len))
     }
 
     pub async fn remove_stream(&self, stream: &str) {
@@ -1279,11 +1574,122 @@ impl OriginStore {
                     idle_secs = idle_ms / 1000,
                     "origin: reclaiming idle stream"
                 );
-                self.remove_stream(&name).await;
+                // `retire_stream`, not `remove_stream`: the media has expired,
+                // the exported clips have not. An ingest gap longer than
+                // retention + grace — a satellite drop, an edge restart — is
+                // exactly when an operator most wants the clip they cut before
+                // it, and `remove_stream`'s `remove_dir_all` took `clips/`
+                // with it. The hard drop stays where it belongs, on the
+                // manager's expiry sweep.
+                self.retire_stream(&name).await;
             }
         }
 
+        self.reclaim_clip_debris().await;
         self.enforce_free_space().await;
+    }
+
+    /// What the relay can reclaim in `clips/` on its own.
+    ///
+    /// Clip retention is the manager's: it holds the expiry in Postgres and
+    /// sends `drop_origin_streams` when it lapses, and that is deliberately the
+    /// authority — the relay does not know what a session is or when it ended.
+    /// But the bytes are here, and the manager is one database and one network
+    /// away, so "the manager will say" is not a complete answer to "when does
+    /// this disk come back". A manager that never returns leaves clips for
+    /// ever, and nothing else in this process can see them.
+    ///
+    /// So this is a backstop, an order of magnitude above any retention the
+    /// manager sets (a day, plus the session), never a policy:
+    ///
+    /// * `.part` files past the grace period — an upload nobody is making any
+    ///   more. (The live ones are minutes old at most; the edge gives a clip
+    ///   upload sixty seconds.)
+    /// * media with no record beside it — invisible to the listing, to both
+    ///   ceilings and to the portal's delete button, but not to the disk.
+    /// * anything at all past [`CLIP_MAX_AGE`].
+    /// * and the stream directory itself, once it holds nothing and no stream
+    ///   is using it — a clips-only directory is in no eviction path and is not
+    ///   re-adopted on restart, so without this it is permanent.
+    async fn reclaim_clip_debris(&self) {
+        let Ok(mut root) = tokio::fs::read_dir(&self.cfg.root).await else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        while let Ok(Some(entry)) = root.next_entry().await {
+            let Some(stream) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !Self::safe_stream_name(&stream) {
+                continue;
+            }
+            let dir = entry.path().join(CLIPS_DIR);
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+
+            let mut records: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut media: Vec<(String, PathBuf, std::time::Duration)> = Vec::new();
+            let mut expired: Vec<PathBuf> = Vec::new();
+            let mut left = 0usize;
+            while let Ok(Some(f)) = rd.next_entry().await {
+                let Some(name) = f.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let age = f
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|m| now.duration_since(m).ok())
+                    .unwrap_or_default();
+                if name.ends_with(PART_SUFFIX) {
+                    if age >= PART_GRACE {
+                        expired.push(f.path());
+                    } else {
+                        left += 1;
+                    }
+                    continue;
+                }
+                if age >= CLIP_MAX_AGE {
+                    expired.push(f.path());
+                    continue;
+                }
+                left += 1;
+                if let Some(stem) = name.strip_suffix(".json") {
+                    records.insert(stem.to_string());
+                } else if let Some(stem) = name.strip_suffix(".mp4") {
+                    media.push((stem.to_string(), f.path(), age));
+                }
+            }
+            // A record may legitimately arrive moments before its media, so an
+            // orphan is only an orphan once it has had time to stop being one.
+            for (stem, path, age) in media {
+                if !records.contains(&stem) && age >= PART_GRACE {
+                    tracing::info!(
+                        stream = %stream, clip = %stem,
+                        "origin: reclaiming clip media nothing has a record for"
+                    );
+                    expired.push(path);
+                    left = left.saturating_sub(1);
+                }
+            }
+            for path in &expired {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            if !expired.is_empty() {
+                tracing::info!(
+                    stream = %stream, files = expired.len(),
+                    "origin: reclaimed clip debris"
+                );
+            }
+            // Nothing left, and nothing ingesting: the directory is the last
+            // thing holding the stream's name on this disk.
+            if left == 0 && !self.streams.contains_key(&stream) {
+                let _ = tokio::fs::remove_dir(&dir).await;
+                let _ = tokio::fs::remove_dir(entry.path()).await;
+            }
+        }
     }
 
     /// Give disk back until the volume is above its floor.
@@ -1724,6 +2130,19 @@ const MAX_CLIPS_PER_STREAM: usize = 100;
 /// paid for out of the window.
 const MAX_CLIP_BYTES_PER_STREAM: u64 = 4 * 1024 * 1024 * 1024;
 
+/// What a clip of this length is assumed to cost before anything has cut it.
+///
+/// The same contribution rate [`MAX_CLIP_BYTES`] is derived from, so the two
+/// numbers cannot drift apart: a sixty-second clip is charged exactly the
+/// per-clip ceiling, and a ten-second one a sixth of it. Used to charge
+/// requested-but-not-yet-cut clips against the per-stream budget, which is the
+/// only way that budget can bound anything — the bytes arrive minutes after the
+/// decision to allow them.
+fn estimated_clip_bytes(pre_secs: u32, post_secs: u32) -> u64 {
+    let secs = u64::from(pre_secs.saturating_add(post_secs)).min(MAX_CLIP_TOTAL_SECS as u64);
+    secs * 35_000_000 / 8
+}
+
 /// The longest clip anyone may export, pre-roll and post-roll together.
 ///
 /// A review clip is a moment, not a passage of play, and the length has to be
@@ -1775,12 +2194,36 @@ fn valid_clip_name(name: &str) -> bool {
         })
 }
 
+/// The largest JSON body the clip control routes will buffer.
+///
+/// Both of them are bounded by their own contents — fifty asks of a 180-byte
+/// name, or a 300-character failure reason — so this is generous by an order of
+/// magnitude and still three thousand times smaller than the media ceiling.
+const MAX_CLIP_JSON_BYTES: usize = 64 * 1024;
+
 pub fn routes() -> Router<Arc<DistributionState>> {
     // A clip is up to thirty segments of media in one object, so it cannot
     // share the segment limit. Its own route carries its own bound rather than
     // raising the limit for every PUT on the origin — a 256 MiB ceiling on
     // segment ingest would turn a runaway encoder into a memory problem.
-    let clips = Router::new()
+    //
+    // The 256 MiB ceiling goes on the media route ONLY. `clips_request` and
+    // `clip_failed` take `axum::Json`, which collects the whole body into heap
+    // before a single line of the handler runs — so a limit raised for the
+    // upload became the amount of memory an unauthenticated caller could make
+    // the relay buffer per connection, on a public listener, before the
+    // credential check it would then fail. (It buys the media PUT nothing
+    // either way: `clip_put` extracts a raw `Body`, which never consults
+    // `DefaultBodyLimit`, and enforces `MAX_CLIP_BYTES` itself while streaming
+    // to disk. The layer is kept there for the route's declared contract.)
+    let clip_media = Router::new()
+        .route(
+            "/origin/{stream}/clips/{file}",
+            put(clip_put).get(clip_get).delete(clip_delete),
+        )
+        .layer(DefaultBodyLimit::max(MAX_CLIP_BYTES));
+
+    let clip_control = Router::new()
         // Static segments beat the `{file}` capture, so these do not shadow the
         // segment routes below.
         .route(
@@ -1788,28 +2231,26 @@ pub fn routes() -> Router<Arc<DistributionState>> {
             axum::routing::post(clips_request).get(clips_list),
         )
         .route(
-            "/origin/{stream}/clips/{file}",
-            put(clip_put).get(clip_get).delete(clip_delete),
-        )
-        .route(
             "/origin/{stream}/clips/{file}/failed",
             axum::routing::post(clip_failed),
         )
-        .layer(DefaultBodyLimit::max(MAX_CLIP_BYTES));
+        .layer(DefaultBodyLimit::max(MAX_CLIP_JSON_BYTES));
 
     Router::new()
         .route("/origin/{stream}/{file}", put(origin_put).get(origin_get))
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
-        .merge(clips)
+        .merge(clip_media)
+        .merge(clip_control)
 }
 
 /// `PUT /origin/{stream}/{file}` — accept an edge CMAF/HLS upload.
 /// `POST /origin/{stream}/clips` — ask for clips around marks.
 ///
-/// Gated exactly like a segment read: whoever may watch this feed may cut from
-/// it. The cut itself happens on the edge — the only component with a decoder
-/// — so all this does is record the ask where the portal and the edge can both
-/// see it.
+/// Whoever may watch this feed may cut from it — but a credential is required
+/// either way, not only when `require_origin_token` is on. See
+/// [`require_clip_credential`]. The cut itself happens on the edge — the only
+/// component with a decoder — so all this does is record the ask where the
+/// portal and the edge can both see it.
 async fn clips_request(
     State(st): State<Arc<DistributionState>>,
     Path(stream): Path<String>,
@@ -1820,9 +2261,7 @@ async fn clips_request(
     let Some(stream) = super::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
-    if st.control.load().require_origin_token
-        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
-    {
+    if let Err(resp) = require_clip_credential(&st, &stream, &headers, query.as_deref()) {
         return resp;
     }
     if req.clips.is_empty() {
@@ -1858,43 +2297,136 @@ async fn clips_request(
 
     // Clips are outside the retention sweep, so they need a bound of their own
     // or they are paid for out of the DVR window when the disk floor trips.
-    let (have, bytes) = st.origin.clip_usage(&stream);
-    if have + req.clips.len() > MAX_CLIPS_PER_STREAM {
-        return (
-            StatusCode::CONFLICT,
-            format!(
-                "this feed already holds {have} clips, and the limit is \
-                 {MAX_CLIPS_PER_STREAM} — delete some before exporting more"
-            ),
-        )
-            .into_response();
-    }
-    if bytes >= MAX_CLIP_BYTES_PER_STREAM {
-        return (
-            StatusCode::CONFLICT,
-            format!(
-                "this feed's clips already use {:.1} GB, which is the limit — \
-                 delete some before exporting more",
-                bytes as f64 / 1024.0 / 1024.0 / 1024.0
-            ),
-        )
-            .into_response();
-    }
+    // Budget check and record write happen together under one lock, on the
+    // blocking pool: `admit_clips` is `read_dir` plus a `read` and a `stat` per
+    // record and a write per ask, and every other method on this store reaches
+    // the filesystem through `tokio::fs` for the reason this one must not run
+    // on a worker — the same runtime carries the QUIC and native-UDP
+    // forwarding tasks.
+    let origin = st.origin.clone();
+    let for_task = stream.clone();
+    let admitted =
+        match tokio::task::spawn_blocking(move || origin.admit_clips(&for_task, &req)).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(stream = %stream, error = %e, "origin: clip admission task failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request")
+                    .into_response();
+            }
+        };
 
-    match st.origin.record_clip_requests(&stream, &req) {
+    match admitted {
         Ok(recs) => {
             tracing::info!(
                 stream = %stream, clips = recs.len(),
-                pre = req.pre_secs, post = req.post_secs,
                 "origin: clip export requested"
             );
             (StatusCode::ACCEPTED, axum::Json(recs)).into_response()
         }
-        Err(e) => {
+        Err(ClipRefusal::TooMany { have, limit }) => (
+            StatusCode::CONFLICT,
+            format!(
+                "this feed already holds {have} clips, and the limit is \
+                 {limit} — delete some before exporting more"
+            ),
+        )
+            .into_response(),
+        Err(ClipRefusal::OverBudget { would_use, limit }) => (
+            StatusCode::CONFLICT,
+            format!(
+                "this feed's clips would use {:.1} GB and the limit is {:.0} GB — \
+                 delete some before exporting more",
+                would_use as f64 / 1024.0 / 1024.0 / 1024.0,
+                limit as f64 / 1024.0 / 1024.0 / 1024.0
+            ),
+        )
+            .into_response(),
+        // The collision ceiling. Refusing is the point — the alternative was
+        // overwriting an earlier mark's record — so this needs a sentence the
+        // player can show, not a 500.
+        Err(ClipRefusal::NamesExhausted(what)) => (
+            StatusCode::CONFLICT,
+            format!(
+                "{what} — rename the mark, or delete one of the clips already \
+                 under that name"
+            ),
+        )
+            .into_response(),
+        Err(ClipRefusal::Io(e)) => {
             tracing::warn!(stream = %stream, error = %e, "origin: could not record clip request");
             (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request").into_response()
         }
     }
+}
+
+/// Credential check for the clip surface, independent of `require_origin_token`.
+///
+/// `require_origin_token` is the *read* gate for segments, and it is off by
+/// default so a CDN can pull a public feed. The clip routes are a different
+/// animal: `POST` commissions decode-and-encode work on the edge that cut the
+/// feed, and `DELETE` destroys an operator's exported footage. Hanging either
+/// off a switch designed to be open makes a default-configuration relay an
+/// unauthenticated work queue and an unauthenticated delete button.
+///
+/// So this always demands a credential, and fails closed when there is no
+/// secret to check one against — the same posture `require_clip_ingest` takes
+/// on the write side. Either credential passes: the edge polls this surface
+/// with its ingest token, the browser and the portal with a viewer token.
+fn require_clip_credential(
+    st: &Arc<DistributionState>,
+    stream: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<(), Response> {
+    let rt = st.control.load();
+    let Some(ref secret) = rt.token_secret else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clip access is unconfigured on this relay",
+        )
+            .into_response());
+    };
+    if super::bearer(headers)
+        .and_then(|t| token::verify_ingest_token(secret, stream, &t).ok())
+        .is_some()
+    {
+        return Ok(());
+    }
+    super::check_viewer_token(st, stream, headers, query)
+}
+
+/// The same posture for the two verbs only the edge may use: upload a finished
+/// clip, and declare one impossible.
+///
+/// Deliberately **not** gated on `require_ingest_token` the way a segment PUT
+/// is. That flag exists so an operator can run an origin whose ingest is
+/// protected by something else — a private network, a fronting proxy — and
+/// turning it off is a statement about *segments*. The clip surface is not
+/// reachable at all without a token secret (`require_clip_credential` refuses
+/// the request that creates the record), so demanding one here costs a
+/// correctly-configured relay nothing and closes the case where an operator
+/// relaxed ingest and silently opened a write surface that stores
+/// operator-owned media under viewer-chosen names.
+fn require_clip_ingest(
+    st: &Arc<DistributionState>,
+    stream: &str,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let rt = st.control.load();
+    let Some(ref secret) = rt.token_secret else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clip access is unconfigured on this relay",
+        )
+            .into_response());
+    };
+    if super::bearer(headers)
+        .and_then(|t| token::verify_ingest_token(secret, stream, &t).ok())
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err((StatusCode::UNAUTHORIZED, "ingest token required").into_response())
 }
 
 /// Who may READ from the origin: a viewer, or the edge that fills it.
@@ -1938,14 +2470,26 @@ async fn clips_list(
     let Some(stream) = super::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
-    if let Err(resp) = check_origin_read(&st, &stream, &headers, query.as_deref()) {
+    if let Err(resp) = require_clip_credential(&st, &stream, &headers, query.as_deref()) {
         return resp;
     }
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        axum::Json(st.origin.list_clips(&stream)),
-    )
-        .into_response()
+    // `read_dir` plus a `read` and a `stat` per record, on a route the edge
+    // polls every five seconds per flow and every open portal tab polls while a
+    // cut is pending — so it is fan-out times poll rate of blocking file
+    // operations on the runtime that also forwards live media.
+    let origin = st.origin.clone();
+    let listed = tokio::task::spawn_blocking(move || origin.list_clips(&stream)).await;
+    match listed {
+        Ok(clips) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::Json(clips),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "origin: clip listing task failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not list the clips").into_response()
+        }
+    }
 }
 
 /// `GET /origin/{stream}/clips/{file}` — download a finished clip.
@@ -1964,38 +2508,111 @@ async fn clip_get(
     if !valid_clip_name(name) {
         return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
     }
-    if st.control.load().require_origin_token
-        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
-    {
+    if let Err(resp) = require_clip_credential(&st, &stream, &headers, query.as_deref()) {
         return resp;
     }
-    match st.origin.read_clip(&stream, name).await {
-        Some(bytes) => (
-            [
-                (header::CONTENT_TYPE, "video/mp4".to_string()),
-                // The name the operator asked for, on their disk.
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{file}\""),
-                ),
-                (header::CACHE_CONTROL, "private, max-age=300".to_string()),
-            ],
-            bytes,
-        )
-            .into_response(),
-        None => (
+    let Some((mut fh, len)) = st.origin.open_clip(&stream, name).await else {
+        return (
             StatusCode::NOT_FOUND,
             [(header::CACHE_CONTROL, "no-store")],
             "clip not ready",
         )
-            .into_response(),
+            .into_response();
+    };
+
+    // Ranges, because a 250 MB download over a contribution uplink is exactly
+    // the kind that gets interrupted, and without this every retry starts again
+    // from zero. The browser asks; there is no reason to make it start over.
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|raw| parse_single_range(raw, len));
+    let (start, end, partial) = match range {
+        // Present and satisfiable.
+        Some(Some((s, e))) => (s, e, true),
+        // Present and not satisfiable: say so rather than quietly serving the
+        // whole file, which is how a resumed download ends up corrupt.
+        Some(None) => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [
+                    (header::CONTENT_RANGE, format!("bytes */{len}")),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                "that range is not in this clip",
+            )
+                .into_response();
+        }
+        None => (0, len.saturating_sub(1), false),
+    };
+    let count = end.saturating_sub(start).saturating_add(1).min(len);
+
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        if fh.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not read the clip").into_response();
+        }
     }
+    // Streamed off the file, not collected: see `OriginStore::open_clip`.
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(
+        tokio::io::AsyncReadExt::take(fh, count),
+    ));
+
+    let mut resp = Response::builder()
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, "video/mp4")
+        // The name the operator asked for, on their disk.
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{file}\""),
+        )
+        .header(header::CACHE_CONTROL, "private, max-age=300")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, count);
+    if partial {
+        resp = resp.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+    }
+    resp.body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// One byte range out of a `Range:` header, resolved against the clip's length.
+///
+/// `Some((first, last))` inclusive, or `None` when the header names something
+/// this file cannot satisfy. Deliberately single-range only: a multipart
+/// response is a lot of machinery for something no browser asks a video file
+/// for, and answering the whole file to a multi-range request is the wrong
+/// answer rather than a lesser one — so anything with a comma is refused.
+fn parse_single_range(raw: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = raw.strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let (start, end) = match (first.trim(), last.trim()) {
+        // `bytes=-N`: the last N bytes.
+        ("", suffix) => {
+            let n: u64 = suffix.parse().ok()?;
+            if n == 0 || len == 0 {
+                return None;
+            }
+            (len.saturating_sub(n), len - 1)
+        }
+        (s, "") => (s.parse().ok()?, len.checked_sub(1)?),
+        (s, e) => (s.parse().ok()?, e.parse::<u64>().ok()?.min(len.saturating_sub(1))),
+    };
+    (start <= end && start < len).then_some((start, end))
 }
 
 /// `PUT /origin/{stream}/clips/{file}` — the edge hands over a finished clip.
 ///
-/// Ingest-gated, like a segment PUT: this is a write surface, and the only
-/// thing that should be writing here is the edge that cut the clip.
+/// Ingest-gated unconditionally — see [`require_clip_ingest`]. This is a write
+/// surface, and the only thing that should be writing here is the edge that cut
+/// the clip.
 async fn clip_put(
     State(st): State<Arc<DistributionState>>,
     Path((stream, file)): Path<(String, String)>,
@@ -2011,28 +2628,64 @@ async fn clip_put(
     if !valid_clip_name(name) {
         return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
     }
-    let rt = st.control.load();
-    if rt.require_ingest_token {
-        let Some(ref secret) = rt.token_secret else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "ingest token gate misconfigured")
-                .into_response();
-        };
-        let tok = super::bearer(&headers);
-        if tok
-            .and_then(|t| token::verify_ingest_token(secret, &stream, &t).ok())
-            .is_none()
-        {
-            return (StatusCode::UNAUTHORIZED, "ingest token required").into_response();
-        }
+    if let Err(resp) = require_clip_ingest(&st, &stream, &headers) {
+        return resp;
     }
+    // Nobody asked for this one — or asked and then cancelled, which is the
+    // reachable case: a viewer deletes a record while the edge is mid-cut, and
+    // the edge uploads it anyway from a listing it snapshotted. Storing it
+    // leaves a `.mp4` with no record: invisible to the listing, to both clip
+    // ceilings and to the portal's delete button, but not to the disk. The 404
+    // also tells the exporter to stop, which nothing else did.
+    //
+    // Both this and the budget below walk the clips directory, so they share
+    // one hop onto the blocking pool rather than doing it on a worker.
+    let origin = st.origin.clone();
+    let (for_stream, for_name) = (stream.clone(), name.to_string());
+    let checked = tokio::task::spawn_blocking(move || {
+        (
+            origin.clip_record_exists(&for_stream, &for_name),
+            origin.clip_budget_used(&for_stream),
+        )
+    })
+    .await;
+    let Ok((have_record, used)) = checked else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not store the clip").into_response();
+    };
+    if !have_record {
+        tracing::info!(
+            stream = %stream, clip = %name,
+            "origin: refusing a clip upload nothing has a record for"
+        );
+        return (StatusCode::NOT_FOUND, "no such clip request").into_response();
+    }
+    // The per-stream ceiling, enforced where the bytes arrive rather than only
+    // where they are asked for. The request-time check works from an estimate;
+    // this one works from the scale.
+    let room = MAX_CLIP_BYTES_PER_STREAM.saturating_sub(used);
+    if room == 0 {
+        tracing::warn!(stream = %stream, clip = %name, used, "origin: stream is over its clip budget");
+        return (StatusCode::INSUFFICIENT_STORAGE, "this feed's clips are over their limit")
+            .into_response();
+    }
+    let ceiling = (MAX_CLIP_BYTES as u64).min(room);
     match st
         .origin
-        .put_clip_streaming(&stream, name, body, MAX_CLIP_BYTES as u64)
+        .put_clip_streaming(&stream, name, body, ceiling)
         .await
     {
         Ok(bytes) => {
             tracing::info!(stream = %stream, clip = %name, bytes, "origin: clip stored");
             (StatusCode::CREATED, "stored").into_response()
+        }
+        // Which limit bound it is decided by which one was smaller: saying
+        // "too large" to a clip that is a normal size but does not fit the
+        // feed's remaining budget sends the operator to shorten a clip when
+        // what they need to do is delete one.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData && ceiling < MAX_CLIP_BYTES as u64 => {
+            tracing::warn!(stream = %stream, clip = %name, used, "origin: clip would cross the stream's budget");
+            (StatusCode::INSUFFICIENT_STORAGE, "this feed's clips are over their limit")
+                .into_response()
         }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             tracing::warn!(stream = %stream, clip = %name, "origin: clip exceeded the size limit");
@@ -2047,8 +2700,10 @@ async fn clip_put(
 
 /// `DELETE /origin/{stream}/clips/{file}` — remove a clip and its record.
 ///
-/// Viewer-gated, like the download: clips belong to the session, so anyone who
-/// may watch the feed may tidy them. Without this the only way to reclaim clip
+/// Gated like the download and never left open: clips belong to the session, so
+/// anyone who may watch the feed may tidy them — but a credential is always
+/// required, because this is the origin's one destructive verb and it must not
+/// ride a flag whose default is off. Without it the only way to reclaim clip
 /// space was to end the session, and clips are exempt from the sweep by design.
 async fn clip_delete(
     State(st): State<Arc<DistributionState>>,
@@ -2063,9 +2718,7 @@ async fn clip_delete(
     if !valid_clip_name(name) {
         return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
     }
-    if st.control.load().require_origin_token
-        && let Err(resp) = super::check_viewer_token(&st, &stream, &headers, query.as_deref())
-    {
+    if let Err(resp) = require_clip_credential(&st, &stream, &headers, query.as_deref()) {
         return resp;
     }
     if st.origin.delete_clip(&stream, name).await {
@@ -2104,20 +2757,18 @@ async fn clip_failed(
     if !valid_clip_name(name) {
         return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
     }
-    let rt = st.control.load();
-    if rt.require_ingest_token {
-        let Some(ref secret) = rt.token_secret else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "ingest token gate misconfigured")
-                .into_response();
-        };
-        if super::bearer(&headers)
-            .and_then(|t| token::verify_ingest_token(secret, &stream, &t).ok())
-            .is_none()
-        {
-            return (StatusCode::UNAUTHORIZED, "ingest token required").into_response();
-        }
+    if let Err(resp) = require_clip_ingest(&st, &stream, &headers) {
+        return resp;
     }
-    match st.origin.fail_clip(&stream, name, &body.reason) {
+    let origin = st.origin.clone();
+    let (for_stream, for_name, reason) = (stream.clone(), name.to_string(), body.reason.clone());
+    let marked =
+        tokio::task::spawn_blocking(move || origin.fail_clip(&for_stream, &for_name, &reason))
+            .await;
+    let Ok(marked) = marked else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not record it").into_response();
+    };
+    match marked {
         Ok(true) => {
             tracing::warn!(
                 stream = %stream, clip = %name, reason = %body.reason,
@@ -3752,7 +4403,7 @@ seg-1.m4s
             },
         )
         .unwrap();
-        s.put_clip("feed", "goal", &vec![7u8; 64]).await.unwrap();
+        s.put_clip("feed", "goal", &[7u8; 64]).await.unwrap();
 
         let dir = tmp.path().join("origin").join("feed");
         assert!(dir.exists(), "the stream should exist to begin with");

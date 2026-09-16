@@ -140,7 +140,9 @@ features = ["openssl"]
 [dependencies.tokio-util]
 version = "0.7.19"
 optional = true
-features = ["rt"]
+# `io` is what turns a `tokio::fs::File` into a response body: a clip is up to
+# 256 MiB and the origin must not hold one in memory to hand it out.
+features = ["rt", "io"]
 
 # Only pulled in by `viewer-distribution-vendored` (the release variant) to
 # statically vendor OpenSSL — feature unification makes str0m's openssl-sys

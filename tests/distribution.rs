@@ -864,13 +864,22 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 /// The whole clip lifecycle, over HTTP, through the real router.
 ///
 /// Every other clip test drives `OriginStore` directly, which cannot see the
-/// two things most likely to break here. The first is route ordering:
+/// three things most likely to break here. The first is route ordering:
 /// `/origin/{stream}/clips` and `/origin/{stream}/{file}` both match that
 /// path, and if the object route wins, asking for the clip list serves a 404
 /// for a segment named "clips" — with the store perfectly correct underneath.
-/// The second is that the clips live on their own router with their own body
-/// limit, merged into the object router; a merge that drops them leaves every
+/// The second is that the clips live on their own routers with their own body
+/// limits, merged into the object router; a merge that drops them leaves every
 /// helper green and every endpoint gone.
+///
+/// The third is the gate. Every clip verb needs a credential, and none of them
+/// rides `require_origin_token` — the *read* flag, which ships off so a CDN can
+/// pull a public feed. Hanging the origin's only destructive verb off that
+/// switch meant a default-configured relay answered an anonymous
+/// `DELETE .../clips/<name>.mp4` with 204, and an anonymous `POST .../clips`
+/// with 202 — commissioning decode work on somebody's edge. This test drives
+/// the whole lifecycle with credentials AND asserts the refusals, because an
+/// earlier version of it pinned the unauthenticated 204 as correct.
 #[tokio::test]
 async fn the_clip_lifecycle_works_over_http() {
     use std::net::SocketAddr;
@@ -878,11 +887,16 @@ async fn the_clip_lifecycle_works_over_http() {
 
     use bilbycast_relay::distribution::hub::DistributionHub as Hub;
     use bilbycast_relay::distribution::origin::OriginStore;
-    use bilbycast_relay::distribution::{build_router, DistributionState};
+    use bilbycast_relay::distribution::{build_router, token, DistributionState};
+    use bilbycast_relay::distribution_control::DistUpdate;
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     let cancel = CancellationToken::new();
     let hub = Arc::new(Hub::new());
     let (events, _rx) = event_channel();
+    // Both gates OFF, and the origin read gate at its shipped default — the
+    // configuration in which the clip surface used to be wide open.
     let cfg = DistributionConfig {
         require_viewer_token: false,
         require_ingest_token: false,
@@ -890,7 +904,7 @@ async fn the_clip_lifecycle_works_over_http() {
     };
     let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
     let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
-    let state = DistributionState::new(hub, origin, cfg, control, cancel.clone(), events);
+    let state = DistributionState::new(hub, origin, cfg, control.clone(), cancel.clone(), events);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -900,6 +914,18 @@ async fn the_clip_lifecycle_works_over_http() {
             axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
     });
 
+    control.apply(DistUpdate {
+        token_secret: Some(SECRET.into()),
+        ..Default::default()
+    });
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let viewer = token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+    let ingest = token::mint_ingest_token(SECRET, "feed", exp).unwrap();
+
     /// Returns (status, body). Written by hand rather than with a client crate
     /// so the test depends on nothing the relay does not already carry.
     async fn req(
@@ -908,8 +934,12 @@ async fn the_clip_lifecycle_works_over_http() {
         path: &str,
         body: Option<&[u8]>,
         content_type: &str,
+        bearer: Option<&str>,
     ) -> (u16, String) {
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
+        if let Some(t) = bearer {
+            head.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
         if let Some(b) = body {
             head.push_str(&format!(
                 "Content-Type: {content_type}\r\nContent-Length: {}\r\n",
@@ -941,47 +971,85 @@ async fn the_clip_lifecycle_works_over_http() {
 
     const ASK: &str = r#"{"pre_secs":10,"post_secs":20,"clips":[
         {"at":"2026-09-07T10:00:00Z","name":"10-00-00-00 - Goal"}]}"#;
+    const CLIP: &str = "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4";
+
+    // 0. With no credential, nothing on the clip surface answers — whatever
+    //    `require_origin_token` says. This is the whole point of the gate:
+    //    POST commissions work on an edge and DELETE destroys an operator's
+    //    footage, and neither may ride a read flag that ships off.
+    for (method, path, payload) in [
+        ("POST", "/origin/feed/clips", Some(ASK.as_bytes())),
+        ("GET", "/origin/feed/clips", None),
+        ("GET", CLIP, None),
+        ("DELETE", CLIP, None),
+        ("PUT", CLIP, Some(b"x".as_slice())),
+    ] {
+        let (st, _) = req(addr, method, path, payload, "application/json", None).await;
+        assert_eq!(st, 401, "{method} {path} was answered without a credential");
+    }
 
     // 1. Requesting a clip is accepted, and this is the route-ordering check:
-    //    a POST that fell through to the object route could not answer 200.
-    let (st, _) = req(addr, "POST", "/origin/feed/clips", Some(ASK.as_bytes()), "application/json").await;
+    //    a POST that fell through to the object route could not answer 202.
+    let (st, _) = req(addr, "POST", "/origin/feed/clips", Some(ASK.as_bytes()), "application/json", Some(&viewer)).await;
     assert_eq!(st, 202, "POST /origin/feed/clips was not routed to the clip handler");
 
     // 2. It lists, unfinished. A `clips` swallowed by `{file}` would 404 here.
-    let (st, body) = req(addr, "GET", "/origin/feed/clips", None, "").await;
+    let (st, body) = req(addr, "GET", "/origin/feed/clips", None, "", Some(&viewer)).await;
     assert_eq!(st, 200, "GET /origin/feed/clips did not reach the list handler: {body}");
     assert!(body.contains("10-00-00-00 - Goal"), "the requested clip is not listed: {body}");
     assert!(body.contains("\"ready\":false"), "a clip nothing has cut yet reads as ready: {body}");
 
     // 3. The edge uploads the cut. Percent-encoded, as a browser would send it.
-    let (st, _) = req(
-        addr,
-        "PUT",
-        "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4",
-        Some(b"ftypisomMOOVDATA"),
-        "video/mp4",
-    )
-    .await;
+    //    A viewer token is not enough — writing here is the edge's job.
+    let (st, _) = req(addr, "PUT", CLIP, Some(b"ftypisomMOOVDATA"), "video/mp4", Some(&viewer)).await;
+    assert_eq!(st, 401, "a viewer token was allowed to write a clip");
+    let (st, _) = req(addr, "PUT", CLIP, Some(b"ftypisomMOOVDATA"), "video/mp4", Some(&ingest)).await;
     assert_eq!(st, 201, "the edge could not upload a finished clip");
 
     // 4. Now it is ready, and carries its size.
-    let (_, body) = req(addr, "GET", "/origin/feed/clips", None, "").await;
+    let (_, body) = req(addr, "GET", "/origin/feed/clips", None, "", Some(&viewer)).await;
     assert!(body.contains("\"ready\":true"), "an uploaded clip still reads as pending: {body}");
     assert!(body.contains("\"bytes\":16"), "the clip's size was not recorded: {body}");
 
     // 5. And downloads byte for byte.
-    let (st, body) = req(addr, "GET", "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4", None, "").await;
+    let (st, body) = req(addr, "GET", CLIP, None, "", Some(&viewer)).await;
     assert_eq!(st, 200, "a finished clip would not download");
     assert_eq!(body, "ftypisomMOOVDATA", "the download is not what was uploaded");
 
+    // 5b. An interrupted download resumes instead of starting again: a clip is
+    //     up to 256 MiB over whatever link the viewer has.
+    let (st, body) = req(addr, "GET", CLIP, None, "", Some(&viewer)).await;
+    assert_eq!(st, 200);
+    assert_eq!(body, "ftypisomMOOVDATA");
+    let ranged = {
+        let head = format!(
+            "GET {CLIP} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {viewer}\r\n\
+             Range: bytes=4-7\r\nConnection: close\r\n\r\n"
+        );
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+    assert!(ranged.starts_with("HTTP/1.1 206"), "a Range request was not honoured: {ranged}");
+    assert!(ranged.contains("content-range: bytes 4-7/16"), "no Content-Range: {ranged}");
+    assert!(ranged.ends_with("isom"), "the wrong bytes came back: {ranged}");
+
     // 6. Deleting it reclaims the space, and it stops being served.
-    let (st, _) = req(addr, "DELETE", "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4", None, "").await;
+    let (st, _) = req(addr, "DELETE", CLIP, None, "", Some(&viewer)).await;
     assert_eq!(st, 204, "a clip could not be deleted");
-    let (st, _) = req(addr, "GET", "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4", None, "").await;
+    let (st, _) = req(addr, "GET", CLIP, None, "", Some(&viewer)).await;
     assert_eq!(st, 404, "a deleted clip is still being served");
 
+    // 6b. And the upload that was already in flight when it was deleted is
+    //     refused rather than stored: a `.mp4` with no record beside it is in
+    //     no listing, in neither ceiling, and reachable by no delete button.
+    let (st, _) = req(addr, "PUT", CLIP, Some(b"orphan"), "video/mp4", Some(&ingest)).await;
+    assert_eq!(st, 404, "a clip upload nothing asked for was stored anyway");
+
     // 7. A clip the edge gives up on says so, rather than pending for ever.
-    let (st, _) = req(addr, "POST", "/origin/feed/clips", Some(ASK.as_bytes()), "application/json").await;
+    let (st, _) = req(addr, "POST", "/origin/feed/clips", Some(ASK.as_bytes()), "application/json", Some(&viewer)).await;
     assert_eq!(st, 202);
     let (st, _) = req(
         addr,
@@ -989,10 +1057,11 @@ async fn the_clip_lifecycle_works_over_http() {
         "/origin/feed/clips/10-00-00-00%20-%20Goal.mp4/failed",
         Some(br#"{"reason":"that moment is no longer in the window"}"#),
         "application/json",
+        Some(&ingest),
     )
     .await;
     assert_eq!(st, 200, "the edge could not report a clip it cannot cut");
-    let (_, body) = req(addr, "GET", "/origin/feed/clips", None, "").await;
+    let (_, body) = req(addr, "GET", "/origin/feed/clips", None, "", Some(&viewer)).await;
     assert!(body.contains("\"failed\":true"), "a given-up clip does not read as failed: {body}");
     assert!(
         body.contains("no longer in the window"),
@@ -1003,9 +1072,65 @@ async fn the_clip_lifecycle_works_over_http() {
     //    names the limit — the player shows this text verbatim.
     let too_long = r#"{"pre_secs":40,"post_secs":40,"clips":[
         {"at":"2026-09-07T10:00:00Z","name":"long"}]}"#;
-    let (st, body) = req(addr, "POST", "/origin/feed/clips", Some(too_long.as_bytes()), "application/json").await;
+    let (st, body) = req(addr, "POST", "/origin/feed/clips", Some(too_long.as_bytes()), "application/json", Some(&viewer)).await;
     assert_eq!(st, 400, "an 80-second clip was accepted");
     assert!(body.contains("60 seconds"), "the refusal does not name the limit: {body}");
+}
+
+/// The 256 MiB ceiling belongs to the media PUT, not to the JSON routes.
+///
+/// `clips_request` and `clip_failed` take `axum::Json`, which collects the
+/// whole body into heap before a single line of the handler runs — so a body
+/// limit raised for a clip upload became the amount of memory an
+/// unauthenticated caller could make the relay buffer per connection, on the
+/// public listener, before the credential check it would then fail.
+#[tokio::test]
+async fn the_clip_json_routes_do_not_inherit_the_media_body_limit() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{build_router, DistributionState};
+
+    let cancel = CancellationToken::new();
+    let hub = Arc::new(Hub::new());
+    let (events, _rx) = event_channel();
+    let cfg = DistributionConfig::default();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
+    let state = DistributionState::new(hub, origin, cfg, control, cancel.clone(), events);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ =
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+
+    // Comfortably over the JSON ceiling and a fraction of the media one.
+    let big = vec![b'a'; 512 * 1024];
+    let body = format!(
+        "{{\"pre_secs\":1,\"post_secs\":1,\"clips\":[{{\"at\":\"2026-09-07T10:00:00Z\",\"name\":\"{}\"}}]}}",
+        String::from_utf8_lossy(&big)
+    );
+    let head = format!(
+        "POST /origin/feed/clips HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    let _ = s.write_all(body.as_bytes()).await;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    assert!(
+        text.starts_with("HTTP/1.1 413"),
+        "a half-megabyte of JSON was buffered on an unauthenticated route: {}",
+        text.lines().next().unwrap_or("")
+    );
 }
 
 /// The edge must be able to read its own work queue.
