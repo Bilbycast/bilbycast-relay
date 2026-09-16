@@ -3941,6 +3941,7 @@
    * newest device wins. */
   function takenOver() {
     forgetToken();
+    stopBeating();
     try { main.pause(); proxy.pause(); } catch (e) {}
     failWith("This login is in use on another device. Only one at a time. ",
              "Open the feed again to take it back",
@@ -3973,6 +3974,9 @@
         TOKEN = body.token;
         rememberToken(TOKEN);
         if (body.holder) rememberHolder(body.holder);
+        // A player that had no holder until now — an older tab restored into
+        // a portal session — starts being counted here rather than never.
+        startBeating();
         renewFailures = 0;
         // hls.js reads `TOKEN` inside `xhrSetup` at request time, and so does
         // every sprite-sheet fetch, so there is nothing to re-attach.
@@ -3990,6 +3994,75 @@
       });
   }
 
+  /* ── still watching ────────────────────────────────────────────────────
+   *
+   * The manager's DVR page shows how many people are watching a feed. It
+   * cannot learn that from renewals: a token lives three hours and the
+   * renewal above runs ten minutes early, so an operator asking mid-match
+   * would read an answer up to three hours old — a full gallery long after
+   * the last person left. That is worse than no number, because it is exactly
+   * the number they came looking for.
+   *
+   * So the player says so itself. The beat carries no credential and asks for
+   * nothing: it moves one timestamp on a row this device already holds. It is
+   * cheap enough to run every minute for the same reason it is safe — there
+   * is nothing to sign and nothing to grant.
+   *
+   * It stops while the tab is hidden, and that is the point rather than an
+   * optimisation. A phone in a pocket is not somebody watching, and the count
+   * decays on its own after a few missed beats — there is no "I have stopped"
+   * message to rely on, because a closed tab sends nothing at all.
+   */
+  var BEAT_MS = 60000;
+  var beatTimer = null;
+
+  function beatNow() {
+    // Only a portal viewer has a login to be counted under. A guest on a
+    // one-off link is anonymous by design, and there is no row to touch.
+    if (!PORTAL_URL || !HOLDER) return;
+    if (document.hidden) return;
+    var url = PORTAL_URL.replace(/\/+$/, "") + "/api/beat?stream=" +
+              encodeURIComponent(STREAM) + "&held=" + encodeURIComponent(HOLDER);
+    // POST, because it writes. No body and no custom header, so it stays a
+    // "simple" request and costs no preflight — the beat must not turn one
+    // round trip into two, every minute, per viewer.
+    fetch(url, { method: "POST", credentials: "include" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (body) {
+        // Displaced. Stop beating and leave it there: the renewal above is
+        // where a viewer is told, and it says it properly. Ending someone's
+        // picture from a background timer they never asked for would be the
+        // wrong place for that news.
+        if (body && body.held === false) { stopBeating(); return; }
+        // The cadence is the manager's to set, not something baked into every
+        // player that was ever deployed. It travels with each reply, so a
+        // change reaches tabs already open — and a player is never left
+        // beating faster than the server wants it to.
+        if (body && body.next_beat_secs > 0) {
+          var ms = Math.max(15000, body.next_beat_secs * 1000);
+          if (ms !== BEAT_MS) { BEAT_MS = ms; stopBeating(); startBeating(); }
+        }
+      })
+      .catch(function () { /* a lost beat costs a number, not a picture */ });
+  }
+
+  function startBeating() {
+    if (beatTimer !== null || !PORTAL_URL || !HOLDER) return;
+    beatTimer = setInterval(beatNow, BEAT_MS);
+    beatNow();   // so somebody opening the feed appears now, not in a minute
+  }
+
+  function stopBeating() {
+    if (beatTimer !== null) { clearInterval(beatTimer); beatTimer = null; }
+  }
+
+  // Coming back to a backgrounded tab should show up immediately, not at the
+  // next tick — the operator watching the count is often the person who just
+  // asked somebody to open it.
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) beatNow();
+  });
+
   // ── start ──────────────────────────────────────────────────────────────
   if (qs.get("debug") === "1") {
     dbg = document.getElementById("debug");
@@ -4006,6 +4079,7 @@
     document.body.dataset.selftest = "1";
   }
   scheduleRenewal();
+  startBeating();
   syncQualityBadge();   // setMode returns early at startup, so seed it here
   loadMarks();
   renderMarks();
