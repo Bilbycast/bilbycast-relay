@@ -12,6 +12,12 @@
     --fg: #e8edf2; --dim: #93a1b0; --accent: #37d3a6; --bad: #ff6b6d;
   }
   * { box-sizing: border-box; }
+  /* The UA sheet's `[hidden] { display: none }` is an author-beats-UA loss
+     waiting to happen: any `display` rule below wins over it, whatever its
+     specificity. `header a.signout` already did, so "Sign out" was drawn even
+     with no `logout_url` configured — a dead `href="#"` that leaves a viewer
+     signed in on a shared machine believing they are not. */
+  [hidden] { display: none !important; }
   html, body { margin: 0; min-height: 100%; }
   body {
     background: var(--bg); color: var(--fg);
@@ -150,6 +156,11 @@
         <tbody id="cliplist"></tbody>
       </table>
     </div>
+    <!-- Clip-scoped errors land here. `msg()` empties #body, which is where the
+         feed list and its Watch buttons live and which nothing re-renders, so
+         reporting a failed delete through it took the whole reason the viewer
+         came to the page away until they reloaded. -->
+    <div id="clipnote" class="msg bad" hidden></div>
   </section>
 </main>
 <script src="/portal.js"></script>

@@ -135,35 +135,72 @@
   var CLIP_POLL_MS = 5000;
   var CLIP_POLL_MAX_MS = 10 * 60 * 1000;
 
+  /* Re-arm from one place, on every outcome.
+   *
+   * The only `setTimeout` used to sit inside the success branch, past an early
+   * `return` for a null body — so one 502 from a reverse proxy, one relay
+   * restart, one dropped connection ended the poller for the life of the page
+   * load. The clip finished cutting and the page never said so, and the
+   * operator concluded the export had failed. `keepGoing` is false only when
+   * the server says nothing is pending; a failed poll knows nothing and must
+   * therefore keep asking. */
+  function schedulePoll(keepGoing) {
+    if (clipPollTimer) { clearTimeout(clipPollTimer); clipPollTimer = null; }
+    if (keepGoing && Date.now() < clipPollUntil) {
+      clipPollTimer = setTimeout(function () { loadClips(true); }, CLIP_POLL_MS);
+    }
+  }
+
   function loadClips(isPoll) {
     if (!isPoll) clipPollUntil = Date.now() + CLIP_POLL_MAX_MS;
     fetch('/api/clips', { headers: { 'Accept': 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
-        if (!d || !d.clips) return;
+        if (!d || !d.clips) { schedulePoll(true); return; }
         renderClips(d.clips);
         /* Nothing pending means nothing to wait for. Note this is decided on
          * the server's answer, not on what was drawn — a row removed by a
          * delete must not keep the timer alive. */
-        var pending = d.clips.some(function (c) { return !c.ready && !c.failed; });
-        if (clipPollTimer) { clearTimeout(clipPollTimer); clipPollTimer = null; }
-        if (pending && Date.now() < clipPollUntil) {
-          clipPollTimer = setTimeout(function () { loadClips(true); }, CLIP_POLL_MS);
-        }
+        schedulePoll(d.clips.some(function (c) { return !c.ready && !c.failed; }));
       })
-      .catch(function () { /* nothing to say to the viewer */ });
+      .catch(function () { schedulePoll(true); });
   }
+
+  /* A clip-scoped message, in the clips section.
+   *
+   * Not `msg()`: that one empties #body, which holds the feed list and its
+   * Watch buttons, and nothing rebuilds it — so a failed delete took away the
+   * only thing on the page that gets someone watching. */
+  function clipMsg(text) {
+    var el = document.getElementById('clipnote');
+    if (!el) return;
+    el.textContent = text || '';
+    el.hidden = !text;
+  }
+
+  /* Rows being deleted right now, keyed the way renderClips keys them.
+   *
+   * A poll lands every five seconds while anything is being cut, and it used to
+   * rebuild the table unconditionally — so a DELETE in flight had its captured
+   * row replaced by a clone, `tr.remove()` became a no-op on a detached node,
+   * and the clip the viewer had just deleted came back with its Delete button
+   * enabled until the next poll dropped it. Clicking that clone raised a
+   * spurious error for a clip that was already gone. */
+  var deleting = Object.create(null);
+
+  function clipKey(c) { return c.session_id + '\u0000' + c.name; }
 
   function renderClips(clips) {
     var section = document.getElementById('clips');
     var list = document.getElementById('cliplist');
-    if (!clips.length) {
+    var shown = clips.filter(function (c) { return !deleting[clipKey(c)]; });
+    if (!shown.length) {
       list.textContent = '';
       section.hidden = true;
       return;
     }
     list.textContent = '';
-    clips.forEach(function (c) { list.appendChild(clipRow(c, list)); });
+    shown.forEach(function (c) { list.appendChild(clipRow(c, list)); });
     section.hidden = false;
   }
 
@@ -226,6 +263,9 @@
     del.addEventListener('click', function () {
       del.disabled = true;
       del.textContent = 'Deleting…';
+      clipMsg('');
+      var key = clipKey(c);
+      deleting[key] = true;
       fetch('/api/clips', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
@@ -241,15 +281,17 @@
           if (!list.children.length) document.getElementById('clips').hidden = true;
           return;
         }
+        delete deleting[key];
         del.disabled = false;
         del.textContent = 'Delete';
         return r.json().catch(function () { return null; }).then(function (e) {
-          msg(e && e.error ? e.error : 'Could not delete that clip.', true);
+          clipMsg(e && e.error ? e.error : 'Could not delete that clip.');
         });
       }).catch(function () {
+        delete deleting[key];
         del.disabled = false;
         del.textContent = 'Delete';
-        msg('Could not delete that clip.', true);
+        clipMsg('Could not delete that clip.');
       });
     });
     act.appendChild(del);

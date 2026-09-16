@@ -96,10 +96,21 @@ async fn main() -> anyhow::Result<()> {
     let state = PortalState {
         cfg: Arc::new(cfg),
         http: reqwest::Client::builder()
-            .use_preconfigured_tls(tls)
+            .use_preconfigured_tls(tls.clone())
             // The manager is one hop away and answers from a database. A
             // request that has not come back in ten seconds is not going to.
             .timeout(std::time::Duration::from_secs(10))
+            .build()?,
+        // A clip, though, is up to 256 MiB proxied to a viewer at the viewer's
+        // own rate, and reqwest's `timeout` covers the body too — so the
+        // manager's deadline truncated every download that took longer than ten
+        // seconds, which on a 10 Mbit/s line is anything over about 12 MB.
+        // Connect and read deadlines instead: a stalled origin is still caught,
+        // a slow viewer is not mistaken for one.
+        media: reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(30))
             .build()?,
     };
 

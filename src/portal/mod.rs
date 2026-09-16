@@ -99,7 +99,19 @@ struct TokenResponse {
 #[derive(Clone)]
 pub struct PortalState {
     pub cfg: Arc<PortalConfig>,
+    /// For the manager: one hop away, answering from a database, so a total
+    /// deadline is the right shape.
     pub http: reqwest::Client,
+    /// For the origin hop on a clip download.
+    ///
+    /// A separate client because reqwest's `timeout` is a deadline on the whole
+    /// exchange *including the body*, and this body is proxied to the viewer at
+    /// the viewer's own rate. On the manager client's ten seconds, any clip
+    /// bigger than (viewer bandwidth x 10 s) died mid-transfer with its
+    /// `Content-Length` already sent — an interrupted download that failed at
+    /// the same point on every retry, through the only download path the portal
+    /// offers. This one catches a stall instead of a slow link.
+    pub media: reqwest::Client,
 }
 
 pub fn router(state: PortalState) -> Router {
@@ -403,16 +415,62 @@ struct OriginClip {
 /// to learn an address it has already been handed.
 fn origin_root_and_token(watch_url: &str) -> Option<(String, String)> {
     let (before_query, query) = watch_url.split_once('?')?;
-    let token = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("token="))?
-        .to_string();
+    // Percent-DECODED, because it came out of a query string and is about to go
+    // into an `Authorization` header. A multi-stream token carries its stream
+    // list comma-separated, which the mint encodes as `%2C`; handing that to
+    // `bearer_auth` verbatim fails verification on every clip call.
+    let token = urldecode(query.split('&').find_map(|kv| kv.strip_prefix("token="))?);
     // Everything up to `/dvr/` is the relay's root.
     let root = before_query.split("/dvr/").next()?.to_string();
     if root.is_empty() || token.is_empty() {
         return None;
     }
     Some((root, token))
+}
+
+/// Undo [`urlencode`] enough to recover a token from a URL.
+///
+/// Only `%XX`; a `+` in a token is a literal `+`, and treating it as a space
+/// (the form-encoding rule) would corrupt the signature.
+fn urldecode(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Some(n) = std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(n);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A clip name the origin will actually accept.
+///
+/// The portal's own copy of `distribution::origin::valid_clip_name` — the two
+/// live behind different Cargo features, so this cannot borrow it. Checking
+/// here is what makes the portal's error messages true: an unchecked name went
+/// into the upstream *path*, where `url` collapses a `..` before the request is
+/// sent, so a download quietly landed on the segment route and was reported as
+/// "that clip is no longer available", and a name carrying CR/LF went into
+/// `Content-Disposition`, where `HeaderValue` refuses it and the viewer got a
+/// bare 500 instead of a 400.
+fn valid_clip_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 180
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '(' | ')' | '[' | ']')
+        })
 }
 
 /// Percent-encode a query-string value.
@@ -477,23 +535,37 @@ async fn clips(
     // access to yields nothing here without the portal reasoning about
     // permissions itself. Holding a mint would trade that away for latency,
     // which is the wrong side of the trade for a credential.
-    let per_feed = streams.iter().map(|s| {
+    let mut per_feed = Vec::with_capacity(streams.len());
+    for s in &streams {
         let st = &st;
         let username = &username;
-        async move {
+        per_feed.push(async move {
             let watch_url = mint(st, username, &s.session_id).await.ok()?;
             let (root, token) = origin_root_and_token(&watch_url)?;
-            let list_url = format!("{root}/origin/{}/clips?token={token}", s.stream_id);
-            let listed: Vec<OriginClip> = match st.http.get(&list_url).send().await {
-                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
-                // A relay too old to know about clips answers 404. That is not
-                // an error worth showing a viewer.
-                _ => return None,
-            };
+            let list_url = format!("{root}/origin/{}/clips", s.stream_id);
+            // The header, not `?token=`. The origin tries the header first and
+            // falls back to the query, so nothing on that side changes — but a
+            // query carries the credential into the request line of the relay's
+            // access log and of every proxy in front of it, once per feed per
+            // poll, for a token good for hours across both renditions.
+            let listed: Vec<OriginClip> =
+                match st.http.get(&list_url).bearer_auth(&token).send().await {
+                    Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+                    // A relay too old to know about clips answers 404. That is
+                    // not an error worth showing a viewer.
+                    _ => return None,
+                };
             Some((s, listed))
-        }
-    });
-    let results = futures_util::future::join_all(per_feed).await;
+        });
+    }
+    // Bounded: an administrator may tick up to 256 feeds onto one portal user,
+    // and each of these is a manager mint plus a relay listing. Eight at a time
+    // is still a page-load rather than a serial crawl, without turning one
+    // browser poll into five hundred upstream requests at once.
+    let results: Vec<_> = futures_util::StreamExt::collect::<Vec<_>>(
+        futures_util::StreamExt::buffer_unordered(futures_util::stream::iter(per_feed), 8),
+    )
+    .await;
 
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (s, listed) in results.into_iter().flatten() {
@@ -766,6 +838,9 @@ async fn download_clip(
     let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
         return unauthenticated();
     };
+    if !valid_clip_name(&q.name) {
+        return (StatusCode::BAD_REQUEST, "That is not a clip name.").into_response();
+    }
     let Ok(watch_url) = mint(&st, &username, &q.session).await else {
         return (StatusCode::FORBIDDEN, "That feed is not yours.").into_response();
     };
@@ -776,11 +851,8 @@ async fn download_clip(
         return (StatusCode::BAD_GATEWAY, "Could not reach the feed's relay.").into_response();
     };
 
-    let url = format!(
-        "{root}/origin/{stream}/clips/{}.mp4?token={token}",
-        q.name.replace(' ', "%20"),
-    );
-    let upstream = match st.http.get(&url).send().await {
+    let url = format!("{root}/origin/{stream}/clips/{}.mp4", urlencode(&q.name));
+    let upstream = match st.media.get(&url).bearer_auth(&token).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::warn!(%username, clip = %q.name, status = r.status().as_u16(),
@@ -849,6 +921,13 @@ async fn delete_clip(
     let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
         return unauthenticated();
     };
+    if !valid_clip_name(&req.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "That is not a clip name." })),
+        )
+            .into_response();
+    }
 
     // The mint is the permission check. A session the viewer has lost access
     // to yields nothing here, so there is no separate rule to keep in step.
@@ -874,11 +953,8 @@ async fn delete_clip(
             .into_response();
     };
 
-    let url = format!(
-        "{root}/origin/{stream}/clips/{}.mp4?token={token}",
-        req.name.replace(' ', "%20"),
-    );
-    match st.http.delete(&url).send().await {
+    let url = format!("{root}/origin/{stream}/clips/{}.mp4", urlencode(&req.name));
+    match st.http.delete(&url).bearer_auth(&token).send().await {
         // 404 is success from where the viewer stands: the clip is gone, which
         // is what they asked for. Anything else is reported.
         Ok(r) if r.status().is_success() || r.status() == StatusCode::NOT_FOUND => {
@@ -1033,6 +1109,142 @@ mod tests {
             !built.contains("token="),
             "a viewer token is back in the download link: {built}"
         );
+    }
+
+    /// The portal's own hops to the origin carry no credential in the URL.
+    ///
+    /// The download link the browser is handed was fixed; the three server-side
+    /// legs behind it — the clip listing, the download proxy and the delete —
+    /// still put the viewer token in `?token=`, once per feed per five-second
+    /// poll while a cut is in flight. That writes a three-hour credential
+    /// covering both renditions into the request line of the relay's access log
+    /// and of every proxy in front of it. The origin tries `Authorization:
+    /// Bearer` first on all three routes, so the header costs nothing.
+    #[test]
+    fn the_portal_sends_its_origin_token_as_a_header() {
+        let src = include_str!("mod.rs");
+        for (marker, what) in [
+            ("/origin/{}/clips\"", "the clip listing"),
+            ("/origin/{stream}/clips/{}.mp4\"", "the download and delete"),
+        ] {
+            assert!(
+                src.contains(marker),
+                "{what} url is built some other way now; re-check this"
+            );
+        }
+        // No `?token=` anywhere an origin URL is assembled.
+        for line in src.lines().filter(|l| l.contains("{root}/origin/")) {
+            assert!(
+                !line.contains("token="),
+                "a viewer token is back in an origin URL: {line}"
+            );
+        }
+        // And every one of those calls presents the header instead.
+        for call in ["get(&list_url)", "media.get(&url)", "delete(&url)"] {
+            let line = src
+                .lines()
+                .find(|l| l.contains(call))
+                .unwrap_or_else(|| panic!("the origin call `{call}` has moved; re-check this"));
+            assert!(
+                line.contains("bearer_auth(&token)"),
+                "an origin call no longer sends the token as a header: {line}"
+            );
+        }
+    }
+
+    /// The token comes out of a URL, so it arrives percent-encoded.
+    ///
+    /// A multi-stream token carries its stream list comma-separated and the
+    /// mint encodes the comma as `%2C`. Moving it from the query to an
+    /// `Authorization` header without decoding would 403 every clip listing,
+    /// download and delete the moment the origin gate is on.
+    #[test]
+    fn a_token_lifted_out_of_a_watch_url_is_decoded() {
+        let (root, token) = origin_root_and_token(
+            "https://relay.example/dvr/match?token=1789200000.match%2Cmatch-proxy.53385b8a",
+        )
+        .expect("a minted watch url must split");
+        assert_eq!(root, "https://relay.example");
+        assert_eq!(token, "1789200000.match,match-proxy.53385b8a");
+    }
+
+    /// A clip name the origin would refuse never reaches it.
+    ///
+    /// Unchecked, the name went into the upstream path — where `url` collapses
+    /// a `..` before the request is sent, so the call landed on the segment
+    /// route and every outcome was reported as "that clip is no longer
+    /// available" — and into `Content-Disposition`, where a CR/LF makes
+    /// `HeaderValue` refuse and the viewer gets a bare 500.
+    #[test]
+    fn the_portal_refuses_a_clip_name_the_origin_would() {
+        for bad in ["../seg-00001.m4s", "Goal\r\nX", "", ".hidden", "Goal/Save"] {
+            assert!(!valid_clip_name(bad), "'{bad}' must not be accepted");
+        }
+        for good in ["10-00-00-00 - Goal", "Try (2)", "half_time [wide]"] {
+            assert!(valid_clip_name(good), "'{good}' must be accepted");
+        }
+    }
+
+    /// `hidden` has to actually hide.
+    ///
+    /// The UA sheet's `[hidden] { display: none }` is a *normal* declaration in
+    /// the user-agent origin, so any author `display` rule beats it whatever
+    /// its specificity. `header a.signout { display: inline-flex }` did exactly
+    /// that, so "Sign out" was drawn with no `logout_url` configured — a dead
+    /// `href="#"` that leaves a viewer signed in on a shared machine believing
+    /// they are not, which is the opposite of what that markup intends.
+    #[test]
+    fn a_hidden_element_on_this_page_is_hidden() {
+        let html = include_str!("portal.html");
+        assert!(
+            html.contains("[hidden] { display: none !important; }"),
+            "portal.html has author `display` rules and no [hidden] guard, so \
+             every `hidden` attribute on the page is decorative"
+        );
+    }
+
+    /// The clip poller survives a blip, and a clip error stays in the clips.
+    ///
+    /// Two separate traps in the same subsystem. The poll re-armed only inside
+    /// the success branch, past an early return for a null body, so one 502
+    /// from a proxy ended it for the life of the page load and the clip that
+    /// finished cutting was never shown as ready. And the delete handler
+    /// reported failures through `msg()`, whose first statement empties
+    /// `#body` — the container holding the feed list and its Watch buttons,
+    /// which has exactly one caller and is never rebuilt.
+    #[test]
+    fn a_clip_failure_costs_neither_the_poller_nor_the_feed_list() {
+        let js = include_str!("portal.js");
+        assert!(
+            js.contains("function schedulePoll("),
+            "the poll re-arm is inline again; a failed poll will end the loop"
+        );
+        // The catch and the null-body path both have to reach it.
+        assert!(
+            js.contains(".catch(function () { schedulePoll(true); });"),
+            "a failed clip poll no longer re-arms"
+        );
+        assert!(
+            js.contains("{ schedulePoll(true); return; }"),
+            "a non-200 clip poll no longer re-arms"
+        );
+        // And nothing in the clips subsystem reaches for the feed list.
+        // Bounded at the feed loader below it, whose own `msg()` calls are the
+        // intended kind: a page that cannot list feeds has nothing else to say.
+        let clips = js
+            .split("function clipRow(")
+            .nth(1)
+            .expect("clipRow has moved; re-check this");
+        let clips = clips
+            .split("fetch('/api/feeds'")
+            .next()
+            .expect("split always yields one");
+        for (i, _) in clips.match_indices("msg(") {
+            assert!(
+                clips[..i].ends_with("clip"),
+                "a clip error is being reported through msg(), which empties the feed list"
+            );
+        }
     }
 
     /// The page's own script may only talk to the page's own origin.

@@ -160,6 +160,7 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
             install_provider();
             reqwest::Client::new()
         },
+        media: reqwest::Client::new(),
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
@@ -396,6 +397,7 @@ async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
             install_provider();
             reqwest::Client::new()
         },
+        media: reqwest::Client::new(),
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
