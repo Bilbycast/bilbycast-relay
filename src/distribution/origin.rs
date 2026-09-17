@@ -1306,19 +1306,25 @@ impl OriginStore {
         out
     }
 
-    /// The edge hands the finished media over.
-    ///
-    /// Written to `.part` and renamed, so a half-uploaded clip is never
-    /// visible as ready — `list_clips` decides on the media file existing.
-    pub async fn put_clip(&self, stream: &str, name: &str, body: &[u8]) -> std::io::Result<()> {
-        let dir = self.clip_dir_for(stream, name)?;
-        tokio::fs::create_dir_all(&dir).await?;
-        let tmp = dir.join(format!("{name}.mp4.part"));
-        tokio::fs::write(&tmp, body).await?;
-        tokio::fs::rename(&tmp, dir.join(format!("{name}.mp4"))).await
+    /// A clip that is already in memory, through the same path production
+    /// uses. Tests only: the buffered writer this replaced wrote a fixed
+    /// `{name}.mp4.part` with no guard — the very shape [`PartFile`] exists
+    /// to remove — and nothing outside the tests ever called it.
+    #[cfg(test)]
+    pub(crate) async fn put_clip(
+        &self,
+        stream: &str,
+        name: &str,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        let len = body.len() as u64;
+        self.put_clip_streaming(stream, name, axum::body::Body::from(body.to_vec()), len)
+            .await
+            .map(|_| ())
     }
 
-    /// The same, streamed to disk rather than buffered whole.
+    /// The edge hands the finished media over, streamed to disk rather than
+    /// buffered whole.
     ///
     /// A clip is up to 256 MiB, and holding one entirely in memory to write it
     /// out again is a quarter-gigabyte spike per concurrent upload on a service
@@ -4696,7 +4702,7 @@ seg-1.m4s
             },
         )
         .unwrap();
-        s.put_clip("feed", "spare", &vec![0u8; 2048]).await.unwrap();
+        s.put_clip("feed", "spare", &[0u8; 2048]).await.unwrap();
 
         let (count, bytes) = s.clip_usage("feed");
         assert_eq!((count, bytes), (1, 2048));
