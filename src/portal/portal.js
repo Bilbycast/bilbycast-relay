@@ -132,6 +132,7 @@
    * next visit, and the edge gives up long before it. */
   var clipPollTimer = null;
   var clipPollUntil = 0;
+  var clipPollSeq = 0;
   var CLIP_POLL_MS = 5000;
   var CLIP_POLL_MAX_MS = 10 * 60 * 1000;
 
@@ -153,11 +154,14 @@
 
   function loadClips(isPoll) {
     if (!isPoll) clipPollUntil = Date.now() + CLIP_POLL_MAX_MS;
+    /* Numbered when sent, so a tombstone left by a finished delete can tell
+     * an answer that predates it from one that post-dates it. */
+    var seq = ++clipPollSeq;
     fetch('/api/clips', { headers: { 'Accept': 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         if (!d || !d.clips) { schedulePoll(true); return; }
-        renderClips(d.clips);
+        renderClips(d.clips, seq);
         /* Nothing pending means nothing to wait for. Note this is decided on
          * the server's answer, not on what was drawn — a row removed by a
          * delete must not keep the timer alive. */
@@ -185,15 +189,30 @@
    * row replaced by a clone, `tr.remove()` became a no-op on a detached node,
    * and the clip the viewer had just deleted came back with its Delete button
    * enabled until the next poll dropped it. Clicking that clone raised a
-   * spurious error for a clip that was already gone. */
+   * spurious error for a clip that was already gone.
+   *
+   * `true` while the DELETE is in flight. Once it has succeeded the entry
+   * becomes the number of the first poll that can be trusted to know — a poll
+   * already on the wire when the delete finished can still list the clip — and
+   * it is dropped when such a poll lands. It must not outlive that: a clip's
+   * file name is deterministic, so deleting a clip and exporting the same
+   * moment again yields the same key, and a tombstone that stood for the life
+   * of the page hid the new clip from every poll. The viewer saw a silent
+   * no-op Export, and if it was the only clip the whole panel stayed hidden. */
   var deleting = Object.create(null);
 
   function clipKey(c) { return c.session_id + '\u0000' + c.name; }
 
-  function renderClips(clips) {
+  function renderClips(clips, seq) {
     var section = document.getElementById('clips');
     var list = document.getElementById('cliplist');
-    var shown = clips.filter(function (c) { return !deleting[clipKey(c)]; });
+    var shown = clips.filter(function (c) {
+      var t = deleting[clipKey(c)];
+      return !(t === true || (typeof t === 'number' && seq < t));
+    });
+    Object.keys(deleting).forEach(function (k) {
+      if (deleting[k] !== true && deleting[k] <= seq) delete deleting[k];
+    });
     if (!shown.length) {
       list.textContent = '';
       section.hidden = true;
@@ -279,6 +298,8 @@
           tr.remove();
           /* The last one going takes the empty table with it. */
           if (!list.children.length) document.getElementById('clips').hidden = true;
+          /* Gone on the server: hide it only from polls sent before now. */
+          deleting[key] = clipPollSeq + 1;
           return;
         }
         delete deleting[key];

@@ -1247,6 +1247,45 @@ mod tests {
         }
     }
 
+    /// A finished delete must stop hiding its key.
+    ///
+    /// `deleting` exists to keep a poll from resurrecting a row while its
+    /// DELETE is in flight, and the success branch never cleared it. A clip's
+    /// file name is deterministic, so exporting the same moment again produced
+    /// the same key, and the new clip was filtered out of every poll for the
+    /// life of the page: a silent no-op Export, and an empty panel if it was
+    /// the only clip. The entry now turns into the number of the first poll
+    /// that can be trusted, and `renderClips` drops it once such a poll lands.
+    /// Both halves are pinned, because either one alone reintroduces the bug.
+    #[test]
+    fn a_finished_delete_stops_hiding_its_key() {
+        let js = include_str!("portal.js");
+        let ok_branch = js
+            .split("if (r.ok) {")
+            .nth(1)
+            .expect("the delete success branch has moved; re-check this");
+        let ok_branch = ok_branch
+            .split("return;")
+            .next()
+            .expect("split always yields one");
+        assert!(
+            ok_branch.contains("deleting[key] = clipPollSeq + 1;"),
+            "a successful delete no longer re-stamps its tombstone before returning, \
+             so re-exporting the same moment is hidden for the life of the page"
+        );
+        assert!(
+            js.contains("function renderClips(clips, seq)")
+                && js.contains("renderClips(d.clips, seq);"),
+            "renderClips no longer knows which poll it is drawing, so it cannot \
+             tell a stale answer from a fresh one"
+        );
+        assert!(
+            js.contains("if (deleting[k] !== true && deleting[k] <= seq) delete deleting[k];"),
+            "a served tombstone is never dropped; the next delete of the same key \
+             starts from stale state"
+        );
+    }
+
     /// The page's own script may only talk to the page's own origin.
     ///
     /// `connect-src 'self'` is deliberate, and it means every `fetch` in
@@ -1264,7 +1303,8 @@ mod tests {
 
         assert!(
             PAGE_CSP.contains("connect-src 'self'"),
-            "the policy this test defends has been relaxed; if that was deliberate,              this test should be reconsidered rather than deleted"
+            "the policy this test defends has been relaxed; if that was deliberate, \
+             this test should be reconsidered rather than deleted"
         );
         let _ = html;
 
@@ -1285,7 +1325,8 @@ mod tests {
             let target = &arg[1..end];
             assert!(
                 target.starts_with('/') && !target.starts_with("//"),
-                "portal.js fetches '{target}', which the page's own CSP forbids —                  route it through the portal instead"
+                "portal.js fetches '{target}', which the page's own CSP forbids — \
+             route it through the portal instead"
             );
             checked += 1;
         }
