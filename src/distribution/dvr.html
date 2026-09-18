@@ -806,6 +806,13 @@
   }
   function forgetToken() {
     try { window.sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* blocked */ }
+    // The holder goes with it. Kept alone, it came back on the next reload as
+    // a device with something to be counted under and nothing to watch with:
+    // the page beat once before the first 401 could say the credential was
+    // gone, and the operator's count read one viewer whose picture was black.
+    // Nothing is stranded — the only way back from a forgotten token is the
+    // portal's link, which claims afresh and hands out a new holder with it.
+    rememberHolder("");
   }
 
   var TOKEN = qs.get("token") || "";
@@ -978,6 +985,12 @@
 
   function failWith(lead, linkText, tailText) {
     accessExpired = true;
+    // Every notice that ends the picture ends the beat with it, here rather
+    // than in each caller. A player showing "your access has expired" that
+    // went on saying "still watching" every minute kept the person the
+    // operator had just revoked at the top of their list — a foreground tab
+    // on a dead picture reads as a viewer for as long as it stays open.
+    stopBeating();
     errEl.textContent = "";
     errEl.appendChild(document.createTextNode(lead));
     var href = portalReturn();
@@ -1609,6 +1622,11 @@
 
         if (data.fatal) {
           fail(label + ": " + data.type + " / " + data.details);
+          // hls.js never retries a 4xx and nothing here re-attaches, so a
+          // fatal error on the main element is the picture stopping for
+          // good — a viewer nobody should still be counting. The proxy's
+          // own fatal error leaves the visible picture running.
+          if (video === main) stopBeating();
         } else if (data.details === "bufferStalledError") {
           // Usually means the playhead is sitting past what is buffered.
           // Nudge back to the live sync point rather than sitting black.
@@ -3968,9 +3986,9 @@
   }
 
   // ── keeping the token alive ────────────────────────────────────────────
-  // A viewing token lasts three hours. A match plus its build-up does not fit
-  // in three hours, and the failure arrives mid-second-half as "your viewing
-  // access has expired" — which is true, and useless.
+  // A token minted through the portal lasts thirty minutes. A match plus its
+  // build-up does not fit in that, and the failure arrives mid-second-half as
+  // "your viewing access has expired" — which is true, and useless.
   //
   // So renew before it runs out. The renewal goes back through the portal to
   // the manager, which re-checks the entitlement before signing: that is what
@@ -3980,7 +3998,8 @@
   //
   // Only a viewer who came through the portal can renew — they have the
   // session cookie the portal authenticates with. A guest holding a one-off
-  // link cannot, and should not: their three hours are the point of the link.
+  // link cannot, and should not: their (three-hour) grant is the point of
+  // the link.
 
   /// Seconds of headroom to renew with. Long enough to survive a few failed
   /// attempts and a slow manager, short enough that a withdrawn entitlement
@@ -4035,7 +4054,6 @@
   function takenOver() {
     wasTakenOver = true;
     forgetToken();
-    stopBeating();
     try { main.pause(); proxy.pause(); } catch (e) {}
     failWith("This login is in use on another device. Only one at a time. ",
              "Open the feed again to take it back",
@@ -4094,11 +4112,12 @@
   /* ── still watching ────────────────────────────────────────────────────
    *
    * The manager's DVR page shows how many people are watching a feed. It
-   * cannot learn that from renewals: a token lives three hours and the
-   * renewal above runs ten minutes early, so an operator asking mid-match
-   * would read an answer up to three hours old — a full gallery long after
-   * the last person left. That is worse than no number, because it is exactly
-   * the number they came looking for.
+   * cannot learn that from renewals: a portal token lives thirty minutes
+   * (PORTAL_TOKEN_TTL_SECS on the manager) and the renewal above runs ten
+   * minutes early, so an operator asking mid-match would read an answer up
+   * to twenty minutes old — a full gallery long after the last person left.
+   * That is worse than no number, because it is exactly the number they
+   * came looking for.
    *
    * So the player says so itself. The beat carries no credential and asks for
    * nothing: it moves one timestamp on a row this device already holds. It is
@@ -4113,11 +4132,23 @@
   var BEAT_MS = 60000;
   var beatTimer = null;
 
+  /* Whether this player is somebody watching, as far as the count is
+   * concerned. One predicate for the timer, the first beat and the
+   * focus-triggered one, so every path that ends the picture ends the beat.
+   *
+   * Only a portal viewer has a login to be counted under — a guest on a
+   * one-off link is anonymous by design, and there is no row to touch. Past
+   * that, two terms for two different dead players: `accessExpired` is the
+   * tab whose picture ended in front of the viewer (`forgetToken` clears the
+   * stored copy, not `TOKEN` itself — the 401 branch still needs it to tell
+   * "expired" from "never had one"), and `TOKEN` is the reload with nothing
+   * to play, which sends its first beat before hls.js can 401 and latch. */
+  function mayBeat() {
+    return !!(PORTAL_URL && HOLDER && TOKEN && !accessExpired);
+  }
+
   function beatNow() {
-    // Only a portal viewer has a login to be counted under. A guest on a
-    // one-off link is anonymous by design, and there is no row to touch.
-    if (!PORTAL_URL || !HOLDER) return;
-    if (document.hidden) return;
+    if (!mayBeat() || document.hidden) return;
     var url = PORTAL_URL.replace(/\/+$/, "") + "/api/beat?stream=" +
               encodeURIComponent(STREAM) + "&held=" + encodeURIComponent(HOLDER);
     // POST, because it writes. No body and no custom header, so it stays a
@@ -4134,17 +4165,25 @@
         // The cadence is the manager's to set, not something baked into every
         // player that was ever deployed. It travels with each reply, so a
         // change reaches tabs already open — and a player is never left
-        // beating faster than the server wants it to.
+        // beating faster than the server wants it to. Capped as the renewal
+        // delay is: past 32 bits setInterval fires at once, which would turn
+        // a generous cadence into every idle tab hammering the portal.
         if (body && body.next_beat_secs > 0) {
-          var ms = Math.max(15000, body.next_beat_secs * 1000);
-          if (ms !== BEAT_MS) { BEAT_MS = ms; stopBeating(); startBeating(); }
+          var ms = Math.min(Math.max(15000, body.next_beat_secs * 1000), 0x7fffffff);
+          // Only a running beat is re-timed. This reply may be to the beat
+          // sent just before a takeover stopped it, and a new cadence is not
+          // a reason to start a displaced tab beating again.
+          if (ms !== BEAT_MS) {
+            BEAT_MS = ms;
+            if (beatTimer !== null) { stopBeating(); startBeating(); }
+          }
         }
       })
       .catch(function () { /* a lost beat costs a number, not a picture */ });
   }
 
   function startBeating() {
-    if (beatTimer !== null || !PORTAL_URL || !HOLDER) return;
+    if (beatTimer !== null || !mayBeat()) return;
     beatTimer = setInterval(beatNow, BEAT_MS);
     beatNow();   // so somebody opening the feed appears now, not in a minute
   }
@@ -4155,9 +4194,11 @@
 
   // Coming back to a backgrounded tab should show up immediately, not at the
   // next tick — the operator watching the count is often the person who just
-  // asked somebody to open it.
+  // asked somebody to open it. Only while the beat is running, though: a tab
+  // told `held: false` has stopped for good, and refocusing it must not send
+  // one more beat for every time the viewer glances back.
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) beatNow();
+    if (!document.hidden && beatTimer !== null) beatNow();
   });
 
   // ── start ──────────────────────────────────────────────────────────────

@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             .connect_timeout(std::time::Duration::from_secs(10))
             .read_timeout(std::time::Duration::from_secs(30))
             .build()?,
+        last_beat_answer: Default::default(),
     };
 
     // `into_make_service_with_connect_info` is load-bearing, not boilerplate:

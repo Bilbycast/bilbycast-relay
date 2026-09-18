@@ -2518,6 +2518,111 @@ mod tests {
         );
     }
 
+    /// A player whose picture has ended stops saying it is watching.
+    ///
+    /// The beat is what the manager's viewer count is built from, and it
+    /// shipped with no way to end except a takeover. A viewer whose access was
+    /// withdrawn mid-match saw "your viewing access has expired" on a black
+    /// picture while their foreground tab went on beating every minute — so
+    /// the person the operator had just revoked stayed at the top of the
+    /// operator's list for as long as the tab was open. Same after a reload
+    /// into a tab with a stored holder and no stored token: the first beat
+    /// went out before the first 401 could latch anything.
+    ///
+    /// Three things are pinned. The stop lives in `failWith`, the one notice
+    /// every terminal path goes through, rather than in each caller; the
+    /// beat itself asks one predicate, so the timer, the first beat and the
+    /// focus-triggered beat cannot disagree about who is watching; and
+    /// nothing restarts a stopped beat — not a refocus, not a cadence change
+    /// riding on the reply to the last beat sent before the stop.
+    #[test]
+    fn a_dead_player_stops_saying_it_is_watching() {
+        let html = include_str!("dvr.html");
+
+        // The choke point: latch and stop, together.
+        let fail = js_fn(html, "failWith");
+        assert!(
+            fail.contains("accessExpired = true"),
+            "failWith no longer latches: {fail}"
+        );
+        assert!(
+            fail.contains("stopBeating()"),
+            "a terminal notice leaves the beat running: {fail}"
+        );
+        // ...and every terminal path goes through it.
+        for f in ["failExpired", "failNoToken", "takenOver"] {
+            let body = js_fn(html, f);
+            assert!(
+                body.contains("failWith("),
+                "{f} ends the picture without failWith: {body}"
+            );
+        }
+
+        // One predicate, both terms, everywhere a beat can start from.
+        let may = js_fn(html, "mayBeat");
+        assert!(
+            may.contains("accessExpired") && may.contains("TOKEN") && may.contains("HOLDER"),
+            "the predicate does not cover a dead tab, a tokenless reload and a guest: {may}"
+        );
+        for f in ["beatNow", "startBeating"] {
+            assert!(
+                js_fn(html, f).contains("mayBeat()"),
+                "{f} does not ask mayBeat"
+            );
+        }
+        // A forgotten token takes its holder with it, or the reload case
+        // comes back with something to be counted under.
+        assert!(
+            js_fn(html, "forgetToken").contains(r#"rememberHolder("")"#),
+            "a forgotten token leaves its holder behind for the next reload to beat with"
+        );
+
+        // A fatal hls.js error on the main element is a fourth terminal
+        // state — nothing retries a 4xx or re-attaches — and it must end the
+        // beat too, without the proxy's fatal error doing the same.
+        let fatal = html
+            .split("if (data.fatal) {")
+            .nth(1)
+            .and_then(|after| after.split("} else if").next())
+            .expect("no fatal branch in the hls.js error handler");
+        assert!(
+            fatal.contains("if (video === main) stopBeating();"),
+            "a dead main picture keeps beating: {fatal}"
+        );
+
+        // A stopped beat stays stopped.
+        let beat = js_fn(html, "beatNow");
+        assert!(
+            beat.contains("body.held === false) { stopBeating(); return; }"),
+            "held:false does not stop the beat: {beat}"
+        );
+        assert!(
+            beat.contains("if (beatTimer !== null) { stopBeating(); startBeating(); }"),
+            "a cadence change restarts a beat that was stopped: {beat}"
+        );
+        let focus = html
+            .split(r#"addEventListener("visibilitychange""#)
+            .nth(1)
+            .and_then(|after| after.split("});").next())
+            .expect("no visibilitychange listener");
+        assert!(
+            focus.contains("beatTimer !== null"),
+            "a refocus beats after the beat was stopped: {focus}"
+        );
+        // Floored AND capped, as the renewal delay is: past 32 bits
+        // setInterval fires at once.
+        assert!(
+            beat.contains("Math.min(Math.max(15000, body.next_beat_secs * 1000), 0x7fffffff)"),
+            "the server-supplied cadence is not bounded on both sides: {beat}"
+        );
+        // Hidden tabs are not people watching — the point of the beat
+        // rather than an optimisation.
+        assert!(
+            beat.contains("document.hidden"),
+            "a pocketed phone counts as watching"
+        );
+    }
+
     /// Renewal must stop at the expiry rather than retry forever.
     ///
     /// Past it the existing expired-access path is the honest answer and it

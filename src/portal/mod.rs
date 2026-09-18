@@ -96,6 +96,42 @@ struct TokenResponse {
     expires_in_secs: u64,
 }
 
+/// The manager's answer to a heartbeat — the two fields the player reads.
+///
+/// A projection rather than a pass-through, as `Feed` is for the stream list:
+/// a field the manager adds to this reply later reaches a viewer's browser
+/// only once somebody here decides it should.
+struct BeatResponse {
+    /// Absent or unreadable reads as held. The manager says `false` only to
+    /// tell a displaced device to stop; a reply that says nothing is a lost
+    /// beat, and a lost beat must never stop a player that is still watching.
+    held: bool,
+    next_beat_secs: Option<u64>,
+}
+
+impl BeatResponse {
+    /// Field by field, not as one struct: a `next_beat_secs` the manager
+    /// someday emits in a shape this does not parse must not turn a `held:
+    /// false` it also said into the default `true`, which would keep a
+    /// displaced device beating until its renewal is refused.
+    fn from_reply(v: &serde_json::Value) -> Self {
+        Self {
+            held: v.get("held").and_then(serde_json::Value::as_bool).unwrap_or(true),
+            next_beat_secs: v.get("next_beat_secs").and_then(serde_json::Value::as_u64),
+        }
+    }
+}
+
+/// The healthy value of [`PortalState::last_beat_answer`], and its initial
+/// one — so the first beat that lands is not news.
+const BEAT_LANDED: u16 = 0;
+// Every constructor of `PortalState` starts the field at `Default::default()`,
+// which is only the healthy state while this is zero.
+const _: () = assert!(BEAT_LANDED == 0, "the initial beat answer must be the healthy one");
+/// A heartbeat that never reached the manager. Outside the HTTP status range,
+/// so it cannot collide with a refusal.
+const BEAT_UNREACHABLE: u16 = u16::MAX;
+
 #[derive(Clone)]
 pub struct PortalState {
     pub cfg: Arc<PortalConfig>,
@@ -112,6 +148,24 @@ pub struct PortalState {
     /// the same point on every retry, through the only download path the portal
     /// offers. This one catches a stall instead of a slow link.
     pub media: reqwest::Client,
+    /// How the manager last answered a heartbeat, as the log has reported it.
+    ///
+    /// A beat runs once a minute per viewer. A refusal logged per beat is a
+    /// flood for the length of an outage, and one logged at `debug` — where
+    /// it started — is invisible at the level anyone runs, so a manager that
+    /// refused every beat left no trail while its viewer count read empty.
+    /// The answer is logged when it *changes*: `BEAT_LANDED`, a refusal's
+    /// status code, or `BEAT_UNREACHABLE`.
+    pub last_beat_answer: Arc<std::sync::atomic::AtomicU16>,
+}
+
+impl PortalState {
+    /// Record the manager's answer to a heartbeat; true when it is news.
+    fn beat_answer_changed(&self, answer: u16) -> bool {
+        self.last_beat_answer
+            .swap(answer, std::sync::atomic::Ordering::Relaxed)
+            != answer
+    }
 }
 
 pub fn router(state: PortalState) -> Router {
@@ -622,7 +676,8 @@ pub struct WatchQuery {
     ///
     /// Its presence is what distinguishes "I am still watching" from "I am
     /// starting to watch": the first must still hold the login, the second
-    /// takes it. A player that omits it is treated as starting.
+    /// takes it. A player that omits it is treated as starting. A beat is
+    /// the one caller that cannot do without it — see `beat`.
     #[serde(default)]
     pub held: Option<String>,
 }
@@ -690,106 +745,22 @@ async fn watch_redirect(
 
 /// `GET /api/renew?stream=…` — a fresh token for a player already watching.
 ///
-/// A viewing token lasts three hours; an event plus its build-up does not fit
-/// in that, and the failure lands mid-match as "your viewing access has
-/// expired". So the player renews itself before it runs out.
+/// A token minted through the portal lasts thirty minutes
+/// (`PORTAL_TOKEN_TTL_SECS` on the manager); an event plus its build-up does
+/// not fit in that, and the failure lands mid-match as "your viewing access
+/// has expired". So the player renews itself before it runs out.
 ///
 /// **Renewal goes through the manager, exactly as the first mint did.** The
 /// manager re-checks the entitlement before it signs, which is what keeps the
 /// short expiry meaningful: it is revocation latency, not a countdown. A
-/// renewal that skipped that check would turn "access lasts three hours" into
-/// "access lasts as long as the tab is open", and withdrawing someone's access
-/// would stop working entirely.
+/// renewal that skipped that check would turn "access lasts thirty minutes"
+/// into "access lasts as long as the tab is open", and withdrawing someone's
+/// access would stop working entirely.
 ///
 /// Cross-origin and credentialed, because the player is served by the relay
 /// and this is the portal. Only origins named in `player_origins` are
 /// answered, and an unlisted one gets the data without the CORS headers that
 /// would let script read it — which is what the browser enforces anyway.
-/// `POST /api/beat` — "still watching", from a player that is.
-///
-/// The operator surface wants to know who is watching a feed *now*. A renewal
-/// cannot answer that: viewing tokens live three hours and the player renews
-/// ten minutes early, so renewals arrive under nine times a day and a count
-/// built on them would be up to three hours stale — reporting a full gallery
-/// long after the last person left.
-///
-/// So watching is its own signal. It carries no credential and grants nothing:
-/// it moves one timestamp on a row the caller must already hold, which is why
-/// it can run every minute where a mint could not. The reply says whether the
-/// beat landed, so a player that has been displaced can stop beating instead
-/// of retrying — it will learn the rest at its next renewal, which is the
-/// right place to end somebody's viewing.
-async fn beat(
-    State(st): State<PortalState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(q): Query<WatchQuery>,
-) -> Response {
-    let origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if !st.cfg.allows_player_origin(&origin) {
-        return (StatusCode::FORBIDDEN, "origin not permitted").into_response();
-    }
-    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
-        return with_cors(&origin, unauthenticated());
-    };
-    // A beat says nothing about a feed the viewer cannot name a holder for, so
-    // one without a holder is a malformed beat rather than a fresh watch. This
-    // is the opposite of `renew`'s forgiving reading, and deliberately: a
-    // renewal that guesses keeps somebody watching, while a beat that guessed
-    // would let any signed-in tab keep any row warm.
-    let Some(held) = q.held.as_deref() else {
-        return with_cors(&origin, (StatusCode::BAD_REQUEST, "no holder").into_response());
-    };
-    // Straight through. The stream id goes as-is and the manager resolves it
-    // inside the one statement that does the write.
-    //
-    // The first cut asked the manager to list this viewer's entitled streams
-    // first, purely to map stream to session — a three-table join and a second
-    // HTTP hop, per viewer, per minute, to move one timestamp. Neither was
-    // buying anything: the row being updated exists only because an entitled
-    // claim created it, so it already *is* the answer to "may they". Checking
-    // again would also make a beat fail for somebody mid-match whose access
-    // was edited, ending their session from a background timer. Renewal is
-    // where a viewer is told, and renewal still checks.
-    let url = format!("{}/api/v1/dvr/portal/heartbeat", st.cfg.manager_url);
-    let resp = st
-        .http
-        .post(&url)
-        .bearer_auth(&st.cfg.manager_token)
-        .json(&serde_json::json!({
-            "username": username,
-            "stream_id": q.stream,
-            "holder": held,
-        }))
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let body = r
-                .json::<serde_json::Value>()
-                .await
-                .unwrap_or_else(|_| serde_json::json!({ "held": true }));
-            with_cors(&origin, Json(body).into_response())
-        }
-        // A beat is not worth an error to the viewer. The picture is playing;
-        // the only casualty of a lost beat is a number on an operator's
-        // screen, and the next one is a minute away.
-        Ok(r) => {
-            tracing::debug!(status = %r.status(), "portal: manager refused a heartbeat");
-            with_cors(&origin, Json(serde_json::json!({ "held": true })).into_response())
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "portal: heartbeat did not reach the manager");
-            with_cors(&origin, Json(serde_json::json!({ "held": true })).into_response())
-        }
-    }
-}
-
 async fn renew(
     State(st): State<PortalState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -888,6 +859,160 @@ fn with_cors(origin: &str, mut resp: Response) -> Response {
         axum::http::HeaderValue::from_static("Origin"),
     );
     resp
+}
+
+/// `POST /api/beat?stream=…&held=…` — "still watching", from a player that is.
+///
+/// The operator surface wants to know who is watching a feed *now*. A renewal
+/// cannot answer that: a portal token lives thirty minutes and the player
+/// renews ten minutes early, so renewals arrive every twenty minutes and a
+/// count built on them would be up to twenty minutes stale — reporting a
+/// full gallery long after the last person left.
+///
+/// So watching is its own signal. It carries no credential and grants nothing:
+/// it moves one timestamp on a row the caller must already hold, which is why
+/// it can run every minute where a mint could not. The reply says whether the
+/// beat landed, so a player that has been displaced can stop beating instead
+/// of retrying — it will learn the rest at its next renewal, which is the
+/// right place to end somebody's viewing.
+///
+/// Cross-origin and credentialed like `renew`, and gated the same way: only
+/// origins named in `player_origins` are answered, and the check comes before
+/// anything is done.
+async fn beat(
+    State(st): State<PortalState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<WatchQuery>,
+) -> Response {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !st.cfg.allows_player_origin(&origin) {
+        return (StatusCode::FORBIDDEN, "origin not permitted").into_response();
+    }
+    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
+        return with_cors(&origin, unauthenticated());
+    };
+    // A beat says nothing about a feed the viewer cannot name a holder for, so
+    // one without a holder is a malformed beat rather than a fresh watch. This
+    // is the opposite of `renew`'s forgiving reading, and deliberately: a
+    // renewal that guesses keeps somebody watching, while a beat that guessed
+    // would let any signed-in tab keep any row warm.
+    let Some(held) = q.held.as_deref().filter(|h| !h.is_empty()) else {
+        return with_cors(
+            &origin,
+            (StatusCode::BAD_REQUEST, "no holder").into_response(),
+        );
+    };
+    // Bounded here, before the hop, to what the other side would accept
+    // anyway: the holder to the cap the manager holds a mint's to, the stream
+    // to the relay's own id rule (`identify` has already bounded the
+    // username). Neither is a security question — the manager binds both as
+    // parameters and the write is scoped to the caller's own row — but this
+    // runs per viewer per minute with no rate limit, and junk that can be
+    // refused for free here is otherwise paid for with a manager round trip
+    // and a Postgres comparison.
+    if held.len() > 64
+        || crate::distribution_control::sanitize_stream_id(&q.stream).as_deref()
+            != Some(q.stream.as_str())
+    {
+        return with_cors(
+            &origin,
+            (StatusCode::BAD_REQUEST, "not a feed or a holder").into_response(),
+        );
+    }
+    // Straight through. The stream id goes as-is and the manager resolves it
+    // inside the one statement that does the write.
+    //
+    // The first cut asked the manager to list this viewer's entitled streams
+    // first, purely to map stream to session — a three-table join and a second
+    // HTTP hop, per viewer, per minute, to move one timestamp. Neither was
+    // buying anything: the row being updated exists only because an entitled
+    // claim created it, so it already *is* the answer to "may they". Checking
+    // again would also make a beat fail for somebody mid-match whose access
+    // was edited, ending their session from a background timer. Renewal is
+    // where a viewer is told, and renewal still checks.
+    let url = format!("{}/api/v1/dvr/portal/heartbeat", st.cfg.manager_url);
+    let resp = st
+        .http
+        .post(&url)
+        .bearer_auth(&st.cfg.manager_token)
+        .json(&serde_json::json!({
+            "username": username,
+            "stream_id": q.stream,
+            "holder": held,
+        }))
+        .send()
+        .await;
+
+    // A beat is not worth an error to the viewer. The picture is playing; the
+    // only casualty of a lost beat is a number on an operator's screen, and
+    // the next one is a minute away. So every failure below answers `held`,
+    // and what it does instead is tell the log — once.
+    let lost = || {
+        with_cors(
+            &origin,
+            Json(serde_json::json!({ "held": true })).into_response(),
+        )
+    };
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            if st.beat_answer_changed(BEAT_LANDED) {
+                tracing::info!("portal: the manager is taking heartbeats again");
+            }
+            // Projected, not forwarded: the two fields the player reads and
+            // nothing the manager may add to its reply later.
+            let body = match r.json::<serde_json::Value>().await {
+                Ok(v) => BeatResponse::from_reply(&v),
+                Err(e) => {
+                    tracing::debug!(error = %e, "portal: unreadable heartbeat reply");
+                    BeatResponse::from_reply(&serde_json::Value::Null)
+                }
+            };
+            with_cors(
+                &origin,
+                Json(serde_json::json!({
+                    "held": body.held,
+                    "next_beat_secs": body.next_beat_secs,
+                }))
+                .into_response(),
+            )
+        }
+        Ok(r) => {
+            let status = r.status();
+            tracing::debug!(%status, "portal: manager refused a heartbeat");
+            // A 404 is a manager that predates heartbeats; a 401 is this
+            // portal's service token being stale — the same rotation that will
+            // break renewals when the next one comes due; a 5xx is a manager
+            // that is unwell. Any of those means the manager's viewer count
+            // reads empty from here on, with the players beating for nothing,
+            // and the first refusal is the one that says so. A 400-class
+            // answer to one beat is that beat's fault — a crafted query, not a
+            // real player — and says nothing about the manager, so it is not
+            // an episode: it must not raise the alarm over forty viewers
+            // whose beats are landing.
+            let systemic = status.is_server_error()
+                || matches!(status.as_u16(), 401 | 403 | 404);
+            if systemic && st.beat_answer_changed(status.as_u16()) {
+                tracing::warn!(%status,
+                    "portal: manager refused a heartbeat; its watching count will \
+                     read stale until it takes them again");
+            }
+            lost()
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "portal: heartbeat did not reach the manager");
+            if st.beat_answer_changed(BEAT_UNREACHABLE) {
+                tracing::warn!(error = %e,
+                    "portal: heartbeats are not reaching the manager; its watching \
+                     count will read stale until they do");
+            }
+            lost()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1202,7 +1327,7 @@ mod tests {
     /// The download link the browser is handed was fixed; the three server-side
     /// legs behind it — the clip listing, the download proxy and the delete —
     /// still put the viewer token in `?token=`, once per feed per five-second
-    /// poll while a cut is in flight. That writes a three-hour credential
+    /// poll while a cut is in flight. That writes a viewing credential
     /// covering both renditions into the request line of the relay's access log
     /// and of every proxy in front of it. The origin tries `Authorization:
     /// Bearer` first on all three routes, so the header costs nothing.

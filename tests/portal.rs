@@ -33,6 +33,9 @@ struct Seen {
     calls: Vec<(String, String, String)>,
     /// What the next mint should answer with.
     mint_status: u16,
+    /// What the next heartbeat should answer with, and whether it lands.
+    beat_status: u16,
+    beat_held: bool,
 }
 
 type Recorder = Arc<Mutex<Seen>>;
@@ -110,6 +113,42 @@ async fn stub_token(
     .into_response()
 }
 
+async fn stub_heartbeat(
+    State(rec): State<Recorder>,
+    headers: HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let (status, held) = {
+        let mut g = rec.lock().unwrap();
+        g.calls
+            .push(("/api/v1/dvr/portal/heartbeat".into(), auth, body.clone()));
+        (g.beat_status, g.beat_held)
+    };
+    if status != 200 {
+        return (
+            axum::http::StatusCode::from_u16(status).unwrap(),
+            Json(serde_json::json!({ "error": "refused" })),
+        )
+            .into_response();
+    }
+    // The manager's real reply is `{held, next_beat_secs}`. The extra fields
+    // are not something it sends today; they stand in for whatever it might
+    // add later, to pin that the portal projects rather than forwards.
+    Json(serde_json::json!({
+        "held": held,
+        "next_beat_secs": 60,
+        "session_id": "s1",
+        "displaced_ip": "203.0.113.9",
+    }))
+    .into_response()
+}
+
 /// Bring up a stub manager and a portal pointed at it. Returns the portal's
 /// base URL and the recorder.
 async fn harness() -> (String, Recorder) {
@@ -131,11 +170,14 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
     let rec: Recorder = Arc::new(Mutex::new(Seen {
         calls: Vec::new(),
         mint_status: 200,
+        beat_status: 200,
+        beat_held: true,
     }));
 
     let manager = Router::new()
         .route("/api/v1/dvr/portal/streams", get(stub_streams))
         .route("/api/v1/dvr/portal/token", post(stub_token))
+        .route("/api/v1/dvr/portal/heartbeat", post(stub_heartbeat))
         .with_state(rec.clone());
     let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let maddr = ml.local_addr().unwrap();
@@ -161,6 +203,7 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
             reqwest::Client::new()
         },
         media: reqwest::Client::new(),
+        last_beat_answer: Default::default(),
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
@@ -374,11 +417,8 @@ async fn the_page_and_its_script_are_both_served() {
     assert!(js.text().await.unwrap().contains("/api/feeds"));
 }
 
-/// A portal that cannot reach the manager must say so as a gateway problem —
-/// not as the viewer not being signed in, which would send them round a login
-/// loop that cannot fix it.
-#[tokio::test]
-async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
+/// A portal whose manager is not there. Returns the portal's base URL.
+async fn harness_unreachable(player_origins: &[&str]) -> String {
     let mut cfg = PortalConfig {
         listen_addr: "127.0.0.1:0".into(),
         // Port 1 on loopback: nothing listens, and the connection refusal is
@@ -387,7 +427,7 @@ async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
         manager_token: SERVICE_TOKEN.into(),
         username_header: "remote-user".into(),
         trusted_proxies: ["127.0.0.1".parse().unwrap()].into_iter().collect(),
-        player_origins: Vec::new(),
+        player_origins: player_origins.iter().map(|s| (*s).to_string()).collect(),
         logout_url: None,
     };
     cfg.normalise();
@@ -398,6 +438,7 @@ async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
             reqwest::Client::new()
         },
         media: reqwest::Client::new(),
+        last_beat_answer: Default::default(),
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
@@ -405,9 +446,18 @@ async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
     tokio::spawn(async move {
         let _ = axum::serve(pl, app).await;
     });
+    format!("http://{paddr}")
+}
+
+/// A portal that cannot reach the manager must say so as a gateway problem —
+/// not as the viewer not being signed in, which would send them round a login
+/// loop that cannot fix it.
+#[tokio::test]
+async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
+    let base = harness_unreachable(&[]).await;
 
     let r = client()
-        .get(format!("http://{paddr}/api/feeds"))
+        .get(format!("{base}/api/feeds"))
         .header("Remote-User", "a.smith")
         .send()
         .await
@@ -544,5 +594,237 @@ async fn renewal_is_refused_when_no_player_origin_is_configured() {
     assert!(
         rec.lock().unwrap().calls.is_empty(),
         "renewal reached the manager with no player origin configured"
+    );
+}
+
+/// The beat has the renewal's origin gate, and for the same reason.
+///
+/// It is a credentialed cross-origin POST — the shape a CSRF wants — so an
+/// unlisted origin is refused **before anything is done**, and a portal that
+/// has not been told which player to trust answers nobody. Asserting the
+/// recorder saw no manager call is what tells "refused" from "refused after
+/// writing the timestamp".
+#[tokio::test]
+async fn a_beat_answers_only_an_allow_listed_origin() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+    let r = client()
+        .post(format!("{base}/api/beat?stream=match-feed&held=dev-1"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "an unlisted origin was answered");
+    assert!(
+        rec.lock().unwrap().calls.is_empty(),
+        "an unlisted origin still caused the manager to be called"
+    );
+
+    let (base, rec) = harness().await;
+    let r = client()
+        .post(format!("{base}/api/beat?stream=match-feed&held=dev-1"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "a beat was answered with no player origin configured"
+    );
+    assert!(rec.lock().unwrap().calls.is_empty());
+}
+
+/// Nobody signed in is nobody to count. The refusal still carries the CORS
+/// headers — the origin is allow-listed by then — so the player sees a 401
+/// rather than an opaque browser error.
+#[tokio::test]
+async fn a_beat_without_a_session_is_refused_before_the_manager_is_asked() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+    let r = client()
+        .post(format!("{base}/api/beat?stream=match-feed&held=dev-1"))
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    assert_eq!(
+        r.headers().get("access-control-allow-origin").unwrap(),
+        "https://player.example"
+    );
+    assert!(rec.lock().unwrap().calls.is_empty());
+}
+
+/// A beat that names no holder is malformed, not a fresh watch.
+///
+/// This is the opposite of the renewal's forgiving reading, on purpose: a
+/// renewal that guesses keeps somebody watching, while a beat that guessed
+/// would let any signed-in tab keep any row warm. So it must not reach the
+/// manager at all — and an empty holder is no holder.
+#[tokio::test]
+async fn a_beat_without_a_holder_is_malformed() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+    for q in ["stream=match-feed", "stream=match-feed&held="] {
+        let r = client()
+            .post(format!("{base}/api/beat?{q}"))
+            .header("Remote-User", "a.smith")
+            .header("Origin", "https://player.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{q} was not refused as malformed");
+    }
+    assert!(
+        rec.lock().unwrap().calls.is_empty(),
+        "a beat with no holder reached the manager"
+    );
+}
+
+/// Junk is refused here, where it is free, not paid for with a manager round
+/// trip and a Postgres comparison once a minute. The holder is held to the
+/// cap the manager holds a mint's to, and the stream to the relay's own id
+/// rule — the same one the player checks before it builds a link.
+#[tokio::test]
+async fn an_oversized_beat_is_refused_before_the_manager_is_asked() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+    let long_holder = "h".repeat(65);
+    let long_stream = "s".repeat(129);
+    for q in [
+        format!("stream=match-feed&held={long_holder}"),
+        format!("stream={long_stream}&held=dev-1"),
+        "stream=match%2Ffeed&held=dev-1".to_string(),
+        "stream=...&held=dev-1".to_string(),
+    ] {
+        let r = client()
+            .post(format!("{base}/api/beat?{q}"))
+            .header("Remote-User", "a.smith")
+            .header("Origin", "https://player.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{q} was forwarded");
+    }
+    assert!(
+        rec.lock().unwrap().calls.is_empty(),
+        "an unbounded beat reached the manager"
+    );
+    // And the edge of the rule is inside it, or a real holder is refused.
+    let r = client()
+        .post(format!(
+            "{base}/api/beat?stream=match-feed&held={}",
+            "h".repeat(64)
+        ))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// A beat reaches the manager on the route it serves, under the service
+/// token, naming the viewer the PROXY vouched for — never one the browser put
+/// in the query — and the player may read the answer.
+#[tokio::test]
+async fn a_beat_reaches_the_manager_under_the_proxys_username() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+    let r = client()
+        .post(format!(
+            "{base}/api/beat?stream=match-feed&held=dev-1&username=admin"
+        ))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let h = r.headers().clone();
+    assert_eq!(
+        h.get("access-control-allow-origin").unwrap(),
+        "https://player.example"
+    );
+    assert_eq!(h.get("access-control-allow-credentials").unwrap(), "true");
+    assert_eq!(h.get("vary").unwrap(), "Origin");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["held"], true);
+    assert_eq!(
+        body["next_beat_secs"], 60,
+        "the manager's cadence did not reach the player"
+    );
+    // Projected, not forwarded: what the player reads and nothing else. The
+    // stub answers with two extra fields standing in for whatever the manager
+    // may add to this reply later.
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        2,
+        "the manager's reply reached the browser unprojected: {body}"
+    );
+
+    let calls = rec.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].0, "/api/v1/dvr/portal/heartbeat");
+    assert_eq!(calls[0].1, format!("Bearer {SERVICE_TOKEN}"));
+    let sent: serde_json::Value = serde_json::from_str(&calls[0].2).unwrap();
+    assert_eq!(sent["username"], "a.smith", "the browser chose who it was");
+    assert_eq!(sent["stream_id"], "match-feed");
+    assert_eq!(sent["holder"], "dev-1");
+}
+
+/// `held: false` is the one answer that must reach the player unchanged: it
+/// is what tells a displaced tab to stop beating rather than retry.
+#[tokio::test]
+async fn a_displaced_players_beat_is_answered_held_false() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+    rec.lock().unwrap().beat_held = false;
+    let r = client()
+        .post(format!("{base}/api/beat?stream=match-feed&held=dev-1"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["held"], false, "{body}");
+}
+
+/// A lost beat is not worth an error to the viewer. The picture is playing;
+/// the only casualty is a number on an operator's screen, and the next beat
+/// is a minute away — so a manager that refuses, or is not there, is answered
+/// as `held: true` and the player keeps going.
+#[tokio::test]
+async fn a_lost_beat_is_not_reported_to_the_viewer() {
+    let (base, rec) = harness_with_player_origin("https://player.example").await;
+    for status in [404u16, 401, 500] {
+        rec.lock().unwrap().beat_status = status;
+        let r = client()
+            .post(format!("{base}/api/beat?stream=match-feed&held=dev-1"))
+            .header("Remote-User", "a.smith")
+            .header("Origin", "https://player.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "a manager {status} reached the viewer");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body["held"], true,
+            "a manager {status} stopped the player: {body}"
+        );
+    }
+
+    let base = harness_unreachable(&["https://player.example"]).await;
+    let r = client()
+        .post(format!("{base}/api/beat?stream=match-feed&held=dev-1"))
+        .header("Remote-User", "a.smith")
+        .header("Origin", "https://player.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "an unreachable manager reached the viewer");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        body["held"], true,
+        "an unreachable manager stopped the player: {body}"
     );
 }

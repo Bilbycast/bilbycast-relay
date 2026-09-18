@@ -126,7 +126,8 @@ Start from `portal-config.example.json`, installed at `/etc/bilbycast/portal.jso
 
 `player_origins` is the one that bites if you drop it. It defaults to an empty
 list, which is accepted at startup and means *nobody may renew* — viewers lose
-access three hours in with nothing logged at either end. See
+access thirty minutes in with nothing logged at either end — and nobody is counted
+as watching, because the player's `POST /api/beat` is refused the same way. See
 [renewal](#renewing-without-signing-in-again) below.
 
 A `manager_url` on plain `http://` is refused at startup unless
@@ -234,10 +235,11 @@ points at the identity provider's own logout (`https://auth.example.com/logout`
 for Authelia). Leave it unset and no button is shown, which is better than one
 that appears to work and leaves the viewer signed in.
 
-## Access lasts three hours
+## Access lasts thirty minutes
 
-A token minted through the portal is good for three hours, after which the
-player stops with "your viewing access has expired". The viewer returns to the
+A token minted through the portal is good for thirty minutes
+(`PORTAL_TOKEN_TTL_SECS` on the manager; a link grant is a separate, three-hour
+token), after which the player stops with "your viewing access has expired". The viewer returns to the
 portal and opens the feed again; if their entitlement has been withdrawn in the
 meantime, it is not there to open.
 
@@ -264,7 +266,7 @@ runs out, by calling `GET /api/renew?stream=…` here.
 That renewal goes back through the manager exactly as the first mint did, and
 **the manager re-checks the entitlement before it signs**. This is what keeps a
 short expiry meaningful: it is revocation latency, not a countdown. A renewal
-that skipped the check would quietly turn "access lasts three hours" into
+that skipped the check would quietly turn "access lasts thirty minutes" into
 "access lasts as long as the tab is open", and withdrawing access would stop
 working.
 
@@ -278,7 +280,7 @@ easy to miss.
 
 **On the relay: `distribution.portal_url` must be set.** The player's
 `scheduleRenewal()` returns immediately when it is empty, so a blank
-`portal_url` turns the three hours into a hard limit however the portal is
+`portal_url` turns the thirty minutes into a hard limit however the portal is
 configured. Nothing reports it at either end — the viewer simply loses access
 mid-event. The manager's Distribution tab labels the field "Optional", which is
 true of the sign-in-again link and false of renewal.
@@ -319,6 +321,7 @@ the outer bound on how long a withdrawal takes to bite.
 | `GET /api/feeds` | What the signed-in user may watch. |
 | `POST /api/watch` | Mint a link for one feed. The body names the *session*; the username comes from the header and can never be supplied by the browser. |
 | `GET /watch?stream=…` | One tap back to a feed whose credential ran out — re-mints and redirects. This is where the player's expired-access link points, not the front page. |
-| `GET /api/renew?stream=…` | Background renewal before the three hours are up. Cross-origin, so it answers only origins named in `player_origins`; an empty list means no renewal at all. |
+| `GET /api/renew?stream=…` | Background renewal before the thirty minutes are up. Cross-origin, so it answers only origins named in `player_origins`; an empty list means no renewal at all. |
+| `POST /api/beat?stream=…&held=…` | "Still watching", once a minute from a visible portal-viewer tab, so the manager's DVR page can count who is watching *now* rather than who last renewed. Carries no token and grants nothing — it moves one timestamp on the row this device already holds. Cross-origin like `/api/renew`, so it too answers only `player_origins`, and the failure is just as silent: with the origin missing the count simply stays empty. A manager that refuses the beats (one without the route, or one whose service token has been rotated) is logged at `warn` once per episode, not per beat. |
 | `GET /api/clips` | Clips cut from the feeds this user may watch, with a download link for each. |
 | `GET /healthz` | Liveness. Deliberately needs no user — a health check that required one would be reporting on the proxy. |
