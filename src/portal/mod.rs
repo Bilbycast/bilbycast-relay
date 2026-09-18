@@ -130,6 +130,7 @@ pub fn router(state: PortalState) -> Router {
         .route("/api/clips/download", get(download_clip))
         .route("/api/watch", post(watch))
         .route("/api/renew", get(renew))
+        .route("/api/beat", post(beat))
         .with_state(state)
 }
 
@@ -704,6 +705,91 @@ async fn watch_redirect(
 /// and this is the portal. Only origins named in `player_origins` are
 /// answered, and an unlisted one gets the data without the CORS headers that
 /// would let script read it — which is what the browser enforces anyway.
+/// `POST /api/beat` — "still watching", from a player that is.
+///
+/// The operator surface wants to know who is watching a feed *now*. A renewal
+/// cannot answer that: viewing tokens live three hours and the player renews
+/// ten minutes early, so renewals arrive under nine times a day and a count
+/// built on them would be up to three hours stale — reporting a full gallery
+/// long after the last person left.
+///
+/// So watching is its own signal. It carries no credential and grants nothing:
+/// it moves one timestamp on a row the caller must already hold, which is why
+/// it can run every minute where a mint could not. The reply says whether the
+/// beat landed, so a player that has been displaced can stop beating instead
+/// of retrying — it will learn the rest at its next renewal, which is the
+/// right place to end somebody's viewing.
+async fn beat(
+    State(st): State<PortalState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<WatchQuery>,
+) -> Response {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !st.cfg.allows_player_origin(&origin) {
+        return (StatusCode::FORBIDDEN, "origin not permitted").into_response();
+    }
+    let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
+        return with_cors(&origin, unauthenticated());
+    };
+    // A beat says nothing about a feed the viewer cannot name a holder for, so
+    // one without a holder is a malformed beat rather than a fresh watch. This
+    // is the opposite of `renew`'s forgiving reading, and deliberately: a
+    // renewal that guesses keeps somebody watching, while a beat that guessed
+    // would let any signed-in tab keep any row warm.
+    let Some(held) = q.held.as_deref() else {
+        return with_cors(&origin, (StatusCode::BAD_REQUEST, "no holder").into_response());
+    };
+    // Straight through. The stream id goes as-is and the manager resolves it
+    // inside the one statement that does the write.
+    //
+    // The first cut asked the manager to list this viewer's entitled streams
+    // first, purely to map stream to session — a three-table join and a second
+    // HTTP hop, per viewer, per minute, to move one timestamp. Neither was
+    // buying anything: the row being updated exists only because an entitled
+    // claim created it, so it already *is* the answer to "may they". Checking
+    // again would also make a beat fail for somebody mid-match whose access
+    // was edited, ending their session from a background timer. Renewal is
+    // where a viewer is told, and renewal still checks.
+    let url = format!("{}/api/v1/dvr/portal/heartbeat", st.cfg.manager_url);
+    let resp = st
+        .http
+        .post(&url)
+        .bearer_auth(&st.cfg.manager_token)
+        .json(&serde_json::json!({
+            "username": username,
+            "stream_id": q.stream,
+            "holder": held,
+        }))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body = r
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({ "held": true }));
+            with_cors(&origin, Json(body).into_response())
+        }
+        // A beat is not worth an error to the viewer. The picture is playing;
+        // the only casualty of a lost beat is a number on an operator's
+        // screen, and the next one is a minute away.
+        Ok(r) => {
+            tracing::debug!(status = %r.status(), "portal: manager refused a heartbeat");
+            with_cors(&origin, Json(serde_json::json!({ "held": true })).into_response())
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "portal: heartbeat did not reach the manager");
+            with_cors(&origin, Json(serde_json::json!({ "held": true })).into_response())
+        }
+    }
+}
+
 async fn renew(
     State(st): State<PortalState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
