@@ -81,8 +81,11 @@ an empty `/etc/bilbycast/portal.env`, and installs the unit.
 
 It does **not start the portal.** It cannot: the portal needs a service token
 that only exists once you generate it in the manager, and one started without a
-token refuses every viewer with a message that reads like their account being
-wrong. Generate the token (below), put it in `portal.env`, then:
+token does not start at all — it exits before binding its listener with
+``portal config: no manager token: set BILBYCAST_PORTAL_TOKEN or `manager_token` in the config file``,
+and under the unit's `Restart=always` that is a crash loop (ten attempts, three
+seconds apart) until systemd's start limit trips. Generate the token (below), put
+it in `portal.env`, then:
 
 ```bash
 sudo systemctl enable --now bilbycast-portal
@@ -150,7 +153,9 @@ Generate that value in the manager: **DVR Sessions → Portal logins → Generat
 token** (super admin only — the token is not group-scoped, so its holder can
 ask about any username in any group). It is shown once. Rotating it stops the
 portal working until the new value is deployed, and the symptom on the viewer's
-side is an empty feed list rather than an error, so do it deliberately.
+side is a red "Cannot reach the manager right now" banner where the feed list
+should be — the manager answers 401 and the portal reports that as the manager
+being unreachable, not as a credential problem — so do it deliberately.
 
 If no token is configured in the manager, the manager refuses every portal
 request. That is the intended failure: a manager that has never been set up for
@@ -207,20 +212,30 @@ edge and lands here, under the feed list, once it is ready. Each row offers a
 **Download** and a **Delete**.
 
 **Entitlement is the same one that governs watching.** `GET /api/clips` asks the
-manager which sessions the signed-in user may watch and lists the clips of
+manager which sessions the signed-in user is entitled to and lists the clips of
 those, so a clip is visible to everyone entitled to the feed it came from — not
-only whoever pressed export. That is deliberate: clips are a working artefact of
-an event, and a gallery only its author can see is the wrong shape for a crew.
+only whoever pressed export. The only widening is in *when*, never *who*: a feed
+that has stopped is gone from the feed list above on the next page load, but its
+clips stay here — listed, downloadable and deletable — for the 24 h of clip
+retention that starts when the session stops. That is deliberate: clips are a
+working artefact of an event, and a gallery only its author can see is the wrong
+shape for a crew.
 
-**Failure is shown, not hidden.** A clip the edge cannot produce reads *"Could
-not be cut — "* and the reason, rather than sitting as "Being cut…" for ever.
-The common one is a mark that spans a recorder restart, where the media either
-side is two separate timelines; the message says to move the mark.
+**Failure is shown, not hidden.** A clip the edge cannot produce reads
+**Failed**, with the edge's reason on its own line underneath, rather than
+sitting as "Cutting…" for ever. The common one is a mark that spans a recorder
+restart, where the media either side is two separate timelines; the message
+says to move the mark.
 
 **Delete is offered on failed clips too.** Clips are exempt from the relay's
 retention sweep — they are removed with the session, not with the window they
-came from — so nothing else reclaims their space, and a failed export still
-holds a record until somebody clears it.
+came from — so neither retention nor the free-space floor reclaims their space.
+The relay does reclaim on its own account, as a backstop for a manager that
+never comes back: anything under `clips/` — media or record, finished or
+failed — is removed seven days after it was last written, whatever the session
+is doing, well past the day the manager allows after a stop; an abandoned
+`.part`, or media with no record beside it, goes after an hour. Short of that, a
+failed export still holds a record until somebody clears it.
 
 **The list is best-effort.** A relay too old to know about clips, or one that
 cannot be reached, leaves the section hidden rather than putting an error in
@@ -259,7 +274,7 @@ survives every reload.
 
 ### Renewing without signing in again
 
-Three hours does not cover a match plus its build-up, and the failure arrives
+Thirty minutes does not cover a match plus its build-up, and the failure arrives
 mid-second-half. So the player renews itself about ten minutes before its token
 runs out, by calling `GET /api/renew?stream=…` here.
 
@@ -272,8 +287,8 @@ working.
 
 `install-relay.sh` takes `--player-origin https://relay.example.com` alongside
 `--with-portal` and writes it for you. Without it the installer warns, because
-the failure is otherwise silent: the portal installs, viewers sign in, and three
-hours later their access ends mid-event with nothing to say why.
+the failure is otherwise silent: the portal installs, viewers sign in, and thirty
+minutes later their access ends mid-event with nothing to say why.
 
 Renewal needs **two** settings, on two different services, and the second is
 easy to miss.
@@ -309,8 +324,9 @@ hours are the point of the link.
 
 Removing a portal login stops them getting *new* tokens immediately. A token
 already in a browser keeps working until it expires — the relay verifies a
-signature and an expiry, and holds no per-viewer state to revoke. Three hours is
-the outer bound on how long a withdrawal takes to bite.
+signature and an expiry, and holds no per-viewer state to revoke. Thirty minutes
+is the outer bound on how long a withdrawal takes to bite for a portal viewer —
+three hours for a link grant, which cannot renew.
 
 ## Endpoints
 
@@ -323,5 +339,7 @@ the outer bound on how long a withdrawal takes to bite.
 | `GET /watch?stream=…` | One tap back to a feed whose credential ran out — re-mints and redirects. This is where the player's expired-access link points, not the front page. |
 | `GET /api/renew?stream=…` | Background renewal before the thirty minutes are up. Cross-origin, so it answers only origins named in `player_origins`; an empty list means no renewal at all. |
 | `POST /api/beat?stream=…&held=…` | "Still watching", once a minute from a visible portal-viewer tab, so the manager's DVR page can count who is watching *now* rather than who last renewed. Carries no token and grants nothing — it moves one timestamp on the row this device already holds. Cross-origin like `/api/renew`, so it too answers only `player_origins`, and the failure is just as silent: with the origin missing the count simply stays empty. A manager that refuses the beats (one without the route, or one whose service token has been rotated) is logged at `warn` once per episode, not per beat. |
-| `GET /api/clips` | Clips cut from the feeds this user may watch, with a download link for each. |
+| `GET /api/clips` | Clips cut from the feeds this user is entitled to — including a feed that has finished, for the day its clips are kept — with a download link for each one that is ready. |
+| `GET /api/clips/download?session=…&name=…` | Hand a finished clip to the viewer, proxied from the relay so no viewer token appears in a link somebody is told to save. Entitlement is re-checked by the same mint the listing uses. |
+| `DELETE /api/clips` | Remove one clip on the viewer's behalf. The body names the session and the clip; the portal mints against the manager as the permission check and deletes on the relay from here, because the page's `connect-src 'self'` never lets the browser reach the origin itself. |
 | `GET /healthz` | Liveness. Deliberately needs no user — a health check that required one would be reporting on the proxy. |

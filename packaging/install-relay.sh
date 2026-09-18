@@ -102,7 +102,7 @@ Options:
   --player-origin <origin>     Where the DVR player is served from, e.g.
                                https://relay.example.com. Without it a viewer's
                                token cannot be renewed and access ends after
-                               three hours, mid-event.
+                               thirty minutes, mid-event.
   --variant <name>             Which release artefact to install:
                                distribution or default, defaulting to
                                distribution. The lean default build is the
@@ -152,7 +152,7 @@ if [[ "${WITH_PORTAL}" -eq 1 ]]; then
 
     # Renewal is a cross-origin request carrying the viewer's session cookie, so
     # the portal answers only origins named here. Empty means nobody: safe, and
-    # silent — the portal works, viewers sign in, and three hours later their
+    # silent — the portal works, viewers sign in, and thirty minutes later their
     # access ends mid-event with nothing to say why. Hence the note below.
     PORTAL_ORIGINS_JSON=""
     if [[ -n "${PORTAL_PLAYER_ORIGIN}" ]]; then
@@ -178,7 +178,7 @@ fi
 # turned two passing checks red.
 if [[ "${WITH_PORTAL}" -eq 1 && -z "${PORTAL_PLAYER_ORIGIN}" ]]; then
     echo "note: no --player-origin given, so viewing tokens will not renew." >&2
-    echo "      Viewers lose access three hours after signing in." >&2
+    echo "      Viewers lose access thirty minutes after signing in." >&2
     echo "      Add the player's origin to player_origins in portal.json." >&2
 fi
 

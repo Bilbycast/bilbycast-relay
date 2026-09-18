@@ -109,7 +109,7 @@ If `manager` is configured in `RelayConfig`, the relay maintains a persistent ou
 1. Connects to manager WebSocket URL, sends auth (registration_token or node_id + node_secret, plus `software_version` and `protocol_version` for compatibility detection)
 2. On first connect: receives `register_ack` with credentials, persists to config file
 3. Sends stats every 1 second: tunnels array, connected edges, total bandwidth/throughput (bps), peak watermarks, active TCP streams, uptime
-4. Sends health every 15 seconds: status, version, tunnel/edge counts, total bytes forwarded, peaks, connections total, `api_addr`, `quic_addr` (bind), `public_quic_addr` (advertised dial address; manager UI prefers this when set, falls back to `quic_addr` only when it isn't listen-only), `public_udp_addr` (advertised dial address for the native plane), native-UDP session counts (`udp_sessions_total` / `udp_sessions_active`), and a `capabilities` array carrying up to three bits: `"udp-relay"` when `udp_relay_enabled` (the manager's tunnel model names it as the precondition for a `transport: "udp"` tunnel, but no manager code reads the bit today — that surface gates on the relay's `public_udp_addr` instead), plus `"viewer-distribution"` and `"origin-policy"` together whenever `RelayStats::distribution_snapshot()` returns a sample — i.e. once the distribution subsystem has published telemetry, not merely once the feature is compiled in. `"origin-policy"` says this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` is **not** covered by the bit: it landed later, in v0.13.0, and nothing gates it. A relay predating the three keys still advertises `"viewer-distribution"` and still ACKs the push while ignoring them, so the manager refuses rather than record a gate or a retention window as applied when nothing was (`api/distribution.rs`, `dvr_reconciler.rs`)
+4. Sends health every 15 seconds: status, version, tunnel/edge counts, total bytes forwarded, peaks, connections total, `api_addr`, `quic_addr` (bind), `public_quic_addr` (advertised dial address; manager UI prefers this when set, falls back to `quic_addr` only when it isn't listen-only), `public_udp_addr` (advertised dial address for the native plane), native-UDP session counts (`udp_sessions_total` / `udp_sessions_active`), and a `capabilities` array carrying up to three bits: `"udp-relay"` when `udp_relay_enabled` (the manager's tunnel model names it as the precondition for a `transport: "udp"` tunnel, but no manager code reads the bit today — that surface gates on the relay's `public_udp_addr` instead), plus `"viewer-distribution"` and `"origin-policy"` together whenever `RelayStats::distribution_snapshot()` returns a sample — i.e. once the distribution subsystem has published telemetry, not merely once the feature is compiled in. `"origin-policy"` says this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` and `retire_origin_streams` (media and manifests go, a non-empty `clips/` stays) are **not** covered by the bit: both landed after it (the bit is v0.11.0; `drop_origin_streams` v0.13.0; `retire_origin_streams` is in the 0.14.0 tree with no tag yet) and nothing gates either — the manager sends `retire_origin_streams` from a session stop and `drop_origin_streams` from a session delete and from the clip-expiry sweep without consulting `capabilities` (`api/dvr_sessions.rs`, `dvr_reconciler.rs`), and an older relay acks the push while ignoring the key it does not know (`apply_configure_distribution` reads only the keys it recognises), so the stream keeps its disk until the origin's own retention sweep reclaims it: a v0.11–v0.12 relay ignores both, a v0.13.0 relay takes the delete's drop but not the stop's retire. A relay predating the three keys still advertises `"viewer-distribution"` and still ACKs the push while ignoring them, so the manager refuses rather than record a gate or a retention window as applied when nothing was (`api/distribution.rs`, `dvr_reconciler.rs`)
 5. Handles eleven commands: `get_config`, `rotate_secret`, `configure_distribution`, `disconnect_edge`, `close_tunnel`, `list_tunnels`, `list_edges`, `list_udp_sessions`, `close_udp_session`, `authorize_tunnel`, `revoke_tunnel`. `list_udp_sessions` / `close_udp_session` are the native-UDP-plane twins of `list_tunnels` / `close_tunnel` — they enumerate and tear down `UdpSessionRouter` rendezvous slots, which the QUIC-tunnel commands never touch. `configure_distribution` carries the whole manager-owned distribution control surface; see [`docs/distribution.md`](docs/distribution.md) for its keys
 6. Reconnects with a **fixed 5 s backoff** (not exponential) on disconnection, rotating to the next configured URL on each failure. The backoff constant is `Duration::from_secs(5)` (`let fixed_backoff = Duration::from_secs(5);` in `manager/client.rs`); `cursor` advances by one (`cursor.wrapping_add(1)`) after every connection close/error so successive attempts cycle through `urls[]`. The backoff is *not* reset on success — there is simply no delay while connected; the 5 s sleep only runs between attempts.
 
@@ -143,16 +143,25 @@ This separation prevents head-of-line blocking between control, TCP, and UDP pla
 | `tokio::join!` | Bidirectional TCP copy (both directions concurrent) |
 | `tokio::spawn` | Per-connection and per-stream task isolation |
 
-No `RwLock` anywhere, and no lock on the opaque forwarding path. Three `Mutex`
+No `RwLock` anywhere, and no lock on the opaque forwarding path. Four `Mutex`
 fields exist in the runtime code, and two of them are in always-compiled modules
 — so this is not a distribution-only exception: `RelayStats::prev_sample`
 (`std::sync`, `stats.rs`) is taken only inside `compute_bandwidth_bps`, on the
 1 s stats tick and on a REST `/api/v1/stats` read; `DistributionControl::drop_rx`
 (`std::sync`, `distribution_control.rs`) is a one-shot handoff of the drop-queue
-receiver to the origin task; and `StreamOrigin::order`, the **per-stream**
+receiver to the origin task; `StreamOrigin::order`, the **per-stream**
 eviction queue (`tokio::sync`, `distribution/origin.rs`, `viewer-distribution`
 builds only), is held for queue surgery on the CMAF segment PUT/evict path and
-dropped before the file I/O it schedules.
+dropped before the file I/O it schedules; and `OriginStore::clip_admission`
+(`std::sync`, `distribution/origin.rs`, `viewer-distribution` builds only)
+serialises `admit_clips` — count, byte budget and record filed as one
+operation, held across the synchronous `read_dir` / `read` / `stat` of every
+record and the temp-then-rename write of each new one. That is safe in an async
+server because its only caller, `POST /origin/{stream}/clips`, runs it on
+`tokio::task::spawn_blocking`, so the lock never parks a runtime worker; and it
+is one lock for the whole store rather than one per stream because admission
+happens when an operator presses Export, never on the segment path, so there is
+nothing to contend for.
 
 ### Security Architecture
 
@@ -231,7 +240,7 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   panics str0m ("Pt locked multiple times: 111") once a session negotiates both
   H.264 and Opus (a WHEP client offering audio, or a server answering a
   default-codec offer). The fix drops the RTX slot on that one profile.
-- **Origin** (`PUT/GET /origin/{stream}/{file}`): **disk-backed** store with time-based retention, a per-stream byte bound and a segment floor, swept every 30 s independently of ingest. Manifests and init segments stay in memory (rewritten every segment, never evicted). Retention is manager-owned at runtime, node-wide plus per-stream overrides
+- **Origin** (`PUT/GET /origin/{stream}/{file}`, plus the **clip** surface at `/origin/{stream}/clips` (POST request / GET list), `…/clips/{file}` (PUT / GET / DELETE) and `…/clips/{file}/failed` (POST)): **disk-backed** store with time-based retention, a per-stream byte bound, a segment floor and an idle grace on top of retention (`origin_idle_grace_secs`, default 60 s, per-stream overridable like the rest of the policy) past which a silent stream is retired — its media deleted and its in-memory state dropped, a non-empty `clips/` kept — swept every 30 s independently of ingest; the same sweep enforces a free-space floor on the origin volume (`origin_min_free_bytes`, default 5 GiB, `0` disables; evicts oldest-first round-robin across every stream down to four segments each, because the relay owns the disk and no health payload reports free space to the manager) and reclaims clip debris (`.part` uploads and record-less `.mp4`s after 1 h, anything in `clips/` after 7 d — a backstop under the manager's 24 h post-session clock, never a policy). Clips are cut on the edge and PUT here (256 MiB each, 100 and 4 GiB per stream, 60 s pre+post). Every clip verb ignores both `require_origin_token` and `require_ingest_token` and fails closed without a `token_secret`: request / list / GET / DELETE accept an ingest **or** viewer token (`require_clip_credential`), while PUT and `…/failed` accept the ingest token only (`require_clip_ingest`). Manifests and init segments stay in memory (rewritten every segment, never evicted). Retention is manager-owned at runtime, node-wide plus per-stream overrides
   of the edge's CMAF PUTs; front with a CDN for scale.
 - **Players**: two, and they are not variants of each other. `GET /watch/{stream}`
   (`player.html`) is the WHEP one — sub-second, live-only, no buffer, no
@@ -248,16 +257,26 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
 - **Tokens** (`src/distribution/token.rs`): short-lived HMAC-SHA256
   `"{exp}.{hmac}"` over `"{scope}:{stream}:{exp}"` with a shared 64-hex
   `token_secret` — same stateless-validation model as `authorize_tunnel`, plus
-  expiry. `require_ingest_token` (default true) gates writes; `require_viewer_token`
-  gates WHEP.
+  expiry. `require_ingest_token` (default true) gates segment PUTs and both
+  ingest paths (WHIP + QUIC); `require_viewer_token` (default false) gates WHEP;
+  `require_origin_token` (default false, so a CDN can pull) gates
+  `GET /origin/{stream}/{file}`, accepting either token. The clip surface under
+  `/origin/{stream}/clips` is on none of the three and is never open: list /
+  request / download / delete take a viewer *or* an ingest token
+  (`require_clip_credential`), the upload and the failure report take an ingest
+  token only (`require_clip_ingest`), and every clip verb fails closed without
+  a `token_secret`.
 - **DoS**: per-source-IP concurrent-viewer cap (`max_viewers_per_ip`) with a
   lifecycle reaper.
 - **Config**: a `distribution` block on `RelayConfig` (parses on any build; a
   plain build logs it as ignored). Example:
   `../testbed/configs/relay-distribution.json`.
 - **Telemetry**: the subsystem publishes `{streams, viewers, bytes_out,
-  origin_bytes, offpath_sessions}` onto `RelayStats`; the manager health payload
-  advertises the `viewer-distribution` capability + a `distribution` object +
+  origin_bytes, offpath_sessions, origin_streams}` onto `RelayStats` — the last
+  a per-stream breakdown of `origin_bytes` (segments, bytes, idle seconds,
+  whether a retention override is in force) that rides health rather than the
+  1 s stats tick; the manager health payload advertises the
+  `viewer-distribution` capability + a `distribution` object +
   `distribution_base_url`. `offpath_sessions` counts viewer sessions that had a
   datagram refused by the WebRTC ingress source pin — one per session, never per
   datagram, so a reflection flood cannot inflate it. Non-zero means a
@@ -293,15 +312,33 @@ entitlements** (read from the manager per page load, so a withdrawal takes
 effect on the viewer's next click rather than on the next successful push).
 
 `GET /api/renew?stream=…` mints a viewing token for a player already watching,
-because three hours does not cover a match plus its build-up and the failure
+because thirty minutes does not cover a match plus its build-up and the failure
 lands mid-second-half. It goes back through the manager exactly as the first
 mint did — that re-check is what keeps a short expiry meaningful as revocation
-latency rather than a countdown. It is a cross-origin request carrying the
-viewer's session cookie, i.e. the shape a CSRF wants, so it is gated on
-`player_origins`: exact matches only, no wildcard (a credentialed response may
-not answer `*`), and **empty means nobody** — an unconfigured portal simply does
-not offer renewal. The origin is checked *before* anything is done, so an
-unlisted one cannot even cause a mint.
+latency rather than a countdown. `POST /api/beat?stream=…&held=…` is the same
+player saying it is still watching: once a minute by default, at whatever
+cadence the manager's reply (`next_beat_secs`, floored at 15 s) sets, and not
+at all while the tab is hidden. It carries no viewing token and mints none —
+the portal forwards it to the manager's `POST /api/v1/dvr/portal/heartbeat`,
+which stamps the viewer-session row this holder already holds
+(`dvr_viewer_sessions.last_beat_at`, manager migration 0070), and answers
+`held`. Any failure to reach the manager, or any refusal from it, is answered
+`held: true`, so a lost beat costs an operator a number and never a viewer a
+picture; a manager that refuses beats outright (5xx, 401/403/404, unreachable)
+is logged at `warn` once per episode rather than once per viewer per minute,
+and any other 4xx is that beat's fault, not an episode. Both are
+cross-origin requests carrying the viewer's session cookie, i.e. the shape a
+CSRF wants, so both are gated on `player_origins`: exact matches only, no
+wildcard (a credentialed response may not answer `*`), and **empty means
+nobody** — an unconfigured portal offers neither renewal nor heartbeats. The
+origin is checked *before* anything is done, so an unlisted one cannot even
+cause a mint or move a timestamp. Exported clips are reached through the portal
+too — `GET` / `DELETE /api/clips` and `GET /api/clips/download` — and each call
+mints a non-claiming token against the manager for the session it touches
+(once per entitled feed for the listing, eight at a time), so entitlement is
+re-checked every time, the mint cannot displace the viewer's own player, and
+the viewer token never reaches the browser: the download is proxied, not
+redirected.
 
 The trust boundary is the one thing to get right. Identity arrives in a header
 (`Remote-User`) that the authenticating proxy sets, which is a *claim*, not a
@@ -339,8 +376,11 @@ gated on `required-features = ["portal"]`, with `tests/portal.rs` gated the same
 way. The only other thing that compiles either subsystem is the release job's
 `cargo build --release --features viewer-distribution-vendored,portal`, which
 builds no test targets and runs no lint — so `tests/portal.rs` is built by
-nothing else at all, and that is how `tampered_signature_rejected` sat failing
-roughly one run in sixteen without anyone seeing it. `portal` gets its own
+nothing else at all, and the same goes for the unit tests inside
+`src/distribution/`: that is how `tampered_signature_rejected` (in
+`src/distribution/token.rs`, compiled only under `viewer-distribution`) sat
+failing roughly one run in sixteen without anyone seeing it, until the
+`viewer-distribution` step's first run compiled it. `portal` gets its own
 configuration rather than being folded in with `viewer-distribution` because it
 is deliberately independent of it (it links neither str0m nor OpenSSL), and
 running the two together would stop proving that. The job then `bash -n`s the three packaging scripts

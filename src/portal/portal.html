@@ -5,8 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>bilbycast — your feeds</title>
 <style>
-  /* Same palette as the player this page hands you off to (dvr.html), so
-     opening a feed does not look like leaving the product. */
+  /* The palette the player this page hands you off to (dvr.html) shipped with,
+     so opening a feed did not look like leaving the product. The player has
+     since been rebuilt around the picture (5e25c0f) and pushed its contrast up
+     — darker --bg / --panel, lighter --line / --fg / --dim — so of the tokens
+     the two pages share only --accent still matches; this page kept the
+     originals. (The player also paints its body #000, not var(--bg), so a
+     resync of these five would still not make the two pages look the same.) */
   :root {
     --bg: #0b0d10; --panel: #14181d; --line: #232a32;
     --fg: #e8edf2; --dim: #93a1b0; --accent: #37d3a6; --bad: #ff6b6d;
@@ -129,8 +134,10 @@
 </header>
 <main>
   <p class="note" id="note" hidden>
-    Opening a feed gives you three hours of access to it. After that, come back
-    here and open it again.
+    Opening a feed gives you thirty minutes of access at a time. Where renewal
+    has been set up, the player renews that for you while you keep watching; if
+    it tells you your access has expired instead, come back here and open it
+    again.
   </p>
   <div id="body"><div class="msg">Loading…</div></div>
 
@@ -138,8 +145,8 @@
        a clip should not be shown an empty shelf every time they sign in. -->
   <section id="clips" hidden>
     <h2>Exports</h2>
-    <p class="note">Exported from the Marks panel while watching. Kept for as
-       long as the feed they came from, then removed with it.</p>
+    <p class="note">Exported from the Marks panel while watching. Kept for a
+       day after the feed they came from stops, then removed.</p>
     <!-- A table, because these are rows of the same four facts and the eye
          should be able to run down any one of them. It scrolls inside its own
          box rather than pushing the page sideways on a phone. -->

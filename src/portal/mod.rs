@@ -373,7 +373,8 @@ async fn mint_inner(
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": "This login is being used on another device.                           Only one at a time — sign in again here to take it back."
+                "error": "This login is being used on another device. \
+                         Only one at a time — sign in again here to take it back."
             })),
         )
             .into_response());

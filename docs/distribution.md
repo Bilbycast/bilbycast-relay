@@ -276,9 +276,16 @@ bind tokens, plus an expiry). The manager mints them with a shared 64-hex
 `token_secret`; the relay validates statelessly (no DB):
 
 ```
-token  = "{exp}.{hex_hmac}"
-hmac   = HMAC-SHA256(secret_bytes, "{scope}:{stream}:{exp}")
-scope  ∈ { "viewer", "ingest" }
+token  = "{exp}.{hex_hmac}"                        — one stream
+token  = "{exp}.{stream1,stream2,…}.{hex_hmac}"   — several streams (portal logins mint one over
+                                                     {stream} + {stream}-proxy); the sorted,
+                                                     de-duplicated, comma-joined list rides in the
+                                                     token and is what the HMAC covers. A one-name
+                                                     list mints the two-part form byte for byte.
+                                                     Names may contain ".", so the list is everything
+                                                     between the first dot and the last.
+hmac   = HMAC-SHA256(secret_bytes, "{scope}:{stream-or-list}:{exp}")
+scope  ∈ { "viewer", "ingest" }   (only viewer tokens take the list form)
 ```
 
 - `require_ingest_token` (default **true**) gates the write surfaces (WHIP + origin PUT).
@@ -986,12 +993,15 @@ while the two catch up. Two things do still need care:
 * **Leave the `.bilbycast-origin` marker alone.** It is how the store tells a
   root it owns — and may therefore adopt from, and evict within — from one an
   operator pointed it at by mistake. A directory that exists, is not empty and
-  carries no marker is refused rather than adopted. That refusal is **not**
-  fatal to the relay: the forwarder comes up as normal and only the
-  distribution subsystem fails to start, saying so once at
+  carries no marker is refused rather than adopted (unless it has the shape of
+  a store written before the marker existed — see `origin_storage_dir` under
+  "Configuration" below). That refusal **is** fatal to the relay, not just to
+  the distribution half: `run_distribution` returns the error, `main` exits on
+  the first subsystem to stop, and under the packaged unit's `Restart=always`
+  the process comes back every 3 s and refuses again, logging
   `viewer-distribution subsystem stopped: origin storage dir … is not empty and
-  was not created by the relay`. So the symptom is a relay that looks healthy
-  serving no DVR at all, and the log line is the only place it is explained.
+  was not created by the relay` each time. So the symptom is a relay that will
+  not stay up, and the log line is the only place it is explained.
 
 **Sizing a whole-event window.** The window costs relay disk, not device
 memory — a viewer holds only `backBufferLength`, whatever the window. Measured
@@ -1133,7 +1143,9 @@ relay applies them to a live runtime cell **and persists them to `config.json`**
 so they survive a restart; the manager also re-pushes on reconnect.
 
 The config block below is therefore only a **bootstrap** (or for standalone,
-manager-less use). Ports/listeners are the only settings not runtime-changeable.
+manager-less use). Ports/listeners, `enabled`, `max_viewers_per_ip`,
+`origin_storage_dir` and `origin_min_free_bytes` are the settings not
+runtime-changeable; everything else in the block can be pushed.
 See `../../testbed/configs/relay-distribution.json`:
 
 ```json
@@ -1177,8 +1189,10 @@ See `../../testbed/configs/relay-distribution.json`:
   produces 404s on seek for anyone parked mid-window. 60 s is a live-only
   default; a scrub-back surface wants minutes to hours.
 - `origin_idle_grace_secs` is how long past `origin_retention_secs` a stream may
-  sit without a PUT before it is reclaimed outright — segments, manifest, init
-  and directory. Default 60. It is the fourth node-wide storage knob, and unlike
+  sit without a PUT before its media is reclaimed — segments, manifest and init
+  go, and the directory with them unless it still holds exported clips
+  (anything in `clips/`), which are kept (the stream is *retired*, not removed;
+  see "Clip export"). Default 60. It is the fourth node-wide storage knob, and unlike
   `origin_min_free_bytes` the manager **can** override it live (`origin_policy`'s
   `idle_grace_secs`), which the relay then persists back here.
 - `origin_max_bytes_per_stream` is the safety bound, not the policy. A bitrate
@@ -1186,9 +1200,10 @@ See `../../testbed/configs/relay-distribution.json`:
   elapsed. Hitting it evicts oldest-first and silently shortens the DVR window,
   so size it above what the retention window is expected to cost — roughly
   `bitrate × origin_retention_secs / 8`.
-- `origin_min_free_bytes` is the guard of last resort, and the only origin
-  knob the manager cannot override: it is read from the config file, never
-  from `configure_distribution`. Default 5 GiB; `0` disables it. Bounded at
+- `origin_min_free_bytes` is the guard of last resort, and one of the two
+  origin knobs the manager cannot override (the other is `origin_storage_dir`):
+  it is read from the config file, never from `configure_distribution`.
+  Default 5 GiB; `0` disables it. Bounded at
   `0` or 16 MiB to 1 TiB — outside that the relay **refuses to start**, naming
   the field. See "The free-space floor" above for what each bound catches.
 - `origin_window_segments` is now a **floor**, not the window: the minimum
@@ -1233,7 +1248,7 @@ See `../../testbed/configs/relay-distribution.json`:
   segments, bytes, idle seconds, and whether an override is in force — because
   `origin_bytes` alone says the node is full but not which stream filled it.
 
-- **`drop_origin_streams` retires streams outright, and is destructive.** The
+- **`drop_origin_streams` removes streams outright, and is destructive.** The
   same `configure_distribution` action takes an array of stream names:
 
   ```jsonc
@@ -1247,27 +1262,72 @@ See `../../testbed/configs/relay-distribution.json`:
   re-adopts the directory on the next restart because it is gone.
 
   Applied **after** `origin_policy` / `origin_stream_policies` in the same push,
-  so a manager that both re-states the override set and retires a session's
+  so a manager that both re-states the override set and drops a session's
   streams gets those in the order it meant them. A name that fails the origin's
-  own stream-id check is dropped silently, as is a name for a stream this relay
-  does not hold.
+  own stream-id check is dropped silently. A name for a stream this relay no
+  longer tracks is **not**: its directory under the origin root is removed
+  anyway, which is exactly how a retired stream's `clips/` is reclaimed once
+  the manager's clock runs out. Only a name with no directory at all is a
+  silent no-op — a `NotFound` on the delete is swallowed, and any other
+  filesystem error is logged at warn.
 
   It is the delete counterpart to `origin_stream_policies`, whose empty-object
-  form only clears overrides. Deleting a DVR session is what sends it: without
-  it, a deleted session holds its disk until the *node default* retention
-  expires — a window that has nothing to do with the one that session asked for
-  (2h40m on the demo rig, for streams an operator deleted to reclaim space). The
-  manager sends it best-effort from the session-delete path, so an unreachable
-  relay simply ages those streams out on the node default instead.
+  form only clears overrides. The manager sends it from two places:
+  `DELETE /api/v1/dvr/sessions/{id}`, and the clip-expiry sweep, on the
+  reconciler's retention tick once a session has been stopped for a day
+  (`run_clip_expiry_pass` — one command per relay naming every expired
+  session's streams, with the session rows deleted only once the relay acks; a
+  relay that does not take it keeps the rows for the next pass). Stopping a
+  session sends the gentler `retire_origin_streams`
+  instead — the same array shape — which takes the media (segments, manifests,
+  init) and leaves `clips/`, so an export cut near full time survives the
+  broadcast ending; a retired stream whose `clips/` is empty loses its
+  directory too. By the time a session can be deleted (never while `active`,
+  and not while its relay still holds an unreleased window — `409
+  session_active` / `409 release_pending`) its window is therefore normally
+  already gone and what the drop reclaims is the clips, which the retention
+  sweep never touches. Normally, not always: the retire is sent once from the
+  stop path and never retried, so a relay that was unreachable at stop keeps
+  that media until its own sweep retires it at `retention + idle_grace`, or
+  until this drop lands — without it those streams would sit until the *node
+  default* retention expired, a window that has nothing to do with the one
+  that session asked for (2h40m on the demo rig, for streams an operator
+  deleted to reclaim space).
+
+  The delete sends it before the row goes, because the stream names come off
+  that row, and it is best-effort only while there is nothing to strand. If
+  the relay cannot be reached and the session's clip-retention clock is still
+  running (`clips_expire_at`, armed for 24 h on every stop whether or not a
+  clip was ever cut — the manager does not know what the relay holds), the
+  delete is refused with `409 relay_unreachable` rather than logged: `clips/`
+  sits outside the relay's restart adoption, retention sweep and byte
+  accounting, so short of the relay's own seven-day `reclaim_clip_debris`
+  backstop a drop naming the stream is the only thing that ever removes it,
+  and deleting the row would leave those clips unreachable to every mechanism
+  on either side until that backstop fires. Once the clock has run out — or
+  the session's relay row is gone (`relay_node_id` is `ON DELETE SET NULL`, so
+  there is nobody to ask) — the delete goes through and an unreachable relay
+  ages the streams out on the node default instead.
 
 - `origin_storage_dir` is **adopted on startup**, not wiped: the segments left
   by a previous run are indexed back into the window, so a relay restart costs
   a segment or two rather than the whole DVR depth. Give it a directory of its
   own — everything under it becomes evictable, and a non-empty directory
-  carrying no `.bilbycast-origin` marker is refused rather than adopted (the
-  relay still comes up; the distribution subsystem does not). Point it at a
-  volume with room for `origin_max_bytes_per_stream` times the number of live
-  streams; the default is inside the packaged unit's `ReadWritePaths`.
+  carrying no `.bilbycast-origin` marker is refused rather than adopted — and
+  the refusal takes the whole relay down, not just the distribution
+  subsystem: `run_distribution` returns the error and `main` exits on the
+  first subsystem to stop, so under the packaged unit's `Restart=always` the
+  process restarts every 3 s until the path is fixed. The one exception is a
+  directory with the shape of a store written by a relay that predates the
+  marker (`looks_like_origin_store` in `origin.rs`, read deliberately
+  narrowly): every top-level entry is a stream directory; inside, nothing but
+  `.m4s` / `.mp4` / `.jpg` / `.part` files and a `clips/` subdirectory; every
+  stream directory that holds files holds at least one packager-named
+  `seg-NNNNN.m4s` / `aud-NNNNN.m4s`; and there are at least two such segments
+  in the tree. That is adopted with a warning and given the marker, so the
+  next start needs no shape check. Point it at a volume with room for
+  `origin_max_bytes_per_stream` times the number of live streams; the default
+  is inside the packaged unit's `ReadWritePaths`.
 
 A config block present on a plain (feature-off) build parses fine and is logged
 as ignored at startup.

@@ -110,7 +110,7 @@ check "player-origin with a path refused" "$(porigin https://relay.example/watch
 check "player-origin https accepted"      "$(porigin https://relay.example)"       "accept"
 
 # Absent, it must fail closed AND say so — an unrenewable token is a silent
-# failure three hours later, not an error at install time.
+# failure thirty minutes later, not an error at install time.
 warned=$(bash ./install-relay.sh --manager wss://m/ws --registration-token t \
          --with-portal https://m.example 2>&1 >/dev/null </dev/null || true)
 case "$warned" in

@@ -649,10 +649,13 @@
       <p class="note" id="clipLen"></p>
     </fieldset>
     <p class="note">Applied to every clip exported from the Marks panel, and
-       kept on this device like the marks themselves. A clip is cut on the edge,
-       so the in and out points land where you asked rather than on a segment
-       boundary. It appears on your sign-in page when it is ready, and is
-       cleaned up with the session.</p>
+       kept on this device like the marks themselves. A clip is cut on the edge.
+       When the flow's own recording still holds the moment, it is cut from
+       that, and runs from the keyframe at or before your in point to the one
+       after your out point; when it does not, the clip is assembled from whole
+       segments and each end can be up to one segment out. It appears on your
+       sign-in page when it is ready, and is kept there for a day after the
+       session stops.</p>
     <button id="optSelftest" type="button">Run the player self-test</button>
     <p class="note">Measures what this device can actually present — shuttle
        rate, scrub preview coverage, token renewal. About a minute.</p>
@@ -692,9 +695,11 @@
   "use strict";
 
   // The edge publishes two renditions of the same source. The main one is
-  // long-GOP and carries the picture you actually watch; the proxy is
-  // low-resolution and ALL-INTRA, which is what makes frame-exact seeking
-  // possible at all — see WEB_DVR_PLAYER_PLAN.md.
+  // long-GOP and carries the picture you actually watch (and frame jog, which
+  // is one exact seek to a frame centre); the proxy is low-resolution and
+  // ALL-INTRA, which is what lets shuttle and a held scrub seek at ~fps/s —
+  // see docs/distribution.md, "Browser DVR player (/dvr/{stream})" →
+  // "Which rendition does what, and why".
   var STREAM = "__STREAM_ID__";
   var qs     = new URLSearchParams(location.search);
   var MAIN   = qs.get("main")  || STREAM;
@@ -1603,10 +1608,15 @@
         //
         // The token is short-lived on purpose — its TTL *is* the revocation
         // latency, since the relay's HMAC tokens cannot be recalled once
-        // minted. Nothing renews it yet, so a long watch eventually starts
-        // 401ing mid-stream and hls.js reports a network error like any other:
-        // the picture simply stops, with a message that means nothing to the
-        // person watching.
+        // minted. A portal viewer renews it before it runs out (see "keeping
+        // the token alive" below), so for them this fires only once a renewal
+        // has been refused — access withdrawn, which is the revocation that
+        // short TTL exists for — or could not complete before expiry. A viewer
+        // on a one-off link has no portal session to renew with, so their
+        // token simply runs out at the end of its three hours. Either way the
+        // relay answers 403 (401 only when no token was sent at all) and
+        // hls.js reports a network error like any other: the picture simply
+        // stops, with a message that means nothing to the person watching.
         //
         // What fixes it depends on how they arrived, so `failExpired` decides
         // rather than this branch asserting one of the two answers.
@@ -1714,9 +1724,6 @@
   // frame *centre* (see `frameCentre`) — what broke stepping was landing on
   // frame boundaries, not the GoP. An operator stepping frames is examining
   // them, so they get the full-resolution picture.
-  // One exact seek per step, on the all-intra proxy. On a long-GOP source
-  // this would land on the nearest keyframe instead, which is the whole
-  // reason the proxy exists.
   function jog(dir) {
     // A frame step is an instruction to stop and look, so it ends any shuttle
     // and hands the picture back to the main rendition.
@@ -2218,11 +2225,16 @@
   var CLIP_POST_KEY = "bilbycast.dvr.clip.post";
   // A clip is capped at a minute, pre-roll and post-roll together.
   //
-  // Not a UI nicety: the edge assembles a clip whole in memory and the relay
-  // holds it whole as a request body, so length is an allocation on two
-  // machines. The origin enforces the same total and refuses anything longer,
-  // so a clamp here is the courtesy of saying so before the request rather
-  // than the only thing standing between a operator and a 400.
+  // Not a UI nicety: the edge assembles a clip whole in memory (`cut_exact`
+  // and `cut_from_segments` both hand `http_put_within` a `Vec<u8>`), and the
+  // relay prices a request by its length before a byte is cut —
+  // `estimated_clip_bytes` charges the seconds against
+  // `MAX_CLIP_BYTES_PER_STREAM` at admission — then streams the upload to disk
+  // under a per-clip ceiling sized from this same sixty seconds
+  // (`MAX_CLIP_BYTES`). So length is memory on the edge and disk on the relay.
+  // The origin enforces the same total and refuses anything longer, so a clamp
+  // here is the courtesy of saying so before the request rather than the only
+  // thing standing between an operator and a 400.
   var CLIP_PRE_DEFAULT = 3, CLIP_POST_DEFAULT = 5, CLIP_MAX_TOTAL = 60;
   var exportMode = false, exportPicked = {}, exportBusy = false;
 
@@ -3942,7 +3954,7 @@
     }
     stSay("");
 
-    // 4. TOKEN RENEWAL. Three hours is longer than anyone will sit here
+    // 4. TOKEN RENEWAL. Thirty minutes is longer than anyone will sit here
     //    waiting, so exercise the path rather than the clock.
     stSay("4. token renewal");
     var expBefore = tokenExpiry(TOKEN);
@@ -3998,8 +4010,9 @@
   //
   // Only a viewer who came through the portal can renew — they have the
   // session cookie the portal authenticates with. A guest holding a one-off
-  // link cannot, and should not: their (three-hour) grant is the point of
-  // the link.
+  // link cannot, and should not: they hold a stateless three-hour token minted
+  // from a revocable grant, and re-opening the link mints another — that is
+  // the point of the link.
 
   /// Seconds of headroom to renew with. Long enough to survive a few failed
   /// attempts and a slow manager, short enough that a withdrawn entitlement
@@ -4048,7 +4061,7 @@
    * passes for 30, 60, 120 and 240, so one takeover became five 409s over
    * about seven and a half minutes, each re-running `takenOver()` — pausing a
    * viewer who had pressed the still-live Play button — and each writing
-   * another `dvr_viewer_displaced` row in the manager's access log. */
+   * another `dvr.viewer.displace` row in the manager's audit log. */
   var wasTakenOver = false;
 
   function takenOver() {
