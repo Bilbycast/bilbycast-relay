@@ -315,6 +315,39 @@
     border-top: 5px solid var(--c, var(--live));
   }
 
+  /* The span a loop plays, on the bar. Inset like every other layer, so its
+     ends sit under the thumb at the loop's in and out points. */
+  #loopSpan {
+    position: absolute; left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);
+    top: 50%; height: 11px; transform: translateY(-50%);
+    pointer-events: none; z-index: 1; display: none;
+  }
+  body[data-loop="1"] #loopSpan { display: block; }
+  #loopSpan i {
+    position: absolute; top: 0; bottom: 0; border-radius: 3px;
+    background: rgba(255,176,32,.28); box-shadow: inset 0 0 0 1.5px #ffb020;
+  }
+
+  /* What is looping and how fast, above the transport while it runs. The
+     speed lives here, not on the 33/50/100 buttons: those are ordinary
+     playback, and pressing one leaves the loop. */
+  #loopBar {
+    position: absolute; left: 50%; bottom: calc(var(--hud) + 6px); z-index: 4;
+    transform: translateX(-50%); display: none; align-items: center; gap: 6px;
+    padding: 5px 6px 5px 12px; border-radius: 14px;
+    background: rgba(18,23,29,.9); border: 1px solid #ffb020;
+    backdrop-filter: blur(8px); max-width: calc(100vw - 20px);
+  }
+  body[data-loop="1"] #loopBar { display: flex; }
+  #loopBar .what {
+    font: 12px/1.2 ui-monospace, Menlo, monospace; font-weight: 700; color: #ffb020;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16em;
+    margin-right: 4px;
+  }
+  #loopBar button { min-width: 50px; min-height: 40px; padding: 0 8px; font-size: 13px; }
+  #loopBar #loopStop { min-width: 40px; font-size: 18px; }
+  #btnLoop[aria-pressed="true"] { background: #ffb020; color: #2a1c00; }
+
   #marktip {
     position: absolute; bottom: 34px; display: none; pointer-events: none;
     transform: translateX(-50%); z-index: 4; max-width: 22em;
@@ -383,6 +416,8 @@
   #settings .clips { border: 0; margin: 6px 0 0; padding: 0; }
   #settings .clips legend { padding: 0 0 4px; font-size: 12px; color: var(--dim);
     text-transform: uppercase; letter-spacing: .08em; }
+  #settings .loopspeeds { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 0 8px; }
+  #settings .loopspeeds button { min-width: 54px; min-height: 40px; font-size: 13px; }
 
   /* Export controls sit at the foot of the marks panel. */
   #markExport { border-top: 1px solid var(--line); padding: 10px 12px; }
@@ -435,6 +470,12 @@
     border: 2px solid transparent;
   }
   #markList .palette button[aria-pressed="true"] { border-color: var(--fg); }
+  #markList .loop {
+    min-width: 36px; min-height: 36px; padding: 0; flex: 0 0 auto;
+    background: transparent; border-color: var(--line); color: var(--dim);
+  }
+  #markList .loop svg { width: 18px; height: 18px; }
+  #markList .loop[aria-pressed="true"] { background: #ffb020; color: #2a1c00; border-color: transparent; }
   #markList .del {
     min-width: 38px; min-height: 38px; padding: 0; font-size: 17px;
     background: transparent; border-color: transparent; color: var(--dim);
@@ -547,12 +588,23 @@
     <span>LIVE</span>
   </button>
 
+  <!-- Only while a loop runs: what it is looping, its speed, and a way out. -->
+  <div id="loopBar" role="group" aria-label="Loop">
+    <span class="what" id="loopWhat">LOOP</span>
+    <button type="button" data-loop-rate="0.25" title="Loop at quarter speed">25%</button>
+    <button type="button" data-loop-rate="0.3333" title="Loop at one third speed">33%</button>
+    <button type="button" data-loop-rate="0.5" title="Loop at half speed">50%</button>
+    <button type="button" data-loop-rate="1" title="Loop at normal speed">100%</button>
+    <button type="button" id="loopStop" title="Stop looping (O)" aria-label="Stop looping">&times;</button>
+  </div>
+
   <div id="hud">
     <div class="timeline">
       <span class="t" id="tPos" title="Time of day this frame was ingested">--:--:--:--</span>
       <div class="track">
         <div id="cached" aria-hidden="true"></div>
         <div id="ticks" aria-hidden="true"></div>
+        <div id="loopSpan" aria-hidden="true"><i></i></div>
         <div id="markbar" aria-hidden="true"></div>
         <div id="marktip" aria-hidden="true"></div>
         <div id="preview" aria-hidden="true"><i></i><b></b></div>
@@ -586,6 +638,9 @@
         </button>
         <button id="btnNextMark" class="icon" title="Next mark (])" aria-label="Next mark">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5l9 7-9 7z" class="fill"/><path d="M18 5v14"/></svg>
+        </button>
+        <button id="btnLoop" class="icon" aria-pressed="false" title="Loop around the nearest mark (O)" aria-label="Loop around the nearest mark">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3l3 3-3 3"/><path d="M4 11V9a3 3 0 0 1 3-3h13"/><path d="M7 21l-3-3 3-3"/><path d="M20 13v2a3 3 0 0 1-3 3H4"/></svg>
         </button>
         <button id="btnRew" class="icon" title="Rewind — press again for 4x, 8x, 16x" aria-label="Rewind">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6l-8 6 8 6z" class="fill"/><path d="M21 6l-8 6 8 6z" class="fill"/></svg>
@@ -649,13 +704,35 @@
       <p class="note" id="clipLen"></p>
     </fieldset>
     <p class="note">Applied to every clip exported from the Marks panel, and
-       kept on this device like the marks themselves. A clip is cut on the edge.
+       kept on this device. A clip is cut on the edge.
        When the flow's own recording still holds the moment, it is cut from
        that, and runs from the keyframe at or before your in point to the one
        after your out point; when it does not, the clip is assembled from whole
        segments and each end can be up to one segment out. It appears on your
        sign-in page when it is ready, and is kept there for a day after the
        session stops.</p>
+    <fieldset class="clips">
+      <legend>Loop around a mark</legend>
+      <label class="opt num">
+        <span>Seconds <b>before</b> the mark</span>
+        <input type="number" id="loopPre" min="0" max="60" step="1" value="3">
+      </label>
+      <label class="opt num">
+        <span>Seconds <b>after</b> the mark</span>
+        <input type="number" id="loopPost" min="0" max="60" step="1" value="3">
+      </label>
+      <div class="loopspeeds" role="group" aria-label="Loop speed">
+        <button type="button" data-loop-rate="0.25">25%</button>
+        <button type="button" data-loop-rate="0.3333">33%</button>
+        <button type="button" data-loop-rate="0.5">50%</button>
+        <button type="button" data-loop-rate="1">100%</button>
+      </div>
+    </fieldset>
+    <p class="note">Replays the moment around a mark over and over, at its own
+       speed — ordinary playback keeps its 33/50/100. Start one from the loop
+       button beside a mark, from the loop button on the transport (nearest
+       mark), or with <b>O</b>. Any other transport control ends it. Kept on
+       this device.</p>
     <button id="optSelftest" type="button">Run the player self-test</button>
     <p class="note">Measures what this device can actually present — shuttle
        rate, scrub preview coverage, token renewal. About a minute.</p>
@@ -663,7 +740,7 @@
   <p class="note foot">Keys: <b>J</b>/<b>L</b> shuttle &middot; <b>K</b> stop &middot;
      <b>,</b>/<b>.</b> frame step &middot; <b>Space</b> play/pause &middot;
      <b>End</b> live &middot; <b>F</b> full screen &middot; <b>M</b> mark &middot;
-     <b>[</b>/<b>]</b> previous/next mark</p>
+     <b>[</b>/<b>]</b> previous/next mark &middot; <b>O</b> loop the nearest mark</p>
 </aside>
 
 <aside id="drawer" aria-label="Marks">
@@ -875,6 +952,9 @@
   var btnMark = document.getElementById("btnMark");
   var btnPrevMark = document.getElementById("btnPrevMark");
   var btnNextMark = document.getElementById("btnNextMark");
+  var btnLoop = document.getElementById("btnLoop");
+  var loopWhat = document.getElementById("loopWhat");
+  var loopSpanBar = document.querySelector("#loopSpan i");
   var btnSettings = document.getElementById("btnSettings");
   var zoomInput = document.getElementById("zoom");
   var zoomLabel = document.getElementById("zoomLabel");
@@ -1703,6 +1783,7 @@
   }
 
   function goLive() {
+    stopLoop();
     stopShuttle();
     setMode("live");
     var t = liveTarget();
@@ -1726,7 +1807,8 @@
   // them, so they get the full-resolution picture.
   function jog(dir) {
     // A frame step is an instruction to stop and look, so it ends any shuttle
-    // and hands the picture back to the main rendition.
+    // or loop and hands the picture back to the main rendition.
+    stopLoop();
     stopShuttle();
     rate = 1;
     // Leave live as well as shuttle: stepping means the operator has
@@ -1751,6 +1833,7 @@
   // stays ~FPS/s no matter the speed — at 8x we present every 8th frame,
   // not every frame. That is what keeps it sustainable on a tablet.
   function startShuttle(r) {
+    stopLoop();
     ensureProxy();
     setMode("shuttle");
     // Whichever element is on screen. In `full` quality that is the proxy;
@@ -1805,6 +1888,7 @@
 
   function setRate(r) {
     fail("");
+    stopLoop();
     // A shuttle rate is a SEEK rate, and it is one in both directions. Routing
     // only the negative ones here left `setRate(+4)` — which is what releasing
     // the scrub bar mid-fast-forward asks for — assigning 4 to
@@ -1858,7 +1942,7 @@
   function syncRateButtons() {
     var shuttling = mode === "shuttle";
     document.querySelectorAll("[data-rate]").forEach(function (b) {
-      var on = !shuttling && parseFloat(b.dataset.rate) === rate;
+      var on = !shuttling && !loop && parseFloat(b.dataset.rate) === rate;
       b.setAttribute("aria-pressed", on ? "true" : "false");
     });
     // The active shuttle speed lives on the button, so the operator can see
@@ -1900,6 +1984,7 @@
 
   function beginScrub() {
     if (scrubbing) return;
+    stopLoop();
     scrubbing = true;
     ensureProxy();
     var v = activeVideo();
@@ -2038,10 +2123,11 @@
   // recorded against the media clock points somewhere else after a reload and
   // somewhere else again for a second viewer.
   //
-  // They live in `localStorage`, per feed, on this device. That is enough to
-  // survive a reload and a whole event, and it is NOT enough to share a mark
-  // with the operator sitting next to you — that needs somewhere server-side
-  // to put them, which this does not have.
+  // They are shared: the relay holds one list per feed (`/origin/{stream}/
+  // marks`) and every viewer of the feed reads and writes it — see "shared
+  // marks" below. `localStorage` is the fallback for a relay that predates
+  // the list, and where marks made in the first moments after load wait until
+  // the page knows which of the two it has.
   /// The colours a mark may be.
   ///
   /// Deliberately a short list, and a closed one. Each is bright enough to
@@ -2100,7 +2186,21 @@
     sortMarks();
   }
 
+  /// Make a mark from the relay's list safe to draw.
+  ///
+  /// The same checks `loadMarks` applies to `localStorage`, and for the same
+  /// reason: the shared list is written by every viewer of the feed, so it is
+  /// exactly as untrusted as anything else on the device.
+  function normaliseMark(m) {
+    m.name = typeof m.name === "string" ? m.name : "";
+    if (!isMarkColour(m.colour)) m.colour = MARK_COLOUR_DEFAULT;
+    m.exported = !!m.exported;
+  }
+
   function saveMarks() {
+    // Shared, the relay is the copy that matters, and a local one would only
+    // come back as a stale second list on a relay that lost the feature.
+    if (marksShared === true) return;
     try { window.localStorage.setItem(MARKS_KEY, JSON.stringify(marks)); }
     catch (e) { /* private mode, or full: the marks still work for this tab */ }
   }
@@ -2130,11 +2230,18 @@
       fail("This feed carries no clock, so marks cannot be placed on it.");
       return;
     }
-    var m = { id: ++markSeq, at: wall, name: "", colour: MARK_COLOUR_DEFAULT };
+    // Whole milliseconds: what the relay stores, so a mark compares equal to
+    // itself on the way back.
+    var m = { id: ++markSeq, at: Math.round(wall), name: "", colour: MARK_COLOUR_DEFAULT };
+    // Drawn at once whatever the network is doing: the flag is the operator's
+    // acknowledgement, and it must not wait on a round trip. Shared, it is
+    // held as pending until the relay has it — see `sendMark`.
+    if (marksShared === true) { m.id = "tmp-" + (++markSeq); m.pending = true; }
     marks.push(m);
     sortMarks();
     saveMarks();
     renderMarks();
+    if (m.pending) sendMark(m);
     // Marking does NOT open the list. A tap on MARK is "that, there" — often
     // while something is still happening on screen — and throwing a drawer
     // over a third of the picture to ask for a name is the wrong moment. The
@@ -2144,7 +2251,17 @@
   }
 
   function deleteMark(id) {
+    var gone = marks.filter(function (m) { return m.id === id; })[0];
     marks = marks.filter(function (m) { return m.id !== id; });
+    forgetEdits(id);
+    if (gone && gone.pending) {
+      // Not on the relay yet, but its POST may already be on the way: let
+      // `sendMark` delete it the moment it lands, or it comes straight back.
+      gone.deleted = true;
+    } else if (marksShared === true) {
+      marksDeleting[id] = true;
+      sendDelete(id);
+    }
     /* A mark that is gone cannot be exported. Leaving it ticked left the bar
      * reading "1 selected" with Export enabled over an empty selection, and
      * pressing it hit `if (!picked.length) return;` — no fetch, no message,
@@ -2161,6 +2278,7 @@
     if (!m) return;
     m.colour = css;
     saveMarks();
+    queueEdit(m, { colour: css }, 0);
     renderMarks();
   }
 
@@ -2169,6 +2287,9 @@
     if (!m) return;
     m.name = name;
     saveMarks();
+    // Not sent per keystroke: a short pause, or leaving the field, sends
+    // what is there.
+    queueEdit(m, { name: name }, NAME_SEND_MS);
     renderFlags();      // the title on the bar follows the name
   }
 
@@ -2177,6 +2298,7 @@
     if (t === null) return;
     var r = range(main);
     if (!r || t < r.start || t > r.end) return;
+    stopLoop();
     if (mode === "live" || mode === "shuttle") setMode("scrub");
     stopShuttle();
     var v = activeVideo();
@@ -2209,7 +2331,508 @@
       }
     }
     for (; n < flagPool.length; n++) flagPool[n].style.display = "none";
+    renderLoopSpan(view);
   }
+
+  // ── shared marks ─────────────────────────────────────────────────────────
+  // Everyone watching this feed sees the same marks. The relay keeps the list
+  // (`GET`/`POST /origin/{stream}/marks`, `PATCH`/`DELETE …/marks/{id}`) and
+  // this page polls it: a `304` while nothing has changed, the whole list when
+  // something has. Six viewers polling every few seconds is a handful of
+  // header exchanges a second, and the relay holds no per-viewer state.
+  //
+  // This page's own changes are drawn at once and sent behind the drawing:
+  //
+  //  * a new mark is **pending** — drawn, under a `tmp-` id — until the relay
+  //    answers with its real one. A failed POST is retried from the next poll,
+  //    and the relay treats a repeated instant as the same mark, so a retry
+  //    cannot duplicate it.
+  //  * a rename or recolour waits in `marksPending` until it is acknowledged,
+  //    and is laid over every list the relay sends meanwhile — otherwise a poll
+  //    landing mid-word would put the old name back under the cursor.
+  //  * a delete waits in `marksDeleting`, so a poll cannot resurrect it.
+  //
+  // A relay without the route (404/405), one with no token secret (500), or a
+  // page with no token (401) leaves this device on `localStorage`, exactly as
+  // before. Anything else — a dropped connection, a 502 from a tunnel — is
+  // simply tried again on the next poll.
+  var MARKS_POLL_MS = 3000;
+  var NAME_SEND_MS = 600;
+  /// null: not known yet · true: the relay holds them · false: this device only.
+  var marksShared = null;
+  var marksEtag = null;
+  var marksPolling = false;
+  var marksPending = {};
+  var marksEditTimers = {};
+  var marksEditing = {};
+  var marksDeleting = {};
+  /// A newer list arrived while the operator was typing in the old one.
+  var marksListDeferred = false;
+  /// Marks older than this stay behind when `localStorage` is carried into
+  /// the shared list. No DVR window reaches back a day, so all they would add
+  /// is a column of greyed-out rows on every other viewer's screen. The old
+  /// list is kept on the device under `.migrated` regardless.
+  var MIGRATE_MAX_AGE_MS = 24 * 3600 * 1000;
+
+  function marksRequest(path, method, body) {
+    var headers = {};
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    // Both carriers, as for every other fetch here: with hls.js in play the
+    // token rides in a header and `url()` leaves the query off.
+    if (TOKEN_IN_HEADER && TOKEN) headers.Authorization = "Bearer " + TOKEN;
+    if (method === "GET" && marksEtag) headers["If-None-Match"] = marksEtag;
+    return fetch(url(STREAM, path), {
+      method: method,
+      headers: headers,
+      cache: "no-store",
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+  }
+
+  /// A list reply, with the validator the next poll sends back.
+  function marksReply(r) {
+    return r.json().then(function (body) {
+      return { body: body, etag: r.headers.get("ETag") };
+    });
+  }
+
+  function pollMarks() {
+    if (marksPolling || marksShared === false || accessExpired) return;
+    if (typeof fetch !== "function") { marksShared = false; return; }
+    marksPolling = true;
+    marksRequest("marks", "GET").then(function (r) {
+      if (r.status === 304) return null;
+      if (r.ok) return marksReply(r);
+      if (marksShared === null &&
+          (r.status === 401 || r.status === 404 || r.status === 405 || r.status === 500)) {
+        marksShared = false;
+      }
+      return null;
+    }).then(function (res) {
+      if (res) {
+        if (marksShared === null) becomeShared();
+        adoptMarks(res.body, res.etag);
+      }
+      // After a 304 too: this is also the retry for anything that did not
+      // get through the first time.
+      if (marksShared === true) flushMarks();
+    }).catch(function () { /* the next poll tries again */ })
+      .then(function () { marksPolling = false; });
+  }
+
+  /// The relay has a list: carry this device's marks into it, once.
+  function becomeShared() {
+    marksShared = true;
+    var now = Date.now();
+    var carried = [];
+    marks.forEach(function (m) {
+      if (now - m.at > MIGRATE_MAX_AGE_MS) return;
+      // Whole milliseconds, which is what the relay stores. Marks written by
+      // an older page carry the fraction `wallClockAt` produces.
+      m.at = Math.round(m.at);
+      m.id = "tmp-" + (++markSeq);
+      m.pending = true;
+      carried.push(m);
+    });
+    marks = carried;
+    // Keyed by the ids just replaced.
+    exportPicked = {};
+    lastMarkId = null;
+    try {
+      var raw = window.localStorage.getItem(MARKS_KEY);
+      if (raw) {
+        window.localStorage.setItem(MARKS_KEY + ".migrated", raw);
+        window.localStorage.removeItem(MARKS_KEY);
+      }
+    } catch (e) { /* blocked: the carried marks are in memory either way */ }
+    syncExportBar();
+  }
+
+  function marksSignature() {
+    return JSON.stringify(marks.map(function (m) {
+      return [m.id, m.at, m.name, m.colour, m.exported, !!m.pending];
+    }));
+  }
+
+  /// Replace the list with the relay's, keeping what this page still owes it.
+  function adoptMarks(body, etag) {
+    if (!body || !Array.isArray(body.marks)) return;
+    if (etag) marksEtag = etag;
+    var next = [], held = {};
+    body.marks.forEach(function (x) {
+      if (!x || typeof x.id !== "string" || typeof x.at !== "number" || !isFinite(x.at)) return;
+      if (marksDeleting[x.id]) return;
+      var m = { id: x.id, at: x.at, name: x.name, colour: x.colour, exported: x.exported };
+      normaliseMark(m);
+      var owed = marksPending[x.id];
+      if (owed) for (var k in owed) m[k] = owed[k];
+      held[m.at] = true;
+      next.push(m);
+    });
+    // This page's marks the relay has not acknowledged. One it already lists —
+    // the POST landed, its reply has not — is the relay's copy.
+    marks.forEach(function (m) {
+      if (m.pending && !m.deleted && !held[m.at]) next.push(m);
+    });
+    var before = marksSignature();
+    marks = next;
+    sortMarks();
+    for (var id in exportPicked) {
+      if (!marks.some(function (m) { return String(m.id) === id; })) delete exportPicked[id];
+    }
+    // Another viewer deleted the mark this page is looping around.
+    if (loop && !marks.some(function (m) { return m.at === loop.at; })) stopLoop(true);
+    if (marksSignature() === before) return;
+    if (exportMode) syncExportBar();
+    // Redrawing the list under a cursor loses the cursor, and the caret with
+    // it. The flags are safe to move; the rows wait for the field to be left.
+    if (markList.contains(document.activeElement)) {
+      marksListDeferred = true;
+      renderFlags();
+      return;
+    }
+    renderMarks();
+  }
+
+  /// POST a pending mark. Retried from `flushMarks` until the relay has it.
+  function sendMark(m) {
+    if (m.sending || m.deleted || marksShared !== true) return;
+    m.sending = true;
+    var sent = { at: m.at, name: m.name, colour: m.colour, exported: !!m.exported };
+    marksRequest("marks", "POST", sent).then(function (r) {
+      if (r.ok) return marksReply(r);
+      if (r.status === 400 || r.status === 409) {
+        // Refused for a reason a retry will not change — the feed is at its
+        // limit, most likely. Say so, and stop drawing a mark nobody else can
+        // see.
+        return r.text().catch(function () { return ""; }).then(function (t) {
+          t = (t || "").trim();
+          marks = marks.filter(function (x) { return x !== m; });
+          renderMarks();
+          fail(t && t.length < 300 ? t : "The relay would not keep that mark (" + r.status + ").");
+          return null;
+        });
+      }
+      return null;
+    }).then(function (res) {
+      m.sending = false;
+      if (!res || !res.body || typeof res.body.id !== "string") return;
+      var was = m.id, real = res.body.id;
+      // The same object keeps its row's handlers pointed at the right mark.
+      m.id = real;
+      delete m.pending;
+      if (lastMarkId === was) lastMarkId = real;
+      if (exportPicked[was]) { delete exportPicked[was]; exportPicked[real] = true; }
+      if (m.deleted) {
+        marksDeleting[real] = true;
+        sendDelete(real);
+      } else {
+        // Named, recoloured or exported while the POST was out: owed as an
+        // edit, now that there is an id to send it to.
+        var owed = {}, any = false;
+        ["name", "colour", "exported"].forEach(function (k) {
+          if (m[k] !== sent[k]) { owed[k] = m[k]; any = true; }
+        });
+        if (any) queueEdit(m, owed, 0);
+      }
+      adoptMarks(res.body, res.etag);
+    }).catch(function () { m.sending = false; });
+  }
+
+  /// Owe the relay an edit to `m`, sent after `delayMs`.
+  function queueEdit(m, fields, delayMs) {
+    // A pending mark's POST carries all of it; `sendMark` settles the rest.
+    if (marksShared !== true || !m || m.pending) return;
+    var id = m.id;
+    var owed = marksPending[id] || (marksPending[id] = {});
+    for (var k in fields) owed[k] = fields[k];
+    clearTimeout(marksEditTimers[id]);
+    marksEditTimers[id] = setTimeout(function () {
+      delete marksEditTimers[id];
+      sendEdit(id);
+    }, delayMs);
+  }
+
+  /// Send an owed edit now rather than after its pause.
+  function flushEdit(id) {
+    if (!marksEditTimers[id]) return;
+    clearTimeout(marksEditTimers[id]);
+    delete marksEditTimers[id];
+    sendEdit(id);
+  }
+
+  function forgetEdits(id) {
+    clearTimeout(marksEditTimers[id]);
+    delete marksEditTimers[id];
+    delete marksPending[id];
+  }
+
+  function sendEdit(id) {
+    var owed = marksPending[id];
+    if (!owed || marksEditing[id]) return;
+    var sent = {};
+    for (var k in owed) sent[k] = owed[k];
+    marksEditing[id] = true;
+    marksRequest("marks/" + encodeURIComponent(id), "PATCH", sent).then(function (r) {
+      if (r.ok) return marksReply(r);
+      // Deleted by another viewer, or refused outright: nothing to retry.
+      if (r.status === 404 || r.status === 400) delete marksPending[id];
+      return null;
+    }).then(function (res) {
+      delete marksEditing[id];
+      if (!res) return;
+      // Clear only what the relay now holds. A keystroke that landed while
+      // this was out is still owed.
+      var now = marksPending[id];
+      if (now) {
+        for (var k in sent) if (now[k] === sent[k]) delete now[k];
+        if (!Object.keys(now).length) delete marksPending[id];
+        else if (!marksEditTimers[id]) sendEdit(id);
+      }
+      adoptMarks(res.body, res.etag);
+    }).catch(function () { delete marksEditing[id]; });
+  }
+
+  function sendDelete(id) {
+    if (marksDeleting[id] === "sending") return;
+    marksDeleting[id] = "sending";
+    marksRequest("marks/" + encodeURIComponent(id), "DELETE").then(function (r) {
+      if (r.ok) return marksReply(r);
+      if (r.status === 404) return {};   // gone either way
+      return null;
+    }).then(function (res) {
+      if (!res) { marksDeleting[id] = true; return; }
+      delete marksDeleting[id];
+      if (res.body) adoptMarks(res.body, res.etag);
+    }).catch(function () { marksDeleting[id] = true; });
+  }
+
+  /// Everything still owed to the relay.
+  function flushMarks() {
+    marks.forEach(function (m) { if (m.pending) sendMark(m); });
+    for (var id in marksPending) if (!marksEditTimers[id]) sendEdit(id);
+    for (var d in marksDeleting) if (marksDeleting[d] === true) sendDelete(d);
+  }
+
+  function startMarksPoll() {
+    pollMarks();
+    // A hidden tab is nobody looking; the list is fetched again the moment
+    // it is.
+    setInterval(function () { if (!document.hidden) pollMarks(); }, MARKS_POLL_MS);
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) pollMarks();
+    });
+    markList.addEventListener("focusout", function () {
+      setTimeout(function () {
+        if (marksListDeferred && !markList.contains(document.activeElement)) renderMarks();
+      }, 0);
+    });
+  }
+
+  // ── loop around a mark ───────────────────────────────────────────────────
+  // Replays the moment around a mark over and over: from `pre` seconds before
+  // it to `post` seconds after, at a speed of its own. The question it answers
+  // is "what exactly happened there", asked several times running and usually
+  // slower than real time.
+  //
+  // It is ordinary playback on the main element with a fence at each end:
+  // `playbackRate` for the speed — every speed offered is real time or slower,
+  // so this is decode at or below real time, not the seek path the shuttle
+  // needs above it — and a seek back to the in point whenever the playhead
+  // reaches the out point. The fence is checked every animation frame and on
+  // `timeupdate`, because a hidden tab gets no animation frames but goes on
+  // playing.
+  //
+  // The bounds are re-derived at every check rather than latched. The loop
+  // holds its mark by wall clock, like everything else here, so the window
+  // rolling past the in point, the live edge reaching the out point, or
+  // another viewer deleting the mark all land in the next check.
+  //
+  // Its speed and length are this device's, not the feed's: two operators
+  // looping the same mark are each studying something different.
+  var LOOP_PRE_KEY = "bilbycast.dvr.loop.pre";
+  var LOOP_POST_KEY = "bilbycast.dvr.loop.post";
+  var LOOP_RATE_KEY = "bilbycast.dvr.loop.rate";
+  var LOOP_PRE_DEFAULT = 3, LOOP_POST_DEFAULT = 3, LOOP_MAX_SECS = 60;
+  var LOOP_RATES = [0.25, 0.3333, 0.5, 1];
+  var LOOP_RATE_DEFAULT = 0.5;
+  /// Stay this far short of the newest media. Playing into the very edge
+  /// stalls on a segment that has not arrived; the out point follows the edge
+  /// forward as it does.
+  var LOOP_EDGE_MARGIN = 0.5;
+  var LOOP_ICON =
+    '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M17 3l3 3-3 3"/><path d="M4 11V9a3 3 0 0 1 3-3h13"/>' +
+    '<path d="M7 21l-3-3 3-3"/><path d="M20 13v2a3 3 0 0 1-3 3H4"/></svg>';
+  /// `{ at, raf }` while looping — `at` is the mark's wall clock.
+  var loop = null;
+
+  function loopSecs(key, dflt) {
+    var raw = null;
+    try { raw = window.localStorage.getItem(key); } catch (e) { /* blocked */ }
+    var n = parseInt(raw, 10);
+    if (!isFinite(n) || n < 0 || n > LOOP_MAX_SECS) return dflt;
+    return n;
+  }
+  function loopPre() { return loopSecs(LOOP_PRE_KEY, LOOP_PRE_DEFAULT); }
+  function loopPost() { return loopSecs(LOOP_POST_KEY, LOOP_POST_DEFAULT); }
+  function loopRate() {
+    var raw = null;
+    try { raw = window.localStorage.getItem(LOOP_RATE_KEY); } catch (e) { /* blocked */ }
+    var n = parseFloat(raw);
+    return LOOP_RATES.indexOf(n) >= 0 ? n : LOOP_RATE_DEFAULT;
+  }
+
+  /// The reachable mark nearest the playhead, either side — what the
+  /// transport's loop button and **O** loop around.
+  function nearestMarkToPlayhead() {
+    var v = activeVideo();
+    var now = wallClockAt(toMainTime(playhead(v), v));
+    if (now === null) return null;
+    var best = null;
+    for (var i = 0; i < marks.length; i++) {
+      var m = marks[i];
+      if (!markIsReachable(m)) continue;
+      if (!best || Math.abs(m.at - now) < Math.abs(best.at - now)) best = m;
+    }
+    return best;
+  }
+
+  /// In and out points on main's clock, or null once the mark cannot be
+  /// reached.
+  function loopBounds() {
+    if (!loop) return null;
+    var t = mainTimeAtWall(loop.at);
+    var r = range(main);
+    if (t === null || !r || t < r.start || t > r.end) return null;
+    var start = Math.max(r.start, t - loopPre());
+    var end = Math.min(r.end - LOOP_EDGE_MARGIN, t + loopPost());
+    // A mark at the live edge with nothing before it: keep a sliver to play
+    // rather than a loop that seeks every frame.
+    return { start: start, end: Math.max(end, start + 0.2) };
+  }
+
+  function startLoop(m) {
+    if (!m || !markIsReachable(m)) return;
+    if (loopPre() + loopPost() <= 0) {
+      fail("A loop of zero seconds is not a loop — set the seconds either side in Settings.");
+      return;
+    }
+    fail("");
+    if (loop) stopLoop();
+    stopShuttle();
+    if (mode === "live" || mode === "shuttle" || mode === "jog") setMode("scrub");
+    proxy.pause();
+    loop = { at: m.at, raf: null };
+    var b = loopBounds();
+    if (!b) { loop = null; return; }
+    pendingSeek = null;
+    try { main.currentTime = b.start; } catch (e) {}
+    main.playbackRate = loopRate();
+    main.play().catch(function () {});
+    document.body.dataset.loop = "1";
+    loop.raf = requestAnimationFrame(loopFrame);
+    showLoopState();
+    syncRateButtons();
+    render();
+  }
+
+  /// End the loop. `pause` freezes the picture where it is — what the loop's
+  /// own stop controls mean. Called bare from every other transport control,
+  /// which each go on to set the transport themselves.
+  function stopLoop(pause) {
+    if (!loop) return;
+    if (loop.raf !== null) cancelAnimationFrame(loop.raf);
+    loop = null;
+    document.body.dataset.loop = "0";
+    main.playbackRate = rate > 0 && rate <= 1 ? rate : 1;
+    if (pause) main.pause();
+    showLoopState();
+    syncRateButtons();
+  }
+
+  function loopFrame() {
+    if (!loop) return;
+    loopCheck();
+    if (loop) loop.raf = requestAnimationFrame(loopFrame);
+  }
+
+  function loopCheck() {
+    if (!loop) return;
+    var b = loopBounds();
+    if (!b) { stopLoop(true); return; }
+    if (awaitingSeek(main) || main.seeking) return;
+    var t = main.currentTime;
+    // Past the out point, or somewhere the loop does not cover at all — the
+    // window rolled past the in point, or a stall recovery moved the playhead.
+    if (t >= b.end || t < b.start - 0.25) {
+      try { main.currentTime = b.start; } catch (e) {}
+    }
+    var want = loopRate();
+    if (main.playbackRate !== want) main.playbackRate = want;
+    if (main.paused && !scrubbing) main.play().catch(function () {});
+  }
+
+  /// The loop's controls, wherever they are, agree with the loop.
+  function showLoopState() {
+    btnLoop.setAttribute("aria-pressed", loop ? "true" : "false");
+    var r = loopRate();
+    document.querySelectorAll("[data-loop-rate]").forEach(function (b) {
+      b.setAttribute("aria-pressed", parseFloat(b.dataset.loopRate) === r ? "true" : "false");
+    });
+    markList.querySelectorAll("button.loop").forEach(function (b) {
+      b.setAttribute("aria-pressed", loop && Number(b.dataset.at) === loop.at ? "true" : "false");
+    });
+    if (!loop) return;
+    var m = marks.filter(function (x) { return x.at === loop.at; })[0];
+    loopWhat.textContent = "LOOP " + fmtTimeOfDay(loop.at).slice(0, 8) +
+      (m && m.name ? " " + m.name : "") +
+      "  −" + loopPre() + "s +" + loopPost() + "s";
+  }
+
+  /// The looped span on the bar, for the current view.
+  function renderLoopSpan(view) {
+    var b = loop ? loopBounds() : null;
+    var span = view ? view.end - view.start : 0;
+    if (!b || !(span > 0)) { loopSpanBar.style.width = "0"; return; }
+    var a = Math.max(0, (b.start - view.start) / span);
+    var z = Math.min(1, (b.end - view.start) / span);
+    if (!(z > a)) { loopSpanBar.style.width = "0"; return; }
+    loopSpanBar.style.left = (a * 100).toFixed(3) + "%";
+    loopSpanBar.style.width = ((z - a) * 100).toFixed(3) + "%";
+  }
+
+  function toggleLoop() {
+    if (loop) stopLoop(true); else startLoop(nearestMarkToPlayhead());
+  }
+
+  main.addEventListener("timeupdate", loopCheck);
+  btnLoop.addEventListener("click", toggleLoop);
+  document.getElementById("loopStop").addEventListener("click", function () { stopLoop(true); });
+  document.querySelectorAll("[data-loop-rate]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      try { window.localStorage.setItem(LOOP_RATE_KEY, b.dataset.loopRate); }
+      catch (e) { /* this loop still changes speed; the next one forgets */ }
+      if (loop) main.playbackRate = loopRate();
+      showLoopState();
+      render();
+    });
+  });
+  function wireLoopSecs(input, key, read) {
+    input.value = read();
+    input.addEventListener("change", function () {
+      var n = parseInt(input.value, 10);
+      if (!isFinite(n) || n < 0) n = 0;
+      if (n > LOOP_MAX_SECS) n = LOOP_MAX_SECS;
+      input.value = n;
+      try { window.localStorage.setItem(key, String(n)); } catch (e) { /* blocked */ }
+      showLoopState();
+    });
+  }
+  wireLoopSecs(document.getElementById("loopPre"), LOOP_PRE_KEY, loopPre);
+  wireLoopSecs(document.getElementById("loopPost"), LOOP_POST_KEY, loopPost);
+  showLoopState();
 
   // ── clip export ──────────────────────────────────────────────────────────
   //
@@ -2378,7 +3001,10 @@
       // happens on the edge over the following seconds and this page is not
       // told when it lands. Acceptance is the last thing here that is
       // certain, and the portal is where a failure is reported.
-      picked.forEach(function (m) { m.exported = true; });
+      picked.forEach(function (m) {
+        m.exported = true;
+        queueEdit(m, { exported: true }, 0);
+      });
       saveMarks();
       renderMarks();
       say(picked.length + (picked.length === 1 ? " clip is" : " clips are") +
@@ -2427,6 +3053,7 @@
     });
 
   function renderMarks() {
+    marksListDeferred = false;
     document.body.dataset.marks = marks.length ? "1" : "0";
     markList.textContent = "";
     marks.forEach(function (m) {
@@ -2466,8 +3093,11 @@
       name.type = "text";
       name.value = m.name;
       name.placeholder = "Name this mark";
+      // The relay's limit, so a long label stops here rather than being refused.
+      name.maxLength = 120;
       name.setAttribute("data-id", String(m.id));
       name.addEventListener("input", function () { renameMark(m.id, name.value); });
+      name.addEventListener("change", function () { flushEdit(m.id); });
       // Enter means done: the name is already saved on every keystroke, so
       // this is about getting the drawer out of the way and the picture back.
       name.addEventListener("keydown", function (e) {
@@ -2526,7 +3156,20 @@
       del.title = "Delete this mark";
       del.addEventListener("click", function () { deleteMark(m.id); });
 
-      li.appendChild(at); li.appendChild(name); li.appendChild(swatch); li.appendChild(del);
+      var lp = document.createElement("button");
+      lp.className = "loop";
+      lp.setAttribute("data-at", String(m.at));
+      lp.title = "Loop around this mark";
+      lp.setAttribute("aria-label", "Loop around this mark");
+      lp.setAttribute("aria-pressed", loop && loop.at === m.at ? "true" : "false");
+      lp.disabled = !reachable;
+      lp.innerHTML = LOOP_ICON;
+      lp.addEventListener("click", function () {
+        if (loop && loop.at === m.at) stopLoop(true); else startLoop(m);
+      });
+
+      li.appendChild(at); li.appendChild(lp); li.appendChild(name);
+      li.appendChild(swatch); li.appendChild(del);
       li.appendChild(palette);
       markList.appendChild(li);
     });
@@ -2654,6 +3297,10 @@
     // reads as broken.
     btnPrevMark.disabled = !markRelative(-1);
     btnNextMark.disabled = !markRelative(1);
+    btnLoop.disabled = !loop && !nearestMarkToPlayhead();
+    // Rows drawn from an older list would be matched to the wrong marks by
+    // index. They are redrawn as soon as the operator leaves the field.
+    if (marksListDeferred) return;
     var rows = markList.children;
     for (var i = 0; i < rows.length && i < marks.length; i++) {
       var li = rows[i];
@@ -2662,6 +3309,8 @@
       var reachable = markIsReachable(marks[i]);
       if (at.disabled !== !reachable) {
         at.disabled = !reachable;
+        var lpb = li.querySelector(".loop");
+        if (lpb) lpb.disabled = !reachable;
         li.className = reachable ? "" : "gone";
         at.title = reachable ? "Go to this mark" : "Past the end of the window";
       }
@@ -3262,6 +3911,7 @@
       document.body.dataset.live = atLive ? "1" : "0";
       document.getElementById("badge").textContent =
         mode === "shuttle" ? (rate > 0 ? rate + "x" : rate + "x") :
+        loop ? "loop " + Math.round(loopRate() * 100) + "%" :
         atLive ? "live" : "delayed";
     }
     status.textContent = mode + " | " + (onProxy() ? "proxy" : "main") +
@@ -3705,6 +4355,7 @@
   /// so a stopped transport shows the full-resolution frame rather than the
   /// low-res proxy still.
   function pauseTransport() {
+    stopLoop();
     stopShuttle();
     if (mode === "shuttle") setMode("scrub");
     rate = 1;
@@ -3734,6 +4385,7 @@
       case "End": goLive(); break;
       case "f": case "F": toggleFullscreen(); break;
       case "m": case "M": addMark(); break;
+      case "o": case "O": toggleLoop(); break;
       case "[": skipToMark(-1); break;
       case "]": skipToMark(1); break;
       case "0": resetZoom(); break;
@@ -4234,6 +4886,7 @@
   syncQualityBadge();   // setMode returns early at startup, so seed it here
   loadMarks();
   renderMarks();
+  startMarksPoll();
   mainHls = attach(main, MAIN, "main");
   // The proxy is NOT attached up front. Two live MSE elements hold two
   // decoders, and Chrome's hardware decoder budget is small and shared —

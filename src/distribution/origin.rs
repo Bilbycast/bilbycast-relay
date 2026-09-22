@@ -44,6 +44,8 @@ use tokio::sync::Mutex;
 
 use super::{token, DistributionState};
 
+mod marks;
+
 /// How the origin store is sized. Bundled so the knobs travel together — they
 /// interact, and reading one without the others is misleading.
 #[derive(Debug, Clone)]
@@ -342,6 +344,10 @@ pub struct OriginStore {
     /// One lock for the store, not one per stream: admission happens when an
     /// operator presses Export, so there is nothing here to contend for.
     clip_admission: std::sync::Mutex<()>,
+    /// Serialises read-modify-write of a marks file — see [`marks`].
+    /// Store-wide for the same reason as `clip_admission`: marks are made by
+    /// hand.
+    marks_lock: std::sync::Mutex<()>,
 }
 
 /// Marker written into the origin root, so the store can tell a directory it
@@ -362,6 +368,10 @@ const ORIGIN_MARKER: &str = ".bilbycast-origin";
 /// same rate as the media it was cut from would vanish while the session that
 /// owns it is still running.
 const CLIPS_DIR: &str = "clips";
+
+/// The stream's shared marks — see [`marks`]. Kept and dropped with `clips/`,
+/// and for the same reason: it belongs to the session, not to the window.
+const MARKS_DIR: &str = "marks";
 
 /// Why a clip request was not admitted.
 ///
@@ -548,7 +558,9 @@ fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
             // Exported clips live in their own subdirectory of the stream, so a
             // directory here is expected as long as it is that one.
             if f.file_type()?.is_dir() {
-                if f.file_name() == std::ffi::OsStr::new(CLIPS_DIR) {
+                if f.file_name() == std::ffi::OsStr::new(CLIPS_DIR)
+                    || f.file_name() == std::ffi::OsStr::new(MARKS_DIR)
+                {
                     continue;
                 }
                 return Ok(false);
@@ -683,6 +695,7 @@ impl OriginStore {
             total_bytes: AtomicU64::new(0),
             started: Instant::now(),
             clip_admission: std::sync::Mutex::new(()),
+            marks_lock: std::sync::Mutex::new(()),
         };
         store.adopt_existing();
         Ok(store)
@@ -740,7 +753,7 @@ impl OriginStore {
                 // change to `remove_dir_all` would silently delete every
                 // exported clip on the next restart. Stating the intent here
                 // costs one comparison.
-                if name == CLIPS_DIR {
+                if name == CLIPS_DIR || name == MARKS_DIR {
                     continue;
                 }
                 // Only media segments live on disk, so anything else here is
@@ -1525,7 +1538,8 @@ impl OriginStore {
 
     /// The session is over, but its clips are not.
     ///
-    /// Removes the media — segments, manifests, init — and keeps `clips/`.
+    /// Removes the media — segments, manifests, init — and keeps `clips/` and
+    /// `marks/`.
     /// Clips outlive the game they came from by design: somebody exports a
     /// moment near full time and the broadcast ends minutes later, so tearing
     /// the whole directory down with the session took the export away before
@@ -1549,7 +1563,11 @@ impl OriginStore {
         match tokio::fs::read_dir(&origin.dir).await {
             Ok(mut rd) => {
                 while let Ok(Some(entry)) = rd.next_entry().await {
-                    if entry.file_name() == std::ffi::OsStr::new(CLIPS_DIR) {
+                    // Shared marks are kept on exactly the same terms: an
+                    // operator's list of moments outlives a feed drop.
+                    if entry.file_name() == std::ffi::OsStr::new(CLIPS_DIR)
+                        || entry.file_name() == std::ffi::OsStr::new(MARKS_DIR)
+                    {
                         // Kept only if it is holding something. Counting the
                         // directory entry itself meant a `clips/` a viewer had
                         // emptied through the portal read as "clips kept", and
@@ -1681,6 +1699,26 @@ impl OriginStore {
             };
             if !Self::safe_stream_name(&stream) {
                 continue;
+            }
+            // Shared marks get the clips' backstop: a list nobody has touched
+            // for `CLIP_MAX_AGE`, on a stream nothing is publishing, belongs to
+            // a session whose manager never came back to drop it.
+            if !self.streams.contains_key(&stream) {
+                let marks = entry.path().join(MARKS_DIR);
+                let file = tokio::fs::metadata(marks.join("marks.json")).await;
+                let touched = match file {
+                    Ok(m) => Ok(m),
+                    Err(_) => tokio::fs::metadata(&marks).await,
+                }
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| now.duration_since(m).ok());
+                if touched.is_some_and(|age| age >= CLIP_MAX_AGE) {
+                    tracing::info!(stream = %stream, "origin: reclaiming a forgotten marks list");
+                    let _ = tokio::fs::remove_dir_all(&marks).await;
+                    // Fails harmlessly while `clips/` still holds something.
+                    let _ = tokio::fs::remove_dir(entry.path()).await;
+                }
             }
             let dir = entry.path().join(CLIPS_DIR);
             let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
@@ -2300,6 +2338,7 @@ pub fn routes() -> Router<Arc<DistributionState>> {
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
         .merge(clip_media)
         .merge(clip_control)
+        .merge(marks::routes())
 }
 
 /// `PUT /origin/{stream}/{file}` — accept an edge CMAF/HLS upload.

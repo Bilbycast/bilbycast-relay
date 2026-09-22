@@ -1267,3 +1267,185 @@ Host: x
         "an ingest token for another stream must not open this one"
     );
 }
+
+/// Shared marks, over HTTP: one viewer's mark is another viewer's list.
+///
+/// Three things only a real listener can show. The routes are reached at all —
+/// `marks` is a static segment beside the `{file}` capture every segment GET
+/// goes through, and a mark that fell through to the object route would come
+/// back 404 or 405 with nothing in the log. The gate holds on a relay whose
+/// read gate is at its shipped default (off): marks are a shared write surface,
+/// so they must not ride the flag a CDN pull needs open. And a poll with the
+/// current validator costs a 304, which is what makes polling affordable.
+#[tokio::test]
+async fn shared_marks_work_over_http_and_need_a_viewer_token() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{build_router, token, DistributionState};
+    use bilbycast_relay::distribution_control::DistUpdate;
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    let cancel = CancellationToken::new();
+    let hub = Arc::new(Hub::new());
+    let (events, _rx) = event_channel();
+    let cfg = DistributionConfig::default();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
+    let state = DistributionState::new(hub, origin, cfg, control.clone(), cancel.clone(), events);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ =
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+
+    /// (status, head, body).
+    async fn req(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        bearer: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> (u16, String, String) {
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
+        if let Some(t) = bearer {
+            head.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        if let Some(e) = if_none_match {
+            head.push_str(&format!("If-None-Match: {e}\r\n"));
+        }
+        if let Some(b) = body {
+            head.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                b.len()
+            ));
+        }
+        head.push_str("\r\n");
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(head.as_bytes()).await.unwrap();
+        if let Some(b) = body {
+            s.write_all(b.as_bytes()).await.unwrap();
+        }
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let mut parts = text.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or("").to_string();
+        let body = parts.next().unwrap_or("").to_string();
+        (status, head, body)
+    }
+    fn etag_of(head: &str) -> String {
+        head.lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("etag").then(|| v.trim().to_string())
+            })
+            .expect("no ETag on a marks reply")
+    }
+
+    const MARK: &str = r##"{"at":1790000000000,"name":"Goal","colour":"#ff4d4f"}"##;
+
+    // 0. No token secret: the surface is closed, not open.
+    let (st, _, _) = req(addr, "GET", "/origin/feed/marks", None, None, None).await;
+    assert_eq!(st, 500, "a relay that cannot check a credential served the shared marks");
+
+    control.apply(DistUpdate {
+        token_secret: Some(SECRET.into()),
+        ..Default::default()
+    });
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let viewer = token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+    let other = token::mint_viewer_token(SECRET, "elsewhere", exp).unwrap();
+    let ingest = token::mint_ingest_token(SECRET, "feed", exp).unwrap();
+
+    // 1. No credential, another stream's, or the edge's: refused, every verb.
+    for (method, path, payload) in [
+        ("GET", "/origin/feed/marks", None),
+        ("POST", "/origin/feed/marks", Some(MARK)),
+        ("PATCH", "/origin/feed/marks/abc", Some(r#"{"name":"x"}"#)),
+        ("DELETE", "/origin/feed/marks/abc", None),
+    ] {
+        let (st, _, _) = req(addr, method, path, payload, None, None).await;
+        assert_eq!(st, 401, "{method} {path} was answered without a credential");
+        let (st, _, _) = req(addr, method, path, payload, Some(&other), None).await;
+        assert_eq!(st, 403, "{method} {path} took another stream's token");
+        let (st, _, _) = req(addr, method, path, payload, Some(&ingest), None).await;
+        assert_eq!(st, 403, "{method} {path} took the edge's ingest token");
+    }
+
+    // 2. A viewer marks. 201 is only reachable through the marks handler.
+    let (st, _, body) = req(addr, "POST", "/origin/feed/marks", Some(MARK), Some(&viewer), None).await;
+    assert_eq!(st, 201, "POST /origin/feed/marks was not routed to the marks handler: {body}");
+    let id = body
+        .split("\"id\":\"")
+        .nth(2) // the first is inside `marks`, the second is the reply's own
+        .and_then(|s| s.split('"').next())
+        .expect("no id in the reply")
+        .to_string();
+
+    // 3. Another viewer of the same feed reads it, and a repeat poll is a 304.
+    let (st, head, body) = req(addr, "GET", "/origin/feed/marks", None, Some(&viewer), None).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"name\":\"Goal\""), "the mark is not in the list: {body}");
+    assert!(head.to_ascii_lowercase().contains("cache-control: no-store"), "{head}");
+    let etag = etag_of(&head);
+    let (st, _, _) = req(addr, "GET", "/origin/feed/marks", None, Some(&viewer), Some(&etag)).await;
+    assert_eq!(st, 304, "an unchanged list was sent again in full");
+
+    // 4. An edit changes the validator, so the next poll sees it.
+    let (st, _, body) = req(
+        addr,
+        "PATCH",
+        &format!("/origin/feed/marks/{id}"),
+        Some(r#"{"name":"Penalty"}"#),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let (st, _, body) = req(addr, "GET", "/origin/feed/marks", None, Some(&viewer), Some(&etag)).await;
+    assert_eq!(st, 200, "a changed list answered 304");
+    assert!(body.contains("\"name\":\"Penalty\""), "{body}");
+
+    // 5. A refusal names what is wrong, for the player to show.
+    let (st, _, body) = req(
+        addr,
+        "POST",
+        "/origin/feed/marks",
+        Some(r#"{"at":1790000000}"#),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(st, 400, "a mark in seconds rather than milliseconds was stored");
+    assert!(body.contains("milliseconds"), "{body}");
+
+    // 6. Delete, and it is gone for everyone.
+    let (st, _, _) = req(addr, "DELETE", &format!("/origin/feed/marks/{id}"), None, Some(&viewer), None).await;
+    assert_eq!(st, 200);
+    let (_, _, body) = req(addr, "GET", "/origin/feed/marks", None, Some(&viewer), None).await;
+    assert!(body.contains("\"marks\":[]"), "a deleted mark is still listed: {body}");
+
+    // 7. The segment route beside it is untouched.
+    let (st, _, _) = req(addr, "GET", "/origin/feed/seg-00001.m4s", None, None, None).await;
+    assert_eq!(st, 404, "the object route was disturbed by the marks routes");
+}

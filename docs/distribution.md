@@ -87,6 +87,10 @@ they are not either/or.
 | `GET` | `/origin/{stream}/clips/{name}.mp4` | Download a finished clip — streamed, `Range` supported (viewer or ingest token, always) |
 | `DELETE` | `/origin/{stream}/clips/{name}.mp4` | Remove a clip and reclaim its disk (viewer or ingest token, always) |
 | `POST` | `/origin/{stream}/clips/{name}.mp4/failed` | Edge reports one it cannot produce (ingest token, always) |
+| `GET` | `/origin/{stream}/marks` | The stream's shared marks, with an `ETag`; `304` to a matching `If-None-Match` (viewer token, always) |
+| `POST` | `/origin/{stream}/marks` | Add a mark `{at, name?, colour?, exported?}` — `at` in wall-clock ms; the same instant twice is one mark (viewer token, always) |
+| `PATCH` | `/origin/{stream}/marks/{id}` | Rename, recolour or flag exported (viewer token, always) |
+| `DELETE` | `/origin/{stream}/marks/{id}` | Remove a mark; removing one already gone succeeds (viewer token, always) |
 | `GET` | `/distribution/health` | Liveness |
 
 **The signaling + origin listener is plain HTTP.** Browsers require a secure
@@ -638,12 +642,71 @@ accepted only if it is one of the six, and anything else silently becomes red.
 The flag carries it via a `--c` custom property, because the pennant is a
 pseudo-element and cannot take an inline style.
 
-**They are kept in `localStorage`, per feed, on this device.** That survives a
-reload and a whole event. It does **not** share a mark with the operator
-sitting next to you — that needs somewhere server-side to put them, which does
-not exist yet. Note the viewing token deliberately uses `sessionStorage`
-instead: a credential has no business outliving its tab, and a test asserts the
-two do not get confused.
+**Marks are shared by everyone watching the feed.** The relay keeps one list per
+stream at `/origin/{stream}/marks` and every player polls it every 3 s (not
+while the tab is hidden, and at once when it comes back). An unchanged list
+costs a `304`, so six viewers is a handful of header exchanges a second and the
+relay holds no per-viewer state. On disk it is one JSON file,
+`{stream}/marks/marks.json`, replaced by temp-then-rename. It lives as long as
+the clips do: through a relay restart and a feed drop (`retire_stream` keeps
+`marks/`), gone when the manager drops the stream, with the clips' seven-day
+backstop under a manager that never comes back. At most 500 marks a stream,
+names up to 120 characters.
+
+The player draws its own changes at once and sends them behind the drawing. A
+new mark is *pending* under a `tmp-` id until the relay answers with its real
+one, and a failed POST is retried from the next poll — safe, because the relay
+treats a repeated instant as the same mark. A rename waits 600 ms after the last
+keystroke (or until the field is left), and until the relay acknowledges it the
+new name is laid over every list that arrives, so a poll landing mid-word
+cannot put the old name back. A list that arrives while a name field has focus
+moves the flags at once but leaves the rows alone until the field is left,
+because redrawing them would take the cursor away.
+
+Anyone who may watch may edit or delete any mark: the gate is the stream's
+viewer token, as for requesting a clip, and the relay's tokens name a stream,
+not a person, so a mark carries no author. The ingest token is **not**
+accepted — the edge has no business here. Without a `token_secret` the routes
+answer 500 rather than open.
+
+A relay that predates the list (404/405), has no token secret (500), or a page
+with no token (401) leaves the player on `localStorage`, per feed, on this
+device, as it always was. When a player first finds a shared list it carries
+the device's marks from the last day into it, once, and keeps the old list
+aside under `….migrated`. Note the viewing token deliberately uses
+`sessionStorage`: a credential has no business outliving its tab, and a test
+asserts the two do not get confused.
+
+### Loop around a mark
+
+Replays the moment around a mark over and over — from *n* seconds before it to
+*m* seconds after — at a speed of its own: 25, 33, 50 or 100 %. Start it from
+the loop button in a mark's row, from the loop button on the transport (which
+takes the reachable mark nearest the playhead), or with `O`. While it runs a
+strip above the transport names the mark and carries the speed buttons and a
+stop; the looped span is shaded on the bar. The seconds either side (default 3
+and 3, up to 60 each) and the speed (default 50 %) are settings, kept on the
+device, and changing the speed mid-loop does not leave it. They are the
+viewer's, not the feed's: two operators looping the same mark are each looking
+at something different.
+
+It is ordinary playback on the main element with a fence at each end:
+`playbackRate` for the speed — every speed offered is real time or slower, so
+this is decode at or below real time and never the seek path the shuttle needs
+— and a seek back to the in point when the playhead reaches the out point. The
+fence is checked every animation frame and on `timeupdate`, because a hidden
+tab gets no animation frames but goes on playing. The bounds are re-derived at
+every check from the mark's wall clock, so the window rolling past the in
+point, the live edge reaching the out point (the out point stays 0.5 s short of
+the newest media and follows it forward), or another viewer deleting the mark
+all take effect on the next check; a mark that can no longer be reached ends
+the loop and holds the picture.
+
+Any other transport control ends the loop and then does its own job — play,
+pause, a rate button, a shuttle, a frame step, live, a scrub, going to a mark.
+The loop's own stop (its button, the strip's `×`, or `O` again) ends it and
+holds the picture where it is. The 33/50/100 buttons stay unlit while it runs:
+they are ordinary playback, and pressing one leaves the loop at that rate.
 
 ### Clip export
 

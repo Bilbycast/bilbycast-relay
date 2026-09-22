@@ -999,11 +999,12 @@ mod tests {
         assert!(html.contains("--thumb: 18px;"), "the thumb size is not named once");
 
         // Every layer that must agree with the playhead, and the thumb itself,
-        // take their geometry from that one value.
+        // take their geometry from that one value: the shading, the ruler, the
+        // flags, and the looped span.
         assert_eq!(
             html.matches("left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);")
                 .count(),
-            3,
+            4,
             "a layer on the bar is still drawn edge to edge"
         );
         assert!(
@@ -2600,11 +2601,14 @@ mod tests {
             beat.contains("if (beatTimer !== null) { stopBeating(); startBeating(); }"),
             "a cadence change restarts a beat that was stopped: {beat}"
         );
+        // The beat's own listener, found by what it does: the shared-marks
+        // poll registers one too, and it comes first in the file.
         let focus = html
             .split(r#"addEventListener("visibilitychange""#)
-            .nth(1)
-            .and_then(|after| after.split("});").next())
-            .expect("no visibilitychange listener");
+            .skip(1)
+            .filter_map(|after| after.split("});").next())
+            .find(|body| body.contains("beat"))
+            .expect("no visibilitychange listener for the beat");
         assert!(
             focus.contains("beatTimer !== null"),
             "a refocus beats after the beat was stopped: {focus}"
@@ -3025,12 +3029,15 @@ mod tests {
         // a new preference is welcome and a new secret is not. Comments are
         // skipped — this section explains itself in prose, and prose stores
         // nothing.
-        const NON_SECRET_KEYS: [&str; 5] = [
+        const NON_SECRET_KEYS: [&str; 8] = [
             "MARKS_KEY",
             "LOWRES_KEY",
             "QUALITY_KEY",
             "CLIP_PRE_KEY",
             "CLIP_POST_KEY",
+            "LOOP_PRE_KEY",
+            "LOOP_POST_KEY",
+            "LOOP_RATE_KEY",
         ];
         for line in html.lines().filter(|l| {
             let t = l.trim_start();
