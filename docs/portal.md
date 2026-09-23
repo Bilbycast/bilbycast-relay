@@ -201,9 +201,123 @@ manager's own UI:
 * The manager cannot verify a username. Adding one grants access to whoever
   Authelia later decides that name belongs to. **A username reused for a
   different person inherits the previous holder's entitlements**, and deleting a
-  leaver in Authelia does not delete their rows here.
+  leaver in Authelia does not delete their rows here. (With
+  [account sync](#accounts-and-password-links) on, the opposite direction does
+  work: removing a login in the manager removes the Authelia account the portal
+  created for it.)
 * Only sessions that are **on air** appear in the portal. A feed that is not
   running is simply absent, rather than offering a link to a black screen.
+
+## Accounts and password links
+
+Optional. With an `accounts` block in the config, the portal also **creates the
+Authelia accounts** for portal logins that have an email in the manager, and
+sends the **set-your-password** link an operator asks for. Without the block
+nothing here happens and every account is managed in Authelia by hand, as
+before.
+
+```json
+"accounts": {
+  "users_file": "/etc/authelia/users/users.yml",
+  "public_host": "watch.example.com",
+  "authelia_url": "http://127.0.0.1:9091/auth",
+  "managed_group": "bilbycast-portal",
+  "interval_secs": 15
+}
+```
+
+Every `interval_secs` the portal fetches `GET /api/v1/dvr/portal/accounts` from
+the manager — one row per username, with its email and any outstanding link
+request — and brings Authelia's user file into line:
+
+* **A login with an email and no Authelia account** gets one: its display
+  name, its email, the `managed_group` in `groups`, and an argon2id hash of 32
+  random bytes nobody ever sees, so it cannot be signed in to until its owner
+  sets a password.
+* **An account carrying `managed_group`** follows the manager: its email and
+  display name are updated, and it is **removed** once no portal login for that
+  username is left in any group. Its `password` is never rewritten.
+* **Any other account is never touched** — not when the manager has a login of
+  the same name, not ever. That is how a hand-made `dvr-test` survives.
+* **A requested link** is sent by calling Authelia's own
+  `POST /api/reset-password/identity/start` on loopback, with
+  `X-Forwarded-Host: <public_host>` so the emailed link names the public site.
+  The user follows it to Authelia's reset page and chooses a password. The
+  portal then tells the manager, on `…/accounts/link-sent`, that it asked (or
+  why it could not), and the Portal logins list shows "sent" or the reason.
+
+Two things Authelia will not tell the portal, and what is done about each:
+
+* **Whether a username exists.** The reset endpoint answers `200` for any name.
+  So a link is requested only for an account already in the file when the
+  cycle began; for an account created in the same cycle it waits one more
+  cycle, by when Authelia's watcher has loaded it. A new login's first email
+  therefore arrives within about two `interval_secs`.
+* **Whether the mail was delivered.** That is between Authelia and its SMTP
+  relay. "Sent" in the manager means the portal asked and Authelia accepted.
+
+**The file has two writers.** Authelia rewrites it whenever someone sets a
+password. The portal writes only when something actually changed, replaces the
+file whole by temp-then-rename with the old file's permissions, and abandons
+the write if the file changed between reading and replacing it — the next cycle
+starts again from what is there. The managed mark is an Authelia **group**, not
+a key of the portal's own, because Authelia keeps the fields it knows when it
+rewrites the file and would drop anything else.
+
+### What Authelia needs
+
+```yaml
+authentication_backend:
+  password_reset:
+    disable: false
+  file:
+    path: /etc/authelia/users/users.yml
+    watch: true            # reload when the portal replaces the file
+    search:
+      email: true          # optional: sign in with the email as well as the username
+
+notifier:
+  smtp:
+    address: 'submission://smtp-relay.brevo.com:587'
+    username: 'xxxxxxx@smtp-brevo.com'   # the SMTP login, not the account email
+    sender: 'Bilbycast DVR <noreply@grs.observer>'
+    subject: '[Bilbycast DVR] {title}'
+```
+
+* **`watch: true`** is required: without it Authelia never sees a new account
+  and every link is answered `200` and sent nowhere.
+* **An SMTP notifier.** Any relay works; this deployment uses **Brevo**, whose
+  relay is `smtp-relay.brevo.com` on 587 with STARTTLS (`submission://`; use
+  `submissions://…:465` for implicit TLS). Two credential traps: the username is
+  the **SMTP login** Brevo shows on its SMTP & API page (`…@smtp-brevo.com`),
+  not the account's email address, and the password is an **SMTP key**, not a
+  v3 API key. Keep the key out of the config file — Authelia reads
+  `AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE`, so put it in a `0600` file owned by
+  the Authelia user and point the environment at it:
+
+  ```ini
+  # /etc/authelia/authelia.env
+  AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE=/etc/authelia/smtp-password
+  ```
+
+* **The sending domain has to be authenticated at the relay**, or the links go
+  to spam — and for a password link, spam is the same as broken. In Brevo:
+  add the sender domain under *Senders, Domains & Dedicated IPs* and publish
+  the DNS records it gives you (its verification code, DKIM, and a DMARC record
+  with a `rua` tag). Gmail, Yahoo and Microsoft all require authenticated
+  senders now, so this is not optional. Send a test to an address on each of
+  the mail providers your viewers actually use before trusting it.
+* **The portal must be able to replace the file**, and Authelia must be able to
+  write it back. Keep it in a directory of its own — replacing a file needs
+  write permission on its directory — shared by both services' groups:
+
+  ```sh
+  install -d -o authelia -g bilbycast-portal -m 2770 /etc/authelia/users
+  chmod 660 /etc/authelia/users/users.yml
+  ```
+
+  and point `authentication_backend.file.path` at the new location. Nothing
+  else under `/etc/authelia` needs to be writable by the portal.
 
 ## Clips
 

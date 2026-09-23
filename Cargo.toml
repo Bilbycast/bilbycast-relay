@@ -152,6 +152,37 @@ features = ["rt", "io"]
 version = "0.10"
 optional = true
 
+# Portal account sync (`src/portal/accounts.rs`): reads and rewrites
+# Authelia's YAML user file, and gives each new account an argon2id hash of a
+# random secret nobody holds. `serde_yaml_ng` is the maintained fork of the
+# deprecated `serde_yaml`.
+[dependencies.serde_yaml_ng]
+version = "0.10"
+optional = true
+
+[dependencies.argon2]
+version = "0.5"
+optional = true
+features = ["std"]
+
+[dependencies.getrandom]
+version = "0.3"
+optional = true
+
+# The portal rewrites Authelia's notification emails (`src/portal/mail.rs`):
+# it receives them on loopback and relays them through the configured SMTP
+# service. `lettre` is the client; rustls + webpki-roots to match the rest of
+# the portal's TLS, never native-tls.
+[dependencies.lettre]
+version = "0.11"
+optional = true
+default-features = false
+features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"]
+
+[dependencies.async-trait]
+version = "0.1"
+optional = true
+
 # The viewer portal ships as a SECOND binary rather than a mode of the relay:
 # it is public-facing and it is not the data plane, so a bug in it must not be
 # able to take the media termination on the same box with it. Declared
@@ -198,7 +229,10 @@ viewer-distribution-vendored = ["viewer-distribution", "dep:openssl", "openssl/v
 # The viewer portal binary. Independent of `viewer-distribution` on purpose:
 # the portal hands out links to a relay, which need not be this one, and
 # building it must not drag in str0m or OpenSSL.
-portal = ["dep:reqwest"]
+# `accounts` (Authelia user-file sync) needs a YAML parser and an argon2
+# hasher; both are portal-only.
+portal = ["dep:reqwest", "dep:serde_yaml_ng", "dep:argon2", "dep:getrandom",
+          "dep:lettre", "dep:async-trait"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

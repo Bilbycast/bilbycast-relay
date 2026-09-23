@@ -192,6 +192,8 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
         username_header: "remote-user".into(),
         trusted_proxies: trusted.iter().map(|s| s.parse().unwrap()).collect(),
         player_origins: player_origins.iter().map(|s| (*s).to_string()).collect(),
+        accounts: None,
+        mail: None,
         logout_url: Some("https://auth.example/logout".into()),
     };
     cfg.normalise();
@@ -204,6 +206,7 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
         },
         media: reqwest::Client::new(),
         last_beat_answer: Default::default(),
+        links: Default::default(),
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
@@ -428,6 +431,8 @@ async fn harness_unreachable(player_origins: &[&str]) -> String {
         username_header: "remote-user".into(),
         trusted_proxies: ["127.0.0.1".parse().unwrap()].into_iter().collect(),
         player_origins: player_origins.iter().map(|s| (*s).to_string()).collect(),
+        accounts: None,
+        mail: None,
         logout_url: None,
     };
     cfg.normalise();
@@ -439,6 +444,7 @@ async fn harness_unreachable(player_origins: &[&str]) -> String {
         },
         media: reqwest::Client::new(),
         last_beat_answer: Default::default(),
+        links: Default::default(),
     };
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();

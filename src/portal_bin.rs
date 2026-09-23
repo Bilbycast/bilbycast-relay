@@ -113,7 +113,42 @@ async fn main() -> anyhow::Result<()> {
             .read_timeout(std::time::Duration::from_secs(30))
             .build()?,
         last_beat_answer: Default::default(),
+        links: Default::default(),
     };
+
+    // Authelia's notification emails, rewritten and relayed as ours. Started
+    // before the account sync, which hands it the links it should expect.
+    if let Some(mail) = state.cfg.mail.clone() {
+        match portal::mail::SmtpRelay::new(&mail) {
+            Ok(relay) => {
+                tracing::info!(
+                    listen = %mail.listen_addr, relay = %mail.relay_host,
+                    "rewriting Authelia's notification email"
+                );
+                tokio::spawn(portal::mail::run(
+                    Arc::new(mail),
+                    state.links.clone(),
+                    Arc::new(relay),
+                ));
+            }
+            // Refuse to start rather than run with Authelia mailing a listener
+            // that is not there: every link would be accepted and silently
+            // dropped.
+            Err(e) => anyhow::bail!("portal mail relay: {e}"),
+        }
+    }
+
+    // Only when configured: a portal without an `accounts` block runs exactly
+    // as it always did, and never touches Authelia's files.
+    if let Some(acc) = state.cfg.accounts.clone() {
+        tracing::info!(
+            users_file = %acc.users_file.display(),
+            authelia = %acc.authelia_url,
+            every_secs = acc.interval_secs,
+            "syncing portal logins to Authelia"
+        );
+        tokio::spawn(portal::accounts::run(state.clone(), acc));
+    }
 
     // `into_make_service_with_connect_info` is load-bearing, not boilerplate:
     // the peer address is what decides whether the username header is believed

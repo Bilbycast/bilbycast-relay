@@ -50,7 +50,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod accounts;
 pub mod config;
+pub mod mail;
 
 pub use config::PortalConfig;
 
@@ -157,6 +159,10 @@ pub struct PortalState {
     /// The answer is logged when it *changes*: `BEAT_LANDED`, a refusal's
     /// status code, or `BEAT_UNREACHABLE`.
     pub last_beat_answer: Arc<std::sync::atomic::AtomicU16>,
+    /// Links asked for and not yet seen leaving, shared with the mail
+    /// listener. Always present; it simply stays empty when the portal is not
+    /// rewriting Authelia's email.
+    pub links: Arc<mail::PendingLinks>,
 }
 
 impl PortalState {
@@ -1554,6 +1560,8 @@ mod tests {
             username_header: "remote-user".into(),
             trusted_proxies: trusted.iter().map(|s| s.parse().unwrap()).collect::<HashSet<_>>(),
             player_origins: Vec::new(),
+            accounts: None,
+            mail: None,
             logout_url: None,
         }
     }

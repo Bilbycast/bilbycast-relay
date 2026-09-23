@@ -340,6 +340,20 @@ re-checked every time, the mint cannot displace the viewer's own player, and
 the viewer token never reaches the browser: the download is proxied, not
 redirected.
 
+**Account sync** (`src/portal/accounts.rs`, optional `accounts` config block):
+the portal polls the manager's `GET /api/v1/dvr/portal/accounts` and mirrors
+logins that have an email into Authelia's YAML user file, marking what it owns
+with an Authelia group (`managed_group`, default `bilbycast-portal`) and never
+touching an unmarked account. New accounts get an argon2id hash of random bytes
+nobody holds; a requested set-your-password link is sent by calling Authelia's
+own `POST /api/reset-password/identity/start` on loopback with
+`X-Forwarded-Host` set, then acknowledged on `…/accounts/link-sent`. Authelia
+answers that endpoint `200` for any name, so a link is only requested for an
+account already loaded (one cycle after creation). The file has two writers
+(Authelia rewrites it on a password change), so writes happen only on change,
+by temp-then-rename, abandoned if the file moved underneath. Adds
+`serde_yaml_ng`, `argon2` and `getrandom` to the `portal` feature only.
+
 The trust boundary is the one thing to get right. Identity arrives in a header
 (`Remote-User`) that the authenticating proxy sets, which is a *claim*, not a
 proof. Two fail-closed controls hold it: `listen_addr` defaults to loopback, and

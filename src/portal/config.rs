@@ -74,6 +74,18 @@ pub struct PortalConfig {
     /// `Access-Control-Allow-Credentials` may not answer `*`.
     #[serde(default)]
     pub player_origins: Vec<String>,
+
+    /// Keep Authelia's user file in step with the manager's portal logins,
+    /// and send set-your-password links. Absent means off — see
+    /// [`super::accounts`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<super::accounts::AccountSyncConfig>,
+
+    /// Take Authelia's notification emails and send them as our own, so an
+    /// invitation reads like one — see [`super::mail`]. Absent means Authelia
+    /// mails the relay itself, with its own wording for both cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail: Option<super::mail::MailConfig>,
 }
 
 fn default_listen() -> String {
@@ -126,6 +138,12 @@ impl PortalConfig {
         for o in &mut self.player_origins {
             *o = o.trim().trim_end_matches('/').to_string();
         }
+        if let Some(a) = &mut self.accounts {
+            a.normalise();
+        }
+        if let Some(m) = &mut self.mail {
+            m.normalise();
+        }
     }
 
     /// Everything that must be true before the service will start.
@@ -134,6 +152,12 @@ impl PortalConfig {
     /// refuses to run instead of refusing every viewer with a message that
     /// reads like their account being wrong.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(a) = &self.accounts {
+            a.validate()?;
+        }
+        if let Some(m) = &self.mail {
+            m.validate()?;
+        }
         if self.manager_url.is_empty() {
             return Err("manager_url is required".into());
         }
@@ -258,6 +282,8 @@ mod tests {
             logout_url: None,
             trusted_proxies: default_proxies(),
             player_origins: Vec::new(),
+            accounts: None,
+            mail: None,
         };
         let err = cfg.validate().expect_err("plaintext must be refused by default");
         assert!(err.contains("BILBYCAST_ALLOW_INSECURE"), "{err}");
@@ -280,6 +306,8 @@ mod tests {
             username_header: default_header().to_ascii_lowercase(),
             trusted_proxies: default_proxies(),
             player_origins: Vec::new(),
+            accounts: None,
+            mail: None,
             logout_url: None,
         }
     }
