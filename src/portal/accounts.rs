@@ -109,6 +109,18 @@ impl AccountSyncConfig {
         {
             return Err("accounts.authelia_url must be an http(s) URL".into());
         }
+        // Plain HTTP carries the username of everyone being invited, and
+        // anyone who can read it can also forge the request that emails them a
+        // password link. On loopback that is the documented deployment —
+        // Authelia listens there without TLS — and anywhere else it is a
+        // mistake nobody would see, so it is refused rather than warned about.
+        if self.authelia_url.starts_with("http://") && !authelia_is_local(&self.authelia_url) {
+            return Err(
+                "accounts.authelia_url may only be http:// on this host; use https:// \
+                        for an Authelia anywhere else"
+                    .into(),
+            );
+        }
         // A host, not a URL: it becomes the `X-Forwarded-Host` header.
         if self.public_host.is_empty()
             || self.public_host.contains('/')
@@ -126,6 +138,24 @@ impl AccountSyncConfig {
         }
         Ok(())
     }
+}
+
+/// Is this Authelia on the same host?
+///
+/// Host only: a port, a path prefix and credentials are all allowed around it.
+fn authelia_is_local(url: &str) -> bool {
+    let rest = url.trim_start_matches("http://");
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.rfind(':') {
+        // Not a port when it is inside `[::1]`.
+        Some(i) if !host[i..].contains(']') => &host[..i],
+        _ => host,
+    };
+    matches!(
+        host.trim_matches(|c| c == '[' || c == ']'),
+        "127.0.0.1" | "localhost" | "::1"
+    )
 }
 
 /// One login, as the manager reports it: one row per username, however many
@@ -876,6 +906,44 @@ users:
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o660);
+        }
+    }
+
+    #[test]
+    fn plain_http_to_authelia_is_this_host_only() {
+        for ok in [
+            "http://127.0.0.1:9091/auth",
+            "http://localhost:9091/auth",
+            "http://[::1]:9091/auth",
+            "https://auth.example.com",
+        ] {
+            let mut c = AccountSyncConfig {
+                users_file: "/etc/authelia/users.yml".into(),
+                authelia_url: ok.into(),
+                public_host: "watch.example.com".into(),
+                managed_group: default_group(),
+                interval_secs: 15,
+            };
+            c.normalise();
+            assert!(c.validate().is_ok(), "{ok} was refused");
+        }
+        for bad in [
+            "http://auth.example.com/auth",
+            // The host is what counts, not what is written before the `@`.
+            "http://127.0.0.1@evil.example.com/auth",
+        ] {
+            let mut c = AccountSyncConfig {
+                users_file: "/etc/authelia/users.yml".into(),
+                authelia_url: bad.into(),
+                public_host: "watch.example.com".into(),
+                managed_group: default_group(),
+                interval_secs: 15,
+            };
+            c.normalise();
+            assert!(
+                c.validate().is_err(),
+                "{bad} would send every invited username over the network in clear"
+            );
         }
     }
 

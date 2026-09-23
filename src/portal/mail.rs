@@ -405,6 +405,19 @@ pub async fn handle(
     relay: &dyn Relay,
     msg: Incoming,
 ) -> Result<(), String> {
+    // Nothing but Authelia should be delivering here, but the listener has no
+    // authentication — it cannot, Authelia has no credential to offer — so
+    // anything else running on this host could hand it a message and have it
+    // relayed under our own domain. The envelope sender is the one thing that
+    // distinguishes them, so a message claiming to be from anyone else is
+    // dropped rather than forwarded.
+    if !sender_is_ours(cfg, &msg.from) {
+        tracing::warn!(
+            from = %msg.from,
+            "refusing to relay a message that did not come from this portal's sender address"
+        );
+        return Err("the message was not from this portal's sender address".into());
+    }
     let matched = pending.take(&msg.recipients).await;
     let Some((to, mut pending_entry)) = matched else {
         // Not ours: a viewer resetting their own password from the sign-in
@@ -459,6 +472,21 @@ fn envelope_for(msg: &Incoming) -> Result<Envelope, String> {
         return Err("the message named no recipient this relay could parse".into());
     }
     Envelope::new(from, to).map_err(|e| format!("bad envelope: {e}"))
+}
+
+/// Does this message claim to come from the address this portal sends as?
+///
+/// Compared on the address alone: `from` carries a display name, the envelope
+/// never does.
+fn sender_is_ours(cfg: &MailConfig, envelope_from: &str) -> bool {
+    let ours = cfg
+        .from
+        .rsplit_once('<')
+        .map(|(_, rest)| rest.trim_end_matches('>'))
+        .unwrap_or(&cfg.from)
+        .trim()
+        .to_ascii_lowercase();
+    key(envelope_from) == ours
 }
 
 /// The SMTP conversation. Enough of RFC 5321 for Authelia, and nothing more.
@@ -732,6 +760,18 @@ mod tests {
             // And the manager hears that it went.
             assert_eq!(rx.await.unwrap(), Ok(()));
         }
+    }
+
+    #[tokio::test]
+    async fn a_message_from_anything_but_us_is_dropped() {
+        let pending = PendingLinks::default();
+        let relay = Captured::default();
+        let mut msg = authelia_message("bea@example.com");
+        // Some other process on the box, using our listener as a way out.
+        msg.from = "spammer@elsewhere.example".into();
+        let out = handle(&cfg(), &pending, &relay, msg).await;
+        assert!(out.is_err(), "the listener relayed mail for a stranger");
+        assert!(relay.sent.lock().await.is_empty());
     }
 
     #[tokio::test]
