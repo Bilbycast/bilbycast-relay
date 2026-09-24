@@ -341,18 +341,68 @@ the viewer token never reaches the browser: the download is proxied, not
 redirected.
 
 **Account sync** (`src/portal/accounts.rs`, optional `accounts` config block):
-the portal polls the manager's `GET /api/v1/dvr/portal/accounts` and mirrors
-logins that have an email into Authelia's YAML user file, marking what it owns
-with an Authelia group (`managed_group`, default `bilbycast-portal`) and never
-touching an unmarked account. New accounts get an argon2id hash of random bytes
-nobody holds; a requested set-your-password link is sent by calling Authelia's
-own `POST /api/reset-password/identity/start` on loopback with
-`X-Forwarded-Host` set, then acknowledged on `…/accounts/link-sent`. Authelia
-answers that endpoint `200` for any name, so a link is only requested for an
-account already loaded (one cycle after creation). The file has two writers
-(Authelia rewrites it on a password change), so writes happen only on change,
-by temp-then-rename, abandoned if the file moved underneath. Adds
-`serde_yaml_ng`, `argon2` and `getrandom` to the `portal` feature only.
+every `interval_secs` (default 15, 5–3600) the portal polls the manager's
+`GET /api/v1/dvr/portal/accounts?interval_secs=N` — the interval rides along so
+the manager can tell a slow portal from a stopped one — and mirrors logins that
+have an email into Authelia's YAML user file, marking what it owns with an
+Authelia group (`managed_group`, default `bilbycast-portal`). A hand-made entry
+(no group) is never rewritten or removed, and a link asked for one is answered
+with a reason instead. **Removal is positive**: a managed account goes only when
+its username is in the answer's `removed[]` (tombstones the manager keeps by
+trigger when a username's last login is deleted, 90 days) and in no
+`accounts[]` row; against a manager too old to send `removed`, absence removes,
+except that an empty list removes nobody. New accounts get an argon2id hash (at
+argon2's minimum cost) of 32 random bytes nobody holds. A requested
+set-your-password link is sent only for a managed account whose file entry
+already holds the manager's email when the cycle begins (Authelia's
+`POST /api/reset-password/identity/start` answers OK for any name, so a new
+account or a changed email waits a cycle), and never in a cycle whose file write
+failed or lost its race for that account; it goes to Authelia on loopback
+(`authelia_url`, default `http://127.0.0.1:9091/auth` — its path must be
+Authelia's `server.address` path, probed once at startup via `/api/health`)
+with `X-Forwarded-Host: <public_host>`, and success means `{"status":"OK"}`,
+since Authelia reports its failures as `200` KO. A `429` is left
+unacknowledged and honours `Retry-After` (≤ 1 h). Each `(username,
+requested_at)` is served at most once per process, then acknowledged on
+`…/accounts/link-sent` with the reason (one line, ≤ 300 bytes) when it failed.
+Collisions that would make Authelia refuse the file under `search.email` (an
+email or username another account holds, case-insensitively) and usernames
+YAML would misread (`<<`, numbers, booleans, `null`) are never written. The
+file has two writers (Authelia rewrites it on a password change), so writes
+happen only on change: a `0600` temp file given the old mode and (by `fchown`,
+best effort) group, refused if it would take the file from Authelia's
+owner/group, inode + mtime + length re-checked just before the rename, the
+directory fsynced after. Rewriting drops comments and normalises quoting, so a
+hand-made entry with an unquoted number/boolean (or a non-string key) blocks
+every write until quoted. The packaged unit gives write access to
+`/etc/authelia/users` only (`ReadWritePaths=-…`) and re-allows
+`SystemCallFilter=@chown` after denying `@privileged` — a denied `fchown` is
+SIGSYS, not an error.
+
+**Mail interception** (`src/portal/mail.rs`, optional `mail` config block):
+Authelia sends one email for an invitation and a reset, so with `mail` it is
+pointed at an SMTP listener inside the portal (`listen_addr`, loopback only,
+default `127.0.0.1:2525`), and a message to an address the account sync has
+just asked a link for (matched within `PENDING_TTL`, 30 s) is rewritten as an
+invitation (the manager's `first_link`) or a reset around Authelia's own link,
+then relayed through `relay_host` with `lettre` (STARTTLS by default, or
+`implicit_tls`). Everything else is relayed byte for byte. The listener requires
+`AUTH PLAIN`/`LOGIN` with the secret in the **required**
+`listen_password_file` (≥ 32 chars; Authelia gets the same file as
+`AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE`), refuses any envelope sender but
+`from`'s address (`550`), takes one recipient per message, and is bounded (16
+connections, 60 s session, 30 s idle, 64 KiB line, 1 MiB message, 8 messages
+waiting on the relay, which gets `RELAY_TIMEOUT` = 20 s, below the account
+sync's 30 s wait — pinned by a `const` assert). Wording comes from `brand`
+(default `Bilbycast`), `invite_subject` / `reset_subject` and an optional
+`link_lifetime`; no customer brand is in the code. `portal_bin.rs` binds the
+listener in `main` before serving, so a taken port or unreadable secret exits
+at startup, and exits non-zero if either background task ever ends. Authelia's
+notifier startup check needs the listener, so Authelia is ordered after the
+portal. Adds `serde_yaml_ng`, `argon2` 0.6, `getrandom` 0.4, `lettre` 0.11
+(rustls + webpki-roots, no native-tls) and `async-trait` to the `portal`
+feature only. Operator detail, including the upgrade steps for a portal that
+already ran either block: `docs/portal.md`.
 
 The trust boundary is the one thing to get right. Identity arrives in a header
 (`Remote-User`) that the authenticating proxy sets, which is a *claim*, not a
