@@ -43,9 +43,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Deliberately narrower than the release workflow, which needs `contents: write`
-# (it pushes tags) and `id-token: write` (it mints a Fulcio cert). CI needs
-# neither, so a compromised action in this path cannot do either.
+# Deliberately narrower than the release workflow's `release` job, which needs
+# `contents: write` (it pushes tags) and `id-token: write` (it mints a Fulcio
+# cert). CI needs neither, so a compromised action in this path cannot do
+# either. Neither job pushes, so neither checkout leaves the token in
+# .git/config for the build scripts, tests and npm install that run after it.
 permissions:
   contents: read
 
@@ -70,6 +72,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -192,6 +196,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v5
         with:

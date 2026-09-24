@@ -21,13 +21,20 @@ on:
     tags:
       - "v*"
 
+# Read-only by default. Only the `release` job below is granted more, because
+# it is the only job that needs more. Both of its grants are worth more than
+# they look, which is why they are not handed to every job:
+#   - `id-token: write` mints a Fulcio certificate whose subject is this
+#     workflow file at the tag (`nightly-release.yml@refs/tags/v*`), not the
+#     job. That is exactly the identity install-relay.sh and upgrade-relay.sh
+#     trust, so any step holding it can sign a manifest operators will accept.
+#   - `contents: write` can create and delete releases and tags.
+# At workflow level both reached `build` too, where every dependency's
+# build.rs and proc-macro runs (the vendored OpenSSL C build included) and
+# where a third-party action installs the toolchain. `check-version` and
+# `build` only read the repository.
 permissions:
-  contents: write
-  # Sigstore Fulcio OIDC token. Manager + relay don't have an
-  # auto-upgrade pipeline today, but signing the manifest is cheap
-  # parity with edge + appear-x and gives operators a verifiable
-  # supply-chain attestation on manual install.
-  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +49,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          # Nothing in this job pushes. `gh release view` below reads the
+          # repository from the `origin` remote, which is still configured,
+          # and authenticates with GH_TOKEN, not the git credential.
+          persist-credentials: false
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -108,6 +120,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          # Nothing in this job pushes, and without this the job's token stays
+          # in .git/config for every later step, `cargo build` included.
+          persist-credentials: false
 
       - name: Install musl tools
         run: |
@@ -222,7 +238,20 @@ jobs:
     needs: [check-version, build]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-24.04
+    # The only job granted more than read (see the top-level block).
+    #   - id-token: write for `cosign sign-blob` (Sigstore keyless: the
+    #     runner's OIDC token buys the Fulcio certificate).
+    #   - contents: write for `git push origin <tag>` on a manual dispatch,
+    #     `gh release create` with its assets, and `gh release delete
+    #     --cleanup-tag` when pruning.
+    # download-artifact reads this run's artefacts with the runner's own
+    # token, not this one, so it needs no `actions` grant.
+    permissions:
+      contents: write
+      id-token: write
     steps:
+      # Credentials stay persisted here, unlike the two jobs above: a manual
+      # `workflow_dispatch` run creates the tag and pushes it with them.
       - name: Checkout repository
         uses: actions/checkout@v5
 
