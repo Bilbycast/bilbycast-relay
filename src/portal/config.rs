@@ -152,6 +152,16 @@ impl PortalConfig {
     /// refuses to run instead of refusing every viewer with a message that
     /// reads like their account being wrong.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with(std::env::var("BILBYCAST_ALLOW_INSECURE").as_deref() == Ok("1"))
+    }
+
+    /// [`validate`](Self::validate), with the plaintext opt-in passed in
+    /// rather than read from the environment.
+    ///
+    /// Split out so the opt-in can be tested both ways without a test writing
+    /// a process-wide variable while every other test thread may be reading
+    /// the environment.
+    fn validate_with(&self, allow_insecure: bool) -> Result<(), String> {
         if let Some(a) = &self.accounts {
             a.validate()?;
         }
@@ -169,9 +179,7 @@ impl PortalConfig {
         // anyone on the path. Gated the way every other credential-bearing
         // escape hatch in the fleet is: an explicit env var, so it cannot be
         // reached by editing a config file alone.
-        if self.manager_url.starts_with("http://")
-            && std::env::var("BILBYCAST_ALLOW_INSECURE").unwrap_or_default() != "1"
-        {
+        if self.manager_url.starts_with("http://") && !allow_insecure {
             return Err(format!(
                 "manager_url {} is plaintext, and the portal sends its manager token on \
                  every request to it. Use https://, or set BILBYCAST_ALLOW_INSECURE=1 if \
@@ -267,13 +275,18 @@ impl PortalConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// The portal sends its manager token on every request, so a plaintext
     /// manager URL must not be reachable by editing a config file alone.
+    ///
+    /// Through `validate_with`, not by setting the variable: `cargo test` runs
+    /// tests on parallel threads. A write to the process environment races
+    /// every libc `getenv` another thread makes outside std's lock (the
+    /// resolver's, for one), which is undefined behaviour, and every other
+    /// test that reads the variable would see whatever this one had set.
     #[test]
     fn a_plaintext_manager_url_needs_the_explicit_env_opt_in() {
-        // SAFETY: single-threaded test, and the variable is read only here.
-        unsafe { std::env::remove_var("BILBYCAST_ALLOW_INSECURE") };
         let mut cfg = PortalConfig {
             listen_addr: default_listen(),
             manager_url: "http://manager.internal".into(),
@@ -285,18 +298,17 @@ mod tests {
             accounts: None,
             mail: None,
         };
-        let err = cfg.validate().expect_err("plaintext must be refused by default");
+        let err = cfg
+            .validate_with(false)
+            .expect_err("plaintext must be refused by default");
         assert!(err.contains("BILBYCAST_ALLOW_INSECURE"), "{err}");
 
-        unsafe { std::env::set_var("BILBYCAST_ALLOW_INSECURE", "1") };
-        assert!(cfg.validate().is_ok(), "the opt-in must actually allow it");
-        unsafe { std::env::remove_var("BILBYCAST_ALLOW_INSECURE") };
+        assert!(cfg.validate_with(true).is_ok(), "the opt-in must actually allow it");
 
         // https needs no opt-in.
         cfg.manager_url = "https://manager.internal".into();
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate_with(false).is_ok());
     }
-    use super::*;
 
     fn ok() -> PortalConfig {
         PortalConfig {
