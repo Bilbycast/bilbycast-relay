@@ -1408,6 +1408,21 @@ async fn sync_once(
                          Either signs every viewer out"
                     );
                 }
+                // A removed account ends a session only when that session next
+                // asks after Authelia's profile refresh; one left idle outlives
+                // the removal and is honoured again if the username is made
+                // afresh later, so the remedy is said here too.
+                let gone = p.remove.iter().chain(p.replace.iter());
+                for u in gone.filter(|u| !p.add.iter().any(|a| &a.username == *u)) {
+                    tracing::info!(
+                        username = %u,
+                        "removed the Authelia account `{u}`; a session open as it ends only when it \
+                         next asks after Authelia's profile refresh, so an idle one survives and is \
+                         honoured again if the username is given out later. Before that, clear \
+                         Authelia's sessions: restart Authelia if it keeps them in memory, or \
+                         delete them from its Redis"
+                    );
+                }
             }
             // Authelia wrote first, after every check that could have stopped
             // the write had passed: nothing is blocked, so nothing is
@@ -3470,8 +3485,8 @@ users:
 
     /// A replacement stops the last holder's password, not a session they
     /// already have open, so the log says so, and how to end one. A username
-    /// given out again with no address gets no new account, and Authelia ends
-    /// a session whose user has gone, so nothing is said for that one.
+    /// given out again with no address gets no new account: it is removed, and
+    /// an idle session outlives a removal too, so that is said as well.
     #[tokio::test]
     async fn a_replacement_says_how_to_end_the_last_holders_session() {
         let answer = serde_json::json!({
@@ -3495,7 +3510,13 @@ users:
                 && text.contains("Redis"),
             "{text}"
         );
-        assert!(!text.contains("`b.jones`"), "{text}");
+        assert!(
+            !text.contains("replaced the Authelia account `b.jones`")
+                && text.contains("removed the Authelia account `b.jones`")
+                && text.contains("an idle one survives"),
+            "{text}"
+        );
+        assert!(!text.contains("removed the Authelia account `a.smith`"), "{text}");
     }
 
     /// Not acknowledged until it is in the file: the manager would forget a

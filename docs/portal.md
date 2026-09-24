@@ -387,13 +387,17 @@ For each record the portal does one of three things:
   one: nothing is written.
 
 **A replacement does not sign the last holder out.** Authelia ends a signed-in
-session when its user has gone from the file or been disabled, at its next
-profile refresh (`authentication_backend.refresh_interval`), and an account
-made afresh under the same username is neither. So a session the last holder
+session when its user has gone from the file or been disabled — and only when
+that session next makes a request after its profile refresh
+(`authentication_backend.refresh_interval`) finds it so. An account made afresh
+under the same username is neither gone nor disabled, and a session left idle
+through a plain removal is never checked while the account is gone, so it is
+honoured again if the username is given out later. So a session the last holder
 opened before the replacement keeps reaching the portal as that username until
 it expires — up to a month with Authelia's default remember-me — and is served
 the new holder's feeds. The portal cannot reach Authelia's sessions, so each
-time it makes a replaced account afresh it logs ``replaced the Authelia account
+time it removes an account it logs the remedy at info level, and each time it
+makes a replaced account afresh it logs at warning level ``replaced the Authelia account
 `<name>` for the login's new holder; …`` with the remedy: clear Authelia's
 sessions — restart Authelia when it keeps them in memory (its default, without
 `session.redis`), or delete them from its Redis. Either signs every viewer out.
