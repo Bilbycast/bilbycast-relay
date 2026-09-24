@@ -344,10 +344,10 @@ pub struct OriginStore {
     /// One lock for the store, not one per stream: admission happens when an
     /// operator presses Export, so there is nothing here to contend for.
     clip_admission: std::sync::Mutex<()>,
-    /// Serialises read-modify-write of a marks file — see [`marks`].
-    /// Store-wide for the same reason as `clip_admission`: marks are made by
-    /// hand.
-    marks_lock: std::sync::Mutex<()>,
+    /// Serialises read-modify-write of a marks file — see [`marks`] and
+    /// [`lock_marks`](OriginStore::lock_marks). Store-wide for the same reason
+    /// as `clip_admission`: marks are made by hand.
+    marks_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Marker written into the origin root, so the store can tell a directory it
@@ -706,7 +706,7 @@ impl OriginStore {
             total_bytes: AtomicU64::new(0),
             started: Instant::now(),
             clip_admission: std::sync::Mutex::new(()),
-            marks_lock: std::sync::Mutex::new(()),
+            marks_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         store.adopt_existing();
         Ok(store)
@@ -1517,6 +1517,25 @@ impl OriginStore {
         let file = tokio::fs::File::open(&path).await.ok()?;
         let len = file.metadata().await.ok()?.len();
         Some((file, len))
+    }
+
+    /// Take the store's marks lock.
+    ///
+    /// A `tokio` mutex, waited for as a future: a marks write queued behind
+    /// another costs a task, not a thread. It was a `std` mutex taken on the
+    /// blocking pool, where every waiter held one of the pool's threads for as
+    /// long as it waited — while each write holds the lock across two fsyncs.
+    /// A burst of marks writes from any viewer token could then fill the pool
+    /// every `tokio::fs` call in the relay shares, segment ingest for every
+    /// stream included.
+    ///
+    /// Owned, so the guard moves into the blocking work and is released when
+    /// that work is done rather than when the request is. A client that hangs
+    /// up drops its handler but not the blocking task the handler started,
+    /// and a guard dropped with the handler would let the next writer in
+    /// while this one was still between its read and its rename.
+    async fn lock_marks(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.marks_lock.clone().lock_owned().await
     }
 
     pub async fn remove_stream(&self, stream: &str) {

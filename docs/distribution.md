@@ -661,7 +661,10 @@ so a mark posted after the drop is refused with `404` rather than bringing the
 directory back for the backstop alone to find; the player keeps such a mark
 pending and posts it once the directory exists, which also covers a mark made
 in the seconds before the first segment lands. Reading a stream with no
-directory is an empty list. A `marks.json` that will not parse (a hand edit, a
+directory is an empty list. Writes queue on one store-wide lock, waited for as
+tasks rather than on the blocking pool's threads: each write syncs the file and
+its directory while holding it, and threads parked behind it would starve every
+other file operation on the relay, segment ingest included. A `marks.json` that will not parse (a hand edit, a
 disk fault) is set aside as `marks.json.unreadable-<time>` by the first request
 of any kind — a read included — and the list starts again empty. A read or
 write that fails is `503` with `Retry-After`; `500` is kept for a relay with no

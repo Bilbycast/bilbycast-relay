@@ -30,6 +30,10 @@
 //! with no directory is an empty list, not an error: a player opened before
 //! the first segment lands must not conclude the relay has no marks at all.
 //!
+//! **Writers queue as tasks, not threads.** The lock is a `tokio` mutex taken
+//! before a write goes to the blocking pool and held until it is done there —
+//! see `OriginStore::lock_marks` for why each half matters.
+//!
 //! **Viewers learn about each other's changes by polling** `GET`, which answers
 //! `304` while the list is unchanged. At six viewers polling every few seconds
 //! that is a handful of header exchanges a second, and it keeps the relay free
@@ -274,7 +278,7 @@ impl OriginStore {
             .then(|| self.cfg.root.join(stream).join(MARKS_DIR).join(MARKS_FILE))
     }
 
-    /// The stream's list as it stands. Blocking: call from the blocking pool.
+    /// The stream's list as it stands.
     ///
     /// Reads without the lock: every write lands by rename, so a reader sees
     /// the whole old list or the whole new one. The lock is taken only to
@@ -286,17 +290,20 @@ impl OriginStore {
     /// Read again under the lock before anything is renamed: a writer may have
     /// set the file aside and stored a fresh one in the meantime, and moving
     /// that one out of the way would lose a mark.
-    pub fn list_marks(&self, stream: &str) -> std::io::Result<MarkSet> {
+    pub async fn list_marks(&self, stream: &str) -> Result<MarkSet, MarkRefusal> {
         let Some(path) = self.marks_path(stream) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "origin: unsafe stream name",
-            ));
+            return Err(MarkRefusal::Invalid("invalid stream id"));
         };
-        match load(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                let _writing = self.marks_lock.lock().unwrap_or_else(|e| e.into_inner());
-                load_or_set_aside(&path, stream)
+        let unlocked = path.clone();
+        match blocking(stream, move || load(&unlocked).map_err(MarkRefusal::Io)).await {
+            Err(MarkRefusal::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let held = self.lock_marks().await;
+                let s = stream.to_owned();
+                blocking(stream, move || {
+                    let _held = held;
+                    load_or_set_aside(&path, &s).map_err(MarkRefusal::Io)
+                })
+                .await
             }
             other => other,
         }
@@ -307,37 +314,45 @@ impl OriginStore {
     /// `f` returns its result and whether it changed anything; an unchanged
     /// list is not rewritten, so its revision — and every viewer's `304` —
     /// survives a no-op.
-    fn mutate_marks<T>(
+    async fn mutate_marks<T: Send + 'static>(
         &self,
         stream: &str,
-        f: impl FnOnce(&mut MarkSet) -> Result<(T, bool), MarkRefusal>,
+        f: impl FnOnce(&mut MarkSet) -> Result<(T, bool), MarkRefusal> + Send + 'static,
     ) -> Result<(MarkSet, T), MarkRefusal> {
         let Some(path) = self.marks_path(stream) else {
             return Err(MarkRefusal::Invalid("invalid stream id"));
         };
+        let stream_dir = self.cfg.root.join(stream);
+        let s = stream.to_owned();
         // One lock for the store, as for clip admission: a mark is made when
         // an operator presses a button, so there is nothing to contend for,
         // and without it two viewers marking in the same instant would each
         // read the same list and the second write would drop the first mark.
-        let _writing = self.marks_lock.lock().unwrap_or_else(|e| e.into_inner());
-        // Checked under the lock, and `store` creates nothing above `marks/`,
-        // so a list cannot outlive the stream it belongs to. See the module
-        // header.
-        if !self.cfg.root.join(stream).is_dir() {
-            return Err(MarkRefusal::NoStream);
-        }
-        let mut set = load_or_set_aside(&path, stream)?;
-        let (out, changed) = f(&mut set)?;
-        if changed {
-            if set.epoch.is_empty() {
-                set.epoch = uuid::Uuid::new_v4().simple().to_string();
+        // Waited for here, as a future, and held until the blocking work is
+        // done — see `lock_marks`.
+        let held = self.lock_marks().await;
+        blocking(stream, move || {
+            let _held = held;
+            // Checked under the lock, and `store` creates nothing above
+            // `marks/`, so a list cannot outlive the stream it belongs to.
+            // See the module header.
+            if !stream_dir.is_dir() {
+                return Err(MarkRefusal::NoStream);
             }
-            set.rev = set.rev.saturating_add(1);
-            set.marks
-                .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
-            store(&path, &set)?;
-        }
-        Ok((set, out))
+            let mut set = load_or_set_aside(&path, &s)?;
+            let (out, changed) = f(&mut set)?;
+            if changed {
+                if set.epoch.is_empty() {
+                    set.epoch = uuid::Uuid::new_v4().simple().to_string();
+                }
+                set.rev = set.rev.saturating_add(1);
+                set.marks
+                    .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+                store(&path, &set)?;
+            }
+            Ok((set, out))
+        })
+        .await
     }
 
     /// Add a mark, returning the list and the new mark's id.
@@ -348,7 +363,11 @@ impl OriginStore {
     /// marks it held locally before this existed — therefore cannot duplicate,
     /// and two operators pressing MARK within the same millisecond is not a
     /// distinction anybody could see on the bar.
-    pub fn add_mark(&self, stream: &str, new: NewMark) -> Result<(MarkSet, String), MarkRefusal> {
+    pub async fn add_mark(
+        &self,
+        stream: &str,
+        new: NewMark,
+    ) -> Result<(MarkSet, String), MarkRefusal> {
         if !(MIN_AT_MS..=MAX_AT_MS).contains(&new.at) {
             return Err(MarkRefusal::Invalid(
                 "a mark's time must be a wall clock in milliseconds",
@@ -360,7 +379,7 @@ impl OriginStore {
         if !valid_colour(&new.colour) {
             return Err(MarkRefusal::Invalid("a mark's colour must be #rrggbb"));
         }
-        self.mutate_marks(stream, |set| {
+        self.mutate_marks(stream, move |set| {
             if let Some(m) = set.marks.iter().find(|m| m.at == new.at) {
                 return Ok((m.id.clone(), false));
             }
@@ -377,9 +396,10 @@ impl OriginStore {
             });
             Ok((id, true))
         })
+        .await
     }
 
-    pub fn edit_mark(
+    pub async fn edit_mark(
         &self,
         stream: &str,
         id: &str,
@@ -394,7 +414,8 @@ impl OriginStore {
         if edit.colour.as_deref().is_some_and(|c| !valid_colour(c)) {
             return Err(MarkRefusal::Invalid("a mark's colour must be #rrggbb"));
         }
-        self.mutate_marks(stream, |set| {
+        let id = id.to_owned();
+        self.mutate_marks(stream, move |set| {
             let Some(m) = set.marks.iter_mut().find(|m| m.id == id) else {
                 return Err(MarkRefusal::NotFound);
             };
@@ -411,21 +432,24 @@ impl OriginStore {
             let changed = *m != before;
             Ok(((), changed))
         })
+        .await
         .map(|(set, ())| set)
     }
 
     /// Remove a mark. Removing one that is already gone succeeds: two viewers
     /// deleting the same mark want the same outcome, and the second should not
     /// be told it failed.
-    pub fn delete_mark(&self, stream: &str, id: &str) -> Result<MarkSet, MarkRefusal> {
+    pub async fn delete_mark(&self, stream: &str, id: &str) -> Result<MarkSet, MarkRefusal> {
         if !valid_id(id) {
             return Err(MarkRefusal::NotFound);
         }
-        self.mutate_marks(stream, |set| {
+        let id = id.to_owned();
+        self.mutate_marks(stream, move |set| {
             let before = set.marks.len();
             set.marks.retain(|m| m.id != id);
             Ok(((), set.marks.len() != before))
         })
+        .await
         .map(|(set, ())| set)
     }
 }
@@ -556,13 +580,7 @@ async fn marks_list(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let origin = st.origin.clone();
-    let s = stream.clone();
-    let set = match blocking(&stream, move || {
-        origin.list_marks(&s).map_err(MarkRefusal::Io)
-    })
-    .await
-    {
+    let set = match st.origin.list_marks(&stream).await {
         Ok(set) => set,
         Err(r) => return refusal(&stream, r),
     };
@@ -596,9 +614,7 @@ async fn marks_add(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let origin = st.origin.clone();
-    let s = stream.clone();
-    match blocking(&stream, move || origin.add_mark(&s, new)).await {
+    match st.origin.add_mark(&stream, new).await {
         Ok((set, id)) => reply(StatusCode::CREATED, &set, Some(id)),
         Err(r) => refusal(&stream, r),
     }
@@ -616,9 +632,7 @@ async fn marks_edit(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let origin = st.origin.clone();
-    let s = stream.clone();
-    match blocking(&stream, move || origin.edit_mark(&s, &id, edit)).await {
+    match st.origin.edit_mark(&stream, &id, edit).await {
         Ok(set) => reply(StatusCode::OK, &set, None),
         Err(r) => refusal(&stream, r),
     }
@@ -635,9 +649,7 @@ async fn marks_delete(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let origin = st.origin.clone();
-    let s = stream.clone();
-    match blocking(&stream, move || origin.delete_mark(&s, &id)).await {
+    match st.origin.delete_mark(&stream, &id).await {
         Ok(set) => reply(StatusCode::OK, &set, None),
         Err(r) => refusal(&stream, r),
     }
@@ -678,37 +690,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_mark_one_viewer_makes_is_the_list_every_viewer_reads() {
+    #[tokio::test]
+    async fn a_mark_one_viewer_makes_is_the_list_every_viewer_reads() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         ingested(&tmp, "feed");
-        assert!(s.list_marks("feed").unwrap().marks.is_empty());
-        assert_eq!(s.list_marks("feed").unwrap().etag(), "\"marks-none\"");
+        assert!(s.list_marks("feed").await.unwrap().marks.is_empty());
+        assert_eq!(s.list_marks("feed").await.unwrap().etag(), "\"marks-none\"");
 
-        let (set, id) = s.add_mark("feed", at(T0 + 5_000)).unwrap();
+        let (set, id) = s.add_mark("feed", at(T0 + 5_000)).await.unwrap();
         assert_eq!(set.rev, 1);
-        let (set, _) = s.add_mark("feed", at(T0)).unwrap();
+        let (set, _) = s.add_mark("feed", at(T0)).await.unwrap();
         assert_eq!(set.rev, 2);
         // Sorted by instant, not by arrival — the order the list is drawn in.
-        let listed = s.list_marks("feed").unwrap();
+        let listed = s.list_marks("feed").await.unwrap();
         assert_eq!(
             listed.marks.iter().map(|m| m.at).collect::<Vec<_>>(),
             vec![T0, T0 + 5_000]
         );
         assert!(listed.marks.iter().any(|m| m.id == id));
         // Another stream's list is another list.
-        assert!(s.list_marks("other").unwrap().marks.is_empty());
+        assert!(s.list_marks("other").await.unwrap().marks.is_empty());
     }
 
-    #[test]
-    fn the_same_instant_twice_is_one_mark_and_no_new_revision() {
+    #[tokio::test]
+    async fn the_same_instant_twice_is_one_mark_and_no_new_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         ingested(&tmp, "feed");
-        let (_, first) = s.add_mark("feed", at(T0)).unwrap();
-        let etag = s.list_marks("feed").unwrap().etag();
-        let (set, again) = s.add_mark("feed", at(T0)).unwrap();
+        let (_, first) = s.add_mark("feed", at(T0)).await.unwrap();
+        let etag = s.list_marks("feed").await.unwrap().etag();
+        let (set, again) = s.add_mark("feed", at(T0)).await.unwrap();
         assert_eq!(first, again, "a retried mark was stored twice");
         assert_eq!(set.marks.len(), 1);
         assert_eq!(
@@ -718,12 +730,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edits_apply_only_what_they_name_and_a_no_op_keeps_the_revision() {
+    #[tokio::test]
+    async fn edits_apply_only_what_they_name_and_a_no_op_keeps_the_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         ingested(&tmp, "feed");
-        let (_, id) = s.add_mark("feed", at(T0)).unwrap();
+        let (_, id) = s.add_mark("feed", at(T0)).await.unwrap();
         let set = s
             .edit_mark(
                 "feed",
@@ -733,6 +745,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(set.rev, 2);
         let set = s
@@ -744,6 +757,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         let m = &set.marks[0];
         assert_eq!((m.name.as_str(), m.colour.as_str()), ("Goal", "#4da3ff"));
@@ -757,6 +771,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(
             set.rev, rev,
@@ -764,42 +779,42 @@ mod tests {
         );
 
         assert!(matches!(
-            s.edit_mark("feed", "abc123", MarkEdit::default()),
+            s.edit_mark("feed", "abc123", MarkEdit::default()).await,
             Err(MarkRefusal::NotFound)
         ));
     }
 
-    #[test]
-    fn deleting_twice_succeeds_twice() {
+    #[tokio::test]
+    async fn deleting_twice_succeeds_twice() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         ingested(&tmp, "feed");
-        let (_, id) = s.add_mark("feed", at(T0)).unwrap();
-        assert!(s.delete_mark("feed", &id).unwrap().marks.is_empty());
-        let rev = s.list_marks("feed").unwrap().rev;
-        let set = s.delete_mark("feed", &id).unwrap();
+        let (_, id) = s.add_mark("feed", at(T0)).await.unwrap();
+        assert!(s.delete_mark("feed", &id).await.unwrap().marks.is_empty());
+        let rev = s.list_marks("feed").await.unwrap().rev;
+        let set = s.delete_mark("feed", &id).await.unwrap();
         assert_eq!(set.rev, rev, "deleting nothing was recorded as a change");
     }
 
-    #[test]
-    fn malformed_marks_are_refused_before_they_are_stored() {
+    #[tokio::test]
+    async fn malformed_marks_are_refused_before_they_are_stored() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         ingested(&tmp, "feed");
         // Seconds where milliseconds were meant: a mark nobody could place.
         assert!(matches!(
-            s.add_mark("feed", at(1_790_000_000)),
+            s.add_mark("feed", at(1_790_000_000)).await,
             Err(MarkRefusal::Invalid(_))
         ));
         let mut bad = at(T0);
         bad.colour = "red; background:url(x)".into();
         assert!(matches!(
-            s.add_mark("feed", bad),
+            s.add_mark("feed", bad).await,
             Err(MarkRefusal::Invalid(_))
         ));
         let mut bad = at(T0);
         bad.name = "x".repeat(MAX_MARK_NAME_CHARS + 1);
-        let Err(MarkRefusal::Invalid(why)) = s.add_mark("feed", bad) else {
+        let Err(MarkRefusal::Invalid(why)) = s.add_mark("feed", bad).await else {
             panic!("a name past the limit was stored");
         };
         // The operator is shown this, so it must state the limit as it is.
@@ -810,54 +825,54 @@ mod tests {
         let mut exactly = at(T0 + 1);
         exactly.name = "x".repeat(MAX_MARK_NAME_CHARS);
         assert!(
-            s.add_mark("feed", exactly).is_ok(),
+            s.add_mark("feed", exactly).await.is_ok(),
             "a name at the limit was refused"
         );
         let mut bad = at(T0);
         bad.name = "line\nbreak".into();
         assert!(matches!(
-            s.add_mark("feed", bad),
+            s.add_mark("feed", bad).await,
             Err(MarkRefusal::Invalid(_))
         ));
         // A name in any script is fine: it is only ever drawn as text.
         let mut ok = at(T0);
         ok.name = "Goal — Müller's header".into();
-        assert!(s.add_mark("feed", ok).is_ok());
+        assert!(s.add_mark("feed", ok).await.is_ok());
         // An id that is not one of ours never reaches the file.
         assert!(matches!(
-            s.delete_mark("feed", "../x"),
+            s.delete_mark("feed", "../x").await,
             Err(MarkRefusal::NotFound)
         ));
         // Nor does a stream name that would escape the root.
-        assert!(s.list_marks("..").is_err());
+        assert!(s.list_marks("..").await.is_err());
     }
 
-    #[test]
-    fn a_stream_is_capped() {
+    #[tokio::test]
+    async fn a_stream_is_capped() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         ingested(&tmp, "feed");
         for i in 0..MAX_MARKS_PER_STREAM as i64 {
-            s.add_mark("feed", at(T0 + i)).unwrap();
+            s.add_mark("feed", at(T0 + i)).await.unwrap();
         }
         assert!(matches!(
-            s.add_mark("feed", at(T0 - 1)),
+            s.add_mark("feed", at(T0 - 1)).await,
             Err(MarkRefusal::TooMany)
         ));
     }
 
-    #[test]
-    fn a_list_started_again_does_not_answer_an_old_validator() {
+    #[tokio::test]
+    async fn a_list_started_again_does_not_answer_an_old_validator() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         ingested(&tmp, "feed");
-        s.add_mark("feed", at(T0)).unwrap();
-        let old = s.list_marks("feed").unwrap().etag();
+        s.add_mark("feed", at(T0)).await.unwrap();
+        let old = s.list_marks("feed").await.unwrap().etag();
         std::fs::remove_dir_all(tmp.path().join("origin/feed")).unwrap();
         // A new session under the same name ingests, and is marked.
         ingested(&tmp, "feed");
-        s.add_mark("feed", at(T0 + 1)).unwrap();
-        let new = s.list_marks("feed").unwrap();
+        s.add_mark("feed", at(T0 + 1)).await.unwrap();
+        let new = s.list_marks("feed").await.unwrap();
         assert_eq!(
             new.rev, 1,
             "the fresh list should be at the same revision number"
@@ -875,8 +890,8 @@ mod tests {
     /// Recovery used to happen on a write only, while a read answered an
     /// error. A player that could not read the list never wrote to it, so a
     /// feed nobody happened to mark stayed broken for every viewer.
-    #[test]
-    fn an_unreadable_list_is_set_aside_by_a_read_not_overwritten() {
+    #[tokio::test]
+    async fn an_unreadable_list_is_set_aside_by_a_read_not_overwritten() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         let dir = tmp.path().join("origin/feed").join(MARKS_DIR);
@@ -892,6 +907,7 @@ mod tests {
 
         let listed = s
             .list_marks("feed")
+            .await
             .expect("a corrupt list was an error to a read, not recovered");
         assert!(listed.marks.is_empty());
         assert_eq!(
@@ -904,8 +920,8 @@ mod tests {
             "the corrupt file is still in place"
         );
 
-        s.add_mark("feed", at(T0)).unwrap();
-        assert_eq!(s.list_marks("feed").unwrap().marks.len(), 1);
+        s.add_mark("feed", at(T0)).await.unwrap();
+        assert_eq!(s.list_marks("feed").await.unwrap().marks.len(), 1);
         assert_eq!(unreadable(), 1, "a healthy list was set aside as well");
     }
 
@@ -915,17 +931,17 @@ mod tests {
     /// A viewer token is stateless and outlives the session, so a mark could
     /// arrive after the drop and quietly re-create the directory, where only
     /// the seven-day backstop would ever find it.
-    #[test]
-    fn a_stream_the_relay_does_not_hold_is_read_as_empty_and_never_written() {
+    #[tokio::test]
+    async fn a_stream_the_relay_does_not_hold_is_read_as_empty_and_never_written() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         let stream_dir = tmp.path().join("origin/feed");
 
-        let listed = s.list_marks("feed").unwrap();
+        let listed = s.list_marks("feed").await.unwrap();
         assert!(listed.marks.is_empty());
         assert_eq!(listed.etag(), "\"marks-none\"");
         assert!(matches!(
-            s.add_mark("feed", at(T0)),
+            s.add_mark("feed", at(T0)).await,
             Err(MarkRefusal::NoStream)
         ));
         assert!(
@@ -942,6 +958,103 @@ mod tests {
         .expect_err("a list was written for a stream with no directory");
         assert_eq!(refused.kind(), std::io::ErrorKind::NotFound);
         assert!(!stream_dir.exists(), "a write re-created a dropped stream");
+    }
+
+    /// Marks writers waiting for the lock wait as tasks, not on threads of
+    /// the blocking pool — the pool every `tokio::fs` call in the relay
+    /// shares, segment ingest for every stream included. Each write holds the
+    /// lock across two fsyncs, so writers queued there on threads could fill
+    /// the pool and stall everything behind them.
+    #[test]
+    fn marks_writers_queue_without_holding_blocking_threads() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = std::sync::Arc::new(store(&tmp));
+            ingested(&tmp, "feed");
+
+            // A write in progress, and more than the pool's worth queued
+            // behind it.
+            let writing = s.lock_marks().await;
+            let writers: Vec<_> = (0..4)
+                .map(|i| {
+                    let s = s.clone();
+                    tokio::spawn(async move { s.add_mark("feed", at(T0 + i)).await })
+                })
+                .collect();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let io =
+                tokio::time::timeout(Duration::from_secs(2), tokio::fs::metadata(tmp.path())).await;
+            assert!(
+                io.is_ok(),
+                "queued marks writers held the blocking pool, and file I/O waited behind them"
+            );
+
+            drop(writing);
+            for w in writers {
+                w.await.unwrap().unwrap();
+            }
+            assert_eq!(s.list_marks("feed").await.unwrap().marks.len(), 4);
+        });
+    }
+
+    /// A write's lock is released when the write is done, not when its
+    /// request is. A client that hangs up drops the handler, and the blocking
+    /// work the handler started goes on; a guard dropped with the handler let
+    /// the next writer read the list while this one was still between its
+    /// read and its rename, and one of the two marks was lost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_whose_request_is_dropped_holds_the_lock_until_it_is_done() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(store(&tmp));
+        ingested(&tmp, "feed");
+        // A list whose read waits until the test lets it through: a FIFO.
+        let dir = tmp.path().join("origin/feed").join(MARKS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let list = dir.join(MARKS_FILE);
+        let c = std::ffi::CString::new(list.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        let writer = tokio::spawn({
+            let s = s.clone();
+            async move { s.add_mark("feed", at(T0)).await }
+        });
+        // The lock is taken, and the write is on the blocking pool with it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while s.marks_lock.try_lock().is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fixture: the write never took the lock");
+
+        // The client hangs up.
+        writer.abort();
+        let _ = writer.await;
+        let released_early = s.marks_lock.try_lock().is_ok();
+
+        // Let the read through before asserting anything: a blocking task
+        // still waiting on the FIFO would hold the runtime open, and the test
+        // would hang rather than fail.
+        std::fs::write(&list, br#"{"epoch":"e","rev":1,"marks":[]}"#).unwrap();
+        assert!(
+            !released_early,
+            "the lock went with the request while the write it guards was still running"
+        );
+        let freed = tokio::time::timeout(Duration::from_secs(5), s.lock_marks()).await;
+        assert!(freed.is_ok(), "the write never gave the lock back");
+        drop(freed);
+        assert_eq!(s.list_marks("feed").await.unwrap().marks.len(), 1);
     }
 
     /// `500` is the token gate's alone, the one refusal the player takes as
@@ -985,14 +1098,14 @@ mod tests {
             )
             .await
             .unwrap();
-            s.add_mark("feed", at(T0)).unwrap();
+            s.add_mark("feed", at(T0)).await.unwrap();
         }
         // Restart: adoption treats anything that is not a segment as debris.
         // What keeps `marks/` out of that is `is_session_subdir`, pinned by
         // its own test in `origin.rs`; this checks the outcome.
         let s = store(&tmp);
         assert_eq!(
-            s.list_marks("feed").unwrap().marks.len(),
+            s.list_marks("feed").await.unwrap().marks.len(),
             1,
             "a restart lost the marks"
         );
@@ -1000,7 +1113,7 @@ mod tests {
         // The feed drops for longer than retention: media goes, marks stay.
         s.retire_stream("feed").await;
         assert_eq!(
-            s.list_marks("feed").unwrap().marks.len(),
+            s.list_marks("feed").await.unwrap().marks.len(),
             1,
             "a feed drop lost the marks"
         );
@@ -1008,12 +1121,12 @@ mod tests {
         // The session is over.
         s.remove_stream("feed").await;
         assert!(
-            s.list_marks("feed").unwrap().marks.is_empty(),
+            s.list_marks("feed").await.unwrap().marks.is_empty(),
             "the session's marks outlived it"
         );
         // And a viewer still holding a token cannot bring them back.
         assert!(matches!(
-            s.add_mark("feed", at(T0 + 1)),
+            s.add_mark("feed", at(T0 + 1)).await,
             Err(MarkRefusal::NoStream)
         ));
         assert!(
