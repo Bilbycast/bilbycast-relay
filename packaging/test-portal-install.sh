@@ -151,5 +151,72 @@ check "fchown is allowed after @privileged is denied" \
   "$([ -n "$deny" ] && [ -n "$allow" ] && [ "$allow" -gt "$deny" ] && echo yes || echo no)" "yes"
 check "and no capability comes with it" "$(grep -c '^CapabilityBoundingSet=$' "$UNIT")" "1"
 
+echo
+echo "== upgrade: the packaged unit is refreshed, and nothing of the operator's is lost =="
+# Lifted out of upgrade-relay.sh at run time, like the validation block above,
+# and run against a scratch unit directory with systemctl stubbed.
+REFRESH="$(awk '/^# >>> portal-unit-refresh/,/^# <<< portal-unit-refresh/' upgrade-relay.sh)"
+[ -n "$REFRESH" ] || bad "upgrade-relay.sh has no portal-unit-refresh block to lift"
+refresh() {  # $1 = scratch root, $2 = the unit systemd reports loading, $3 = the new unit
+  ( SYSTEMD_UNIT_DIR="$1/units" PORTAL_UNIT_NAME=bilbycast-portal
+    PORTAL_BINARY="$1/opt/bilbycast-portal" PORTAL_UNIT_PREV="" LOADED="$2" CALLS="$1/calls"
+    systemctl() {
+      case "$1" in
+        show) echo "$LOADED";;
+        *) echo "$*" >> "$CALLS";;
+      esac
+    }
+    eval "$REFRESH"
+    refresh_portal_unit "$3"
+    echo "prev=$PORTAL_UNIT_PREV" >> "$CALLS" ) 2>"$1/stderr" >/dev/null
+}
+scenario() {  # $1 = name; leaves an old packaged unit with a drop-in in place
+  local root="$WORK/unit-$1"
+  mkdir -p "$root/units/bilbycast-portal.service.d" "$root/opt"
+  printf '[Service]\nExecStart=/old\n' > "$root/units/bilbycast-portal.service"
+  printf '[Service]\nReadWritePaths=/srv/authelia/users\n' \
+    > "$root/units/bilbycast-portal.service.d/override.conf"
+  : > "$root/calls"
+  echo "$root"
+}
+R=$(scenario changed)
+refresh "$R" "$R/units/bilbycast-portal.service" ./bilbycast-portal.service
+check "an outdated packaged unit is replaced by this release's" \
+  "$(cmp -s ./bilbycast-portal.service "$R/units/bilbycast-portal.service" && echo yes || echo no)" "yes"
+check "and systemd is told" "$(grep -c '^daemon-reload$' "$R/calls")" "1"
+check "the drop-in is kept" "$(grep -c '^ReadWritePaths=/srv/authelia/users$' \
+  "$R/units/bilbycast-portal.service.d/override.conf")" "1"
+check "the replaced unit is kept beside the binary, for a rollback" \
+  "$(grep -c '^ExecStart=/old$' "$R/opt/bilbycast-portal.service.previous")" "1"
+check "and named for the rollback" "$(grep -c "^prev=$R/opt/bilbycast-portal.service.previous\$" "$R/calls")" "1"
+
+R=$(scenario same)
+cp ./bilbycast-portal.service "$R/units/bilbycast-portal.service"
+refresh "$R" "$R/units/bilbycast-portal.service" ./bilbycast-portal.service
+check "an unchanged unit is not reloaded" "$(grep -c 'daemon-reload' "$R/calls")" "0"
+check "nor copied aside" "$(grep -c '^prev=$' "$R/calls")" "1"
+
+R=$(scenario foreign)
+refresh "$R" /lib/systemd/system/bilbycast-portal.service ./bilbycast-portal.service
+check "a unit of the operator's own elsewhere is left alone" \
+  "$(grep -c '^ExecStart=/old$' "$R/units/bilbycast-portal.service")" "1"
+check "and said so" "$(grep -c 'left alone' "$R/stderr")" "1"
+
+R=$(scenario lean)
+refresh "$R" "$R/units/bilbycast-portal.service" ""
+check "a tarball without a unit changes nothing" \
+  "$(grep -c '^ExecStart=/old$' "$R/units/bilbycast-portal.service")" "1"
+
+# Called where it matters: after the portal binary is swapped, before the
+# portal is started again, and undone by a rollback.
+call=$(grep -n '^ *refresh_portal_unit "' upgrade-relay.sh | cut -d: -f1)
+swap=$(grep -n 'mv -Tf "${PORTAL_BINARY}.new" "${PORTAL_BINARY}"' upgrade-relay.sh | cut -d: -f1)
+start=$(grep -n 'systemctl start "${PORTAL_UNIT_NAME}"' upgrade-relay.sh | head -1 | cut -d: -f1)
+check "the upgrade refreshes the unit after the swap and before the start" \
+  "$([ -n "$call" ] && [ -n "$swap" ] && [ -n "$start" ] && [ "$call" -gt "$swap" ] \
+     && [ "$call" -lt "$start" ] && echo yes || echo no)" "yes"
+check "a rollback puts the old unit back" \
+  "$(grep -c 'mv -Tf "${PORTAL_UNIT_PREV}" "${SYSTEMD_UNIT_DIR}/${PORTAL_UNIT_NAME}.service"' upgrade-relay.sh)" "1"
+
 echo "-- $PASS passed, $FAIL failed --"
 [ "$FAIL" -eq 0 ]

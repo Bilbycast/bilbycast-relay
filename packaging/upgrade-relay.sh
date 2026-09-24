@@ -43,7 +43,9 @@
 #      the tarball, verifies the hash.
 #   5. Compares against the running version; no-op if equal.
 #   6. Stops the service, swaps the binary atomically (mv -Tf), starts
-#      the service.
+#      the service. A viewer portal on the same host is upgraded with it:
+#      its binary, and its packaged unit file when that changed (drop-ins
+#      are kept).
 #   7. Polls /health. On failure, restores the previous binary and
 #      restarts (unless --no-rollback).
 #   8. Exits 0 only when the new version reports healthy.
@@ -79,6 +81,7 @@ COSIGN_VERSION="${COSIGN_VERSION:-v2.4.1}"
 
 CHANNEL="stable"
 SERVICE_NAME="bilbycast-relay"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 BINARY_PATH=""
 HEALTH_URL="http://127.0.0.1:4480/health"
 HEALTH_TIMEOUT=30
@@ -450,6 +453,58 @@ PORTAL_UNIT_NAME="bilbycast-portal"
 PORTAL_BINARY=""
 PORTAL_PREV=""
 PORTAL_WAS_ACTIVE=0
+PORTAL_UNIT_PREV=""
+
+# >>> portal-unit-refresh (lifted verbatim by test-portal-install.sh — keep
+# it self-contained: it may use only its argument and the variables above)
+#
+# The unit carries what a release needs from systemd — the users directory
+# account sync writes, the fchown it keeps that file's group with — so a new
+# binary under the old unit can fail where the new one would not. It is
+# refreshed only where install-relay.sh put it; a unit of the operator's own
+# elsewhere is theirs, and named. Changes of their own to the packaged one
+# belong in a drop-in (`systemctl edit bilbycast-portal`), which lives beside
+# it in `.d/` and is kept; an edit to the file itself is replaced, and the
+# replaced file is kept next to the binary.
+refresh_portal_unit() {  # $1 = the unit the new tarball carries, or empty
+    local new_unit="$1" installed="${SYSTEMD_UNIT_DIR}/${PORTAL_UNIT_NAME}.service" loaded
+    if [[ -z "${new_unit}" ]]; then
+        echo "  note: this tarball carries no ${PORTAL_UNIT_NAME}.service; the installed unit is left as it is" >&2
+        return 0
+    fi
+    loaded="$(systemctl show --property=FragmentPath --value "${PORTAL_UNIT_NAME}" 2>/dev/null || true)"
+    if [[ "${loaded}" != "${installed}" ]]; then
+        echo "WARNING: ${PORTAL_UNIT_NAME} runs from '${loaded}', not the packaged ${installed}," >&2
+        echo "         so its unit is left alone. Compare it with ${new_unit} from this release:" >&2
+        echo "         account sync needs ReadWritePaths= on the users directory, and" >&2
+        echo "         SystemCallFilter=@chown after any line denying @privileged." >&2
+        return 0
+    fi
+    if cmp -s "${new_unit}" "${installed}"; then
+        return 0
+    fi
+    # Best-effort like the rest of the portal's upgrade: a unit that cannot be
+    # replaced leaves the portal on its old one, said, and the relay upgrade
+    # goes on.
+    if ! cp "${installed}" "${PORTAL_BINARY}.service.previous"; then
+        echo "WARNING: could not keep a copy of ${installed}; its unit is left as it is." >&2
+        return 0
+    fi
+    PORTAL_UNIT_PREV="${PORTAL_BINARY}.service.previous"
+    if ! install -m 0644 "${new_unit}" "${installed}"; then
+        cp -f "${PORTAL_UNIT_PREV}" "${installed}" || true
+        PORTAL_UNIT_PREV=""
+        echo "WARNING: could not replace ${installed}; the portal keeps its old unit." >&2
+        return 0
+    fi
+    if ! systemctl daemon-reload; then
+        echo "WARNING: systemctl daemon-reload failed; the portal starts under its old unit" >&2
+        echo "         until systemd reloads." >&2
+    fi
+    echo "  ${PORTAL_UNIT_NAME}: unit file refreshed; drop-ins in ${installed}.d/ are kept,"
+    echo "  and the one it replaced is at ${PORTAL_UNIT_PREV}"
+}
+# <<< portal-unit-refresh
 if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
    && systemctl cat "${PORTAL_UNIT_NAME}" >/dev/null 2>&1; then
     PORTAL_EXEC="$(systemctl cat "${PORTAL_UNIT_NAME}" 2>/dev/null \
@@ -474,6 +529,7 @@ if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
         chown "$(stat -c '%u:%g' "${PORTAL_BINARY}")" "${PORTAL_BINARY}.new"
         chmod "$(stat -c '%a' "${PORTAL_BINARY}")" "${PORTAL_BINARY}.new"
         mv -Tf "${PORTAL_BINARY}.new" "${PORTAL_BINARY}"
+        refresh_portal_unit "$(find staging -maxdepth 4 -name "${PORTAL_UNIT_NAME}.service" -type f | head -1)"
     elif [[ -n "${PORTAL_BINARY}" && -z "${NEW_PORTAL}" ]]; then
         echo "WARNING: ${PORTAL_UNIT_NAME} is installed but this tarball carries no" >&2
         echo "         portal binary — it ships in the distribution variant. The" >&2
@@ -540,11 +596,18 @@ echo "Rolling back to previous binary…" >&2
 systemctl stop "${SERVICE_NAME}" || true
 mv -Tf "${PREV_BACKUP}" "${BINARY_PATH}"
 systemctl start "${SERVICE_NAME}"
-# Roll the portal back with it, so the pair never straddles a version.
+# Roll the portal back with it, so the pair never straddles a version, and
+# leave it running only if it was.
 if [[ -n "${PORTAL_PREV}" && -e "${PORTAL_PREV}" ]]; then
     echo "Rolling the portal back too…"
     mv -Tf "${PORTAL_PREV}" "${PORTAL_BINARY}"
-    systemctl start "${PORTAL_UNIT_NAME}" || true
+    if [[ -n "${PORTAL_UNIT_PREV}" && -e "${PORTAL_UNIT_PREV}" ]]; then
+        mv -Tf "${PORTAL_UNIT_PREV}" "${SYSTEMD_UNIT_DIR}/${PORTAL_UNIT_NAME}.service"
+        systemctl daemon-reload || true
+    fi
+    if [[ "${PORTAL_WAS_ACTIVE}" -eq 1 ]]; then
+        systemctl start "${PORTAL_UNIT_NAME}" || true
+    fi
 fi
 
 echo "Waiting up to ${HEALTH_TIMEOUT}s for rollback to come up…" >&2
