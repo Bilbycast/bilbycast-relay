@@ -98,9 +98,12 @@ pub struct AccountSyncConfig {
 
     /// Authelia itself, reached directly on loopback rather than through the
     /// public proxy. Its path must be the path of Authelia's own
-    /// `server.address` — none by default, `/auth` when Authelia is served
-    /// under that prefix. Checked once at startup against Authelia's health
-    /// endpoint, so a wrong one is said then rather than on every link.
+    /// `server.address`: `/auth` here by default, because that is how the
+    /// portal's Authelia has been deployed since account sync shipped, and a
+    /// changed default would silently break it; set it without the path for
+    /// an Authelia served at the root. Checked once at startup against
+    /// Authelia's health endpoint, so a wrong one is said then rather than on
+    /// every link.
     #[serde(default = "default_authelia_url")]
     pub authelia_url: String,
 
@@ -124,7 +127,7 @@ pub struct AccountSyncConfig {
 }
 
 fn default_authelia_url() -> String {
-    "http://127.0.0.1:9091".to_string()
+    "http://127.0.0.1:9091/auth".to_string()
 }
 fn default_group() -> String {
     "bilbycast-portal".to_string()
@@ -1173,6 +1176,14 @@ async fn serve(
 /// what actually happened rather than that the request was accepted.
 const RELAY_WAIT: Duration = Duration::from_secs(30);
 
+// The listener forgets an expectation no later than this wait gives up on it,
+// and its relay gives up before either, so a slow relay is reported as the
+// relay's answer and a stale expectation never rewrites a later email.
+const _: () = assert!(
+    super::mail::PENDING_TTL.as_secs() <= RELAY_WAIT.as_secs()
+        && super::mail::RELAY_TIMEOUT.as_secs() < RELAY_WAIT.as_secs()
+);
+
 /// Ask Authelia for a link, and report whether the email really went.
 ///
 /// With [`mail`](super::mail) rewriting it, `pending` is its list of links to
@@ -1207,7 +1218,10 @@ async fn send_link(
             "the portal never saw the email Authelia was asked to send".into(),
         )),
         Err(_) => Err(LinkError::Failed(
-            "timed out waiting for the email to reach the relay".into(),
+            "timed out waiting for Authelia's email; check that Authelia's notifier points at \
+             mail.listen_addr, authenticates with mail.listen_password_file, and sends from \
+             mail.from's address"
+                .into(),
         )),
     }
 }
