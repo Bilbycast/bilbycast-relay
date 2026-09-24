@@ -232,6 +232,21 @@ check "a unit edited to read another token file is left alone" \
   "$(grep -c '^EnvironmentFile=/root/portal.env$' "$R/units/bilbycast-portal.service")" "1"
 check "and said so" "$(grep -c 'left alone' "$R/stderr")" "1"
 
+# A release that changes one of the run lines must add its set to `shipped`,
+# or an installed unit carrying the lines as released would be taken for a
+# hand-edited one and never refreshed again.
+runs_now="$(grep -E '^(ExecStart|User|Group|WorkingDirectory|EnvironmentFile)=' ./bilbycast-portal.service)"
+check "this release's run lines, in order, are a set upgrade-relay.sh knows was shipped" \
+  "$(printf '%s\n' "$REFRESH" | tr '\n' '\001' | grep -cF -- "'$(printf '%s' "$runs_now" | tr '\n' '\001')'")" "1"
+# A packaged unit as an earlier release shipped it is still refreshed when
+# this release's lines differ from it.
+R=$(scenario earlier)
+sed 's#^WorkingDirectory=/var/lib/bilbycast/portal$#WorkingDirectory=/var/lib/bilbycast/portal2#' \
+  ./bilbycast-portal.service > "$R/newer.service"
+refresh "$R" "$R/units/bilbycast-portal.service" "$R/newer.service"
+check "a unit carrying an earlier release's run lines is refreshed to a release that changed one" \
+  "$(cmp -s "$R/newer.service" "$R/units/bilbycast-portal.service" && echo yes || echo no)" "yes"
+
 R=$(scenario lean)
 refresh "$R" "$R/units/bilbycast-portal.service" ""
 check "a tarball without a unit changes nothing" "$(untouched "$R")" "yes"

@@ -462,8 +462,11 @@ PORTAL_UNIT_PREV=""
 # account sync writes, the fchown it keeps that file's group with — so a new
 # binary under the old unit can fail where the new one would not. It is
 # refreshed only where install-relay.sh put it, and only while it still runs
-# what the packaged one runs: the same ExecStart=, User=, Group=,
-# WorkingDirectory= and EnvironmentFile= lines, which no release has changed.
+# what a packaged one runs: ExecStart=, User=, Group=, WorkingDirectory= and
+# EnvironmentFile= lines exactly as this release's unit, or some earlier
+# release's, carries them (`shipped` below; test-portal-install.sh fails until
+# a release that changes one of them adds its set there — otherwise that
+# change would stop every installed unit from ever being refreshed again).
 # A unit that differs there was written or edited by hand — a binary moved
 # with PORTAL_ROOT, another config or token file — and the packaged one would
 # start something else; like a unit of the operator's own elsewhere, it is
@@ -473,15 +476,26 @@ PORTAL_UNIT_PREV=""
 # is kept next to the binary.
 refresh_portal_unit() {  # $1 = the unit the new tarball carries, or empty
     local new_unit="$1" installed="${SYSTEMD_UNIT_DIR}/${PORTAL_UNIT_NAME}.service" loaded why=""
-    local runs='^(ExecStart|User|Group|WorkingDirectory|EnvironmentFile)='
+    local runs='^(ExecStart|User|Group|WorkingDirectory|EnvironmentFile)=' ran packaged=0 set
+    # Every set of those lines, in file order, that a release has shipped.
+    local shipped=(
+'User=bilbycast-portal
+Group=bilbycast-portal
+WorkingDirectory=/var/lib/bilbycast/portal
+ExecStart=/opt/bilbycast/portal/bilbycast-portal --config /etc/bilbycast/portal.json
+EnvironmentFile=/etc/bilbycast/portal.env'
+    )
     if [[ -z "${new_unit}" ]]; then
         echo "  note: this tarball carries no ${PORTAL_UNIT_NAME}.service; the installed unit is left as it is" >&2
         return 0
     fi
     loaded="$(systemctl show --property=FragmentPath --value "${PORTAL_UNIT_NAME}" 2>/dev/null || true)"
+    ran="$(grep -E "${runs}" "${installed}" 2>/dev/null || true)"
+    [[ "${ran}" == "$(grep -E "${runs}" "${new_unit}")" ]] && packaged=1
+    for set in "${shipped[@]}"; do [[ "${ran}" == "${set}" ]] && packaged=1; done
     if [[ "${loaded}" != "${installed}" ]]; then
         why="runs from '${loaded}', not the packaged ${installed}"
-    elif [[ "$(grep -E "${runs}" "${installed}")" != "$(grep -E "${runs}" "${new_unit}")" ]]; then
+    elif (( ! packaged )); then
         why="runs from ${installed}, but its ExecStart=, User=, Group=,"$'\n'
         why+="         WorkingDirectory= or EnvironmentFile= is not the packaged unit's"
     fi
