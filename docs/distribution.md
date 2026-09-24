@@ -88,7 +88,7 @@ they are not either/or.
 | `DELETE` | `/origin/{stream}/clips/{name}.mp4` | Remove a clip and reclaim its disk (viewer or ingest token, always) |
 | `POST` | `/origin/{stream}/clips/{name}.mp4/failed` | Edge reports one it cannot produce (ingest token, always) |
 | `GET` | `/origin/{stream}/marks` | The stream's shared marks, with an `ETag`; `304` to a matching `If-None-Match` (viewer token, always) |
-| `POST` | `/origin/{stream}/marks` | Add a mark `{at, name?, colour?, exported?}` — `at` in wall-clock ms; the same instant twice is one mark (viewer token, always) |
+| `POST` | `/origin/{stream}/marks` | Add a mark `{at, name?, colour?, exported?}` — `at` in wall-clock ms; the same instant twice is one mark; `404` while the relay holds no directory for the stream (viewer token, always) |
 | `PATCH` | `/origin/{stream}/marks/{id}` | Rename, recolour or flag exported (viewer token, always) |
 | `DELETE` | `/origin/{stream}/marks/{id}` | Remove a mark; removing one already gone succeeds (viewer token, always) |
 | `GET` | `/distribution/health` | Liveness |
@@ -647,21 +647,44 @@ stream at `/origin/{stream}/marks` and every player polls it every 3 s (not
 while the tab is hidden, and at once when it comes back). An unchanged list
 costs a `304`, so six viewers is a handful of header exchanges a second and the
 relay holds no per-viewer state. On disk it is one JSON file,
-`{stream}/marks/marks.json`, replaced by temp-then-rename. It lives as long as
-the clips do: through a relay restart and a feed drop (`retire_stream` keeps
-`marks/`), gone when the manager drops the stream, with the clips' seven-day
-backstop under a manager that never comes back. At most 500 marks a stream,
-names up to 120 characters.
+`{stream}/marks/marks.json`, replaced by temp-then-rename with the data synced
+before the rename and the directory after, so a power cut leaves the old list
+or the new one, never an empty file. It lives as long as the clips do: through
+a relay restart and a feed drop (`retire_stream` keeps `marks/`), gone when the
+manager drops the stream, with the clips' seven-day backstop under a manager
+that never comes back. At most 500 marks a stream, names up to 120 characters
+of plain text (no tabs or line breaks).
+
+A list is written only into a stream directory that already exists: ingest
+makes it, the manager's drop removes it. A viewer token outlives the session,
+so a mark posted after the drop is refused with `404` rather than bringing the
+directory back for the backstop alone to find; the player keeps such a mark
+pending and posts it once the directory exists, which also covers a mark made
+in the seconds before the first segment lands. Reading a stream with no
+directory is an empty list. A `marks.json` that will not parse (a hand edit, a
+disk fault) is set aside as `marks.json.unreadable-<time>` by the first request
+of any kind — a read included — and the list starts again empty. A read or
+write that fails is `503` with `Retry-After`; `500` is kept for a relay with no
+token secret.
 
 The player draws its own changes at once and sends them behind the drawing. A
-new mark is *pending* under a `tmp-` id until the relay answers with its real
-one, and a failed POST is retried from the next poll — safe, because the relay
-treats a repeated instant as the same mark. A rename waits 600 ms after the last
-keystroke (or until the field is left), and until the relay acknowledges it the
-new name is laid over every list that arrives, so a poll landing mid-word
-cannot put the old name back. A list that arrives while a name field has focus
-moves the flags at once but leaves the rows alone until the field is left,
-because redrawing them would take the cursor away.
+new mark is *pending* under a `tmp-` id until the relay names it, and a failed
+POST is retried from the next poll — safe, because the relay treats a repeated
+instant as the same mark. What the operator changes while a mark is pending is
+noted on it and sent as an edit once it has a name, whether that comes from the
+POST's reply or, when the reply is lost, from the next list showing the relay
+holding the instant; only the changed fields are sent, because the relay's
+copy may be another viewer's mark at the same millisecond. A pending mark
+deleted before its POST settled is deleted on the relay too if the POST turns
+out to have landed. A rename waits 600 ms after the last keystroke (or until
+the field is left), and until the relay acknowledges it the new name is laid
+over every list that arrives, so a poll landing mid-word cannot put the old
+name back. A list that arrives while a name field has the cursor, or a colour
+palette is open, moves the flags at once but leaves the rows alone until the
+field is left or the palette closed; a row drawn from the older list checks
+that its mark still exists before going to it or looping around it. Every
+reply carries the whole list and its revision, and a list older than the one
+drawn — a poll answered after a later delete's reply — is ignored.
 
 Anyone who may watch may edit or delete any mark: the gate is the stream's
 viewer token, as for requesting a clip, and the relay's tokens name a stream,
@@ -669,13 +692,22 @@ not a person, so a mark carries no author. The ingest token is **not**
 accepted — the edge has no business here. Without a `token_secret` the routes
 answer 500 rather than open.
 
-A relay that predates the list (404/405), has no token secret (500), or a page
-with no token (401) leaves the player on `localStorage`, per feed, on this
-device, as it always was. When a player first finds a shared list it carries
-the device's marks from the last day into it, once, and keeps the old list
-aside under `….migrated`. Note the viewing token deliberately uses
-`sessionStorage`: a credential has no business outliving its tab, and a test
-asserts the two do not get confused.
+A relay that predates the list (`400` to the first poll: its object route
+catches `marks` and wants a `.` in the name), one with no token secret
+(`500`), a page with no token (`401`), or a `404`/`405` leaves the player on
+`localStorage`, per feed, on this device, as it always was — and the player
+asks again about once a minute, so a relay upgraded or given its secret
+mid-session is joined without a reload. Anything else, a `503` included, is
+tried again on the next poll. A player that has already joined a list does not
+go back: after a rollback to a relay without the list, marks it makes are kept
+in the page only, and are lost when it is closed. When a player first finds a
+shared list it carries the device's marks from the last day into it, making
+each name one the relay accepts (a tab becomes a space, a long name is cut to
+120 characters) and dropping a name the relay still refuses rather than the
+mark; the device's list is kept aside under `….migrated`, and a later carry
+never replaces that first copy but is kept beside it as `….migrated.<time>`.
+Note the viewing token deliberately uses `sessionStorage`: a credential has no
+business outliving its tab, and a test asserts the two do not get confused.
 
 ### Loop around a mark
 
@@ -685,10 +717,11 @@ the loop button in a mark's row, from the loop button on the transport (which
 takes the reachable mark nearest the playhead), or with `O`. While it runs a
 strip above the transport names the mark and carries the speed buttons and a
 stop; the looped span is shaded on the bar. The seconds either side (default 3
-and 3, up to 60 each) and the speed (default 50 %) are settings, kept on the
-device, and changing the speed mid-loop does not leave it. They are the
-viewer's, not the feed's: two operators looping the same mark are each looking
-at something different.
+and 3, up to 60 each) and the speed (default 50 %) are settings, held by the
+page and kept on the device where the browser allows it — with site data
+blocked they still apply until the page is closed — and changing the speed
+mid-loop does not leave it. They are the viewer's, not the feed's: two
+operators looping the same mark are each looking at something different.
 
 It is ordinary playback on the main element with a fence at each end:
 `playbackRate` for the speed — every speed offered is real time or slower, so
@@ -696,16 +729,20 @@ this is decode at or below real time and never the seek path the shuttle needs
 — and a seek back to the in point when the playhead reaches the out point. The
 fence is checked every animation frame and on `timeupdate`, because a hidden
 tab gets no animation frames but goes on playing. The bounds are re-derived at
-every check from the mark's wall clock, so the window rolling past the in
-point, the live edge reaching the out point (the out point stays 0.5 s short of
-the newest media and follows it forward), or another viewer deleting the mark
-all take effect on the next check; a mark that can no longer be reached ends
-the loop and holds the picture.
+every check from the mark's wall clock and the mark list, so the window rolling
+past the in point, the live edge reaching the out point (the out point stays
+0.5 s short of the newest media and follows it forward), or the mark being
+deleted — on this device, by another viewer, or refused by the relay — all
+take effect on the next check; a mark that can no longer be reached, or is
+gone, ends the loop and holds the picture.
 
 Any other transport control ends the loop and then does its own job — play,
-pause, a rate button, a shuttle, a frame step, live, a scrub, going to a mark.
+pause, a rate button, a shuttle, a frame step, live, a scrub, going to a mark —
+at normal speed: a loop started from a shuttle does not hand the shuttle back.
 The loop's own stop (its button, the strip's `×`, or `O` again) ends it and
-holds the picture where it is. The 33/50/100 buttons stay unlit while it runs:
+holds the picture where it is, and so does access ending (expired, withdrawn,
+or taken over by another sign-in), after which no loop can be started. The
+player self-test stops a loop before it drives the transport. The 33/50/100 buttons stay unlit while it runs:
 they are ordinary playback, and pressing one leaves the loop at that rate.
 
 ### Clip export
@@ -1253,9 +1290,9 @@ See `../../testbed/configs/relay-distribution.json`:
   default; a scrub-back surface wants minutes to hours.
 - `origin_idle_grace_secs` is how long past `origin_retention_secs` a stream may
   sit without a PUT before its media is reclaimed — segments, manifest and init
-  go, and the directory with them unless it still holds exported clips
-  (anything in `clips/`), which are kept (the stream is *retired*, not removed;
-  see "Clip export"). Default 60. It is the fourth node-wide storage knob, and unlike
+  go, and the directory with them unless it still holds exported clips or a
+  shared marks list (anything in `clips/` or `marks/`), which are kept (the
+  stream is *retired*, not removed; see "Clip export" and "Marks"). Default 60. It is the fourth node-wide storage knob, and unlike
   `origin_min_free_bytes` the manager **can** override it live (`origin_policy`'s
   `idle_grace_secs`), which the relay then persists back here.
 - `origin_max_bytes_per_stream` is the safety bound, not the policy. A bitrate
@@ -1329,8 +1366,8 @@ See `../../testbed/configs/relay-distribution.json`:
   streams gets those in the order it meant them. A name that fails the origin's
   own stream-id check is dropped silently. A name for a stream this relay no
   longer tracks is **not**: its directory under the origin root is removed
-  anyway, which is exactly how a retired stream's `clips/` is reclaimed once
-  the manager's clock runs out. Only a name with no directory at all is a
+  anyway, which is exactly how a retired stream's `clips/` and `marks/` are
+  reclaimed once the manager's clock runs out. Only a name with no directory at all is a
   silent no-op — a `NotFound` on the delete is swallowed, and any other
   filesystem error is logged at warn.
 
@@ -1343,13 +1380,14 @@ See `../../testbed/configs/relay-distribution.json`:
   relay that does not take it keeps the rows for the next pass). Stopping a
   session sends the gentler `retire_origin_streams`
   instead — the same array shape — which takes the media (segments, manifests,
-  init) and leaves `clips/`, so an export cut near full time survives the
-  broadcast ending; a retired stream whose `clips/` is empty loses its
-  directory too. By the time a session can be deleted (never while `active`,
-  and not while its relay still holds an unreleased window — `409
-  session_active` / `409 release_pending`) its window is therefore normally
-  already gone and what the drop reclaims is the clips, which the retention
-  sweep never touches. Normally, not always: the retire is sent once from the
+  init) and leaves `clips/` and `marks/`, so an export cut near full time, and
+  the marks it was cut around, survive the broadcast ending; a retired stream
+  whose `clips/` and `marks/` are both empty loses its directory too. By the
+  time a session can be deleted (never while `active`, and not while its relay
+  still holds an unreleased window — `409 session_active` / `409
+  release_pending`) its window is therefore normally already gone and what the
+  drop reclaims is the clips and the marks, which the retention sweep never
+  touches. Normally, not always: the retire is sent once from the
   stop path and never retried, so a relay that was unreachable at stop keeps
   that media until its own sweep retires it at `retention + idle_grace`, or
   until this drop lands — without it those streams would sit until the *node
@@ -1363,9 +1401,10 @@ See `../../testbed/configs/relay-distribution.json`:
   running (`clips_expire_at`, armed for 24 h on every stop whether or not a
   clip was ever cut — the manager does not know what the relay holds), the
   delete is refused with `409 relay_unreachable` rather than logged: `clips/`
-  sits outside the relay's restart adoption, retention sweep and byte
-  accounting, so short of the relay's own seven-day `reclaim_clip_debris`
-  backstop a drop naming the stream is the only thing that ever removes it,
+  (and `marks/` beside it) sits outside the relay's restart adoption,
+  retention sweep and byte accounting, so short of the relay's own seven-day
+  `reclaim_clip_debris` backstop a drop naming the stream is the only thing
+  that ever removes it,
   and deleting the row would leave those clips unreachable to every mechanism
   on either side until that backstop fires. Once the clock has run out — or
   the session's relay row is gone (`relay_node_id` is `ON DELETE SET NULL`, so
@@ -1384,7 +1423,8 @@ See `../../testbed/configs/relay-distribution.json`:
   directory with the shape of a store written by a relay that predates the
   marker (`looks_like_origin_store` in `origin.rs`, read deliberately
   narrowly): every top-level entry is a stream directory; inside, nothing but
-  `.m4s` / `.mp4` / `.jpg` / `.part` files and a `clips/` subdirectory; every
+  `.m4s` / `.mp4` / `.jpg` / `.part` files and the `clips/` and `marks/`
+  subdirectories; every
   stream directory that holds files holds at least one packager-named
   `seg-NNNNN.m4s` / `aud-NNNNN.m4s`; and there are at least two such segments
   in the tree. That is adopted with a warning and given the marker, so the
