@@ -43,7 +43,9 @@
 //! Only a message to somebody the portal has just asked for a link for, matched
 //! by recipient within [`PENDING_TTL`]. Everything else Authelia sends — a
 //! viewer using the "reset password" link on the sign-in page itself, or one of
-//! Authelia's own event notices — is relayed byte for byte.
+//! Authelia's own event notices — is relayed byte for byte. So is a message the
+//! portal asked for but could not rewrite: the person still gets their link, in
+//! Authelia's wording rather than ours.
 //!
 //! # What "sent" means
 //!
@@ -62,8 +64,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lettre::address::Envelope;
+use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::{Deserialize, Serialize};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -146,10 +149,24 @@ pub struct MailConfig {
     /// Where a viewer signs in, named in the emails.
     pub sign_in_url: String,
 
-    #[serde(default = "default_invite_subject")]
-    pub invite_subject: String,
-    #[serde(default = "default_reset_subject")]
-    pub reset_subject: String,
+    /// Who the emails say they come from, in their wording and in the default
+    /// subjects.
+    #[serde(default = "default_brand")]
+    pub brand: String,
+
+    /// How long the link lasts, in words — `three days` — as the emails should
+    /// state it. It has to agree with Authelia's
+    /// `identity_validation.reset_password.jwt_lifespan`, which the portal
+    /// cannot read; unset, the emails make no claim about it at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_lifetime: Option<String>,
+
+    /// Unset means `Your <brand> account`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_subject: Option<String>,
+    /// Unset means `<brand> password reset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_subject: Option<String>,
 
     /// STARTTLS on the way out, which is what unset means unless
     /// `implicit_tls` is on. Off with neither is for a local test sink only —
@@ -165,11 +182,8 @@ pub struct MailConfig {
 fn default_listen() -> String {
     "127.0.0.1:2525".to_string()
 }
-fn default_invite_subject() -> String {
-    "GRS New User".to_string()
-}
-fn default_reset_subject() -> String {
-    "GRS password reset".to_string()
+fn default_brand() -> String {
+    "Bilbycast".to_string()
 }
 
 /// How the connection to the relay is protected.
@@ -185,6 +199,18 @@ impl MailConfig {
         self.relay_host = self.relay_host.trim().to_string();
         self.from = self.from.trim().to_string();
         self.sign_in_url = self.sign_in_url.trim().trim_end_matches('/').to_string();
+        self.brand = self.brand.trim().to_string();
+        for text in [
+            &mut self.link_lifetime,
+            &mut self.invite_subject,
+            &mut self.reset_subject,
+        ] {
+            *text = text
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -220,11 +246,27 @@ impl MailConfig {
         if self.relay_password_file.as_os_str().is_empty() {
             return Err("mail.relay_password_file is required".into());
         }
-        if self.from.is_empty() || !self.from.contains('@') {
-            return Err("mail.from must be an email address".into());
+        // Parsed as the rewritten email will parse it, so a From that cannot be
+        // sent is found now rather than on the first invitation.
+        if self.from.parse::<Mailbox>().is_err() {
+            return Err(format!(
+                "mail.from `{}` is not an address to send from: write `Name <noreply@example.com>`, \
+                 with the name in double quotes if it contains any of , ( ) : ; @ [ ] \\ \"",
+                self.from
+            ));
         }
         if !self.sign_in_url.starts_with("https://") && !self.sign_in_url.starts_with("http://") {
             return Err("mail.sign_in_url must be an http(s) URL".into());
+        }
+        one_line("mail.brand", &self.brand, 64)?;
+        if let Some(l) = &self.link_lifetime {
+            one_line("mail.link_lifetime", l, 64)?;
+        }
+        if let Some(s) = &self.invite_subject {
+            one_line("mail.invite_subject", s, 200)?;
+        }
+        if let Some(s) = &self.reset_subject {
+            one_line("mail.reset_subject", s, 200)?;
         }
         if self.implicit_tls && self.starttls == Some(true) {
             return Err(
@@ -258,6 +300,19 @@ impl MailConfig {
             .unwrap_or(if self.implicit_tls { 465 } else { 587 })
     }
 
+    fn subject(&self, kind: LinkKind) -> String {
+        match kind {
+            LinkKind::Invite => self
+                .invite_subject
+                .clone()
+                .unwrap_or_else(|| format!("Your {} account", self.brand)),
+            LinkKind::Reset => self
+                .reset_subject
+                .clone()
+                .unwrap_or_else(|| format!("{} password reset", self.brand)),
+        }
+    }
+
     fn password(&self) -> anyhow::Result<String> {
         let raw = std::fs::read_to_string(&self.relay_password_file).map_err(|e| {
             anyhow::anyhow!("cannot read {}: {e}", self.relay_password_file.display())
@@ -289,6 +344,20 @@ impl MailConfig {
 fn on_this_host(host: &str) -> bool {
     host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
         || host.eq_ignore_ascii_case("localhost")
+}
+
+/// A value that goes into a header or a sentence: present, short, one line.
+fn one_line(what: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{what} cannot be empty"));
+    }
+    if value.chars().count() > max {
+        return Err(format!("{what} is longer than {max} characters"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{what} cannot contain control characters"));
+    }
+    Ok(())
 }
 
 /// Which email this is, which decides what it says.
@@ -385,50 +454,130 @@ pub fn extract_link(data: &[u8]) -> Option<String> {
     Some(url.replace("=3D", "="))
 }
 
-fn invite_text(name: &str, link: &str, sign_in: &str) -> String {
+/// A display name fit for a header and a page. It is whatever an operator
+/// typed: control characters become spaces — a CR or LF above all, which
+/// lettre cannot encode and panics on when it writes the header — and runs of
+/// whitespace collapse.
+fn clean_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// For everything interpolated into the HTML part, which goes out under our
+/// own domain.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// What either email is made of.
+struct Letter<'a> {
+    brand: &'a str,
+    /// Already through [`clean_name`].
+    name: &'a str,
+    link: &'a str,
+    sign_in: &'a str,
+    lifetime: Option<&'a str>,
+}
+
+/// The sentences that differ between an invitation and a reset.
+struct Wording {
+    lead: String,
+    ask: &'static str,
+    action: &'static str,
+    /// Either side of the sign-in address.
+    then: (&'static str, &'static str),
+    footer: &'static str,
+}
+
+fn wording(kind: LinkKind, brand: &str) -> Wording {
+    match kind {
+        LinkKind::Invite => Wording {
+            lead: format!("You have been given access to {brand} live and recorded video."),
+            ask: "To get started, choose a password for your account:",
+            action: "Set your password",
+            then: (
+                "Once your password is set, sign in at",
+                "with your email address or your username, and the feeds you have been given \
+                 will be listed there.",
+            ),
+            footer: "If you were not expecting this, you can ignore this email — no password is \
+                     set and no access is granted until somebody uses the link.",
+        },
+        LinkKind::Reset => Wording {
+            lead: format!("Somebody asked to reset the password on your {brand} account."),
+            ask: "To choose a new one:",
+            action: "Choose a new password",
+            then: (
+                "Once your new password is set, sign in at",
+                "with your email address or your username.",
+            ),
+            footer: "If you did not ask for this, you can ignore this email — your current \
+                     password still works and nothing changes until somebody uses the link.",
+        },
+    }
+}
+
+fn greeting(name: &str) -> String {
+    if name.is_empty() {
+        "Hello,".to_string()
+    } else {
+        format!("Hello {name},")
+    }
+}
+
+/// "This link lasts three days. " — or nothing, when nobody has said how long
+/// Authelia makes it last.
+fn lifetime_sentence(lifetime: Option<&str>) -> String {
+    lifetime
+        .map(|l| format!("This link lasts {l}. "))
+        .unwrap_or_default()
+}
+
+fn text_body(l: &Letter, kind: LinkKind) -> String {
+    let w = wording(kind, l.brand);
     format!(
-        "Hello {name},\n\n\
-         You have been given access to GRS live and recorded video.\n\n\
-         To get started, choose a password for your account:\n\n\
-         {link}\n\n\
-         This link lasts three days. Once your password is set, sign in at\n\
-         {sign_in} with your email address or your username, and the feeds you\n\
-         have been given will be listed there.\n\n\
-         If you were not expecting this, you can ignore this email — no password\n\
-         is set and no access is granted until somebody uses the link.\n\n\
-         GRS Notifications\n"
+        "{greeting}\n\n{lead}\n\n{ask}\n\n{link}\n\n{lasts}{before} {sign_in} {after}\n\n\
+         {footer}\n\n{brand} Notifications\n",
+        greeting = greeting(l.name),
+        lead = w.lead,
+        ask = w.ask,
+        link = l.link,
+        lasts = lifetime_sentence(l.lifetime),
+        before = w.then.0,
+        sign_in = l.sign_in,
+        after = w.then.1,
+        footer = w.footer,
+        brand = l.brand,
     )
 }
 
-fn reset_text(name: &str, link: &str, sign_in: &str) -> String {
-    format!(
-        "Hello {name},\n\n\
-         Somebody asked to reset the password on your GRS account.\n\n\
-         To choose a new one:\n\n\
-         {link}\n\n\
-         This link lasts three days. Afterwards, sign in at {sign_in} with your\n\
-         email address or your username.\n\n\
-         If you did not ask for this, you can ignore this email — your current\n\
-         password still works and nothing changes until somebody uses the link.\n\n\
-         GRS Notifications\n"
-    )
-}
-
-fn html_body(name: &str, link: &str, sign_in: &str, kind: LinkKind) -> String {
-    let (lead, action, footer) = match kind {
-        LinkKind::Invite => (
-            "You have been given access to GRS live and recorded video.",
-            "Set your password",
-            "If you were not expecting this you can ignore this email — no password is set \
-             and no access is granted until somebody uses the link.",
-        ),
-        LinkKind::Reset => (
-            "Somebody asked to reset the password on your GRS account.",
-            "Choose a new password",
-            "If you did not ask for this you can ignore this email — your current password \
-             still works and nothing changes until somebody uses the link.",
-        ),
-    };
+fn html_body(l: &Letter, kind: LinkKind) -> String {
+    let w = wording(kind, l.brand);
+    let greeting = html_escape(&greeting(l.name));
+    let lead = html_escape(&w.lead);
+    let action = html_escape(w.action);
+    let lasts = html_escape(&lifetime_sentence(l.lifetime));
+    let before = html_escape(w.then.0);
+    let after = html_escape(w.then.1);
+    let footer = html_escape(w.footer);
+    let brand = html_escape(l.brand);
+    let link = html_escape(l.link);
+    let sign_in = html_escape(l.sign_in);
     format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"></head>
@@ -436,12 +585,12 @@ fn html_body(name: &str, link: &str, sign_in: &str, kind: LinkKind) -> String {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f8;padding:24px 12px;">
 <tr><td align="center">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:10px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2933;border:1px solid #e1e6eb;">
-<tr><td style="background:#0f172a;padding:18px 24px;color:#ffffff;font-size:16px;font-weight:600;">GRS Notifications</td></tr>
+<tr><td style="background:#0f172a;padding:18px 24px;color:#ffffff;font-size:16px;font-weight:600;">{brand} Notifications</td></tr>
 <tr><td style="padding:24px;font-size:15px;line-height:1.6;">
-<p style="margin:0 0 14px;">Hello {name},</p>
+<p style="margin:0 0 14px;">{greeting}</p>
 <p style="margin:0 0 20px;">{lead}</p>
 <p style="margin:0 0 22px;"><a href="{link}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 22px;border-radius:8px;font-weight:600;">{action}</a></p>
-<p style="margin:0 0 14px;color:#52606d;font-size:13px;">This link lasts three days. Afterwards, sign in at <a href="{sign_in}" style="color:#2563eb;">{sign_in}</a> with your email address or your username.</p>
+<p style="margin:0 0 14px;color:#52606d;font-size:13px;">{lasts}{before} <a href="{sign_in}" style="color:#2563eb;">{sign_in}</a> {after}</p>
 <p style="margin:0 0 14px;color:#52606d;font-size:13px;">{footer}</p>
 <p style="margin:18px 0 0;color:#7b8794;font-size:12px;word-break:break-all;">If the button does not work, paste this into your browser:<br>{link}</p>
 </td></tr></table></td></tr></table></body></html>"#
@@ -456,28 +605,29 @@ pub fn rewrite(
     to: &str,
     link: &str,
 ) -> anyhow::Result<Message> {
-    let (subject, text) = match kind {
-        LinkKind::Invite => (
-            cfg.invite_subject.clone(),
-            invite_text(display_name, link, &cfg.sign_in_url),
-        ),
-        LinkKind::Reset => (
-            cfg.reset_subject.clone(),
-            reset_text(display_name, link, &cfg.sign_in_url),
-        ),
+    let name = clean_name(display_name);
+    let letter = Letter {
+        brand: &cfg.brand,
+        name: &name,
+        link,
+        sign_in: &cfg.sign_in_url,
+        lifetime: cfg.link_lifetime.as_deref(),
     };
-    let to_mailbox = if display_name.is_empty() {
-        to.parse()?
-    } else {
-        format!("{display_name} <{to}>").parse()?
-    };
+    // Built, never parsed out of `Name <address>`: lettre's parser takes only a
+    // bare phrase, so `Jones, Bea`, `Bea (Producer)` or a username that is an
+    // email address could not be written that way. Built, the name is quoted
+    // as it needs to be on the way out.
+    let to_mailbox = Mailbox::new(
+        (!name.is_empty()).then(|| name.clone()),
+        to.parse::<Address>()?,
+    );
     Ok(Message::builder()
         .from(cfg.from.parse()?)
         .to(to_mailbox)
-        .subject(subject)
-        .multipart(lettre::message::MultiPart::alternative_plain_html(
-            text,
-            html_body(display_name, link, &cfg.sign_in_url, kind),
+        .subject(cfg.subject(kind))
+        .multipart(MultiPart::alternative_plain_html(
+            text_body(&letter, kind),
+            html_body(&letter, kind),
         ))?)
 }
 
@@ -580,7 +730,14 @@ pub async fn handle(
                 let envelope = message.envelope().clone();
                 relay.send(envelope, message.formatted()).await
             }
-            Err(e) => Err(format!("could not compose the email: {e}")),
+            Err(e) => {
+                // Still the person's link, in Authelia's words rather than ours.
+                tracing::warn!(
+                    to = %to, error = %e,
+                    "could not compose the rewritten email; relaying Authelia's unchanged"
+                );
+                pass_through(relay, msg).await
+            }
         },
         None => {
             // Authelia changed its message, or this was not the mail we
@@ -1129,8 +1286,10 @@ mod tests {
             relay_password_file: "/dev/null".into(),
             from: "Example Notifications <noreply@portal.example>".into(),
             sign_in_url: "https://watch.portal.example".into(),
-            invite_subject: default_invite_subject(),
-            reset_subject: default_reset_subject(),
+            brand: default_brand(),
+            link_lifetime: None,
+            invite_subject: None,
+            reset_subject: None,
             starttls: None,
             implicit_tls: false,
         }
@@ -1158,6 +1317,9 @@ mod tests {
             data: data.into_bytes(),
         }
     }
+
+    const LINK: &str =
+        "https://watch.portal.example/auth/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc";
 
     /// The words of a message, with quoted-printable's soft breaks and `=3D`
     /// undone so an assertion reads what the recipient would.
@@ -1317,12 +1479,12 @@ mod tests {
         for (kind, subject, phrase) in [
             (
                 LinkKind::Invite,
-                "GRS New User",
+                "Your Bilbycast account",
                 "You have been given access",
             ),
             (
                 LinkKind::Reset,
-                "GRS password reset",
+                "Bilbycast password reset",
                 "asked to reset the password",
             ),
         ] {
@@ -1355,6 +1517,145 @@ mod tests {
             // And the manager hears that it went.
             assert_eq!(rx.await.unwrap(), Ok(()));
         }
+    }
+
+    /// Names an operator will type, and the one a username falls back to.
+    /// lettre's parser refuses every one of these as `Name <address>`; built
+    /// rather than parsed, each is written as a header that reads back as
+    /// itself — and a CR/LF cannot start a header of its own.
+    #[tokio::test]
+    async fn any_display_name_composes_and_cannot_add_a_header() {
+        for name in [
+            "Jones, Bea",
+            "Bea (Producer)",
+            "a<b",
+            "Bea\r\nBcc: someone@attacker.example",
+            "Bea\u{1b}[31m\u{7}",
+            "bea@example.com",
+        ] {
+            let message = rewrite(&cfg(), LinkKind::Invite, name, "bea@example.com", LINK)
+                .unwrap_or_else(|e| panic!("{name:?} did not compose: {e}"));
+            let to: Mailbox = message
+                .headers()
+                .get_raw("To")
+                .expect("no To header")
+                .parse()
+                .unwrap_or_else(|e| panic!("the To header for {name:?} does not parse: {e:?}"));
+            assert_eq!(to.email.to_string(), "bea@example.com");
+            assert_eq!(to.name.as_deref(), Some(clean_name(name).as_str()));
+            assert!(
+                !to.name.unwrap().contains(char::is_control),
+                "{name:?} kept a control character"
+            );
+            let formatted = String::from_utf8(message.formatted()).unwrap();
+            assert!(
+                !formatted.contains("\nBcc:"),
+                "a name added a header: {formatted}"
+            );
+        }
+
+        // And through the whole path: the person is invited, by name.
+        let pending = PendingLinks::default();
+        let rx = pending
+            .expect("bea@example.com", LinkKind::Invite, "Jones, Bea")
+            .await;
+        let relay = Captured::default();
+        let msg = authelia_message("bea@example.com");
+        handle(&cfg(), &pending, &relay, msg.clone()).await.unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+        let sent = relay.sent.lock().await;
+        assert_ne!(
+            sent[0].1.as_bytes(),
+            msg.data.as_slice(),
+            "it was not rewritten"
+        );
+        assert!(
+            readable(&sent[0].1).contains("Hello Jones, Bea,"),
+            "{}",
+            sent[0].1
+        );
+    }
+
+    /// The name is whatever a group administrator typed, and the email goes
+    /// out under our domain: nothing typed may become markup.
+    #[test]
+    fn the_html_part_escapes_everything_it_interpolates() {
+        let name = clean_name(r#"Bea</p><a href="https://evil.example">Sign in again</a>"#);
+        let letter = Letter {
+            brand: "Tom & Jerry's",
+            name: &name,
+            link: "https://watch.portal.example/r?token=a&b=\"c\"",
+            sign_in: "https://watch.portal.example",
+            lifetime: Some("3 <b>days</b>"),
+        };
+        for kind in [LinkKind::Invite, LinkKind::Reset] {
+            let html = html_body(&letter, kind);
+            assert!(
+                !html.contains("<a href=\"https://evil.example\">"),
+                "{html}"
+            );
+            assert!(html.contains(
+                "Hello Bea&lt;/p&gt;&lt;a href=&quot;https://evil.example&quot;&gt;Sign in \
+                 again&lt;/a&gt;,"
+            ));
+            assert!(html.contains("Tom &amp; Jerry&#39;s Notifications"));
+            assert!(html.contains("This link lasts 3 &lt;b&gt;days&lt;/b&gt;."));
+            assert!(
+                html.contains(
+                    "href=\"https://watch.portal.example/r?token=a&amp;b=&quot;c&quot;\""
+                )
+            );
+        }
+    }
+
+    /// Whatever stops the rewrite, the person still gets Authelia's email and
+    /// its link, and the manager hears how the relay answered.
+    #[tokio::test]
+    async fn a_compose_failure_relays_authelias_own_email() {
+        let mut c = cfg();
+        // `validate` refuses this From at startup; a rewrite that fails for
+        // any reason must still not cost anyone their link.
+        c.from = "Example, Inc <noreply@portal.example>".into();
+        assert!(rewrite(&c, LinkKind::Invite, "Bea", "bea@example.com", LINK).is_err());
+        let pending = PendingLinks::default();
+        let rx = pending
+            .expect("bea@example.com", LinkKind::Invite, "Bea")
+            .await;
+        let relay = Captured::default();
+        let msg = authelia_message("bea@example.com");
+        handle(&c, &pending, &relay, msg.clone()).await.unwrap();
+        let sent = relay.sent.lock().await;
+        let (_, body) = sent.first().expect("the link was dropped");
+        assert_eq!(body.as_bytes(), msg.data.as_slice());
+        assert_eq!(rx.await.unwrap(), Ok(()));
+    }
+
+    /// No customer's name in the code: the brand is configured, and so is how
+    /// long the link lasts — which the emails do not guess at.
+    #[test]
+    fn the_emails_carry_the_configured_brand_and_claim_no_lifetime_unless_told() {
+        let message = rewrite(&cfg(), LinkKind::Reset, "Bea", "bea@example.com", LINK).unwrap();
+        let body = readable(&String::from_utf8(message.formatted()).unwrap());
+        assert!(body.contains("Subject: Bilbycast password reset"), "{body}");
+        assert!(body.contains("your Bilbycast account"));
+        assert!(
+            !body.contains("lasts"),
+            "a lifetime nobody configured: {body}"
+        );
+
+        let mut c = cfg();
+        c.brand = "Acme Sport".into();
+        c.link_lifetime = Some("three days".into());
+        let message = rewrite(&c, LinkKind::Invite, "Bea", "bea@example.com", LINK).unwrap();
+        let body = readable(&String::from_utf8(message.formatted()).unwrap());
+        assert!(body.contains("Subject: Your Acme Sport account"), "{body}");
+        assert!(body.contains("access to Acme Sport live"));
+        assert!(body.contains("This link lasts three days."));
+        assert!(!body.contains("Bilbycast"));
+
+        c.invite_subject = Some("Welcome aboard".into());
+        let message = rewrite(&c, LinkKind::Invite, "Bea", "bea@example.com", LINK).unwrap();
+        assert_eq!(message.headers().get_raw("Subject"), Some("Welcome aboard"));
     }
 
     #[tokio::test]
@@ -1547,6 +1848,38 @@ mod tests {
         assert!(err.contains("mail.listen_password_file"), "{err}");
         c.listen_password_file = "/etc/bilbycast/portal-mail-listener".into();
         assert_eq!(c.validate(), Ok(()));
+        assert_eq!(c.subject(LinkKind::Invite), "Welcome");
+    }
+
+    #[test]
+    fn what_goes_into_a_header_or_a_sentence_is_one_short_line() {
+        fn refuses(what: &str, break_it: impl FnOnce(&mut MailConfig)) {
+            let mut c = cfg();
+            break_it(&mut c);
+            assert!(c.validate().is_err(), "accepted a bad {what}");
+        }
+        refuses("brand", |c| c.brand = String::new());
+        refuses("brand", |c| c.brand = "Acme\r\nBcc: x@y.z".into());
+        refuses("brand", |c| c.brand = "A".repeat(65));
+        refuses("link_lifetime", |c| {
+            c.link_lifetime = Some("three\ndays".into())
+        });
+        refuses("invite_subject", |c| {
+            c.invite_subject = Some("Hi\r\nBcc: x@y.z".into())
+        });
+        refuses("reset_subject", |c| c.reset_subject = Some(String::new()));
+        refuses("from", |c| {
+            c.from = "Example, Inc <noreply@example.com>".into()
+        });
+        refuses("from", |c| c.from = "not an address".into());
+
+        let mut c = cfg();
+        c.from = "\"Example, Inc\" <noreply@example.com>".into();
+        assert_eq!(c.validate(), Ok(()), "a quoted name is an address");
+        c.link_lifetime = Some("   ".into());
+        c.invite_subject = Some(String::new());
+        c.normalise();
+        assert_eq!((c.link_lifetime, c.invite_subject), (None, None));
     }
 
     #[test]
@@ -1817,7 +2150,7 @@ mod tests {
         );
         let sent = relay.sent.lock().await;
         assert!(
-            sent[0].1.contains("GRS New User"),
+            sent[0].1.contains("Your Bilbycast account"),
             "the invite was not rewritten"
         );
     }
