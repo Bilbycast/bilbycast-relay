@@ -25,23 +25,38 @@
 //! So the only way to put our own words around Authelia's link is to take the
 //! message it produced.
 //!
+//! # Who may deliver here
+//!
+//! Only Authelia. Loopback alone would not make it so: every other process on
+//! this host — and anything that can steer one of them into opening a socket —
+//! could hand the listener a message and have it relayed under our domain and
+//! its reputation. So the listener takes no sender until the client has
+//! authenticated (`AUTH PLAIN` or `AUTH LOGIN`) with the secret in
+//! `mail.listen_password_file`, which Authelia's notifier is given too. After
+//! that the envelope sender must still be `mail.from`'s address. A different
+//! one is refused at `MAIL FROM` with a `550`, so an Authelia configured with
+//! another sender fails loudly — at its own startup check, and on every send —
+//! instead of having its mail accepted and then dropped.
+//!
 //! # What is rewritten, and what is not
 //!
 //! Only a message to somebody the portal has just asked for a link for, matched
 //! by recipient within [`PENDING_TTL`]. Everything else Authelia sends — a
 //! viewer using the "reset password" link on the sign-in page itself, or one of
-//! Authelia's own event notices — is relayed **byte for byte**, so turning this
-//! on cannot silently swallow mail nobody here anticipated.
+//! Authelia's own event notices — is relayed byte for byte.
 //!
-//! # Failure is reported, not swallowed
+//! # What "sent" means
 //!
-//! Authelia believes the message is sent the moment this listener accepts it,
-//! and it will not send it again. So the relay result is what the manager is
-//! told: the Portal logins list says "sent" only once Brevo has taken it, and
-//! names the error when it has not.
+//! Authelia believes a message is sent the moment this listener answers `250`,
+//! and it will not send it again. For a link the portal asked for, the relay's
+//! answer is what the manager is told: the Portal logins list says "sent" once
+//! the relay has accepted the message for delivery — not once it has reached
+//! an inbox — and names the error when it has not. Mail nobody here asked for
+//! has nobody to report to, so a relay failure on it is logged at ERROR and
+//! that is all.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,40 +65,82 @@ use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, oneshot};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex, Semaphore, oneshot};
 
-/// How long a requested link stays matchable. Authelia sends within a second of
-/// being asked; this is generous so a slow box still matches, and short enough
-/// that a viewer's own reset minutes later is not mistaken for our invite.
-const PENDING_TTL: Duration = Duration::from_secs(300);
+/// How long a requested link stays matchable.
+///
+/// No longer than the account sync waits for the email (its `RELAY_WAIT`,
+/// 30 s): an expectation that outlived its waiter would claim — and reword —
+/// the next email Authelia sends that address, a viewer's own reset from the
+/// sign-in page among them, with nobody left to report the outcome to.
+/// Authelia mails during the request that asks it to, so this is still ample.
+pub const PENDING_TTL: Duration = Duration::from_secs(30);
 
-/// Caps on what the listener will read. Authelia's message is a few kilobytes.
+/// The longest one relay attempt may take, end to end.
+///
+/// Below the account sync's 30 s wait, so the manager is told the relay's real
+/// answer rather than a timeout. Enforced around the whole send: on tokio,
+/// lettre's own timeout covers only the connect.
+pub const RELAY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Caps on what the listener will read. Authelia's message is a few kilobytes,
+/// and no line is read further than [`MAX_LINE_BYTES`], however long it is.
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
-/// A conversation that stalls is dropped rather than held open.
+/// A conversation that stalls is dropped rather than held open...
 const SMTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// ...and so is one that keeps talking. Authelia is done in well under a
+/// second; this is what stops a client sending `NOOP` forever from holding a
+/// connection slot, and with it Authelia's mail, hostage.
+const SESSION_DEADLINE: Duration = Duration::from_secs(60);
+/// Connections served at once. Past this a new one is told `421` and closed.
+const MAX_CONNECTIONS: usize = 16;
+/// Messages accepted and not yet relayed. Past this `DATA` is answered `451`.
+const MAX_IN_FLIGHT: usize = 8;
+/// Failed `AUTH` attempts, and unrecognised commands, before a connection is
+/// closed. Authelia needs neither more than once.
+const MAX_AUTH_FAILURES: u8 = 3;
+const MAX_UNKNOWN_COMMANDS: u8 = 3;
+/// The shortest listener secret accepted. It is a machine secret two services
+/// read from a file; nobody types it.
+const MIN_LISTEN_PASSWORD: usize = 32;
+
+const AUTH_FIRST: &[u8] = b"530 5.7.0 Authentication required\r\n";
+const AUTH_INVALID: &[u8] = b"535 5.7.8 authentication credentials invalid\r\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailConfig {
-    /// Where Authelia delivers. Loopback: it speaks no TLS and authenticates
-    /// with nothing, so anything that can reach it can send mail as us.
+    /// Where Authelia delivers. Loopback only: the listener speaks no TLS, so
+    /// the secret Authelia authenticates with must not cross a network.
     #[serde(default = "default_listen")]
     pub listen_addr: String,
 
+    /// A file holding the secret Authelia authenticates to the listener with —
+    /// the same file Authelia's `AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE` names.
+    /// Required. Defaulted only so a config written before it existed is
+    /// refused by [`validate`](Self::validate), with a message saying what to
+    /// add, rather than by the JSON parser.
+    #[serde(default)]
+    pub listen_password_file: PathBuf,
+
     /// The relay that actually delivers, e.g. `smtp-relay.brevo.com`.
     pub relay_host: String,
-    #[serde(default = "default_relay_port")]
-    pub relay_port: u16,
+    /// 587 unless set, or 465 with `implicit_tls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_port: Option<u16>,
     pub relay_username: String,
     /// A file holding the relay's password (Brevo calls it an SMTP key), so it
     /// is not in this config.
     pub relay_password_file: PathBuf,
 
     /// The From on everything that leaves here, e.g.
-    /// `GRS Notifications <noreply@example.com>`. Its domain has to be
-    /// authenticated at the relay.
+    /// `Example Notifications <noreply@example.com>`. Its domain has to be
+    /// authenticated at the relay, and Authelia's `notifier.smtp.sender` must
+    /// carry the same address.
     pub from: String,
 
     /// Where a viewer signs in, named in the emails.
@@ -94,18 +151,19 @@ pub struct MailConfig {
     #[serde(default = "default_reset_subject")]
     pub reset_subject: String,
 
-    /// STARTTLS on the way out. Off is for a local test sink only — it sends
-    /// the relay password in clear, so [`validate`](Self::validate) refuses it
-    /// against anything but loopback.
-    #[serde(default = "default_true")]
-    pub starttls: bool,
+    /// STARTTLS on the way out, which is what unset means unless
+    /// `implicit_tls` is on. Off with neither is for a local test sink only —
+    /// it sends the relay password in clear, so [`validate`](Self::validate)
+    /// refuses it for any relay not on this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starttls: Option<bool>,
+    /// TLS from the first byte (`submissions`, port 465) instead of STARTTLS.
+    #[serde(default)]
+    pub implicit_tls: bool,
 }
 
 fn default_listen() -> String {
     "127.0.0.1:2525".to_string()
-}
-fn default_relay_port() -> u16 {
-    587
 }
 fn default_invite_subject() -> String {
     "GRS New User".to_string()
@@ -113,8 +171,13 @@ fn default_invite_subject() -> String {
 fn default_reset_subject() -> String {
     "GRS password reset".to_string()
 }
-fn default_true() -> bool {
-    true
+
+/// How the connection to the relay is protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outbound {
+    StartTls,
+    Implicit,
+    Clear,
 }
 
 impl MailConfig {
@@ -131,13 +194,25 @@ impl MailConfig {
             .map_err(|_| "mail.listen_addr must be host:port".to_string())?;
         if !addr.ip().is_loopback() {
             return Err(
-                "mail.listen_addr must be a loopback address: the listener has no \
-                        authentication, so anything that can reach it can send mail as you"
+                "mail.listen_addr must be a loopback address: the listener speaks no TLS, so \
+                 the secret Authelia authenticates with would cross the network in clear"
                     .into(),
             );
         }
+        if self.listen_password_file.as_os_str().is_empty() {
+            return Err(format!(
+                "mail.listen_password_file is required: the listener takes mail only from a \
+                 client that authenticates. Put a random secret of at least \
+                 {MIN_LISTEN_PASSWORD} characters in a file, name it here, and give Authelia the \
+                 same secret (notifier.smtp.username, and AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE \
+                 pointing at that file)"
+            ));
+        }
         if self.relay_host.is_empty() {
             return Err("mail.relay_host is required".into());
+        }
+        if self.relay_port == Some(0) {
+            return Err("mail.relay_port cannot be 0".into());
         }
         if self.relay_username.is_empty() {
             return Err("mail.relay_username is required".into());
@@ -151,13 +226,36 @@ impl MailConfig {
         if !self.sign_in_url.starts_with("https://") && !self.sign_in_url.starts_with("http://") {
             return Err("mail.sign_in_url must be an http(s) URL".into());
         }
-        if !self.starttls
-            && !self.relay_host.starts_with("127.0.0.1")
-            && self.relay_host != "localhost"
-        {
-            return Err("mail.starttls may only be off for a relay on this host".into());
+        if self.implicit_tls && self.starttls == Some(true) {
+            return Err(
+                "mail.implicit_tls and mail.starttls are two ways of encrypting the same \
+                 connection; for implicit TLS (port 465) remove starttls or set it to false"
+                    .into(),
+            );
+        }
+        if self.outbound() == Outbound::Clear && !on_this_host(&self.relay_host) {
+            return Err(
+                "mail.starttls may only be off for a relay on this host (127.0.0.1, ::1 or \
+                 localhost): it sends the relay password in clear"
+                    .into(),
+            );
         }
         Ok(())
+    }
+
+    fn outbound(&self) -> Outbound {
+        if self.implicit_tls {
+            Outbound::Implicit
+        } else if self.starttls.unwrap_or(true) {
+            Outbound::StartTls
+        } else {
+            Outbound::Clear
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.relay_port
+            .unwrap_or(if self.implicit_tls { 465 } else { 587 })
     }
 
     fn password(&self) -> anyhow::Result<String> {
@@ -166,6 +264,31 @@ impl MailConfig {
         })?;
         Ok(raw.trim().to_string())
     }
+
+    /// The secret Authelia must present to the listener, read once at startup.
+    pub fn listen_password(&self) -> anyhow::Result<String> {
+        let path = self.listen_password_file.display();
+        let raw = std::fs::read_to_string(&self.listen_password_file)
+            .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let secret = raw.trim();
+        if secret.chars().any(char::is_control) {
+            anyhow::bail!("{path} must hold the listener secret on one line");
+        }
+        if secret.len() < MIN_LISTEN_PASSWORD {
+            anyhow::bail!(
+                "the listener secret in {path} is shorter than {MIN_LISTEN_PASSWORD} characters; \
+                 generate one with `openssl rand -hex 32`"
+            );
+        }
+        Ok(secret.to_string())
+    }
+}
+
+/// Plain text to a relay is allowed only here: an address that is loopback,
+/// not a name that merely starts like one.
+fn on_this_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || host.eq_ignore_ascii_case("localhost")
 }
 
 /// Which email this is, which decides what it says.
@@ -232,7 +355,7 @@ impl PendingLinks {
 }
 
 /// One message as it arrived from Authelia.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Incoming {
     pub from: String,
     pub recipients: Vec<String>,
@@ -367,19 +490,30 @@ pub trait Relay: Send + Sync {
 
 pub struct SmtpRelay {
     transport: AsyncSmtpTransport<Tokio1Executor>,
+    /// [`RELAY_TIMEOUT`]; a field so a test need not wait that long.
+    deadline: Duration,
 }
 
 impl SmtpRelay {
     pub fn new(cfg: &MailConfig) -> anyhow::Result<Self> {
         let creds = Credentials::new(cfg.relay_username.clone(), cfg.password()?);
-        let builder = if cfg.starttls {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.relay_host)?
-        } else {
-            // Loopback only — `validate` refuses this anywhere else.
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.relay_host)
+        let builder = match cfg.outbound() {
+            Outbound::StartTls => {
+                AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.relay_host)?
+            }
+            Outbound::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.relay_host)?,
+            // This host only — `validate` refuses it anywhere else.
+            Outbound::Clear => {
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.relay_host)
+            }
         };
         Ok(Self {
-            transport: builder.port(cfg.relay_port).credentials(creds).build(),
+            transport: builder
+                .port(cfg.port())
+                .credentials(creds)
+                .timeout(Some(RELAY_TIMEOUT))
+                .build(),
+            deadline: RELAY_TIMEOUT,
         })
     }
 }
@@ -387,11 +521,14 @@ impl SmtpRelay {
 #[async_trait::async_trait]
 impl Relay for SmtpRelay {
     async fn send(&self, envelope: Envelope, body: Vec<u8>) -> Result<(), String> {
-        self.transport
-            .send_raw(&envelope, &body)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("the mail relay refused it: {e}"))
+        match tokio::time::timeout(self.deadline, self.transport.send_raw(&envelope, &body)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("the mail relay refused it: {e}")),
+            Err(_) => Err(format!(
+                "the mail relay did not answer within {:?}",
+                self.deadline
+            )),
+        }
     }
 }
 
@@ -405,27 +542,28 @@ pub async fn handle(
     relay: &dyn Relay,
     msg: Incoming,
 ) -> Result<(), String> {
-    // Nothing but Authelia should be delivering here, but the listener has no
-    // authentication — it cannot, Authelia has no credential to offer — so
-    // anything else running on this host could hand it a message and have it
-    // relayed under our own domain. The envelope sender is the one thing that
-    // distinguishes them, so a message claiming to be from anyone else is
-    // dropped rather than forwarded.
+    // Refused at `MAIL FROM` already. Checked again so that nothing reaching
+    // here by some other road is relayed under our domain.
     if !sender_is_ours(cfg, &msg.from) {
-        tracing::warn!(
+        tracing::error!(
             from = %msg.from,
+            mail_from = %cfg.from,
             "refusing to relay a message that did not come from this portal's sender address"
         );
         return Err("the message was not from this portal's sender address".into());
     }
-    let matched = pending.take(&msg.recipients).await;
-    let Some((to, mut pending_entry)) = matched else {
+    let Some((to, mut pending_entry)) = pending.take(&msg.recipients).await else {
         // Not ours: a viewer resetting their own password from the sign-in
-        // page, or one of Authelia's notices. Relayed exactly as written.
-        let envelope = envelope_for(&msg)?;
-        let out = relay.send(envelope, msg.data).await;
+        // page, or one of Authelia's notices. Relayed exactly as written — and
+        // if that fails, the log is all there is to tell: Authelia already
+        // has its 250.
+        let out = pass_through(relay, msg).await;
         if let Err(ref e) = out {
-            tracing::warn!(error = %e, "could not relay a message Authelia sent");
+            tracing::error!(
+                error = %e,
+                "could not relay an email Authelia sent; Authelia was told it was accepted and \
+                 will not send it again"
+            );
         }
         return out;
     };
@@ -451,14 +589,22 @@ pub async fn handle(
                 to = %to,
                 "no set-password link found in Authelia's email; relaying it unchanged"
             );
-            let envelope = envelope_for(&msg)?;
-            relay.send(envelope, msg.data).await
+            pass_through(relay, msg).await
         }
     };
+    if let Err(ref e) = result {
+        tracing::warn!(to = %to, error = %e, "a requested password link was not relayed");
+    }
     if let Some(done) = pending_entry.done.take() {
         let _ = done.send(result.clone());
     }
     result
+}
+
+/// Relay what Authelia wrote, untouched.
+async fn pass_through(relay: &dyn Relay, msg: Incoming) -> Result<(), String> {
+    let envelope = envelope_for(&msg)?;
+    relay.send(envelope, msg.data).await
 }
 
 fn envelope_for(msg: &Incoming) -> Result<Envelope, String> {
@@ -489,114 +635,6 @@ fn sender_is_ours(cfg: &MailConfig, envelope_from: &str) -> bool {
     key(envelope_from) == ours
 }
 
-/// The SMTP conversation. Enough of RFC 5321 for Authelia, and nothing more.
-async fn serve_conn(
-    stream: TcpStream,
-    cfg: Arc<MailConfig>,
-    pending: Arc<PendingLinks>,
-    relay: Arc<dyn Relay>,
-) -> std::io::Result<()> {
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    let mut msg = Incoming {
-        from: String::new(),
-        recipients: Vec::new(),
-        data: Vec::new(),
-    };
-
-    write.write_all(b"220 bilbycast-portal ESMTP\r\n").await?;
-    loop {
-        line.clear();
-        let read = tokio::time::timeout(SMTP_IDLE_TIMEOUT, reader.read_line(&mut line)).await;
-        let n = match read {
-            Ok(Ok(n)) => n,
-            _ => return Ok(()),
-        };
-        if n == 0 {
-            return Ok(());
-        }
-        if line.len() > MAX_LINE_BYTES {
-            write.write_all(b"500 line too long\r\n").await?;
-            return Ok(());
-        }
-        let cmd = line.trim_end();
-        let upper = cmd.to_ascii_uppercase();
-        if upper.starts_with("EHLO") {
-            write
-                .write_all(b"250-bilbycast-portal\r\n250-8BITMIME\r\n250 SIZE 1048576\r\n")
-                .await?;
-        } else if upper.starts_with("HELO") {
-            write.write_all(b"250 bilbycast-portal\r\n").await?;
-        } else if upper.starts_with("MAIL FROM:") {
-            msg.from = address_in(cmd);
-            msg.recipients.clear();
-            write.write_all(b"250 2.1.0 ok\r\n").await?;
-        } else if upper.starts_with("RCPT TO:") {
-            msg.recipients.push(address_in(cmd));
-            write.write_all(b"250 2.1.5 ok\r\n").await?;
-        } else if upper.starts_with("DATA") {
-            if msg.recipients.is_empty() {
-                write.write_all(b"503 5.5.1 need RCPT first\r\n").await?;
-                continue;
-            }
-            write.write_all(b"354 go ahead\r\n").await?;
-            msg.data.clear();
-            loop {
-                line.clear();
-                let n = match tokio::time::timeout(SMTP_IDLE_TIMEOUT, reader.read_line(&mut line))
-                    .await
-                {
-                    Ok(Ok(n)) => n,
-                    _ => return Ok(()),
-                };
-                if n == 0 {
-                    return Ok(());
-                }
-                if line == ".\r\n" || line == ".\n" {
-                    break;
-                }
-                // Dot-stuffing, as the sender applied it.
-                let body = line.strip_prefix("..").map(|r| format!(".{r}"));
-                msg.data
-                    .extend_from_slice(body.as_deref().unwrap_or(&line).as_bytes());
-                if msg.data.len() > MAX_MESSAGE_BYTES {
-                    write.write_all(b"552 5.3.4 message too large\r\n").await?;
-                    return Ok(());
-                }
-            }
-            // Accepted here, delivered after: Authelia will not send it again,
-            // so whatever happens next is reported to the manager instead.
-            write.write_all(b"250 2.0.0 accepted\r\n").await?;
-            let taken = std::mem::replace(
-                &mut msg,
-                Incoming {
-                    from: String::new(),
-                    recipients: Vec::new(),
-                    data: Vec::new(),
-                },
-            );
-            let (cfg, pending, relay) = (cfg.clone(), pending.clone(), relay.clone());
-            tokio::spawn(async move {
-                if let Err(e) = handle(&cfg, &pending, relay.as_ref(), taken).await {
-                    tracing::warn!(error = %e, "a notification email was not relayed");
-                }
-            });
-        } else if upper.starts_with("RSET") {
-            msg.recipients.clear();
-            msg.data.clear();
-            write.write_all(b"250 2.0.0 ok\r\n").await?;
-        } else if upper.starts_with("NOOP") {
-            write.write_all(b"250 2.0.0 ok\r\n").await?;
-        } else if upper.starts_with("QUIT") {
-            write.write_all(b"221 2.0.0 bye\r\n").await?;
-            return Ok(());
-        } else {
-            write.write_all(b"502 5.5.2 not implemented\r\n").await?;
-        }
-    }
-}
-
 /// `MAIL FROM:<a@b>` / `RCPT TO:<a@b> SIZE=…` → `a@b`.
 fn address_in(cmd: &str) -> String {
     let rest = cmd.split_once(':').map(|(_, r)| r).unwrap_or("");
@@ -606,35 +644,468 @@ fn address_in(cmd: &str) -> String {
     }
 }
 
-/// Listen for Authelia. Returns once the listener cannot be bound.
-pub async fn run(cfg: Arc<MailConfig>, pending: Arc<PendingLinks>, relay: Arc<dyn Relay>) {
-    let listener = match TcpListener::bind(&cfg.listen_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(
-                addr = %cfg.listen_addr, error = %e,
-                "cannot bind the notification mail listener; Authelia's emails will not be sent"
-            );
-            return;
+/// Is this (upper-cased) line the start of an HTTP request rather than an
+/// SMTP command? A browser, or a server-side request somebody steered at this
+/// port, says this first; nothing that speaks SMTP ever does.
+fn speaks_http(upper: &str) -> bool {
+    [
+        "GET ", "POST ", "PUT ", "HEAD ", "DELETE ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE ",
+        "HOST:",
+    ]
+    .iter()
+    .any(|m| upper.starts_with(m))
+}
+
+/// Standard base64, as SASL carries it. `None` for anything else.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let body = s.trim_end_matches('=');
+    if s.len() - body.len() > 2 || body.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in body.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
         }
-    };
-    tracing::info!(addr = %cfg.listen_addr, relay = %cfg.relay_host,
-                   "accepting notification mail from Authelia");
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                if !peer.ip().is_loopback() {
-                    // Cannot happen while bound to loopback; cheap to keep true.
+    }
+    Some(out)
+}
+
+/// A SASL response line, decoded — or the reply that refuses it.
+fn decode_response(response: &str) -> Result<Vec<u8>, &'static [u8]> {
+    if response == "*" {
+        return Err(b"501 5.7.0 authentication cancelled\r\n");
+    }
+    base64_decode(response).ok_or(b"501 5.5.2 cannot decode the response\r\n")
+}
+
+/// What one bounded read produced. The line itself is left in the buffer.
+enum Line {
+    Read,
+    TooLong,
+    /// End of stream (mid-line included), the idle timeout, or an I/O error.
+    Closed,
+}
+
+/// Read one line into `buf`, never more than [`MAX_LINE_BYTES`] of it.
+///
+/// `read_line` alone buffers until a newline comes, so a client that never
+/// sends one would grow the buffer without limit — gigabytes inside the idle
+/// timeout, over loopback — in the process that is also the viewers' front
+/// door.
+async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> Line {
+    buf.clear();
+    let mut bounded = (&mut *reader).take(MAX_LINE_BYTES as u64 + 1);
+    match tokio::time::timeout(SMTP_IDLE_TIMEOUT, bounded.read_until(b'\n', buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => Line::Closed,
+        Ok(Ok(_)) if buf.len() > MAX_LINE_BYTES => Line::TooLong,
+        Ok(Ok(_)) if !buf.ends_with(b"\n") => Line::Closed,
+        Ok(Ok(_)) => Line::Read,
+    }
+}
+
+/// Send a `334` challenge and read the answer, or `None` once the client has
+/// gone.
+async fn prompt<R, W>(
+    challenge: &[u8],
+    reader: &mut R,
+    write: &mut W,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    write.write_all(challenge).await?;
+    Ok(match read_line(reader, buf).await {
+        Line::Read => Some(String::from_utf8_lossy(buf).trim().to_string()),
+        Line::TooLong | Line::Closed => None,
+    })
+}
+
+/// How an `AUTH` exchange ended.
+enum Auth {
+    Accepted,
+    /// Refused, with the reply that says why.
+    Refused(&'static [u8]),
+    Closed,
+}
+
+/// The listener Authelia delivers to, and what its connections share.
+pub struct Interceptor {
+    cfg: MailConfig,
+    /// What a client must present in `AUTH`. Never logged.
+    secret: String,
+    pending: Arc<PendingLinks>,
+    relay: Arc<dyn Relay>,
+    connections: Arc<Semaphore>,
+    in_flight: Arc<Semaphore>,
+    /// [`SESSION_DEADLINE`]; a field so a test need not wait that long.
+    session_deadline: Duration,
+}
+
+impl Interceptor {
+    pub fn new(
+        cfg: MailConfig,
+        secret: String,
+        pending: Arc<PendingLinks>,
+        relay: Arc<dyn Relay>,
+    ) -> Self {
+        Self {
+            cfg,
+            secret,
+            pending,
+            relay,
+            connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            session_deadline: SESSION_DEADLINE,
+        }
+    }
+
+    /// Take Authelia's mail on `listener` for as long as the process runs.
+    ///
+    /// The caller binds it, so a port somebody else already holds stops the
+    /// portal at startup, instead of leaving it serving viewers while
+    /// Authelia's mail — reset links included — goes to whoever holds it.
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) {
+        let mut full = false;
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    if !peer.ip().is_loopback() {
+                        // Cannot happen while bound to loopback; cheap to keep true.
+                        continue;
+                    }
+                    let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                        if !full {
+                            tracing::warn!(
+                                limit = MAX_CONNECTIONS,
+                                "the notification mail listener is full; turning connections \
+                                 away until one closes"
+                            );
+                            full = true;
+                        }
+                        // Written without waiting, on the non-blocking std
+                        // socket: a client that never reads must not stall
+                        // the accept loop. (tokio's `try_write` would not do:
+                        // a socket the reactor has not yet seen writable
+                        // answers WouldBlock.)
+                        if let Ok(mut s) = stream.into_std() {
+                            let _ = std::io::Write::write(
+                                &mut s,
+                                b"421 4.3.2 too many connections, try again later\r\n",
+                            );
+                        }
+                        continue;
+                    };
+                    full = false;
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        this.serve_conn(stream).await;
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "notification mail listener: accept failed");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+
+    /// One connection, cut off at the session deadline however it is going.
+    async fn serve_conn<S>(self: Arc<Self>, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let _ = tokio::time::timeout(self.session_deadline, self.converse(stream)).await;
+    }
+
+    /// Does `presented` match the listener secret? Constant time, and without
+    /// the trailing newline a password file read as-is may carry — ours was
+    /// trimmed when it was read.
+    fn is_secret(&self, presented: &[u8]) -> bool {
+        crate::util::constant_time_eq(presented.trim_ascii(), self.secret.as_bytes())
+    }
+
+    /// One `AUTH` exchange: PLAIN or LOGIN, with or without an initial
+    /// response. Only the password is checked — it is the secret, and the name
+    /// Authelia gives for itself is not.
+    async fn authenticate<R, W>(
+        &self,
+        cmd: &str,
+        reader: &mut R,
+        write: &mut W,
+        buf: &mut Vec<u8>,
+    ) -> std::io::Result<Auth>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut words = cmd.split_whitespace().skip(1);
+        let mechanism = words.next().unwrap_or_default().to_ascii_uppercase();
+        let initial = words.next().map(str::to_string);
+        let password = match mechanism.as_str() {
+            "PLAIN" => {
+                let response = match initial {
+                    Some(r) => r,
+                    // `AUTH PLAIN` alone: an empty challenge, then the response.
+                    None => match prompt(b"334 \r\n", reader, write, buf).await? {
+                        Some(r) => r,
+                        None => return Ok(Auth::Closed),
+                    },
+                };
+                let decoded = match decode_response(&response) {
+                    Ok(d) => d,
+                    Err(reply) => return Ok(Auth::Refused(reply)),
+                };
+                // authzid NUL authcid NUL password
+                let mut parts = decoded.splitn(3, |&b| b == 0);
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(_), Some(_), Some(p)) => p.to_vec(),
+                    _ => return Ok(Auth::Refused(AUTH_INVALID)),
+                }
+            }
+            "LOGIN" => {
+                // A username given with the command needs no prompt for it.
+                if initial.is_none() {
+                    // "Username:"
+                    match prompt(b"334 VXNlcm5hbWU6\r\n", reader, write, buf).await? {
+                        Some(r) => {
+                            if let Err(reply) = decode_response(&r) {
+                                return Ok(Auth::Refused(reply));
+                            }
+                        }
+                        None => return Ok(Auth::Closed),
+                    }
+                }
+                // "Password:"
+                match prompt(b"334 UGFzc3dvcmQ6\r\n", reader, write, buf).await? {
+                    Some(r) => match decode_response(&r) {
+                        Ok(p) => p,
+                        Err(reply) => return Ok(Auth::Refused(reply)),
+                    },
+                    None => return Ok(Auth::Closed),
+                }
+            }
+            _ => {
+                return Ok(Auth::Refused(
+                    b"504 5.5.4 only AUTH PLAIN and AUTH LOGIN are offered\r\n",
+                ));
+            }
+        };
+        Ok(if self.is_secret(&password) {
+            Auth::Accepted
+        } else {
+            Auth::Refused(AUTH_INVALID)
+        })
+    }
+
+    /// The SMTP conversation. Enough of RFC 5321 and RFC 4954 for Authelia,
+    /// and nothing more.
+    async fn converse<S>(self: &Arc<Self>, stream: S) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read);
+        let mut buf = Vec::new();
+        let mut msg = Incoming::default();
+        let mut authenticated = false;
+        let (mut auth_failures, mut unknown) = (0u8, 0u8);
+
+        write.write_all(b"220 bilbycast-portal ESMTP\r\n").await?;
+        loop {
+            match read_line(&mut reader, &mut buf).await {
+                Line::Read => {}
+                Line::TooLong => {
+                    write.write_all(b"500 5.5.2 line too long\r\n").await?;
+                    return Ok(());
+                }
+                Line::Closed => return Ok(()),
+            }
+            let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+            let upper = line.to_ascii_uppercase();
+            if speaks_http(&upper) {
+                tracing::warn!("closed a notification mail connection that spoke HTTP");
+                return Ok(());
+            }
+            if upper.starts_with("EHLO") {
+                msg = Incoming::default();
+                write
+                    .write_all(
+                        b"250-bilbycast-portal\r\n250-8BITMIME\r\n250-SIZE 1048576\r\n\
+                          250 AUTH PLAIN LOGIN\r\n",
+                    )
+                    .await?;
+            } else if upper.starts_with("HELO") {
+                msg = Incoming::default();
+                write.write_all(b"250 bilbycast-portal\r\n").await?;
+            } else if upper == "AUTH" || upper.starts_with("AUTH ") {
+                if authenticated {
+                    write
+                        .write_all(b"503 5.5.1 already authenticated\r\n")
+                        .await?;
                     continue;
                 }
-                let (cfg, pending, relay) = (cfg.clone(), pending.clone(), relay.clone());
+                match self
+                    .authenticate(&line, &mut reader, &mut write, &mut buf)
+                    .await?
+                {
+                    Auth::Accepted => {
+                        authenticated = true;
+                        write.write_all(b"235 2.7.0 authenticated\r\n").await?;
+                    }
+                    Auth::Refused(reply) => {
+                        auth_failures += 1;
+                        tracing::warn!(
+                            "a client failed to authenticate to the notification mail listener; \
+                             if it was Authelia, its notifier.smtp password is not the secret in \
+                             mail.listen_password_file"
+                        );
+                        write.write_all(reply).await?;
+                        if auth_failures >= MAX_AUTH_FAILURES {
+                            return Ok(());
+                        }
+                    }
+                    Auth::Closed => return Ok(()),
+                }
+            } else if upper.starts_with("MAIL FROM:") {
+                if !authenticated {
+                    write.write_all(AUTH_FIRST).await?;
+                } else if !msg.from.is_empty() {
+                    write
+                        .write_all(b"503 5.5.1 sender already given\r\n")
+                        .await?;
+                } else {
+                    let from = address_in(&line);
+                    if sender_is_ours(&self.cfg, &from) {
+                        msg = Incoming {
+                            from,
+                            ..Default::default()
+                        };
+                        write.write_all(b"250 2.1.0 ok\r\n").await?;
+                    } else {
+                        tracing::error!(
+                            from = %from,
+                            mail_from = %self.cfg.from,
+                            "refused mail from a sender other than mail.from; Authelia's \
+                             notifier.smtp.sender must carry the same address"
+                        );
+                        write
+                            .write_all(
+                                b"550 5.7.1 sender is not this portal's mail.from address\r\n",
+                            )
+                            .await?;
+                    }
+                }
+            } else if upper.starts_with("RCPT TO:") {
+                if !authenticated {
+                    write.write_all(AUTH_FIRST).await?;
+                } else if msg.from.is_empty() {
+                    write.write_all(b"503 5.5.1 need MAIL first\r\n").await?;
+                } else if !msg.recipients.is_empty() {
+                    // Authelia addresses every message to one person.
+                    write
+                        .write_all(b"452 4.5.3 one recipient per message\r\n")
+                        .await?;
+                } else {
+                    let to = address_in(&line);
+                    if to.is_empty() {
+                        write
+                            .write_all(b"501 5.1.3 no recipient address\r\n")
+                            .await?;
+                    } else {
+                        msg.recipients.push(to);
+                        write.write_all(b"250 2.1.5 ok\r\n").await?;
+                    }
+                }
+            } else if upper.starts_with("DATA") {
+                if !authenticated {
+                    write.write_all(AUTH_FIRST).await?;
+                    continue;
+                }
+                if msg.from.is_empty() {
+                    write.write_all(b"503 5.5.1 need MAIL first\r\n").await?;
+                    continue;
+                }
+                if msg.recipients.is_empty() {
+                    write.write_all(b"503 5.5.1 need RCPT first\r\n").await?;
+                    continue;
+                }
+                write.write_all(b"354 go ahead\r\n").await?;
+                loop {
+                    match read_line(&mut reader, &mut buf).await {
+                        Line::Read => {}
+                        Line::TooLong => {
+                            write.write_all(b"500 5.5.2 line too long\r\n").await?;
+                            return Ok(());
+                        }
+                        Line::Closed => return Ok(()),
+                    }
+                    if buf == b".\r\n" || buf == b".\n" {
+                        break;
+                    }
+                    // Dot-stuffing undone: the sender doubled every leading dot.
+                    let body = buf.strip_prefix(b".").unwrap_or(&buf);
+                    if msg.data.len() + body.len() > MAX_MESSAGE_BYTES {
+                        write.write_all(b"552 5.3.4 message too large\r\n").await?;
+                        return Ok(());
+                    }
+                    msg.data.extend_from_slice(body);
+                }
+                let taken = std::mem::take(&mut msg);
+                // Accepted here, delivered after: Authelia will not send it
+                // again, so whatever happens next is reported to the manager
+                // instead. Bounded, so no client can queue relay work faster
+                // than the relay drains it.
+                let Ok(permit) = self.in_flight.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        limit = MAX_IN_FLIGHT,
+                        "too many notification emails waiting on the relay; refused one with 451"
+                    );
+                    write
+                        .write_all(b"451 4.3.2 too many messages in flight, try again later\r\n")
+                        .await?;
+                    continue;
+                };
+                write.write_all(b"250 2.0.0 accepted\r\n").await?;
+                let this = Arc::clone(self);
                 tokio::spawn(async move {
-                    let _ = serve_conn(stream, cfg, pending, relay).await;
+                    let _permit = permit;
+                    // Every outcome is logged, or reported to the manager, inside.
+                    let _ = handle(&this.cfg, &this.pending, this.relay.as_ref(), taken).await;
                 });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "notification mail listener: accept failed");
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            } else if upper.starts_with("RSET") {
+                msg = Incoming::default();
+                write.write_all(b"250 2.0.0 ok\r\n").await?;
+            } else if upper.starts_with("NOOP") {
+                write.write_all(b"250 2.0.0 ok\r\n").await?;
+            } else if upper.starts_with("QUIT") {
+                write.write_all(b"221 2.0.0 bye\r\n").await?;
+                return Ok(());
+            } else {
+                unknown += 1;
+                if unknown >= MAX_UNKNOWN_COMMANDS {
+                    write
+                        .write_all(b"421 4.7.0 too many unrecognised commands\r\n")
+                        .await?;
+                    return Ok(());
+                }
+                write.write_all(b"502 5.5.2 not implemented\r\n").await?;
             }
         }
     }
@@ -643,19 +1114,25 @@ pub async fn run(cfg: Arc<MailConfig>, pending: Arc<PendingLinks>, relay: Arc<dy
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+    use tokio::net::TcpStream;
+
+    const SECRET: &str = "a-listener-secret-that-is-well-over-thirty-two-characters";
 
     fn cfg() -> MailConfig {
         MailConfig {
             listen_addr: default_listen(),
+            listen_password_file: "/etc/bilbycast/portal-mail-listener".into(),
             relay_host: "smtp-relay.example.com".into(),
-            relay_port: 587,
+            relay_port: None,
             relay_username: "u".into(),
             relay_password_file: "/dev/null".into(),
-            from: "GRS Notifications <noreply@grs.example>".into(),
-            sign_in_url: "https://watch.grs.example".into(),
+            from: "Example Notifications <noreply@portal.example>".into(),
+            sign_in_url: "https://watch.portal.example".into(),
             invite_subject: default_invite_subject(),
             reset_subject: default_reset_subject(),
-            starttls: true,
+            starttls: None,
+            implicit_tls: false,
         }
     }
 
@@ -663,7 +1140,7 @@ mod tests {
     /// link split across lines by a soft break.
     fn authelia_message(to: &str) -> Incoming {
         let data = format!(
-            "From: GRS <noreply@grs.example>\r\n\
+            "From: Example <noreply@portal.example>\r\n\
              To: {to}\r\n\
              Subject: Reset your password\r\n\
              Content-Type: multipart/alternative; boundary=b1\r\n\r\n\
@@ -671,15 +1148,21 @@ mod tests {
              Content-Type: text/plain; charset=utf-8\r\n\
              Content-Transfer-Encoding: quoted-printable\r\n\r\n\
              Use this link:\r\n\
-             https://watch.grs.example/auth/reset-password/step2?token=3DeyJhbGciOiJIUzI1NiJ9.=\r\n\
+             https://watch.portal.example/auth/reset-password/step2?token=3DeyJhbGciOiJIUzI1NiJ9.=\r\n\
              abc-def_123\r\n\r\n\
              --b1--\r\n"
         );
         Incoming {
-            from: "noreply@grs.example".into(),
+            from: "noreply@portal.example".into(),
             recipients: vec![to.into()],
             data: data.into_bytes(),
         }
+    }
+
+    /// The words of a message, with quoted-printable's soft breaks and `=3D`
+    /// undone so an assertion reads what the recipient would.
+    fn readable(body: &str) -> String {
+        body.replace("=\r\n", "").replace("=3D", "=")
     }
 
     #[derive(Default)]
@@ -702,13 +1185,124 @@ mod tests {
         }
     }
 
+    fn interceptor(pending: Arc<PendingLinks>, relay: Arc<Captured>) -> Interceptor {
+        Interceptor::new(cfg(), SECRET.into(), pending, relay)
+    }
+
+    /// Standard base64, for writing credentials the way a client does.
+    fn b64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |acc, (i, &b)| acc | (u32::from(b) << (16 - 8 * i)));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// The client end of one SMTP conversation.
+    struct Client<S> {
+        r: BufReader<ReadHalf<S>>,
+        w: WriteHalf<S>,
+    }
+
+    impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
+        fn over(stream: S) -> Self {
+            let (r, w) = tokio::io::split(stream);
+            Self {
+                r: BufReader::new(r),
+                w,
+            }
+        }
+
+        async fn send(&mut self, line: &str) {
+            // The server may already have hung up; the reply says what it did.
+            let _ = self.w.write_all(format!("{line}\r\n").as_bytes()).await;
+        }
+
+        /// The next reply, continuation lines included, or `None` once the
+        /// server has closed the connection.
+        async fn reply(&mut self) -> Option<String> {
+            let mut all = String::new();
+            loop {
+                let mut line = String::new();
+                let read =
+                    tokio::time::timeout(Duration::from_secs(5), self.r.read_line(&mut line))
+                        .await
+                        .expect("no reply within five seconds");
+                match read {
+                    Ok(0) | Err(_) => return (!all.is_empty()).then_some(all),
+                    Ok(_) => {}
+                }
+                all.push_str(&line);
+                if line.as_bytes().get(3) != Some(&b'-') {
+                    return Some(all);
+                }
+            }
+        }
+
+        async fn say(&mut self, line: &str) -> String {
+            self.send(line).await;
+            self.reply()
+                .await
+                .unwrap_or_else(|| panic!("the connection closed after {line:?}"))
+        }
+
+        async fn authenticate(&mut self) {
+            let r = self
+                .say(&format!(
+                    "AUTH PLAIN {}",
+                    b64(format!("\0authelia\0{SECRET}").as_bytes())
+                ))
+                .await;
+            assert!(r.starts_with("235"), "{r}");
+        }
+
+        /// MAIL, RCPT and DATA for `msg`; the reply to the closing dot.
+        async fn deliver(&mut self, msg: &Incoming) -> String {
+            let r = self.say(&format!("MAIL FROM:<{}>", msg.from)).await;
+            assert!(r.starts_with("250"), "{r}");
+            let r = self.say(&format!("RCPT TO:<{}>", msg.recipients[0])).await;
+            assert!(r.starts_with("250"), "{r}");
+            let r = self.say("DATA").await;
+            assert!(r.starts_with("354"), "{r}");
+            self.w.write_all(&msg.data).await.unwrap();
+            self.say(".").await
+        }
+    }
+
+    /// A conversation with `interceptor`, past its greeting.
+    async fn connect(interceptor: Arc<Interceptor>) -> Client<DuplexStream> {
+        let (ours, theirs) = tokio::io::duplex(1 << 20);
+        tokio::spawn(interceptor.serve_conn(theirs));
+        let mut c = Client::over(ours);
+        let greeting = c.reply().await.unwrap();
+        assert!(greeting.starts_with("220"), "{greeting}");
+        c
+    }
+
+    /// Give a spawned relay the moment it would need to send anything.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     #[test]
     fn the_link_survives_a_soft_line_break() {
         let msg = authelia_message("bea@example.com");
         let link = extract_link(&msg.data).expect("no link found");
         assert_eq!(
             link,
-            "https://watch.grs.example/auth/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc-def_123",
+            "https://watch.portal.example/auth/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc-def_123",
             "the token was truncated or the soft break left in"
         );
     }
@@ -745,6 +1339,7 @@ mod tests {
             .unwrap();
             let sent = relay.sent.lock().await;
             let (envelope, body) = sent.first().expect("nothing was relayed");
+            let body = readable(body);
             assert!(body.contains(subject), "wrong subject for {kind:?}: {body}");
             assert!(body.contains(phrase), "wrong wording for {kind:?}");
             assert!(
@@ -767,7 +1362,6 @@ mod tests {
         let pending = PendingLinks::default();
         let relay = Captured::default();
         let mut msg = authelia_message("bea@example.com");
-        // Some other process on the box, using our listener as a way out.
         msg.from = "spammer@elsewhere.example".into();
         let out = handle(&cfg(), &pending, &relay, msg).await;
         assert!(out.is_err(), "the listener relayed mail for a stranger");
@@ -811,19 +1405,20 @@ mod tests {
         assert_eq!(rx.await.unwrap(), Err("relay said no".into()));
     }
 
-    #[tokio::test]
-    async fn a_stale_expectation_does_not_claim_a_later_email() {
+    async fn aged(age: Duration) -> PendingLinks {
         let pending = PendingLinks::default();
         let _rx = pending
             .expect("bea@example.com", LinkKind::Invite, "Bea")
             .await;
-        // Age it past the window.
-        {
-            let mut map = pending.0.lock().await;
-            if let Some(p) = map.get_mut("bea@example.com") {
-                p.at = Instant::now() - PENDING_TTL - Duration::from_secs(1);
-            }
+        if let Some(p) = pending.0.lock().await.get_mut("bea@example.com") {
+            p.at = Instant::now() - age;
         }
+        pending
+    }
+
+    #[tokio::test]
+    async fn a_stale_expectation_does_not_claim_a_later_email() {
+        let pending = aged(PENDING_TTL + Duration::from_secs(1)).await;
         let relay = Captured::default();
         let msg = authelia_message("bea@example.com");
         handle(&cfg(), &pending, &relay, msg.clone()).await.unwrap();
@@ -835,6 +1430,18 @@ mod tests {
         );
     }
 
+    /// The account sync gives up on an email after 30 s. An expectation that
+    /// lived on past that would reword the viewer's own reset, minutes later,
+    /// as an invitation nobody is waiting to hear about.
+    #[tokio::test]
+    async fn an_expectation_does_not_outlive_the_account_syncs_wait() {
+        let pending = aged(Duration::from_secs(31)).await;
+        let relay = Captured::default();
+        let msg = authelia_message("bea@example.com");
+        handle(&cfg(), &pending, &relay, msg.clone()).await.unwrap();
+        assert_eq!(relay.sent.lock().await[0].1.as_bytes(), msg.data.as_slice());
+    }
+
     #[test]
     fn addresses_are_read_out_of_the_commands() {
         assert_eq!(address_in("MAIL FROM:<a@b.c>"), "a@b.c");
@@ -843,84 +1450,362 @@ mod tests {
     }
 
     #[test]
-    fn the_listener_must_be_loopback_and_clear_text_relaying_is_refused() {
+    fn base64_decodes_what_sasl_clients_send_and_nothing_else() {
+        for sample in [
+            &b""[..],
+            b"a",
+            b"ab",
+            b"abc",
+            b"\0authelia\0pass",
+            &[0xff, 0x00, 0x80],
+        ] {
+            assert_eq!(base64_decode(&b64(sample)).as_deref(), Some(sample));
+        }
+        assert_eq!(
+            base64_decode("VXNlcm5hbWU6").as_deref(),
+            Some(&b"Username:"[..])
+        );
+        // RFC 4954's zero-length response.
+        assert_eq!(base64_decode("=").as_deref(), Some(&b""[..]));
+        assert_eq!(base64_decode("A"), None);
+        assert_eq!(base64_decode("not base64!"), None);
+        assert_eq!(base64_decode("QQ==="), None);
+    }
+
+    #[test]
+    fn the_listener_must_be_loopback_and_clear_text_relaying_is_this_host_only() {
         let mut c = cfg();
-        assert!(c.validate().is_ok());
+        assert_eq!(c.validate(), Ok(()));
         c.listen_addr = "0.0.0.0:2525".into();
         assert!(
             c.validate().is_err(),
-            "a public listener would let anyone send mail as us"
+            "a public listener would put its secret on the network"
         );
+
         let mut c = cfg();
-        c.starttls = false;
+        c.starttls = Some(false);
         assert!(
             c.validate().is_err(),
             "the relay password would go out in clear"
         );
-        c.relay_host = "127.0.0.1".into();
-        assert!(
-            c.validate().is_ok(),
-            "a local sink is the one case that may be plain"
-        );
+        for local in ["127.0.0.1", "127.0.0.2", "::1", "localhost", "LocalHost"] {
+            c.relay_host = local.into();
+            assert_eq!(c.validate(), Ok(()), "{local} is this host");
+        }
+        for remote in [
+            "127.0.0.1.mailsink.example",
+            "localhost.example",
+            "10.0.0.1",
+        ] {
+            c.relay_host = remote.into();
+            assert!(c.validate().is_err(), "{remote} was taken for this host");
+        }
     }
 
-    /// The whole conversation, over a real socket.
+    #[test]
+    fn implicit_tls_is_its_own_setting_with_its_own_port() {
+        let mut c = cfg();
+        assert_eq!((c.outbound(), c.port()), (Outbound::StartTls, 587));
+        c.implicit_tls = true;
+        assert_eq!(c.validate(), Ok(()));
+        assert_eq!((c.outbound(), c.port()), (Outbound::Implicit, 465));
+        // Encrypted from the first byte, so not "starttls off" in clear.
+        c.starttls = Some(false);
+        assert_eq!(c.validate(), Ok(()));
+        assert_eq!(c.outbound(), Outbound::Implicit);
+        c.starttls = Some(true);
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("starttls"), "{err}");
+
+        let mut c = cfg();
+        c.relay_port = Some(2587);
+        assert_eq!(c.port(), 2587);
+        c.relay_port = Some(0);
+        assert!(c.validate().is_err());
+    }
+
+    /// The config in production before the listener demanded a password must
+    /// be refused by name, not by a parse error or not at all.
+    #[test]
+    fn a_config_from_before_the_listener_secret_says_what_to_add() {
+        let mut c: MailConfig = serde_json::from_str(
+            r#"{
+                "relay_host": "smtp-relay.brevo.com",
+                "relay_port": 587,
+                "relay_username": "xxxx@smtp-brevo.com",
+                "relay_password_file": "/etc/bilbycast/brevo-smtp-key",
+                "from": "Example Notifications <noreply@example.com>",
+                "sign_in_url": "https://watch.example.com/",
+                "invite_subject": "Welcome",
+                "reset_subject": "Password reset",
+                "starttls": true
+            }"#,
+        )
+        .expect("the existing keys no longer parse");
+        c.normalise();
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("mail.listen_password_file"), "{err}");
+        c.listen_password_file = "/etc/bilbycast/portal-mail-listener".into();
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_listener_secret_is_one_long_line_from_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("listener");
+        let mut c = cfg();
+        c.listen_password_file = path.clone();
+        assert!(c.listen_password().is_err(), "a missing file");
+        std::fs::write(&path, "short\n").unwrap();
+        assert!(c.listen_password().is_err(), "a guessable secret");
+        std::fs::write(&path, format!("{SECRET}\nsecond line\n")).unwrap();
+        assert!(c.listen_password().is_err(), "two lines");
+        std::fs::write(&path, format!("{SECRET}\n")).unwrap();
+        assert_eq!(c.listen_password().unwrap(), SECRET);
+    }
+
+    #[test]
+    fn the_secret_is_compared_whole() {
+        let i = interceptor(Default::default(), Default::default());
+        assert!(i.is_secret(SECRET.as_bytes()));
+        assert!(
+            i.is_secret(format!("{SECRET}\n").as_bytes()),
+            "Authelia may send its file's newline"
+        );
+        assert!(!i.is_secret(&SECRET.as_bytes()[..SECRET.len() - 1]));
+        assert!(!i.is_secret(format!("{SECRET}x").as_bytes()));
+        assert!(!i.is_secret(b""));
+    }
+
+    /// The configured sender's address is public — it is the From of every
+    /// email the portal sends — so claiming it proves nothing. Without the
+    /// listener secret, nothing is taken.
+    #[tokio::test]
+    async fn mail_is_refused_until_the_client_authenticates() {
+        let relay = Arc::new(Captured::default());
+        let mut c = connect(Arc::new(interceptor(Default::default(), relay.clone()))).await;
+        let ehlo = c.say("EHLO somebody").await;
+        assert!(ehlo.contains("AUTH PLAIN LOGIN"), "{ehlo}");
+        for cmd in [
+            "MAIL FROM:<noreply@portal.example>",
+            "RCPT TO:<victim@example.com>",
+            "DATA",
+        ] {
+            let r = c.say(cmd).await;
+            assert!(r.starts_with("530"), "{cmd}: {r}");
+        }
+        settle().await;
+        assert!(relay.sent.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_is_refused_and_the_third_ends_the_conversation() {
+        let mut c = connect(Arc::new(interceptor(
+            Default::default(),
+            Default::default(),
+        )))
+        .await;
+        let wrong = format!("AUTH PLAIN {}", b64(b"\0authelia\0not-the-secret"));
+        for _ in 0..MAX_AUTH_FAILURES {
+            let r = c.say(&wrong).await;
+            assert!(r.starts_with("535"), "{r}");
+        }
+        assert_eq!(c.reply().await, None, "a fourth guess was allowed");
+    }
+
+    /// Every way Authelia's SMTP client might present the secret.
+    #[tokio::test]
+    async fn each_form_of_auth_a_client_uses_is_accepted() {
+        let plain = b64(format!("\0authelia\0{SECRET}").as_bytes());
+        let (user, pass) = (b64(b"authelia"), b64(SECRET.as_bytes()));
+        let forms: [&[(&str, &str)]; 4] = [
+            &[(&format!("AUTH PLAIN {plain}"), "235")],
+            &[("AUTH PLAIN", "334"), (&plain, "235")],
+            &[
+                ("AUTH LOGIN", "334 VXNlcm5hbWU6"),
+                (&user, "334 UGFzc3dvcmQ6"),
+                (&pass, "235"),
+            ],
+            &[
+                (&format!("AUTH LOGIN {user}"), "334 UGFzc3dvcmQ6"),
+                (&pass, "235"),
+            ],
+        ];
+        for steps in forms {
+            let relay = Arc::new(Captured::default());
+            let mut c = connect(Arc::new(interceptor(Default::default(), relay.clone()))).await;
+            c.say("EHLO authelia").await;
+            for (send, expect) in steps {
+                let r = c.say(send).await;
+                assert!(r.starts_with(expect), "{send}: {r}");
+            }
+            let r = c.deliver(&authelia_message("bea@example.com")).await;
+            assert!(r.starts_with("250"), "{r}");
+            settle().await;
+            assert_eq!(relay.sent.lock().await.len(), 1, "{steps:?}");
+        }
+    }
+
+    /// Refused while Authelia is still talking, so a mismatched sender fails
+    /// Authelia's own startup check instead of being accepted and dropped.
+    #[tokio::test]
+    async fn a_sender_other_than_ours_is_refused_at_mail_from() {
+        let relay = Arc::new(Captured::default());
+        let mut c = connect(Arc::new(interceptor(Default::default(), relay.clone()))).await;
+        c.authenticate().await;
+        let r = c.say("MAIL FROM:<noreply@somewhere-else.example>").await;
+        assert!(r.starts_with("550"), "{r}");
+        let r = c.say("RCPT TO:<bea@example.com>").await;
+        assert!(
+            r.starts_with("503"),
+            "a recipient without an accepted sender: {r}"
+        );
+        let r = c.say("DATA").await;
+        assert!(r.starts_with("503"), "{r}");
+        settle().await;
+        assert!(relay.sent.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_message_goes_to_one_recipient() {
+        let relay = Arc::new(Captured::default());
+        let mut c = connect(Arc::new(interceptor(Default::default(), relay.clone()))).await;
+        c.authenticate().await;
+        c.say("MAIL FROM:<noreply@portal.example>").await;
+        assert!(c.say("RCPT TO:<bea@example.com>").await.starts_with("250"));
+        let r = c.say("RCPT TO:<second@example.com>").await;
+        assert!(r.starts_with("452"), "{r}");
+        assert!(c.say("DATA").await.starts_with("354"));
+        c.w.write_all(&authelia_message("bea@example.com").data)
+            .await
+            .unwrap();
+        assert!(c.say(".").await.starts_with("250"));
+        settle().await;
+        let sent = relay.sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0.to().len(), 1);
+    }
+
+    /// A line with no end is cut off at the cap and answered, rather than
+    /// buffered until a newline that never comes.
+    #[tokio::test]
+    async fn an_endless_line_is_cut_off_not_buffered() {
+        let endless = vec![b'A'; MAX_LINE_BYTES + 1];
+
+        let mut c = connect(Arc::new(interceptor(
+            Default::default(),
+            Default::default(),
+        )))
+        .await;
+        c.say("EHLO somebody").await;
+        c.w.write_all(&endless).await.unwrap();
+        let r = c.reply().await.expect("closed without an answer");
+        assert!(r.starts_with("500"), "{r}");
+        assert_eq!(c.reply().await, None);
+
+        // And inside a message, where no line was checked at all.
+        let relay = Arc::new(Captured::default());
+        let mut c = connect(Arc::new(interceptor(Default::default(), relay.clone()))).await;
+        c.authenticate().await;
+        c.say("MAIL FROM:<noreply@portal.example>").await;
+        c.say("RCPT TO:<bea@example.com>").await;
+        assert!(c.say("DATA").await.starts_with("354"));
+        c.w.write_all(&endless).await.unwrap();
+        let r = c.reply().await.expect("closed without an answer");
+        assert!(r.starts_with("500"), "{r}");
+        assert_eq!(c.reply().await, None);
+        settle().await;
+        assert!(relay.sent.lock().await.is_empty());
+    }
+
+    /// An HTTP request smuggling SMTP in its body never reaches the body.
+    #[tokio::test]
+    async fn http_is_hung_up_on() {
+        for first in [
+            "POST /send HTTP/1.1",
+            "GET / HTTP/1.0",
+            "Host: 127.0.0.1:2525",
+        ] {
+            let mut c = connect(Arc::new(interceptor(
+                Default::default(),
+                Default::default(),
+            )))
+            .await;
+            c.send(first).await;
+            assert_eq!(c.reply().await, None, "{first} was answered");
+        }
+    }
+
+    #[tokio::test]
+    async fn three_unrecognised_commands_end_the_conversation() {
+        let mut c = connect(Arc::new(interceptor(
+            Default::default(),
+            Default::default(),
+        )))
+        .await;
+        assert!(c.say("VRFY bea").await.starts_with("502"));
+        assert!(c.say("HELP").await.starts_with("502"));
+        assert!(c.say("EXPN staff").await.starts_with("421"));
+        assert_eq!(c.reply().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_full_relay_queue_refuses_the_message_rather_than_growing() {
+        let relay = Arc::new(Captured::default());
+        let i = Arc::new(interceptor(Default::default(), relay.clone()));
+        let _busy = i
+            .in_flight
+            .clone()
+            .try_acquire_many_owned(MAX_IN_FLIGHT as u32)
+            .unwrap();
+        let mut c = connect(i).await;
+        c.authenticate().await;
+        let r = c.deliver(&authelia_message("bea@example.com")).await;
+        assert!(r.starts_with("451"), "{r}");
+        settle().await;
+        assert!(relay.sent.lock().await.is_empty());
+    }
+
+    /// Resetting the idle timer with a NOOP does not buy a connection forever.
+    #[tokio::test]
+    async fn a_conversation_that_never_ends_is_cut_off() {
+        let mut i = interceptor(Default::default(), Default::default());
+        i.session_deadline = Duration::from_millis(300);
+        let mut c = connect(Arc::new(i)).await;
+        let started = Instant::now();
+        loop {
+            c.send("NOOP").await;
+            let Some(r) = c.reply().await else { break };
+            assert!(r.starts_with("250"), "{r}");
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "a NOOP every 100 ms held the session open"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The whole conversation, over a real socket, the way Authelia holds it.
     #[tokio::test]
     async fn authelia_can_deliver_over_smtp() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let cfg = Arc::new(cfg());
         let pending = Arc::new(PendingLinks::default());
         let rx = pending
             .expect("bea@example.com", LinkKind::Invite, "Bea Jones")
             .await;
         let relay = Arc::new(Captured::default());
-
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        {
-            let (cfg, pending, relay) = (cfg.clone(), pending.clone(), relay.clone());
-            tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let _ = serve_conn(stream, cfg, pending, relay).await;
-            });
-        }
+        tokio::spawn(Arc::new(interceptor(pending, relay.clone())).serve(listener));
 
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (r, mut w) = stream.into_split();
-        let mut r = BufReader::new(r);
-        let mut line = String::new();
-        let expect = |line: &mut String, code: &str| assert!(line.starts_with(code), "{line}");
-        r.read_line(&mut line).await.unwrap();
-        expect(&mut line, "220");
-
-        for (cmd, code) in [
-            ("EHLO authelia\r\n", "250"),
-            ("MAIL FROM:<noreply@grs.example>\r\n", "250"),
-            ("RCPT TO:<bea@example.com>\r\n", "250"),
-        ] {
-            w.write_all(cmd.as_bytes()).await.unwrap();
-            line.clear();
-            r.read_line(&mut line).await.unwrap();
-            // EHLO answers several lines; drain the continuations.
-            while line.len() > 3 && line.as_bytes()[3] == b'-' {
-                line.clear();
-                r.read_line(&mut line).await.unwrap();
-            }
-            expect(&mut line, code);
-        }
-        w.write_all(b"DATA\r\n").await.unwrap();
-        line.clear();
-        r.read_line(&mut line).await.unwrap();
-        expect(&mut line, "354");
-
-        let body = String::from_utf8(authelia_message("bea@example.com").data).unwrap();
-        w.write_all(body.as_bytes()).await.unwrap();
-        w.write_all(b".\r\n").await.unwrap();
-        line.clear();
-        r.read_line(&mut line).await.unwrap();
-        expect(&mut line, "250");
-        w.write_all(b"QUIT\r\n").await.unwrap();
+        let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
+        assert!(c.reply().await.unwrap().starts_with("220"));
+        c.say("EHLO authelia").await;
+        assert!(c.say("AUTH LOGIN").await.starts_with("334"));
+        assert!(c.say(&b64(b"authelia")).await.starts_with("334"));
+        assert!(c.say(&b64(SECRET.as_bytes())).await.starts_with("235"));
+        let r = c.deliver(&authelia_message("bea@example.com")).await;
+        assert!(r.starts_with("250"), "{r}");
+        c.send("QUIT").await;
 
         // The relay result is what the manager is told.
         assert_eq!(
@@ -935,5 +1820,62 @@ mod tests {
             sent[0].1.contains("GRS New User"),
             "the invite was not rewritten"
         );
+    }
+
+    #[tokio::test]
+    async fn a_full_listener_turns_the_next_connection_away() {
+        let i = Arc::new(interceptor(Default::default(), Default::default()));
+        let busy = i
+            .connections
+            .clone()
+            .try_acquire_many_owned(MAX_CONNECTIONS as u32)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(i.serve(listener));
+
+        let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
+        let r = c.reply().await.expect("closed without an answer");
+        assert!(r.starts_with("421"), "{r}");
+        drop(busy);
+        let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
+        assert!(c.reply().await.unwrap().starts_with("220"));
+    }
+
+    /// lettre bounds only the connect. A relay that accepts the connection and
+    /// then says nothing must still be given up on before the account sync
+    /// stops waiting, or the manager hears "timed out" about a send that may
+    /// yet succeed — and the operator sends it again.
+    #[tokio::test]
+    async fn a_relay_that_never_answers_is_given_up_on() {
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _held = silent.accept().await;
+            std::future::pending::<()>().await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("relay-key");
+        std::fs::write(&key, "key\n").unwrap();
+        let mut c = cfg();
+        c.relay_host = "127.0.0.1".into();
+        c.relay_port = Some(port);
+        c.starttls = Some(false);
+        c.relay_password_file = key;
+        let mut relay = SmtpRelay::new(&c).unwrap();
+        relay.deadline = Duration::from_millis(300);
+        let envelope = Envelope::new(
+            Some("noreply@portal.example".parse().unwrap()),
+            vec!["bea@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            relay.send(envelope, b"Subject: x\r\n\r\nx\r\n".to_vec()),
+        )
+        .await
+        .expect("the send outlived every deadline");
+        let err = out.unwrap_err();
+        assert!(err.contains("did not answer"), "{err}");
     }
 }
