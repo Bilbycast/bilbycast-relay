@@ -218,7 +218,8 @@ impl PortalConfig {
             // startup beats a portal that looks configured and never renews.
             if o == "*" {
                 return Err(
-                    "player_origins cannot contain `*`: a credentialed response may not                      answer a wildcard origin. List each player origin."
+                    "player_origins cannot contain `*`: a credentialed response may not \
+                     answer a wildcard origin. List each player origin."
                         .into(),
                 );
             }
@@ -342,10 +343,14 @@ mod tests {
         // check — so assert on the *message*, which is the only thing the
         // explicit check adds. Told "must start with https://", an operator
         // reaches for `https://*`; told why a wildcard cannot work with
-        // credentials, they list the origin.
-        assert!(
-            err.contains("credential") || err.contains("wildcard"),
-            "the wildcard refusal does not explain itself: {err}"
+        // credentials, they list the origin. Exact, so the text an operator
+        // reads at startup is pinned too: it once carried a run of 22 spaces
+        // where a line-continuation `\` had gone missing.
+        assert_eq!(
+            err,
+            "player_origins cannot contain `*`: a credentialed response may not answer a \
+             wildcard origin. List each player origin.",
+            "the wildcard refusal does not explain itself"
         );
 
         c.player_origins = vec!["https://relay.example/watch".into()];

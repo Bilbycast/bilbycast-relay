@@ -5210,7 +5210,8 @@ seg-1.m4s
         s.remove_stream("feed").await;
         assert!(
             !dir.exists(),
-            "a retired stream's directory survived removal, so its clips would              never expire"
+            "a retired stream's directory survived removal, so its clips would \
+             never expire"
         );
     }
 

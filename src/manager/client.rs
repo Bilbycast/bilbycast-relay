@@ -796,7 +796,8 @@ fn update_config_file(
         Some(on_disk) => on_disk,
         None => {
             tracing::warn!(
-                "could not re-read {config_path:?}; persisting from the in-memory config,                  which may drop changes another writer made since startup"
+                "could not re-read {config_path:?}; persisting from the in-memory config, \
+                 which may drop changes another writer made since startup"
             );
             fallback.clone()
         }
