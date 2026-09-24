@@ -373,6 +373,18 @@ const CLIPS_DIR: &str = "clips";
 /// and for the same reason: it belongs to the session, not to the window.
 const MARKS_DIR: &str = "marks";
 
+/// A subdirectory of a stream that belongs to the session rather than to the
+/// window: `clips/` and `marks/`.
+///
+/// One answer for every place that must tell them from media — adoption on
+/// restart, retirement, and the store-shape check — so a third such directory
+/// cannot be taught to two of them and not the third. Adoption is where that
+/// would hurt silently: it deletes anything that is not a segment, and today
+/// it happens to use a call that refuses a directory.
+fn is_session_subdir(name: &std::ffi::OsStr) -> bool {
+    name == std::ffi::OsStr::new(CLIPS_DIR) || name == std::ffi::OsStr::new(MARKS_DIR)
+}
+
 /// Why a clip request was not admitted.
 ///
 /// Every arm is something an operator can act on, and the handler turns each
@@ -529,7 +541,7 @@ impl Drop for PartFile {
 ///
 /// * every top-level entry is a directory (a home directory has files in it);
 /// * inside those, nothing but segments, thumbnails, init segments,
-///   interrupted PUTs, and the one `clips/` subdirectory;
+///   interrupted PUTs, and the `clips/` and `marks/` subdirectories;
 /// * every directory that holds files holds at least one segment named the way
 ///   **this system's** packager names them — `seg-00042.m4s` / `aud-00042.m4s`
 ///   (bilbycast-edge `engine::cmaf::manifest::segment_file_name`);
@@ -555,12 +567,11 @@ fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
         let mut segments_here = 0usize;
         for f in std::fs::read_dir(entry.path())? {
             let f = f?;
-            // Exported clips live in their own subdirectory of the stream, so a
-            // directory here is expected as long as it is that one.
+            // Exported clips and shared marks live in their own
+            // subdirectories of the stream, so a directory here is expected as
+            // long as it is one of those.
             if f.file_type()?.is_dir() {
-                if f.file_name() == std::ffi::OsStr::new(CLIPS_DIR)
-                    || f.file_name() == std::ffi::OsStr::new(MARKS_DIR)
-                {
+                if is_session_subdir(&f.file_name()) {
                     continue;
                 }
                 return Ok(false);
@@ -584,7 +595,7 @@ fn looks_like_origin_store(root: &std::path::Path) -> std::io::Result<bool> {
         }
         // A directory holding files but no segments of ours is not a stream of
         // ours. One holding no files at all — a stream retired down to its
-        // clips — proves nothing either way and is allowed to pass.
+        // clips or marks — proves nothing either way and is allowed to pass.
         if files_here > 0 && segments_here == 0 {
             return Ok(false);
         }
@@ -743,17 +754,18 @@ impl OriginStore {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
-                // Exported clips are not segments: they must survive a restart
-                // untouched, and must not enter the eviction queue.
+                // Exported clips and shared marks are not segments: they must
+                // survive a restart untouched, and must not enter the eviction
+                // queue.
                 //
                 // Skipped explicitly rather than relying on what follows. The
                 // debris sweep below uses `remove_file`, which refuses a
-                // directory, so the clips would survive without this — but that
-                // is an accident of the call used, not a decision, and a later
+                // directory, so they would survive without this — but that is
+                // an accident of the call used, not a decision, and a later
                 // change to `remove_dir_all` would silently delete every
-                // exported clip on the next restart. Stating the intent here
-                // costs one comparison.
-                if name == CLIPS_DIR || name == MARKS_DIR {
+                // exported clip and every marks list on the next restart.
+                // Stating the intent here costs one comparison.
+                if is_session_subdir(f.file_name().as_os_str()) {
                     continue;
                 }
                 // Only media segments live on disk, so anything else here is
@@ -1559,15 +1571,13 @@ impl OriginStore {
         self.total_bytes
             .fetch_sub(origin.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
 
-        let mut kept = 0usize;
+        let mut kept: Vec<String> = Vec::new();
         match tokio::fs::read_dir(&origin.dir).await {
             Ok(mut rd) => {
                 while let Ok(Some(entry)) = rd.next_entry().await {
-                    // Shared marks are kept on exactly the same terms: an
-                    // operator's list of moments outlives a feed drop.
-                    if entry.file_name() == std::ffi::OsStr::new(CLIPS_DIR)
-                        || entry.file_name() == std::ffi::OsStr::new(MARKS_DIR)
-                    {
+                    // Shared marks are kept on exactly the same terms as the
+                    // clips: an operator's list of moments outlives a feed drop.
+                    if is_session_subdir(&entry.file_name()) {
                         // Kept only if it is holding something. Counting the
                         // directory entry itself meant a `clips/` a viewer had
                         // emptied through the portal read as "clips kept", and
@@ -1578,7 +1588,7 @@ impl OriginStore {
                             Err(_) => false,
                         };
                         if holds_anything {
-                            kept += 1;
+                            kept.push(entry.file_name().to_string_lossy().into_owned());
                         } else {
                             let _ = tokio::fs::remove_dir(entry.path()).await;
                         }
@@ -1607,12 +1617,15 @@ impl OriginStore {
         }
         // Nothing kept means nothing to keep it for: leave no empty shell
         // behind for the store-shape check to puzzle over on the next start.
-        if kept == 0 {
+        if kept.is_empty() {
             let _ = tokio::fs::remove_dir(&origin.dir).await;
         }
+        // Named, not counted: an operator reading this after a feed drop goes
+        // looking for whatever it says is left, and "clips remain" sent them
+        // to the portal for clips a stream holding only marks never had.
         tracing::info!(
-            stream = %stream, clips_kept = kept > 0,
-            "origin: stream retired; its media is gone and its clips remain"
+            stream = %stream, kept = %kept.join(","),
+            "origin: stream retired; its media is gone"
         );
     }
 
@@ -1685,9 +1698,11 @@ impl OriginStore {
     /// * media with no record beside it — invisible to the listing, to both
     ///   ceilings and to the portal's delete button, but not to the disk.
     /// * anything at all past [`CLIP_MAX_AGE`].
+    /// * a `marks/` list nobody has changed for [`CLIP_MAX_AGE`], on a stream
+    ///   nothing is ingesting — the same backstop for the same reason.
     /// * and the stream directory itself, once it holds nothing and no stream
-    ///   is using it — a clips-only directory is in no eviction path and is not
-    ///   re-adopted on restart, so without this it is permanent.
+    ///   is using it — a clips- or marks-only directory is in no eviction path
+    ///   and is not re-adopted on restart, so without this it is permanent.
     async fn reclaim_clip_debris(&self) {
         let Ok(mut root) = tokio::fs::read_dir(&self.cfg.root).await else {
             return;
@@ -1705,7 +1720,7 @@ impl OriginStore {
             // a session whose manager never came back to drop it.
             if !self.streams.contains_key(&stream) {
                 let marks = entry.path().join(MARKS_DIR);
-                let file = tokio::fs::metadata(marks.join("marks.json")).await;
+                let file = tokio::fs::metadata(marks.join(marks::MARKS_FILE)).await;
                 let touched = match file {
                     Ok(m) => Ok(m),
                     Err(_) => tokio::fs::metadata(&marks).await,
@@ -4467,6 +4482,79 @@ seg-1.m4s
             "the reclaim took a live clip with the debris"
         );
         assert_eq!(s.list_clips("feed").len(), 1);
+    }
+
+    /// Shared marks get the clips' backstop, and only where the clips do.
+    ///
+    /// A list goes once nobody has changed it for `CLIP_MAX_AGE` and nothing
+    /// is ingesting the stream — a session whose manager never came back with
+    /// its `drop_origin_streams`. It stays while the stream is live however old
+    /// it is, stays while it is young, and taking it never takes a clip.
+    #[tokio::test]
+    async fn a_forgotten_marks_list_is_reclaimed_and_no_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        let root = tmp.path().join("origin");
+        let list = |stream: &str| root.join(stream).join(MARKS_DIR).join(marks::MARKS_FILE);
+        let write = |stream: &str| {
+            std::fs::create_dir_all(list(stream).parent().unwrap()).unwrap();
+            std::fs::write(list(stream), br#"{"epoch":"e","rev":1,"marks":[]}"#).unwrap();
+        };
+
+        write("gone");
+        age(&list("gone"), CLIP_MAX_AGE * 2);
+        write("fresh");
+        put_seg(&s, "live", "seg-00001.m4s", 8).await;
+        write("live");
+        age(&list("live"), CLIP_MAX_AGE * 2);
+        s.record_clip_requests(
+            "cut",
+            &ClipRequest {
+                pre_secs: 5,
+                post_secs: 5,
+                clips: vec![ClipAsk { at: "2026-09-09T10:00:00Z".into(), name: "goal".into() }],
+            },
+        )
+        .unwrap();
+        s.put_clip("cut", "goal", b"clip").await.unwrap();
+        write("cut");
+        age(&list("cut"), CLIP_MAX_AGE * 2);
+
+        s.reclaim_clip_debris().await;
+
+        assert!(
+            !root.join("gone").exists(),
+            "a forgotten marks list, and the directory it alone held, outlived the backstop"
+        );
+        assert!(
+            list("fresh").exists(),
+            "a marks list inside the backstop was reclaimed"
+        );
+        assert!(
+            list("live").exists(),
+            "the backstop took the marks of a stream that is still ingesting"
+        );
+        assert!(
+            !root.join("cut").join(MARKS_DIR).exists(),
+            "a forgotten marks list survived because a clip sat beside it"
+        );
+        assert!(
+            s.read_clip("cut", "goal").await.is_some(),
+            "reclaiming the marks took a live clip with them"
+        );
+    }
+
+    /// Every place that tells session files from media asks the same
+    /// question, and both answers are pinned here: adoption on restart deletes
+    /// whatever the answer leaves out.
+    #[test]
+    fn clips_and_marks_are_the_session_subdirectories_and_nothing_else() {
+        use std::ffi::OsStr;
+        assert!(is_session_subdir(OsStr::new(CLIPS_DIR)));
+        assert!(is_session_subdir(OsStr::new(MARKS_DIR)));
+        for other in ["seg-00001.m4s", "marks.json", "clips.mp4", "Marks", ""] {
+            assert!(!is_session_subdir(OsStr::new(other)), "{other}");
+        }
     }
 
     /// A clips-only directory nobody is ingesting is not permanent.
