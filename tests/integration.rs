@@ -170,18 +170,14 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 }
 
 /// Start the relay server in the background and return its QUIC address.
+///
+/// The endpoint binds port 0 and the address is read back from the bound
+/// socket. Do not "find a free port" first with a throwaway socket: dropping it
+/// and binding again by number leaves a gap in which any other socket on the
+/// host — a client endpoint in a test running alongside this one, another test
+/// binary, any process — can be handed the same ephemeral port, and the rebind
+/// fails with EADDRINUSE. That is how `start_relay().await.unwrap()` flaked.
 async fn start_relay() -> anyhow::Result<SocketAddr> {
-    use std::net::TcpListener;
-
-    // Find free ports
-    let quic_listener = std::net::UdpSocket::bind("127.0.0.1:0")?;
-    let quic_addr = quic_listener.local_addr()?;
-    drop(quic_listener);
-
-    let api_listener = TcpListener::bind("127.0.0.1:0")?;
-    let api_addr = api_listener.local_addr()?;
-    drop(api_listener);
-
     // Generate self-signed cert
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".into(), "bilbycast-relay".into()])?;
@@ -201,7 +197,7 @@ async fn start_relay() -> anyhow::Result<SocketAddr> {
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?,
     ));
 
-    let endpoint = quinn::Endpoint::server(server_config, quic_addr)?;
+    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse()?)?;
     let actual_addr = endpoint.local_addr()?;
 
     // Shared state — no auth needed
@@ -229,19 +225,6 @@ async fn start_relay() -> anyhow::Result<SocketAddr> {
             });
         }
     });
-
-    // Start API server
-    tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
-        let app = axum::Router::new().route(
-            "/health",
-            axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
-        );
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    // Give the server a moment to bind
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     Ok(actual_addr)
 }
