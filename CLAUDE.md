@@ -360,7 +360,11 @@ the dropped password for a replacement) — at once when nothing needed writing;
 a read showing Authelia wrote the old entry back (a stale copy saved before it
 reloaded) applies the record again. An in-process set of applied
 `(username, removed_at)` stops a failed acknowledgement from replacing the
-account twice, and a 404 from a manager without the route is logged once.
+account twice, and a 404 from a manager without the route is logged once. A
+replacement stops the old holder's password, not a session they already have
+open in Authelia, so each one that re-creates the account logs how to end it
+(clear Authelia's sessions: restart it with in-memory sessions, or delete them
+from Redis).
 Against a manager too old to send `removed`, absence removes, except that an
 empty list removes nobody. New accounts get an argon2id hash (at argon2's
 minimum cost) of 32 random bytes nobody holds. A requested

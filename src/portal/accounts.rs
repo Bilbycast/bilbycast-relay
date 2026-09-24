@@ -33,7 +33,8 @@
 //! the username is given out again meanwhile, so a username in `removed` *and*
 //! in `accounts` has changed hands: its entry is replaced — dropped and made
 //! afresh in the same write — or the old holder's password would open the new
-//! holder's feeds.
+//! holder's feeds. That stops the password, not a session the old holder
+//! already has open in Authelia; the log says how to end one.
 //!
 //! A removal that takes a write is acknowledged only once that write has
 //! landed *and* the next cycle's read of the file still shows it: Authelia
@@ -1392,6 +1393,21 @@ async fn sync_once(
                 out.removed = p.remove.len();
                 out.replaced = p.replace.len();
                 memory.sync_error = None;
+                // Authelia ends a session only for a user who is gone or
+                // disabled, and one replaced by a new account of the same name
+                // is neither: whatever session the last holder has open
+                // outlives their password.
+                let remade = p.add.iter().map(|a| &a.username);
+                for u in remade.filter(|u| p.replace.contains(u)) {
+                    tracing::warn!(
+                        username = %u,
+                        "replaced the Authelia account `{u}` for the login's new holder; the last \
+                         holder's password no longer works, but a session they already have open \
+                         does until it expires. To end it, clear Authelia's sessions: restart \
+                         Authelia if it keeps them in memory, or delete them from its Redis. \
+                         Either signs every viewer out"
+                    );
+                }
             }
             // Authelia wrote first, after every check that could have stopped
             // the write had passed: nothing is blocked, so nothing is
@@ -3406,6 +3422,80 @@ users:
         let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
         assert_eq!((out.replaced, out.removed), (0, 0));
         assert_eq!(removal_acks(&r), ["a.smith", "b.jones"]);
+    }
+
+    thread_local! {
+        /// What this thread logs, while a test is collecting it.
+        static LOGGED: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    struct ThreadLog;
+
+    impl std::io::Write for ThreadLog {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            LOGGED.with_borrow_mut(|l| {
+                if let Some(l) = l {
+                    l.extend_from_slice(b);
+                }
+            });
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `f`'s result, and what this thread logged while it ran.
+    ///
+    /// Through the process's one global subscriber, installed on first use:
+    /// tracing caches per callsite, process-wide, whether any subscriber
+    /// wants it, and a subscriber scoped to this thread is not asked when
+    /// another test's thread reaches the callsite first.
+    async fn logged<T>(f: impl Future<Output = T>) -> (T, String) {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLog)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("nothing else in these tests sets a global subscriber");
+        });
+        LOGGED.set(Some(Vec::new()));
+        let out = f.await;
+        let text = LOGGED.take().unwrap_or_default();
+        (out, String::from_utf8_lossy(&text).into_owned())
+    }
+
+    /// A replacement stops the last holder's password, not a session they
+    /// already have open, so the log says so, and how to end one. A username
+    /// given out again with no address gets no new account, and Authelia ends
+    /// a session whose user has gone, so nothing is said for that one.
+    #[tokio::test]
+    async fn a_replacement_says_how_to_end_the_last_holders_session() {
+        let answer = serde_json::json!({
+            "accounts": [
+                { "username": "a.smith", "email": "sam@example.com" },
+                { "username": "b.jones" },
+            ],
+            "removed": [
+                { "username": "a.smith", "removed_at": "2026-09-24T08:00:00Z" },
+                { "username": "b.jones", "removed_at": "2026-09-24T08:00:01Z" },
+            ],
+        });
+        let r = rig(TWO_MANAGED, answer, None).await;
+        let (out, text) = logged(sync_once(&r.state, &r.cfg, &mut Memory::default())).await;
+        let out = out.unwrap();
+        assert_eq!((out.replaced, out.added), (2, 1));
+        assert!(
+            text.contains("replaced the Authelia account `a.smith`")
+                && text.contains("a session they already have open")
+                && text.contains("restart Authelia")
+                && text.contains("Redis"),
+            "{text}"
+        );
+        assert!(!text.contains("`b.jones`"), "{text}");
     }
 
     /// Not acknowledged until it is in the file: the manager would forget a

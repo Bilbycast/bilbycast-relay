@@ -379,12 +379,25 @@ For each record the portal does one of three things:
   or another, before the portal applied the removal: the managed account is
   **replaced**, dropped and made afresh with a new unusable password and the
   current email and display name, in one write. The last holder's password no
-  longer works; the new holder sets their own through the invitation, which
-  goes out on a later cycle like any new account's. Removing a login and adding
-  the same username again is therefore a clean start, however quickly it is
-  done.
+  longer works, however quickly the username was given out again; the new
+  holder sets their own through the invitation, which goes out on a later cycle
+  like any new account's. A session the last holder already has open is
+  another matter (below).
 * **There is no managed account of that name** — none at all, or a hand-made
   one: nothing is written.
+
+**A replacement does not sign the last holder out.** Authelia ends a signed-in
+session when its user has gone from the file or been disabled, at its next
+profile refresh (`authentication_backend.refresh_interval`), and an account
+made afresh under the same username is neither. So a session the last holder
+opened before the replacement keeps reaching the portal as that username until
+it expires — up to a month with Authelia's default remember-me — and is served
+the new holder's feeds. The portal cannot reach Authelia's sessions, so each
+time it makes a replaced account afresh it logs ``replaced the Authelia account
+`<name>` for the login's new holder; …`` with the remedy: clear Authelia's
+sessions — restart Authelia when it keeps them in memory (its default, without
+`session.redis`), or delete them from its Redis. Either signs every viewer out.
+Where you can, give a new person a username nobody has had instead.
 
 The portal tells the manager it has applied a record on
 `POST /api/v1/dvr/portal/accounts/removed-applied` with its `username` and
@@ -1074,7 +1087,7 @@ fails its startup check against it, and an Authelia still running the old
 notifier config has its mail refused by the new one with `530`. The window
 between the two restarts is the only time mail fails.
 
-Two behaviours change without any config:
+Three behaviours change without any config:
 
 * **Removal needs the manager's word.** Against a manager that sends `removed`,
   an account is removed only when its username is listed there; absence alone
@@ -1087,7 +1100,9 @@ Two behaviours change without any config:
 * **A username given out again is a new account.** Against a manager that keeps
   removal records until they are acknowledged, a login removed and added again
   before the portal applied the removal gets its account replaced, with a new
-  unusable password; the earlier build kept the account and its password.
+  unusable password; the earlier build kept the account and its password. A
+  session the last holder has open is not ended — see
+  [When an account is removed](#when-an-account-is-removed).
 
 ## Clips
 
