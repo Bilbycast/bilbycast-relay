@@ -219,6 +219,13 @@ impl PendingLinks {
         rx
     }
 
+    /// Stop expecting a message to `email`: Authelia was asked and refused, so
+    /// nothing is coming — and a stale expectation would otherwise rewrite the
+    /// viewer's own reset from the sign-in page as ours.
+    pub async fn forget(&self, email: &str) {
+        self.0.lock().await.remove(&key(email));
+    }
+
     async fn take(&self, recipients: &[String]) -> Option<(String, Pending)> {
         let mut map = self.0.lock().await;
         map.retain(|_, p| p.at.elapsed() < PENDING_TTL);
