@@ -626,6 +626,49 @@ test("a tap on another row closes the palette once its click is aimed, and the n
   assert.deepEqual(rowAts(b), [20_000, 30_000], "the list stayed held back once the palette had closed");
 });
 
+test("leaving a name field for another row's button does not redraw the rows before the click", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => { closePage(a); closePage(b); });
+  await settle();
+  key(a, "m");
+  a.document.getElementById("main").currentTime = 30;
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [30_000, 50_000], "fixture");
+
+  // The list is held back for the name field while another viewer marks.
+  const name = rows(b)[0].querySelector("input[type=text]");
+  name.focus();
+  a.document.getElementById("main").currentTime = 20;
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [30_000, 50_000], "fixture: the name field should hold the list");
+
+  // A mouse press on the second row's ×: focus leaves the name field on the
+  // press, and the list's focusout runs while the button is still held.
+  const pressed = rows(b)[1];
+  const del = pressed.querySelector(".del");
+  del.dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  name.blur();
+  await settle();
+  assert.equal(rows(b)[1], pressed, "the rows were redrawn between the press and its click");
+  del.dispatchEvent(new b.Event("pointerup", { bubbles: true }));
+  del.dispatchEvent(new b.Event("click", { bubbles: true }));
+  await settle();
+  assert.ok(
+    relay.calls.some((c) => c.startsWith("DELETE ")) &&
+      !relay.marks.some((m) => m.at === T0 + 50_000) &&
+      relay.marks.some((m) => m.at === T0 + 30_000),
+    "the click did not delete the mark it was aimed at"
+  );
+});
+
 test("a press in the drawer outside the list closes the palette and leaves the list to the next poll", async (t) => {
   const relay = fakeRelay();
   const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
