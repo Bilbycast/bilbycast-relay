@@ -167,6 +167,14 @@ A `manager_url` on plain `http://` is refused at startup unless
 `BILBYCAST_ALLOW_INSECURE=1` is set: the portal sends its manager token on every
 request to that URL, so plaintext hands out its service identity.
 
+The portal follows no redirects, from the manager, from Authelia or from a
+relay's origin. A `3xx` is handled as that service refusing; from the manager
+it reaches the log as, for instance, `portal: manager refused the stream list
+status=308 Permanent Redirect`. So point `manager_url` at where the manager
+actually answers, not at an address that forwards to it. Following a redirect
+would re-send the request, body and all (usernames, a viewer's address),
+wherever `Location` pointed, to another host or over plain `http://`.
+
 The binary takes `--config <path>` (default `portal-config.json`, which is why
 the packaged unit passes `--config /etc/bilbycast/portal.json`) and `--listen
 <addr>` to override `listen_addr` without editing the file.

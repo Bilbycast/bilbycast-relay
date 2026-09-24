@@ -51,6 +51,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod clients;
 pub mod config;
 pub mod mail;
 

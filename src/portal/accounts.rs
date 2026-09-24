@@ -3109,12 +3109,13 @@ users:
         if let Some(mail) = mail {
             portal["mail"] = mail;
         }
-        // Bare clients need a provider installed; the binary installs its own.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // The clients the binary uses, so the sync runs under the same
+        // policy as in production: no redirect followed.
+        let clients = crate::portal::clients::Clients::build().unwrap();
         let state = PortalState {
             cfg: Arc::new(serde_json::from_value(portal).unwrap()),
-            http: reqwest::Client::new(),
-            media: reqwest::Client::new(),
+            http: clients.http,
+            media: clients.media,
             last_beat_answer: Default::default(),
             links: Default::default(),
         };

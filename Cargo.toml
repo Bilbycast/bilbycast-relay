@@ -203,9 +203,9 @@ required-features = ["portal"]
 # `musl-tools` and nothing else, so aws-lc-sys would not build there.
 # `rustls-no-provider` keeps the relay on ring, matching the `rustls` pin
 # above, at the cost of having to install the provider and supply the roots
-# ourselves — both done in `portal_bin.rs`, because reqwest 0.13 resolves its
-# provider with the STRICT `CryptoProvider::get_default()` (never from crate
-# features) and panics when none is installed.
+# ourselves — both done in `src/portal/clients.rs`, because reqwest 0.13
+# resolves its provider with the STRICT `CryptoProvider::get_default()` (never
+# from crate features) and panics when none is installed.
 #
 # `query` is new here and not optional: `RequestBuilder::query` moved behind
 # it in 0.13, and `portal::manager_get` uses it.

@@ -198,16 +198,7 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
     };
     cfg.normalise();
 
-    let state = PortalState {
-        cfg: Arc::new(cfg),
-        http: {
-            install_provider();
-            reqwest::Client::new()
-        },
-        media: reqwest::Client::new(),
-        last_beat_answer: Default::default(),
-        links: Default::default(),
-    };
+    let state = portal_state(cfg);
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
     let app = portal::router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -218,10 +209,24 @@ async fn harness_cfg(trusted: &[&str], player_origins: &[&str]) -> (String, Reco
     (format!("http://{paddr}"), rec)
 }
 
+/// The portal as the binary builds it, clients included, so every test here
+/// runs through the same client policy production does — no redirect
+/// followed, the same deadlines.
+fn portal_state(cfg: PortalConfig) -> PortalState {
+    let clients = portal::clients::Clients::build().unwrap();
+    PortalState {
+        cfg: Arc::new(cfg),
+        http: clients.http,
+        media: clients.media,
+        last_beat_answer: Default::default(),
+        links: Default::default(),
+    }
+}
+
 /// `reqwest` is built with `rustls-no-provider`, so a client built without an
 /// installed provider panics at the first request rather than failing to
-/// compile. The binary installs one while building its TLS config; these tests
-/// build bare clients, so they must install it themselves.
+/// compile. The portal's own clients carry a finished TLS config and need
+/// none; the bare client below, which stands in for a browser, does.
 fn install_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -436,16 +441,7 @@ async fn harness_unreachable(player_origins: &[&str]) -> String {
         logout_url: None,
     };
     cfg.normalise();
-    let state = PortalState {
-        cfg: Arc::new(cfg),
-        http: {
-            install_provider();
-            reqwest::Client::new()
-        },
-        media: reqwest::Client::new(),
-        last_beat_answer: Default::default(),
-        links: Default::default(),
-    };
+    let state = portal_state(cfg);
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();
     let app = portal::router(state).into_make_service_with_connect_info::<SocketAddr>();
