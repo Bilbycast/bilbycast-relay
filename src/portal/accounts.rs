@@ -23,27 +23,40 @@
 //! first password change and the account would be orphaned.
 //!
 //! An account is removed only when the manager says its login is gone — the
-//! username is in the answer's `removed` and not in its `accounts`. Missing
-//! from the list is not enough: a database restored from an older backup is
-//! missing everything created since, and a deleted account takes the password
-//! its owner chose with it. A manager too old to send `removed` gets the
-//! previous rule, removal by absence, except that an empty list removes
-//! nobody.
+//! username is in the answer's `removed`. Missing from the list is not enough:
+//! a database restored from an older backup is missing everything created
+//! since, and a deleted account takes the password its owner chose with it. A
+//! manager too old to send `removed` gets the previous rule, removal by
+//! absence, except that an empty list removes nobody.
+//!
+//! The manager keeps each removal until the portal acknowledges it, even when
+//! the username is given out again meanwhile, so a username in `removed` *and*
+//! in `accounts` has changed hands: its entry is replaced — dropped and made
+//! afresh in the same write — or the old holder's password would open the new
+//! holder's feeds. A removal is acknowledged only once the write that applied
+//! it has landed, and the process remembers what it has applied, so a failed
+//! acknowledgement is retried without replacing the account a second time,
+//! perhaps after its new owner has set a password.
 //!
 //! # Passwords are Authelia's
 //!
 //! A new account gets an argon2id hash of 32 random bytes that nobody ever
 //! sees, so it cannot be signed in to until its owner sets a password through
 //! the emailed link. An existing account's `password` is never rewritten: the
-//! user may have set it a second ago.
+//! user may have set it a second ago. A replaced one is a new account.
 //!
 //! # One address, one account
 //!
 //! With `search.email` on, Authelia refuses the whole file when two accounts
 //! share an email, or one's email is another's username — hand-made accounts
 //! included — and a refused file is a lockout for everyone at its next
-//! restart. So an account is not created, and an email not changed, when that
-//! would follow; the login is reported instead.
+//! restart. So an account is not created, and an email not changed, when the
+//! file this cycle writes would hold such a pair; the login is reported
+//! instead. That is judged against the file as it will be, not as it was, so
+//! an address one account gives up can go to another in the same write, and
+//! two accounts can swap theirs. A login whose address is held only by an
+//! account the manager is moving off it, which could not move this cycle,
+//! waits rather than being refused.
 //!
 //! # Two things Authelia will not tell us
 //!
@@ -238,16 +251,22 @@ pub struct ManagerAccount {
 struct AccountsResponse {
     #[serde(default)]
     accounts: Vec<ManagerAccount>,
-    /// Logins deleted outright, and not re-added since. Absent from a manager
-    /// older than this list, which is the one case removal falls back to
-    /// absence from `accounts`.
+    /// Usernames whose last login was deleted, each kept by the manager until
+    /// the portal acknowledges it — a username given out again since included.
+    /// Absent from a manager older than this list, which is the one case
+    /// removal falls back to absence from `accounts`.
     #[serde(default)]
-    removed: Option<Vec<RemovedLogin>>,
+    removed: Option<Vec<Removal>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RemovedLogin {
-    username: String,
+/// The manager's record that a username's last login was deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct Removal {
+    pub username: String,
+    /// The manager's stamp, echoed back verbatim when acknowledging: the
+    /// manager forgets the record only while it still carries this stamp, so
+    /// acknowledging an older removal never loses a newer one.
+    pub removed_at: String,
 }
 
 /// A managed account's entry, brought back in line with the manager.
@@ -294,6 +313,14 @@ pub struct Plan {
     /// Managed accounts whose login the manager has deleted — or, from a
     /// manager too old to say, no longer lists.
     pub remove: Vec<String>,
+    /// Managed accounts whose username was deleted and given out again: the
+    /// entry is dropped, and made afresh in `add` when the new login can have
+    /// an account at all, so nothing set on the old one survives.
+    pub replace: Vec<String>,
+    /// The manager's removal records this plan settles, each with whether
+    /// settling it takes this cycle's write. One that needs no write — no
+    /// managed account of that name — is settled already.
+    pub removals: Vec<(Removal, bool)>,
     /// Links to ask Authelia for now.
     pub links: Vec<Link>,
     /// Link requests to answer with a reason.
@@ -302,7 +329,8 @@ pub struct Plan {
     /// alone, and logged so the operator can be told why an edit did nothing.
     pub foreign: Vec<String>,
     /// Logins that were not written, and why: an email or a username another
-    /// account already holds, or a username the file cannot hold as it is.
+    /// account already holds, a username the file cannot hold as it is, or an
+    /// address still on an account that is moving off it.
     pub conflicts: Vec<(String, &'static str)>,
     /// Removals held back because the manager, too old to say what it deleted,
     /// reported no logins at all.
@@ -311,7 +339,10 @@ pub struct Plan {
 
 impl Plan {
     pub fn changes_file(&self) -> bool {
-        !(self.add.is_empty() && self.update.is_empty() && self.remove.is_empty())
+        !(self.add.is_empty()
+            && self.update.is_empty()
+            && self.remove.is_empty()
+            && self.replace.is_empty())
     }
 }
 
@@ -326,6 +357,11 @@ const NAME_TAKEN: &str = "another Authelia account already has this username, in
                           or as its email, so the portal did not create it";
 const UNWRITABLE_NAME: &str = "this username cannot be written into Authelia's user file as it \
                                is, so the portal did not create it";
+/// Logged, never sent to the manager: the login's request stays outstanding
+/// and is tried again next cycle.
+const WAITING: &str = "another Authelia account still holds its email or username, and the \
+                       manager is moving that account off it; it is written once that has \
+                       happened";
 
 fn is_managed(entry: &Value, group: &str) -> bool {
     entry
@@ -363,27 +399,190 @@ fn plausible_username(u: &str) -> bool {
     !u.is_empty() && u.len() <= 256 && !u.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-/// Can this username be a new key without Authelia reading it as something
-/// else? Not `<<`, which is a merge key to Authelia's parser, and nothing YAML
-/// would resolve to anything but that same string. Asked only before creating
-/// an account: an existing one is never judged by it, or a stricter rule would
-/// remove it.
-fn creatable_key(u: &str) -> bool {
-    u != "<<" && serde_yaml_ng::from_str::<Value>(u).is_ok_and(|v| v.as_str() == Some(u))
+/// The login's email, when it is one the portal will write.
+fn usable_email(a: &ManagerAccount) -> Option<&str> {
+    a.email.as_deref().filter(|e| plausible_email(e))
 }
 
-/// Who holds a name: the lower-cased username or email → the account key.
-type Held = HashMap<String, String>;
+/// Can this username be a new key that Authelia reads back as the same text?
+///
+/// A new key is written as a string, and serde_yaml_ng quotes one wherever
+/// the bare text would read as something else — `'12345':`, `'true':`,
+/// `'@bob':` — so a staff number is as good a username as any. The exception
+/// is `<<`, which it writes bare and Authelia's parser takes as a merge key.
+/// That is refused by name, and anything else whose emitted key does not
+/// parse back as the same string is refused too, so a change in the emitter
+/// cannot turn into a renamed account. Asked only before creating an
+/// account: an existing one is never judged by it, or a stricter rule would
+/// remove it.
+fn creatable_key(u: &str) -> bool {
+    if u == "<<" {
+        return false;
+    }
+    let key = Value::String(u.to_string());
+    let mut probe = Mapping::new();
+    probe.insert(key.clone(), Value::Null);
+    serde_yaml_ng::to_string(&probe)
+        .ok()
+        .and_then(|text| serde_yaml_ng::from_str::<Mapping>(&text).ok())
+        .is_some_and(|back| back.len() == 1 && back.contains_key(&key))
+}
 
-/// Is `name` held by an account other than `owner`?
-fn taken(held: &Held, name: &str, owner: &str) -> bool {
-    held.get(&name.to_lowercase()).is_some_and(|o| o != owner)
+/// What a login asks of the file this cycle: an address, and for a new
+/// account its username as well.
+struct Claim<'a> {
+    name: &'a str,
+    email: &'a str,
+    /// A new entry. Otherwise an existing managed entry taking a new address;
+    /// its username it holds already.
+    new: bool,
+}
+
+/// One holder of a lower-cased username or address in the file a plan would
+/// write.
+struct Hold<'a> {
+    /// The account's name.
+    owner: &'a str,
+    /// Held as its email rather than its username.
+    as_email: bool,
+    /// The claim it comes from; `None` for what an entry keeps as it is.
+    claim: Option<usize>,
+}
+
+type Holds<'a> = HashMap<String, Vec<Hold<'a>>>;
+
+/// Everything the file would hold with the claims still `alive` written:
+/// every kept entry's username, its email — or, for a managed entry whose
+/// move is going ahead, the address it moves to — and each new account's
+/// username and email.
+fn holds<'a>(
+    kept: &'a [(String, Option<&'a str>)],
+    claims: &[Claim<'a>],
+    alive: &[bool],
+) -> Holds<'a> {
+    let moving: HashSet<&str> = claims
+        .iter()
+        .zip(alive)
+        .filter(|(c, alive)| **alive && !c.new)
+        .map(|(c, _)| c.name)
+        .collect();
+    let mut holds = Holds::new();
+    for (name, email) in kept {
+        holds.entry(name.to_lowercase()).or_default().push(Hold {
+            owner: name,
+            as_email: false,
+            claim: None,
+        });
+        if let Some(email) = email.filter(|_| !moving.contains(name.as_str())) {
+            holds.entry(email.to_lowercase()).or_default().push(Hold {
+                owner: name,
+                as_email: true,
+                claim: None,
+            });
+        }
+    }
+    for (i, c) in claims.iter().enumerate().filter(|(i, _)| alive[*i]) {
+        holds.entry(c.email.to_lowercase()).or_default().push(Hold {
+            owner: c.name,
+            as_email: true,
+            claim: Some(i),
+        });
+        if c.new {
+            holds.entry(c.name.to_lowercase()).or_default().push(Hold {
+                owner: c.name,
+                as_email: false,
+                claim: Some(i),
+            });
+        }
+    }
+    holds
+}
+
+/// The holders of `key` other than `c` itself.
+fn others<'h, 'a>(holds: &'h Holds<'a>, key: &str, c: &Claim) -> Vec<&'h Hold<'a>> {
+    holds
+        .get(&key.to_lowercase())
+        .into_iter()
+        .flatten()
+        .filter(|h| h.owner != c.name)
+        .collect()
+}
+
+/// Which claims can be written together, and who holds what once they are.
+///
+/// Judged against the file as the write would leave it, so a managed account
+/// moving off an address frees it for another login in the same write, and
+/// two accounts can swap theirs. Repeated until nothing changes: a claim that
+/// collides with what a kept entry holds is dropped first, then, between two
+/// claims on one name, the later in the manager's order. A dropped move leaves
+/// its account on its old address, which can drop another claim in turn.
+/// Every round drops something or ends, so it ends.
+fn resolve<'a>(
+    kept: &'a [(String, Option<&'a str>)],
+    claims: &[Claim<'a>],
+) -> (Vec<bool>, Holds<'a>) {
+    let keys = |c: &Claim<'a>| {
+        let name = c.new.then_some(c.name);
+        std::iter::once(c.email).chain(name)
+    };
+    let mut alive = vec![true; claims.len()];
+    loop {
+        let held = holds(kept, claims, &alive);
+        let mut next = alive.clone();
+        for (i, c) in claims.iter().enumerate().filter(|(i, _)| alive[*i]) {
+            if keys(c).any(|k| others(&held, k, c).iter().any(|h| h.claim.is_none())) {
+                next[i] = false;
+            }
+        }
+        if next == alive {
+            for (i, c) in claims.iter().enumerate() {
+                let beaten = |k| {
+                    others(&held, k, c)
+                        .iter()
+                        .any(|h| h.claim.is_some_and(|j| j < i && next[j]))
+                };
+                if next[i] && keys(c).any(beaten) {
+                    next[i] = false;
+                }
+            }
+        }
+        if next == alive {
+            return (alive, held);
+        }
+        alive = next;
+    }
+}
+
+/// Why a claim `resolve` dropped was not written: the reason to answer its
+/// link request with, or `None` when it should wait. It waits when every
+/// holder in its way is a managed account the manager lists with another
+/// address — one that could not move this cycle, and may next — or when
+/// nobody holds it once the write is done.
+fn refusal_for(c: &Claim, held: &Holds, moving_to: &HashMap<&str, &str>) -> Option<&'static str> {
+    // Held for good: by a claim going ahead, by a username, or as an address
+    // its account is not being moved off.
+    let fixed = |key: &str| {
+        others(held, key, c).iter().any(|h| {
+            h.claim.is_some()
+                || !h.as_email
+                || moving_to
+                    .get(h.owner)
+                    .is_none_or(|to| to.to_lowercase() == key.to_lowercase())
+        })
+    };
+    if fixed(c.email) {
+        Some(EMAIL_TAKEN)
+    } else if c.new && fixed(c.name) {
+        Some(NAME_TAKEN)
+    } else {
+        None
+    }
 }
 
 pub fn plan(
     users: &Mapping,
     accounts: &[ManagerAccount],
-    removed: Option<&[String]>,
+    removed: Option<&[Removal]>,
     group: &str,
 ) -> Plan {
     let mut p = Plan::default();
@@ -399,23 +598,36 @@ pub fn plan(
                 .or_insert((v, k.is_string()));
         }
     }
+    let ours =
+        |name: &str| matches!(by_name.get(name), Some(&(entry, true)) if is_managed(entry, group));
 
     // Removals first, so an address a deleted login frees can go to a new one
     // in the same cycle.
     let listed: HashSet<&str> = accounts.iter().map(|a| a.username.as_str()).collect();
-    let managed_names = users
-        .iter()
-        .filter(|(_, v)| is_managed(v, group))
-        .filter_map(|(k, _)| k.as_str());
     match removed {
         Some(removed) => {
-            let removed: HashSet<&str> = removed.iter().map(String::as_str).collect();
-            p.remove = managed_names
-                .filter(|n| removed.contains(n) && !listed.contains(n))
-                .map(str::to_string)
-                .collect();
+            // Written only where there is a managed account to take away. A
+            // username listed again has changed hands, so its entry is
+            // replaced rather than kept. No entry, or a hand-made one, is
+            // settled with nothing to write.
+            let mut acted = HashSet::new();
+            for r in removed {
+                let write = ours(&r.username);
+                if write && acted.insert(r.username.as_str()) {
+                    if listed.contains(r.username.as_str()) {
+                        p.replace.push(r.username.clone());
+                    } else {
+                        p.remove.push(r.username.clone());
+                    }
+                }
+                p.removals.push((r.clone(), write));
+            }
         }
         None => {
+            let managed_names = users
+                .iter()
+                .filter(|(_, v)| is_managed(v, group))
+                .filter_map(|(k, _)| k.as_str());
             let wanted: HashSet<&str> = accounts
                 .iter()
                 .map(|a| a.username.as_str())
@@ -440,48 +652,98 @@ pub fn plan(
         }
     }
     p.remove.sort();
+    p.replace.sort();
 
-    let mut held = Held::new();
-    for (k, v) in users {
-        let Some(name) = key_text(k) else { continue };
-        if k.as_str().is_some_and(|n| p.remove.iter().any(|r| r == n)) {
-            continue;
-        }
-        if let Some(e) = str_field(v, "email").filter(|e| !e.is_empty()) {
-            held.insert(e.to_lowercase(), name.clone());
-        }
-        held.insert(name.to_lowercase(), name);
+    // What each login is to the file. A replaced entry is gone, so its
+    // username makes a new account.
+    enum Slot<'v> {
+        New,
+        Ours(&'v Value),
+        Foreign,
     }
+    let replaced: HashSet<String> = p.replace.iter().cloned().collect();
+    let slot = |name: &str| match by_name.get(name) {
+        _ if replaced.contains(name) => Slot::New,
+        None => Slot::New,
+        Some(&(entry, true)) if is_managed(entry, group) => Slot::Ours(entry),
+        Some(_) => Slot::Foreign,
+    };
 
-    for a in accounts {
+    // Every entry the write leaves in place, with the address it holds now.
+    let gone: HashSet<&str> = p
+        .remove
+        .iter()
+        .chain(&p.replace)
+        .map(String::as_str)
+        .collect();
+    let kept: Vec<(String, Option<&str>)> = users
+        .iter()
+        .filter(|(k, _)| !k.as_str().is_some_and(|n| gone.contains(n)))
+        .filter_map(|(k, v)| {
+            Some((
+                key_text(k)?,
+                str_field(v, "email").filter(|e| !e.is_empty()),
+            ))
+        })
+        .collect();
+
+    // What each login would write: a new account with an address, or a
+    // managed account's new address. Settled together, against the file as
+    // it will be.
+    let mut claims = Vec::new();
+    let mut claim_of = vec![None; accounts.len()];
+    // The address the manager wants each managed account on.
+    let mut moving_to: HashMap<&str, &str> = HashMap::new();
+    for (i, a) in accounts.iter().enumerate() {
+        let Some(email) = usable_email(a).filter(|_| plausible_username(&a.username)) else {
+            continue;
+        };
+        let new = match slot(&a.username) {
+            Slot::New if creatable_key(&a.username) => true,
+            Slot::Ours(entry) => {
+                moving_to.insert(&a.username, email);
+                if str_field(entry, "email") == Some(email) {
+                    continue;
+                }
+                false
+            }
+            Slot::New | Slot::Foreign => continue,
+        };
+        claim_of[i] = Some(claims.len());
+        claims.push(Claim {
+            name: &a.username,
+            email,
+            new,
+        });
+    }
+    let (alive, held) = resolve(&kept, &claims);
+    // A claim that was not written: answered with the reason, or left to wait.
+    let dropped = |p: &mut Plan, a: &ManagerAccount, c: usize| {
+        let why = refusal_for(&claims[c], &held, &moving_to);
+        p.conflicts
+            .push((a.username.clone(), why.unwrap_or(WAITING)));
+        why
+    };
+
+    for (i, a) in accounts.iter().enumerate() {
         if !plausible_username(&a.username) {
             continue;
         }
-        let email = a.email.as_deref().filter(|e| plausible_email(e));
+        let email = usable_email(a);
         let mut refusal = None;
         let mut link_email = None;
-        match by_name.get(a.username.as_str()) {
-            None => {
-                let conflict = match email {
-                    None => None,
-                    Some(_) if !creatable_key(&a.username) => Some(UNWRITABLE_NAME),
-                    Some(e) if taken(&held, e, &a.username) => Some(EMAIL_TAKEN),
-                    Some(_) if taken(&held, &a.username, &a.username) => Some(NAME_TAKEN),
-                    Some(e) => {
-                        held.insert(e.to_lowercase(), a.username.clone());
-                        held.insert(a.username.to_lowercase(), a.username.clone());
-                        p.add.push(a.clone());
-                        None
-                    }
-                };
-                if let Some(why) = conflict {
-                    p.conflicts.push((a.username.clone(), why));
+        match slot(&a.username) {
+            // Nothing to mail yet: a new account's link waits a cycle.
+            Slot::New => match (email, claim_of[i]) {
+                (None, _) => refusal = Some(NO_EMAIL),
+                (Some(_), None) => {
+                    p.conflicts.push((a.username.clone(), UNWRITABLE_NAME));
+                    refusal = Some(UNWRITABLE_NAME);
                 }
-                // Nothing to mail yet: a new account's link waits a cycle.
-                refusal = conflict.or(email.is_none().then_some(NO_EMAIL));
-            }
-            Some(&(entry, true)) if is_managed(entry, group) => {
-                let on_file = str_field(entry, "email");
+                (Some(_), Some(c)) if alive[c] => p.add.push(a.clone()),
+                (Some(_), Some(c)) => refusal = dropped(&mut p, a, c),
+            },
+            Slot::Ours(entry) => {
                 let mut update = Update {
                     username: a.username.clone(),
                     email: None,
@@ -490,30 +752,19 @@ pub fn plan(
                         .clone()
                         .filter(|n| !n.is_empty() && str_field(entry, "displayname") != Some(n)),
                 };
-                match email {
-                    None => refusal = Some(NO_EMAIL),
-                    Some(e) if on_file == Some(e) => link_email = on_file,
-                    Some(e) if taken(&held, e, &a.username) => {
-                        p.conflicts.push((a.username.clone(), EMAIL_TAKEN));
-                        refusal = Some(EMAIL_TAKEN);
-                    }
+                match (email, claim_of[i]) {
+                    (None, _) => refusal = Some(NO_EMAIL),
+                    (Some(_), None) => link_email = str_field(entry, "email"),
                     // A new address: written now, mailed next cycle, once
                     // Authelia has loaded it rather than the one it replaces.
-                    Some(e) => {
-                        if let Some(old) = on_file
-                            && held.get(&old.to_lowercase()) == Some(&a.username)
-                        {
-                            held.remove(&old.to_lowercase());
-                        }
-                        held.insert(e.to_lowercase(), a.username.clone());
-                        update.email = Some(e.to_string());
-                    }
+                    (Some(e), Some(c)) if alive[c] => update.email = Some(e.to_string()),
+                    (Some(_), Some(c)) => refusal = dropped(&mut p, a, c),
                 }
                 if update.email.is_some() || update.display_name.is_some() {
                     p.update.push(update);
                 }
             }
-            Some(_) => {
+            Slot::Foreign => {
                 p.foreign.push(a.username.clone());
                 refusal = Some(HAND_MADE_LINK);
             }
@@ -634,7 +885,7 @@ pub fn apply(
         .and_then(Value::as_mapping_mut)
         .expect("just made a mapping");
 
-    for name in &p.remove {
+    for name in p.remove.iter().chain(&p.replace) {
         users.shift_remove(Value::String(name.clone()));
     }
     for a in &p.add {
@@ -730,9 +981,10 @@ fn cannot_write(what: &Path, dir: &Path, e: std::io::Error) -> anyhow::Error {
 }
 
 /// Whether `uid` belongs to group `gid`, as `passwd` and `group` (the text of
-/// /etc/passwd and /etc/group) say. `None` when `uid` is not in them — a
-/// container's user, or one from a directory service — which cannot be judged
-/// from here.
+/// /etc/passwd and /etc/group) say. `None` when `uid` is not in them — one
+/// from a directory service, or a container's that no host user shares —
+/// which cannot be judged from here. A container uid that a host user does
+/// share is judged as that host user, which is why a refusal says so.
 fn in_group(passwd: &str, group: &str, uid: u32, gid: u32) -> Option<bool> {
     let fields = |l: &str| l.split(':').map(str::to_string).collect::<Vec<_>>();
     let id = |f: &str| f.parse::<u32>().ok();
@@ -750,43 +1002,59 @@ fn in_group(passwd: &str, group: &str, uid: u32, gid: u32) -> Option<bool> {
     Some(listed)
 }
 
-/// Why putting a file owned `new_uid:new_gid` in place of one owned
+/// Does a file's group reach it in a way everyone else does not? Only then
+/// does handing the file to another group take anything from anyone.
+fn group_matters(mode: u32) -> bool {
+    ((mode >> 3) & 0o7) & !(mode & 0o7) != 0
+}
+
+/// Why putting a file owned `new_uid:new_gid` in place of `path`, owned
 /// `old_uid:old_gid`, both with `mode`, would take the file away from someone
-/// who can use it now — `None` when it would not.
+/// who can use it now — with what to do about it — or `None` when it would
+/// not.
 ///
 /// Authelia must still read the file, and write it when someone sets a
 /// password. A rename replaces the owner, and the old one keeps the file only
 /// through its group; once this process owns the file, Authelia reaches it only
-/// that way too. So the group must not change while it grants anything, and
-/// when the owner changes, it must grant read-write and have the old owner in
-/// it.
+/// that way too. So the group must not change while it grants anything
+/// `other` does not, and when the owner changes, it must grant read-write and
+/// have the old owner in it. A root owner needs none of that — root is kept out
+/// by no mode bit — so a root-owned `0644` file, in root's group, is replaced
+/// as it is.
 fn lockout(
+    path: &Path,
     (old_uid, old_gid): (u32, u32),
     (new_uid, new_gid): (u32, u32),
     mode: u32,
     owner_in_group: impl FnOnce(u32, u32) -> Option<bool>,
 ) -> Option<String> {
-    if new_gid != old_gid && mode & 0o060 != 0 {
+    let file = path.display();
+    if new_gid != old_gid && group_matters(mode) {
         return Some(format!(
             "the replacement would belong to group {new_gid}, not the file's group {old_gid}, \
-             and could not be given it"
+             which the portal is not in and so cannot keep. Give the file a group the portal \
+             is in: `chgrp {new_gid} {file}`, and put Authelia's user in that group too unless \
+             Authelia runs as root"
         ));
     }
-    // Unchanged owner, or root, which no mode bit keeps out.
     if old_uid == new_uid || old_uid == 0 {
         return None;
     }
     if mode & 0o060 != 0o060 {
         return Some(format!(
             "it is owned by uid {old_uid}, who could reach the replacement only through its \
-             group, and its mode {:o} gives the group no read-write",
+             group, and its mode {:o} gives the group no read-write: `chmod g+rw {file}`",
             mode & 0o777
         ));
     }
     if owner_in_group(old_uid, old_gid) == Some(false) {
         return Some(format!(
             "it is owned by uid {old_uid}, who could reach the replacement only through its \
-             group, and is not in group {old_gid}"
+             group, and this host's /etc/passwd and /etc/group do not put that user in group \
+             {old_gid}: `usermod -aG {old_gid} <Authelia's user>`, then restart Authelia. \
+             That check reads this host's account files only, so for an Authelia in a \
+             container, or one given the group by SupplementaryGroups=, add the host user \
+             with uid {old_uid} to the group as well"
         ));
     }
     None
@@ -854,18 +1122,13 @@ fn replace_file(
         in_group(&passwd, &group, uid, gid)
     };
     if let Some(why) = lockout(
+        path,
         (old.uid(), old.gid()),
         (new.uid(), new.gid()),
         old.mode(),
         membership,
     ) {
-        anyhow::bail!(
-            "not replacing {}: {why}. Authelia reaches the file through its group once the \
-             portal has written it: put Authelia's user in that group (`usermod -aG <group> \
-             <user>`, then restart Authelia), make the file mode 660, and make its directory \
-             setgid to the group",
-            path.display(),
-        );
+        anyhow::bail!("not replacing {}: {why}", path.display());
     }
     f.sync_all()
         .map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", tmp.display()))?;
@@ -931,13 +1194,26 @@ struct Memory {
     /// cannot be unsent, so an acknowledgement that fails is retried from
     /// here, never by asking Authelia for another.
     served: HashMap<(String, String), Served>,
+    /// Removal records a landed write has applied, kept until the manager
+    /// stops listing them. Never applied twice: a replaced account may have a
+    /// password its new owner set since, so an acknowledgement that fails is
+    /// retried from here, never by replacing the account again.
+    applied: HashSet<Removal>,
+    /// A removal acknowledgement has failed, and the log has said so.
+    removal_ack_failing: bool,
     /// Authelia's rate limit: no link is asked for before then.
     paused_until: Option<Instant>,
-    /// Authelia has rate-limited a link since the last one it took, and the
-    /// log has said so.
+    /// Authelia has rate-limited a link, and the log has said so. Cleared by
+    /// any other answer from Authelia, or when the pause it asked for is
+    /// over, so the next episode is said too.
     limited: bool,
     /// Plan notes already logged.
     noted: HashSet<String>,
+    /// Why the last cycle could not read or write Authelia's file, bounded
+    /// like a link error. Sent with the next poll, so the manager can say why
+    /// its logins are not reaching Authelia; `None` once nothing stood in the
+    /// way of a write, or nothing needed writing.
+    sync_error: Option<String>,
 }
 
 impl Memory {
@@ -983,6 +1259,7 @@ struct Outcome {
     added: usize,
     updated: usize,
     removed: usize,
+    replaced: usize,
     links_sent: usize,
     links_refused: usize,
     lost_race: bool,
@@ -991,43 +1268,60 @@ struct Outcome {
     write_error: Option<String>,
 }
 
-/// One sync: fetch, plan, write, request links, acknowledge.
+/// One sync: fetch, plan, write, acknowledge removals, request links,
+/// acknowledge those.
 async fn sync_once(
     state: &PortalState,
     cfg: &AccountSyncConfig,
     memory: &mut Memory,
 ) -> anyhow::Result<Outcome> {
-    let resp = state
+    let mut poll = state
         .http
         .get(format!(
             "{}/api/v1/dvr/portal/accounts",
             state.cfg.manager_url
         ))
-        .query(&[("interval_secs", cfg.interval_secs)])
-        .bearer_auth(&state.cfg.manager_token)
-        .send()
-        .await?;
+        .query(&[("interval_secs", cfg.interval_secs)]);
+    // Only here does the manager hear that its logins are not reaching
+    // Authelia; the portal's journal is not somewhere an operator looks.
+    if let Some(e) = &memory.sync_error {
+        poll = poll.query(&[("sync_error", e)]);
+    }
+    let resp = poll.bearer_auth(&state.cfg.manager_token).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("manager answered {} for the account list", resp.status());
     }
     let answer = resp.json::<AccountsResponse>().await?;
     let accounts = answer.accounts;
-    let removed: Option<Vec<String>> = answer
-        .removed
-        .map(|r| r.into_iter().map(|r| r.username).collect());
+    let removed = answer.removed;
+    let unapplied: Option<Vec<Removal>> = removed.as_ref().map(|r| {
+        r.iter()
+            .filter(|r| !memory.applied.contains(*r))
+            .cloned()
+            .collect()
+    });
 
     let path = cfg.users_file.clone();
-    let snap = tokio::task::spawn_blocking(move || read_users_file(&path)).await??;
+    let snap = match tokio::task::spawn_blocking(move || read_users_file(&path)).await? {
+        Ok(snap) => snap,
+        Err(e) => {
+            memory.sync_error = Some(bound_error(&format!("{e:#}")));
+            return Err(e);
+        }
+    };
     let empty = Mapping::new();
     let p = plan(
         snap.users().unwrap_or(&empty),
         &accounts,
-        removed.as_deref(),
+        unapplied.as_deref(),
         &cfg.managed_group,
     );
     memory.note(&p);
 
     let mut out = Outcome::default();
+    // Whether this cycle's changes are in the file — trivially so when there
+    // were none.
+    let mut landed = true;
     if p.changes_file() {
         let (path, group, changes) = (cfg.users_file.clone(), cfg.managed_group.clone(), p.clone());
         // Hashing included: it is CPU, and this runtime also serves viewers.
@@ -1045,25 +1339,78 @@ async fn sync_once(
                 out.added = p.add.len();
                 out.updated = p.update.len();
                 out.removed = p.remove.len();
+                out.replaced = p.replace.len();
+                memory.sync_error = None;
             }
-            Ok(false) => out.lost_race = true,
-            Err(e) => out.write_error = Some(format!("{e:#}")),
+            // Authelia wrote first, after every check that could have stopped
+            // the write had passed: nothing is blocked, so nothing is
+            // reported. The next cycle re-plans from Authelia's file.
+            Ok(false) => {
+                out.lost_race = true;
+                memory.sync_error = None;
+                landed = false;
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                memory.sync_error = Some(bound_error(&e));
+                out.write_error = Some(e);
+                landed = false;
+            }
         }
+    } else {
+        memory.sync_error = None;
     }
     // Accounts this cycle would have changed are as they were if the write
     // did not land; their links wait for one that does.
-    let unsettled: HashSet<&str> = if out.lost_race || out.write_error.is_some() {
+    let unsettled: HashSet<&str> = if landed {
+        HashSet::new()
+    } else {
         p.add
             .iter()
             .map(|a| a.username.as_str())
             .chain(p.update.iter().map(|u| u.username.as_str()))
             .collect()
-    } else {
-        HashSet::new()
     };
 
+    for (r, needs_write) in &p.removals {
+        if landed || !needs_write {
+            memory.applied.insert(r.clone());
+        }
+    }
+    if let Some(removed) = &removed {
+        memory.applied.retain(|r| removed.contains(r));
+        for r in removed.iter().filter(|r| memory.applied.contains(*r)) {
+            let failed = match acknowledge_removal(state, r).await {
+                Ok(true) => None,
+                Ok(false) => Some(
+                    "the manager has no route to acknowledge a removal on, so it is older than \
+                     this portal; its removal records stay until it is upgraded, and none is \
+                     applied twice meanwhile"
+                        .to_string(),
+                ),
+                Err(e) => Some(format!(
+                    "could not tell the manager a removal was applied ({e:#}); retrying without \
+                     applying it again"
+                )),
+            };
+            match failed {
+                None => memory.removal_ack_failing = false,
+                Some(why) if !memory.removal_ack_failing => {
+                    memory.removal_ack_failing = true;
+                    tracing::warn!(username = %r.username, "{why}");
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
     let pending = state.cfg.mail.is_some().then_some(&*state.links);
-    let mut asking = memory.paused_until.is_none_or(|t| Instant::now() >= t);
+    // A pause that has run out ends the episode, so the next 429 is said.
+    if memory.paused_until.is_some_and(|t| Instant::now() >= t) {
+        memory.paused_until = None;
+        memory.limited = false;
+    }
+    let mut asking = memory.paused_until.is_none();
     let mut planned = HashSet::new();
     for r in &p.refused {
         let key = (r.username.clone(), r.requested_at.clone());
@@ -1089,7 +1436,10 @@ async fn sync_once(
                     memory.limited = false;
                     memory.served.insert(key.clone(), Served::new(None));
                 }
+                // Authelia answered, and not with its limit: that episode is
+                // over.
                 Err(LinkError::Failed(e)) => {
+                    memory.limited = false;
                     memory.served.insert(key.clone(), Served::new(Some(e)));
                 }
                 // Not acknowledged, so it stays outstanding, and no further
@@ -1325,44 +1675,120 @@ async fn acknowledge(
     Ok(())
 }
 
-/// Is Authelia where `authelia_url` says? Asked once at startup: a wrong path
-/// prefix otherwise shows up only as a refusal against every link, one login
-/// at a time.
-async fn probe_authelia(state: &PortalState, cfg: &AccountSyncConfig) {
-    let url = format!("{}/api/health", cfg.authelia_url);
-    match state.http.get(&url).send().await {
-        Ok(r) if r.status().is_success() => {}
-        Ok(r) => tracing::error!(
-            authelia_url = %cfg.authelia_url, status = %r.status(),
-            "Authelia's health check did not answer at accounts.authelia_url; its path must be \
-             the path of Authelia's own server.address, and every password link will fail \
-             until it is"
-        ),
-        Err(e) => tracing::error!(
-            authelia_url = %cfg.authelia_url, error = %e,
-            "could not reach Authelia at accounts.authelia_url; password links will fail until \
-             it answers there"
-        ),
+/// Tell the manager a removal is applied, so it forgets the record.
+///
+/// `Ok(false)` when the manager has no such route: one older than removal
+/// acknowledgements, which lists its records until it is upgraded and is
+/// otherwise unaffected.
+async fn acknowledge_removal(state: &PortalState, r: &Removal) -> anyhow::Result<bool> {
+    let resp = state
+        .http
+        .post(format!(
+            "{}/api/v1/dvr/portal/accounts/removed-applied",
+            state.cfg.manager_url
+        ))
+        .bearer_auth(&state.cfg.manager_token)
+        .json(&serde_json::json!({
+            "username": r.username,
+            "removed_at": r.removed_at,
+        }))
+        .send()
+        .await?;
+    match resp.status() {
+        s if s.is_success() => Ok(true),
+        reqwest::StatusCode::NOT_FOUND => Ok(false),
+        s => anyhow::bail!("manager answered {s} to a removal acknowledgement"),
     }
 }
 
-/// The loop. A problem is logged when it starts, changes or clears, rather
-/// than every fifteen seconds for as long as it lasts.
+/// How often the startup probe asks, and for how long before it says so. At
+/// boot Authelia starts after the portal — its notifier needs the portal's
+/// mail listener — so the first answers are expected to fail.
+const PROBE_EVERY: Duration = Duration::from_secs(10);
+const PROBE_WITHIN: Duration = Duration::from_secs(120);
+
+/// Does Authelia answer its health check at `authelia_url`? Only its own
+/// `{"status":"OK"}` counts: an Authelia at the root serves its sign-in page,
+/// with a 200, for a path under a `/auth` it does not have.
+async fn authelia_health(state: &PortalState, cfg: &AccountSyncConfig) -> Result<(), String> {
+    let resp = state
+        .http
+        .get(format!("{}/api/health", cfg.authelia_url))
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "could not reach Authelia at accounts.authelia_url ({e}); password links will \
+                 fail until it answers there"
+            )
+        })?;
+    let status = resp.status();
+    let healthy = status.is_success()
+        && resp
+            .bytes()
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<AutheliaReply>(&b).ok())
+            .is_some_and(|r| r.status == "OK");
+    if healthy {
+        return Ok(());
+    }
+    Err(format!(
+        "Authelia's health check did not answer at accounts.authelia_url ({status}, and not \
+         Authelia's own OK); its path must be the path of Authelia's own server.address, and \
+         every password link will fail until it is"
+    ))
+}
+
+/// Is Authelia where `authelia_url` says? Asked at startup, every `every`
+/// until it answers or `within` has passed, and only then reported: a wrong
+/// path prefix otherwise shows up only as a refusal against every link, one
+/// login at a time.
+async fn probe_authelia(
+    state: &PortalState,
+    cfg: &AccountSyncConfig,
+    every: Duration,
+    within: Duration,
+) -> Result<(), String> {
+    let until = Instant::now() + within;
+    loop {
+        match authelia_health(state, cfg).await {
+            Ok(()) => return Ok(()),
+            Err(e) if Instant::now() + every > until => return Err(e),
+            Err(_) => tokio::time::sleep(every).await,
+        }
+    }
+}
+
+/// The loop, with the startup probe beside it rather than ahead of it: a
+/// sync does not wait two minutes for an Authelia that is still starting.
 pub async fn run(state: PortalState, cfg: AccountSyncConfig) {
-    probe_authelia(&state, &cfg).await;
+    let probe = async {
+        if let Err(e) = probe_authelia(&state, &cfg, PROBE_EVERY, PROBE_WITHIN).await {
+            tracing::error!(authelia_url = %cfg.authelia_url, "{e}");
+        }
+    };
+    tokio::join!(probe, sync_loop(&state, &cfg));
+}
+
+/// A problem is logged when it starts, changes or clears, rather than every
+/// fifteen seconds for as long as it lasts.
+async fn sync_loop(state: &PortalState, cfg: &AccountSyncConfig) {
     let mut ticker = tokio::time::interval(Duration::from_secs(cfg.interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut memory = Memory::default();
     let mut problem: Option<String> = None;
     loop {
         ticker.tick().await;
-        let now = match sync_once(&state, &cfg, &mut memory).await {
+        let now = match sync_once(state, cfg, &mut memory).await {
             Ok(o) => {
-                if o.added + o.updated + o.removed + o.links_sent + o.links_refused > 0 {
+                if o.added + o.updated + o.removed + o.replaced + o.links_sent + o.links_refused > 0
+                {
                     tracing::info!(
                         added = o.added,
                         updated = o.updated,
                         removed = o.removed,
+                        replaced = o.replaced,
                         links_sent = o.links_sent,
                         links_refused = o.links_refused,
                         "portal accounts synced to Authelia"
@@ -1407,6 +1833,17 @@ mod tests {
     fn asking(mut a: ManagerAccount, at: &str) -> ManagerAccount {
         a.link_requested_at = Some(at.into());
         a
+    }
+
+    /// The manager's removal records for `names`.
+    fn gone(names: &[&str]) -> Vec<Removal> {
+        names
+            .iter()
+            .map(|n| Removal {
+                username: n.to_string(),
+                removed_at: "2026-09-24T08:00:00.123456Z".into(),
+            })
+            .collect()
     }
 
     fn file(yaml: &str) -> Value {
@@ -1523,27 +1960,70 @@ users:
         let p = plan(&users(&doc), &[someone()], Some(&[]), G);
         assert!(p.remove.is_empty(), "absence alone removed an account");
 
-        let gone = ["a.smith".to_string(), "dvr-test".to_string()];
-        let p = plan(&users(&doc), &[someone()], Some(&gone), G);
+        let removed = gone(&["a.smith", "dvr-test"]);
+        let p = plan(&users(&doc), &[someone()], Some(&removed), G);
         assert_eq!(
             p.remove,
             ["a.smith"],
             "only the managed account goes, never a hand-made one of the same name"
         );
-
-        // Re-added since: listed again, so it stays.
-        let p = plan(
-            &users(&doc),
-            &[acct("a.smith", Some("alex@example.com"))],
-            Some(&gone),
-            G,
+        assert_eq!(
+            p.removals,
+            [(removed[0].clone(), true), (removed[1].clone(), false)],
+            "the hand-made one's record is settled with nothing to write"
         );
-        assert!(p.remove.is_empty());
 
         // The last login deleted is deleted too: the list says so outright.
-        let p = plan(&users(&doc), &[], Some(&gone), G);
+        let p = plan(&users(&doc), &[], Some(&removed), G);
         assert_eq!(p.remove, ["a.smith"]);
         assert_eq!(p.held_back, 0);
+    }
+
+    /// Removed and added again before the portal saw the removal: the same
+    /// username, but a different person, who must not inherit a password the
+    /// last one chose.
+    #[test]
+    fn a_username_given_out_again_is_made_afresh_not_kept() {
+        let doc = file(HAND_MADE);
+        let mut sam = asking(
+            acct("a.smith", Some("sam@example.com")),
+            "2026-09-24T08:05:00Z",
+        );
+        sam.display_name = Some("Sam Smith".into());
+        sam.first_link = true;
+        let removed = gone(&["a.smith"]);
+        let p = plan(&users(&doc), std::slice::from_ref(&sam), Some(&removed), G);
+        assert_eq!(p.replace, ["a.smith"]);
+        assert!(p.remove.is_empty() && p.update.is_empty(), "{p:?}");
+        assert_eq!(names(&p.add), ["a.smith"]);
+        assert_eq!(p.removals, [(removed[0].clone(), true)]);
+        assert!(
+            p.links.is_empty() && p.refused.is_empty(),
+            "a new account's link waits a cycle, and is not refused: {p:?}"
+        );
+
+        let mut doc2 = doc.clone();
+        apply(&mut doc2, &p, G, || Ok("$argon2id$fresh".into())).unwrap();
+        let e = &doc2["users"]["a.smith"];
+        assert_eq!(
+            e["password"].as_str(),
+            Some("$argon2id$fresh"),
+            "Alex's password survived"
+        );
+        assert_eq!(e["email"].as_str(), Some("sam@example.com"));
+        assert_eq!(e["displayname"].as_str(), Some("Sam Smith"));
+        assert_eq!(
+            e["groups"],
+            file("[bilbycast-portal]"),
+            "Alex's own groups came along"
+        );
+        assert_eq!(doc2["users"]["dvr-test"], doc["users"]["dvr-test"]);
+
+        // A username given out again with no address the portal can use is
+        // still taken from the last holder: it just gets no new account.
+        let p = plan(&users(&doc), &[acct("a.smith", None)], Some(&removed), G);
+        assert_eq!(p.replace, ["a.smith"]);
+        assert!(p.add.is_empty());
     }
 
     #[test]
@@ -1800,7 +2280,7 @@ users:
         let p = plan(
             &users(&doc),
             &[acct("alex2", Some("alex@example.com"))],
-            Some(&["a.smith".to_string()]),
+            Some(&gone(&["a.smith"])),
             G,
         );
         assert_eq!(p.remove, ["a.smith"]);
@@ -1808,24 +2288,202 @@ users:
         assert!(p.conflicts.is_empty());
     }
 
+    fn managed(entries: &[(&str, &str)]) -> Value {
+        let mut yaml = String::from("users:\n");
+        for (name, email) in entries {
+            yaml.push_str(&format!(
+                "  '{name}':\n    password: chosen\n    email: '{email}'\n    groups: [bilbycast-portal]\n"
+            ));
+        }
+        file(&yaml)
+    }
+
+    /// `(username, the email it would be written with)` for every update.
+    fn moves(p: &Plan) -> Vec<(&str, &str)> {
+        p.update
+            .iter()
+            .filter_map(|u| Some((u.username.as_str(), u.email.as_deref()?)))
+            .collect()
+    }
+
+    /// An address one account gives up goes to another in the same write,
+    /// whichever sorts first — the manager answers in username order.
     #[test]
-    fn a_username_yaml_would_misread_is_not_created() {
-        let doc = file("users: {}");
+    fn an_address_a_moved_account_frees_can_go_to_a_new_one() {
+        let doc = managed(&[("b-old", "x@example.com")]);
+        let at = "2026-09-24T08:00:00Z";
         let p = plan(
             &users(&doc),
             &[
-                // A merge key to Authelia's parser.
-                acct("<<", Some("m@example.com")),
-                acct("12345", Some("n@example.com")),
-                acct("0x3039", Some("h@example.com")),
-                acct("true", Some("t@example.com")),
+                asking(acct("a-new", Some("x@example.com")), at),
+                acct("b-old", Some("y@example.com")),
             ],
             Some(&[]),
             G,
         );
-        assert!(p.add.is_empty(), "{p:?}");
-        assert!(p.conflicts.iter().all(|(_, why)| *why == UNWRITABLE_NAME));
-        assert_eq!(p.conflicts.len(), 4);
+        assert_eq!(names(&p.add), ["a-new"]);
+        assert_eq!(moves(&p), [("b-old", "y@example.com")]);
+        assert!(
+            p.conflicts.is_empty() && p.refused.is_empty(),
+            "the invitation was used up on a refusal: {p:?}"
+        );
+    }
+
+    /// Two accounts trading addresses, or three passing them round, land in
+    /// one write: Authelia never loads the file in between.
+    #[test]
+    fn a_swap_or_a_rotation_lands_in_one_write() {
+        let at = "2026-09-24T08:00:00Z";
+        let doc = managed(&[("alpha", "a@example.com"), ("beta", "b@example.com")]);
+        let p = plan(
+            &users(&doc),
+            &[
+                asking(acct("alpha", Some("B@example.com")), at),
+                asking(acct("beta", Some("a@example.com")), at),
+            ],
+            Some(&[]),
+            G,
+        );
+        assert_eq!(
+            moves(&p),
+            [("alpha", "B@example.com"), ("beta", "a@example.com")]
+        );
+        assert!(p.conflicts.is_empty() && p.refused.is_empty(), "{p:?}");
+        let mut doc2 = doc.clone();
+        apply(&mut doc2, &p, G, || panic!("no account is new")).unwrap();
+        assert_eq!(
+            doc2["users"]["alpha"]["email"].as_str(),
+            Some("B@example.com")
+        );
+        assert_eq!(
+            doc2["users"]["beta"]["email"].as_str(),
+            Some("a@example.com")
+        );
+
+        let doc = managed(&[
+            ("one", "x@example.com"),
+            ("two", "y@example.com"),
+            ("three", "z@example.com"),
+        ]);
+        let p = plan(
+            &users(&doc),
+            &[
+                acct("one", Some("y@example.com")),
+                acct("three", Some("x@example.com")),
+                acct("two", Some("z@example.com")),
+            ],
+            Some(&[]),
+            G,
+        );
+        assert_eq!(p.update.len(), 3, "{p:?}");
+        assert!(p.conflicts.is_empty());
+    }
+
+    /// A move a hand-made account blocks keeps its old address, so a login
+    /// that wanted that address waits — unrefused, its request outstanding —
+    /// while the blocked one is refused: the hand-made holder is going nowhere.
+    #[test]
+    fn a_blocked_move_keeps_its_address_and_whoever_wanted_it_waits() {
+        let at = "2026-09-24T08:00:00Z";
+        let doc = file(
+            "users:\n  alpha:\n    email: a@example.com\n    groups: [bilbycast-portal]\n  \
+             hand:\n    email: h@example.com\n    groups: []\n",
+        );
+        let p = plan(
+            &users(&doc),
+            &[
+                asking(acct("alpha", Some("h@example.com")), at),
+                asking(acct("newbie", Some("a@example.com")), at),
+            ],
+            Some(&[]),
+            G,
+        );
+        assert!(p.add.is_empty() && p.update.is_empty(), "{p:?}");
+        assert_eq!(
+            refused(&p),
+            [("alpha", EMAIL_TAKEN)],
+            "newbie's request was used up on an address that is still moving"
+        );
+        assert_eq!(
+            p.conflicts,
+            [
+                ("alpha".to_string(), EMAIL_TAKEN),
+                ("newbie".to_string(), WAITING)
+            ]
+        );
+    }
+
+    /// When the account holding an address is one the manager really lists
+    /// with it, the request is answered — there is nothing to wait for.
+    #[test]
+    fn an_address_the_manager_still_gives_its_holder_is_refused() {
+        let at = "2026-09-24T08:00:00Z";
+        let doc = managed(&[("zed", "ann@example.com")]);
+        let p = plan(
+            &users(&doc),
+            &[
+                asking(acct("ann", Some("ann@example.com")), at),
+                acct("zed", Some("ann@example.com")),
+            ],
+            Some(&[]),
+            G,
+        );
+        assert!(p.add.is_empty());
+        assert_eq!(refused(&p), [("ann", EMAIL_TAKEN)]);
+    }
+
+    /// A username that is an address keeps holding that address as a name
+    /// when the account's email moves: the name does not move with it.
+    #[test]
+    fn an_account_named_after_its_address_keeps_the_name_when_the_address_moves() {
+        let doc = managed(&[("a@example.com", "a@example.com")]);
+        let p = plan(
+            &users(&doc),
+            &[
+                acct("a@example.com", Some("new@example.com")),
+                acct("zed", Some("A@example.com")),
+            ],
+            Some(&[]),
+            G,
+        );
+        assert_eq!(moves(&p), [("a@example.com", "new@example.com")]);
+        assert!(
+            p.add.is_empty(),
+            "zed's email would be another account's username: {p:?}"
+        );
+        assert_eq!(p.conflicts, [("zed".to_string(), EMAIL_TAKEN)]);
+    }
+
+    /// Membership numbers, handles, words YAML has a meaning for: written as
+    /// quoted keys, they read back as themselves. Only `<<`, which goes out
+    /// bare and is a merge key to Authelia's parser, cannot be a username.
+    #[test]
+    fn a_username_is_refused_only_when_its_key_would_not_read_back() {
+        let mut doc = file("users: {}");
+        let usernames = [
+            "12345", "0x3039", "@bob", "true", "null", "~", "yes", "-", "a:b", "#tag", "*x",
+        ];
+        let logins: Vec<_> = usernames
+            .iter()
+            .enumerate()
+            .map(|(i, u)| acct(u, Some(&format!("n{i}@example.com"))))
+            .chain([acct("<<", Some("m@example.com"))])
+            .collect();
+        let p = plan(&users(&doc), &logins, Some(&[]), G);
+        assert_eq!(names(&p.add), usernames);
+        assert_eq!(p.conflicts, [("<<".to_string(), UNWRITABLE_NAME)]);
+
+        // And what is written reads back with every one of them as text.
+        apply(&mut doc, &p, G, || Ok("$argon2id$fake".into())).unwrap();
+        let text = serde_yaml_ng::to_string(&doc).unwrap();
+        let back: Value = serde_yaml_ng::from_str(&text).unwrap();
+        let keys: Vec<_> = users(&back).keys().cloned().collect();
+        let expected: Vec<_> = usernames
+            .iter()
+            .map(|u| Value::String(u.to_string()))
+            .collect();
+        assert_eq!(keys, expected, "{text}");
+        assert_eq!(unrewritable(&users(&back), G), None, "{text}");
     }
 
     #[test]
@@ -1845,8 +2503,9 @@ users:
             "a second '12345' key would be a duplicate to Authelia: {p:?}"
         );
         assert_eq!(p.foreign, ["12345"]);
-        let p = plan(&users(&doc), &[], Some(&["12345".to_string()]), G);
+        let p = plan(&users(&doc), &[], Some(&gone(&["12345"])), G);
         assert!(p.remove.is_empty(), "a key that is not text is never ours");
+        assert!(!p.removals[0].1, "and its record needs no write");
     }
 
     #[test]
@@ -1996,33 +2655,72 @@ users:
         const AUTHELIA: u32 = 990;
         const PORTAL: u32 = 991;
         const SHARED: u32 = 995;
+        let f = Path::new("/etc/authelia/users/users.yml");
         let member = |_, _| Some(true);
         let outsider = |_, _| Some(false);
         let unknown = |_, _| None;
         // The documented layout, with Authelia in the group: fine.
         assert_eq!(
-            lockout((AUTHELIA, SHARED), (PORTAL, SHARED), 0o660, member),
+            lockout(f, (AUTHELIA, SHARED), (PORTAL, SHARED), 0o660, member),
             None
         );
         // The same, before anyone added Authelia to the group.
-        assert!(lockout((AUTHELIA, SHARED), (PORTAL, SHARED), 0o660, outsider).is_some());
+        assert!(lockout(f, (AUTHELIA, SHARED), (PORTAL, SHARED), 0o660, outsider).is_some());
         // A group that cannot write.
-        assert!(lockout((AUTHELIA, SHARED), (PORTAL, SHARED), 0o640, member).is_some());
+        assert!(lockout(f, (AUTHELIA, SHARED), (PORTAL, SHARED), 0o640, member).is_some());
         // A group the portal could not give the new file.
-        assert!(lockout((AUTHELIA, SHARED), (PORTAL, PORTAL), 0o660, member).is_some());
+        assert!(lockout(f, (AUTHELIA, SHARED), (PORTAL, PORTAL), 0o660, member).is_some());
         // Once the portal owns it, Authelia is in the group, so the group
         // cannot change either.
-        assert!(lockout((PORTAL, SHARED), (PORTAL, PORTAL), 0o660, member).is_some());
+        assert!(lockout(f, (PORTAL, SHARED), (PORTAL, PORTAL), 0o660, member).is_some());
         // Unless it granted nothing; and root is locked out of nothing.
         assert_eq!(
-            lockout((PORTAL, SHARED), (PORTAL, PORTAL), 0o600, outsider),
+            lockout(f, (PORTAL, SHARED), (PORTAL, PORTAL), 0o600, outsider),
             None
         );
-        assert_eq!(lockout((0, 0), (PORTAL, PORTAL), 0o600, outsider), None);
-        // A user the account files do not list (a container's) is not judged.
+        assert_eq!(lockout(f, (0, 0), (PORTAL, PORTAL), 0o600, outsider), None);
+        // A user the account files do not list is not judged.
         assert_eq!(
-            lockout((AUTHELIA, SHARED), (PORTAL, SHARED), 0o660, unknown),
+            lockout(f, (AUTHELIA, SHARED), (PORTAL, SHARED), 0o660, unknown),
             None
+        );
+    }
+
+    /// What root with umask 022 makes: root:root 0644. Its group grants
+    /// nothing everyone else does not have, so a new group takes nothing from
+    /// anyone — and a root Authelia needs neither group nor mode.
+    #[test]
+    fn a_group_that_grants_nothing_extra_may_change() {
+        const PORTAL: u32 = 991;
+        const AUTHELIA_GROUP: u32 = 990;
+        let f = Path::new("/etc/authelia/users/users.yml");
+        let outsider = |_, _| Some(false);
+        assert_eq!(lockout(f, (0, 0), (PORTAL, PORTAL), 0o644, outsider), None);
+        // A root-owned file whose group is how a non-root Authelia reaches it
+        // is another matter.
+        assert!(lockout(f, (0, AUTHELIA_GROUP), (PORTAL, PORTAL), 0o664, outsider).is_some());
+    }
+
+    /// Each refusal says what clears it, and the membership check says whose
+    /// account files it read.
+    #[test]
+    fn a_refusal_names_its_remedy() {
+        let f = Path::new("/etc/authelia/users/users.yml");
+        let group = lockout(f, (990, 995), (991, 991), 0o660, |_, _| Some(true)).unwrap();
+        assert!(
+            group.contains("`chgrp 991 /etc/authelia/users/users.yml`"),
+            "{group}"
+        );
+        let mode = lockout(f, (990, 995), (991, 995), 0o640, |_, _| Some(true)).unwrap();
+        assert!(
+            mode.contains("`chmod g+rw /etc/authelia/users/users.yml`"),
+            "{mode}"
+        );
+        let member = lockout(f, (990, 995), (991, 995), 0o660, |_, _| Some(false)).unwrap();
+        assert!(member.contains("`usermod -aG 995"), "{member}");
+        assert!(
+            member.contains("this host's account files only") && member.contains("container"),
+            "{member}"
         );
     }
 
@@ -2147,8 +2845,33 @@ users:
         asked: Vec<String>,
         authelia: (u16, String),
         retry_after: Option<&'static str>,
+        /// Removal acknowledgements received; the status to answer them
+        /// with, when not 200.
+        removal_acks: Vec<serde_json::Value>,
+        removal_ack_status: Option<u16>,
+        /// How Authelia's health check answers, each time it is asked in
+        /// turn, the last answer repeating.
+        health: Vec<(u16, &'static str)>,
+        health_asked: usize,
     }
     type Shared = Arc<Mutex<Stub>>;
+
+    async fn stub_removal_ack(
+        State(s): State<Shared>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> StatusCode {
+        let mut s = s.lock().unwrap();
+        s.removal_acks.push(body);
+        StatusCode::from_u16(s.removal_ack_status.unwrap_or(200)).unwrap()
+    }
+
+    async fn stub_health(State(s): State<Shared>) -> (StatusCode, &'static str) {
+        let mut s = s.lock().unwrap();
+        let i = s.health_asked.min(s.health.len() - 1);
+        s.health_asked += 1;
+        let (code, body) = s.health[i];
+        (StatusCode::from_u16(code).unwrap(), body)
+    }
 
     async fn stub_accounts(State(s): State<Shared>, RawQuery(q): RawQuery) -> impl IntoResponse {
         let mut s = s.lock().unwrap();
@@ -2203,11 +2926,17 @@ users:
         let stub: Shared = Arc::new(Mutex::new(Stub {
             answer,
             authelia: (200, r#"{"status":"OK"}"#.into()),
+            health: vec![(200, r#"{"status":"OK"}"#)],
             ..Stub::default()
         }));
         let app = axum::Router::new()
             .route("/api/v1/dvr/portal/accounts", get(stub_accounts))
             .route("/api/v1/dvr/portal/accounts/link-sent", post(stub_ack))
+            .route(
+                "/api/v1/dvr/portal/accounts/removed-applied",
+                post(stub_removal_ack),
+            )
+            .route("/api/health", get(stub_health))
             .route(
                 "/api/reset-password/identity/start",
                 post(stub_identity_start),
@@ -2359,6 +3088,56 @@ users:
         assert_eq!(r.stub.lock().unwrap().asked, ["a.smith"]);
     }
 
+    /// The warning is said once per episode, and an episode ends with any
+    /// other answer from Authelia, or with the pause it asked for — not only
+    /// with a link it took, which may be days away.
+    #[tokio::test]
+    async fn the_rate_limit_warning_is_rearmed_by_any_other_answer_or_the_end_of_the_pause() {
+        let r = rig(TWO_MANAGED, requesting(&["a.smith"]), None).await;
+        r.stub.lock().unwrap().authelia = (
+            200,
+            r#"{"status":"KO","message":"Operation failed"}"#.into(),
+        );
+        let mut memory = Memory {
+            limited: true,
+            ..Memory::default()
+        };
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert!(!memory.limited, "a failed send left the warning latched");
+
+        r.stub.lock().unwrap().answer = requesting(&[]);
+        let mut memory = Memory {
+            limited: true,
+            paused_until: Some(Instant::now() - Duration::from_secs(1)),
+            ..Memory::default()
+        };
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert!(
+            !memory.limited && memory.paused_until.is_none(),
+            "a pause that is over left the warning latched"
+        );
+    }
+
+    /// At boot Authelia comes up after the portal, so the probe keeps asking
+    /// quietly; and only Authelia's own OK counts, not any 200.
+    #[tokio::test]
+    async fn the_startup_probe_waits_for_authelia_and_wants_its_own_ok() {
+        let r = rig(TWO_MANAGED, requesting(&[]), None).await;
+        r.stub.lock().unwrap().health = vec![(503, ""), (503, ""), (200, r#"{"status":"OK"}"#)];
+        let every = Duration::from_millis(10);
+        let got = probe_authelia(&r.state, &r.cfg, every, Duration::from_secs(5)).await;
+        assert_eq!(got, Ok(()));
+        assert_eq!(r.stub.lock().unwrap().health_asked, 3);
+
+        // An Authelia at the root answers a path under `/auth` with its
+        // sign-in page, and a 200.
+        r.stub.lock().unwrap().health = vec![(200, "<!DOCTYPE html><html></html>")];
+        let err = probe_authelia(&r.state, &r.cfg, every, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.contains("its path must be the path"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_write_that_fails_holds_back_only_the_links_it_would_have_changed() {
         // A hand-made entry the portal cannot rewrite faithfully, so the write
@@ -2386,6 +3165,169 @@ users:
              account it did not write"
         );
         assert_eq!(s.acks.len(), 1);
+    }
+
+    fn password(r: &Rig, user: &str) -> String {
+        let doc = read_users_file(&r.cfg.users_file).unwrap().doc;
+        doc["users"][user]["password"].as_str().unwrap().to_string()
+    }
+
+    /// A username removed and given out again is replaced once. If telling
+    /// the manager fails, the retry tells it again and replaces nothing: the
+    /// new holder may have chosen a password in the meantime.
+    #[tokio::test]
+    async fn a_removal_is_applied_once_and_acknowledged_until_the_manager_forgets_it() {
+        let answer = serde_json::json!({
+            "accounts": [{ "username": "a.smith", "email": "sam@example.com" }],
+            "removed": [
+                { "username": "a.smith", "removed_at": "2026-09-24T08:00:00.123456Z" },
+                { "username": "never.made", "removed_at": "2026-09-24T08:00:01.5Z" },
+            ],
+        });
+        let r = rig(TWO_MANAGED, answer, None).await;
+        r.stub.lock().unwrap().removal_ack_status = Some(500);
+        let mut memory = Memory::default();
+
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(out.replaced, 1);
+        let fresh = password(&r, "a.smith");
+        assert_ne!(fresh, "x", "the last holder's password survived");
+        {
+            let s = r.stub.lock().unwrap();
+            let acked: Vec<_> = s
+                .removal_acks
+                .iter()
+                .map(|a| a["username"].clone())
+                .collect();
+            assert_eq!(acked, ["a.smith", "never.made"]);
+            assert_eq!(
+                s.removal_acks[0]["removed_at"], "2026-09-24T08:00:00.123456Z",
+                "echoed verbatim"
+            );
+        }
+
+        // Sam sets a password; the manager still lists both, as neither
+        // acknowledgement got through.
+        let text = std::fs::read_to_string(&r.cfg.users_file)
+            .unwrap()
+            .replace(&fresh, "set-by-sam");
+        std::fs::write(&r.cfg.users_file, text).unwrap();
+        r.stub.lock().unwrap().removal_ack_status = None;
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(out.replaced, 0);
+        assert_eq!(
+            password(&r, "a.smith"),
+            "set-by-sam",
+            "a retried acknowledgement replaced the account a second time"
+        );
+        assert_eq!(r.stub.lock().unwrap().removal_acks.len(), 4);
+
+        // Forgotten by the manager, forgotten here.
+        r.stub.lock().unwrap().answer["removed"] = serde_json::json!([]);
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert!(memory.applied.is_empty());
+        assert_eq!(r.stub.lock().unwrap().removal_acks.len(), 4);
+    }
+
+    /// Not acknowledged until it is in the file: the manager would forget a
+    /// removal that never happened.
+    #[tokio::test]
+    async fn a_removal_the_write_did_not_carry_is_not_acknowledged() {
+        let yaml = format!(
+            "{TWO_MANAGED}  phone:\n    password: x\n    email: +61412345678\n    groups: []\n"
+        );
+        let answer = serde_json::json!({
+            "accounts": [{ "username": "b.jones", "email": "bea@example.com" }],
+            "removed": [{ "username": "a.smith", "removed_at": "2026-09-24T08:00:00Z" }],
+        });
+        let r = rig(&yaml, answer, None).await;
+        let out = sync_once(&r.state, &r.cfg, &mut Memory::default())
+            .await
+            .unwrap();
+        assert!(out.write_error.is_some());
+        assert!(r.stub.lock().unwrap().removal_acks.is_empty());
+    }
+
+    /// A manager from before acknowledgements answers them 404. That is not
+    /// the cycle's failure, and the removal is still applied only once.
+    #[tokio::test]
+    async fn a_manager_without_the_acknowledgement_route_is_tolerated() {
+        let answer = serde_json::json!({
+            "accounts": [],
+            "removed": [{ "username": "a.smith", "removed_at": "2026-09-24T08:00:00Z" }],
+        });
+        let r = rig(TWO_MANAGED, answer, None).await;
+        r.stub.lock().unwrap().removal_ack_status = Some(404);
+        assert!(
+            acknowledge_removal(&r.state, &gone(&["a.smith"])[0])
+                .await
+                .is_ok_and(|a| !a)
+        );
+        let mut memory = Memory::default();
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(out.removed, 1);
+        assert!(memory.removal_ack_failing);
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(out.removed, 0);
+
+        r.stub.lock().unwrap().removal_ack_status = Some(503);
+        assert!(
+            acknowledge_removal(&r.state, &gone(&["a.smith"])[0])
+                .await
+                .is_err()
+        );
+    }
+
+    fn sync_errors(r: &Rig) -> Vec<Option<String>> {
+        r.stub
+            .lock()
+            .unwrap()
+            .queries
+            .iter()
+            .map(|q| {
+                reqwest::Url::parse(&format!("http://manager/?{q}"))
+                    .unwrap()
+                    .query_pairs()
+                    .find(|(k, _)| k == "sync_error")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .collect()
+    }
+
+    /// A file the portal will not rewrite is said on the next poll, so the
+    /// manager can show why its logins go nowhere — and no longer once it
+    /// writes.
+    #[tokio::test]
+    async fn a_blocked_write_is_reported_on_the_next_poll() {
+        let yaml = format!(
+            "{TWO_MANAGED}  phone:\n    password: x\n    email: +61412345678\n    groups: []\n"
+        );
+        let mut answer = requesting(&["a.smith", "b.jones"]);
+        answer["accounts"][0]["display_name"] = "Alexandra".into();
+        let r = rig(&yaml, answer, None).await;
+        let mut memory = Memory::default();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        let errors = sync_errors(&r);
+        assert_eq!(errors[0], None);
+        let said = errors[1]
+            .as_deref()
+            .expect("the blocked write was not reported");
+        assert!(
+            said.starts_with("not rewriting ") && said.contains("`phone`"),
+            "{said}"
+        );
+        assert!(said.len() <= MAX_ACK_ERROR);
+
+        // Quoted, the entry no longer stops the write.
+        std::fs::write(
+            &r.cfg.users_file,
+            yaml.replace("+61412345678", "'+61412345678'"),
+        )
+        .unwrap();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(sync_errors(&r)[3], None);
     }
 
     #[tokio::test]
