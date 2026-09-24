@@ -988,6 +988,42 @@ async fn the_clip_lifecycle_works_over_http() {
         assert_eq!(st, 401, "{method} {path} was answered without a credential");
     }
 
+    // 0b. A feed the relay holds nothing for — dropped by the manager, under a
+    //     token that outlived it — is refused with a sentence the player shows.
+    //     Not `404`: the player reads that as a relay without clip export.
+    let (st, body) = req(
+        addr,
+        "POST",
+        "/origin/feed/clips",
+        Some(ASK.as_bytes()),
+        "application/json",
+        Some(&viewer),
+    )
+    .await;
+    assert_eq!(
+        st, 410,
+        "a clip was asked for on a feed the relay does not hold: {body}"
+    );
+    assert!(
+        body.contains("no longer holds this feed"),
+        "the refusal does not say why: {body}"
+    );
+
+    // The feed is ingested, which gives it the directory clips are filed in.
+    let (st, body) = req(
+        addr,
+        "PUT",
+        "/origin/feed/seg-00001.m4s",
+        Some(b"x"),
+        "video/iso.segment",
+        Some(&ingest),
+    )
+    .await;
+    assert_eq!(
+        st, 201,
+        "the segment PUT that gives the feed its directory failed: {body}"
+    );
+
     // 1. Requesting a clip is accepted, and this is the route-ordering check:
     //    a POST that fell through to the object route could not answer 202.
     let (st, _) = req(addr, "POST", "/origin/feed/clips", Some(ASK.as_bytes()), "application/json", Some(&viewer)).await;

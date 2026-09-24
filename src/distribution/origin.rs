@@ -340,13 +340,16 @@ pub struct OriginStore {
     total_bytes: AtomicU64,
     /// Anchor for `last_put_ms`, so idle time needs no wall clock.
     started: Instant,
-    /// Serialises clip admission — see [`admit_clips`](OriginStore::admit_clips).
-    /// One lock for the store, not one per stream: admission happens when an
-    /// operator presses Export, so there is nothing here to contend for.
-    clip_admission: std::sync::Mutex<()>,
-    /// Serialises read-modify-write of a marks file — see [`marks`] and
-    /// [`lock_marks`](OriginStore::lock_marks). Store-wide for the same reason
-    /// as `clip_admission`: marks are made by hand.
+    /// Serialises clip admission — see [`admit_clips`](OriginStore::admit_clips) —
+    /// and a stream's removal against it. One lock for the store, not one per
+    /// stream: admission happens when an operator presses Export, so there is
+    /// nothing here to contend for. In an `Arc` so the removal, which runs on
+    /// the blocking pool, can take it there.
+    clip_admission: Arc<std::sync::Mutex<()>>,
+    /// Serialises read-modify-write of a marks file, and a stream's removal
+    /// against it — see [`marks`] and [`lock_marks`](OriginStore::lock_marks).
+    /// Store-wide for the same reason as `clip_admission`: marks are made by
+    /// hand.
     marks_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -398,6 +401,10 @@ pub enum ClipRefusal {
     OverBudget { would_use: u64, limit: u64 },
     /// Every candidate name for one mark is held by a different mark.
     NamesExhausted(String),
+    /// The relay holds no directory for the stream: the manager has dropped
+    /// it (or nothing has been ingested yet), and a request must not make it
+    /// again.
+    NoStream,
     Io(std::io::Error),
 }
 
@@ -705,7 +712,7 @@ impl OriginStore {
             streams: DashMap::new(),
             total_bytes: AtomicU64::new(0),
             started: Instant::now(),
-            clip_admission: std::sync::Mutex::new(()),
+            clip_admission: Arc::new(std::sync::Mutex::new(())),
             marks_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         store.adopt_existing();
@@ -1165,17 +1172,6 @@ impl OriginStore {
         }
     }
 
-    /// Record what was asked for. The media follows later, from the edge.
-    ///
-    /// Re-requesting the **same mark** is idempotent: the existing record is
-    /// left alone, so asking again for something already cut does not throw
-    /// away the clip sitting there ready.
-    ///
-    /// A **different** mark that happens to produce the same name is a
-    /// different clip and gets a suffix. The name is built from a timecode and
-    /// a label, so two marks in the same second with the same label collide —
-    /// and silently dropping the second, which is what skipping on name alone
-    /// did, loses an export the operator asked for and reported nothing.
     /// Check this stream's clip budget and file the request, as one operation.
     ///
     /// The two were separate calls with nothing held between them, so two
@@ -1209,15 +1205,29 @@ impl OriginStore {
                 limit: MAX_CLIP_BYTES_PER_STREAM,
             });
         }
-        self.record_clip_requests(stream, req).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                ClipRefusal::NamesExhausted(e.to_string())
-            } else {
-                ClipRefusal::Io(e)
-            }
-        })
+        self.record_clip_requests(stream, req)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => ClipRefusal::NamesExhausted(e.to_string()),
+                std::io::ErrorKind::NotFound => ClipRefusal::NoStream,
+                _ => ClipRefusal::Io(e),
+            })
     }
 
+    /// Record what was asked for. The media follows later, from the edge.
+    ///
+    /// Re-requesting the **same mark** is idempotent: the existing record is
+    /// left alone, so asking again for something already cut does not throw
+    /// away the clip sitting there ready.
+    ///
+    /// A **different** mark that happens to produce the same name is a
+    /// different clip and gets a suffix. The name is built from a timecode and
+    /// a label, so two marks in the same second with the same label collide —
+    /// and silently dropping the second, which is what skipping on name alone
+    /// did, loses an export the operator asked for and reported nothing.
+    ///
+    /// Fails `NotFound` for a stream the relay holds no directory for, and
+    /// makes none: `clips/` is created inside an existing stream directory or
+    /// not at all.
     pub fn record_clip_requests(
         &self,
         stream: &str,
@@ -1235,7 +1245,19 @@ impl OriginStore {
                 format!("origin: unsafe clip name '{}'", bad.name),
             ));
         }
-        std::fs::create_dir_all(&dir)?;
+        // Only into a stream the relay holds, as for marks. The directory is
+        // ingest's to make and the manager's to remove, and a viewer token
+        // outlives the session: a request after the drop used to make the
+        // stream again with `create_dir_all`, after which a mark the player
+        // was still retrying landed in it too — a clip record and a marks
+        // list for a deleted session that only the seven-day backstop would
+        // ever find. `clips/` alone is made here, never what is above it, so
+        // a stream with no directory fails right here with `NotFound`.
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let mut out = Vec::new();
         // One listing for the whole request. It used to be re-read per
@@ -1556,7 +1578,24 @@ impl OriginStore {
             }
             None => self.cfg.root.join(stream),
         };
-        if let Err(e) = tokio::fs::remove_dir_all(&dir).await
+        // Under both locks that write into a stream's session files, each of
+        // which checks the stream directory exists before it writes. Without
+        // them a write that had passed its check could make `marks/` or
+        // `clips/` again behind `remove_dir_all`'s walk; the final rmdir then
+        // failed, and a marks list or a clip request outlived its session
+        // with a success sent for it. Marks and admissions for every stream
+        // wait out one removal, which is rare, and both are made by hand.
+        let marks = self.lock_marks().await;
+        let admission = self.clip_admission.clone();
+        let target = dir.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            let _marks = marks;
+            let _admitting = admission.lock().unwrap_or_else(|e| e.into_inner());
+            std::fs::remove_dir_all(&target)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        if let Err(e) = removed
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
@@ -2484,6 +2523,15 @@ async fn clips_request(
             ),
         )
             .into_response(),
+        // `410`, not the `404` the marks surface answers for the same thing:
+        // the player reads a `404` here as a relay without clip export, and
+        // says so. What is reachable is a session the manager has deleted,
+        // under a viewer token that has outlived it.
+        Err(ClipRefusal::NoStream) => (
+            StatusCode::GONE,
+            "the relay no longer holds this feed, so there is nothing to cut a clip from",
+        )
+            .into_response(),
         Err(ClipRefusal::Io(e)) => {
             tracing::warn!(stream = %stream, error = %e, "origin: could not record clip request");
             (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request").into_response()
@@ -3120,6 +3168,12 @@ mod tests {
             idle_grace: Duration::from_millis(80),
         })
         .expect("store should build")
+    }
+
+    /// Give `stream` the directory ingest would have made: clip requests and
+    /// marks are written only into one that exists.
+    fn ingested(tmp: &tempfile::TempDir, stream: &str) {
+        std::fs::create_dir_all(tmp.path().join("origin").join(stream)).unwrap();
     }
 
     /// Backdate a file, so a test can reach a grace period measured in hours.
@@ -4294,6 +4348,7 @@ seg-1.m4s
     async fn a_clip_is_pending_until_its_media_arrives() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         let req = ClipRequest {
             pre_secs: 10,
             post_secs: 20,
@@ -4329,6 +4384,7 @@ seg-1.m4s
     async fn clips_are_not_evicted_with_the_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         s.record_clip_requests(
             "feed",
             &ClipRequest {
@@ -4378,6 +4434,7 @@ seg-1.m4s
     async fn an_idle_sweep_retires_a_stream_without_taking_its_clips() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         s.record_clip_requests(
             "feed",
             &ClipRequest {
@@ -4467,6 +4524,7 @@ seg-1.m4s
     async fn the_relay_reclaims_clip_debris_it_alone_can_see() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         s.record_clip_requests(
             "feed",
             &ClipRequest {
@@ -4526,6 +4584,7 @@ seg-1.m4s
         put_seg(&s, "live", "seg-00001.m4s", 8).await;
         write("live");
         age(&list("live"), CLIP_MAX_AGE * 2);
+        ingested(&tmp, "cut");
         s.record_clip_requests(
             "cut",
             &ClipRequest {
@@ -4586,6 +4645,7 @@ seg-1.m4s
     async fn an_emptied_clip_directory_is_not_left_on_disk_for_ever() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         s.record_clip_requests(
             "feed",
             &ClipRequest {
@@ -4621,6 +4681,7 @@ seg-1.m4s
     async fn clips_asked_for_but_not_yet_cut_still_count_against_the_budget() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
 
         fn batch(n: usize) -> ClipRequest {
             ClipRequest {
@@ -4668,6 +4729,7 @@ seg-1.m4s
     async fn a_name_that_cannot_be_freed_is_refused_rather_than_reused() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
 
         // Ten distinct marks, one label. The first nine take `Goal` and
         // `Goal (2)`..`Goal (9)`.
@@ -4714,6 +4776,7 @@ seg-1.m4s
     async fn dropping_a_stream_takes_its_clips_too() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         s.record_clip_requests(
             "feed",
             &ClipRequest {
@@ -4732,6 +4795,85 @@ seg-1.m4s
         s.remove_stream("feed").await;
         assert!(s.read_clip("feed", "keeper").await.is_none());
         assert!(s.list_clips("feed").is_empty());
+    }
+
+    /// ...nor come back after it. A viewer token outlives the session, and a
+    /// clip request after the drop used to make the stream's directory again,
+    /// after which a mark the player was still retrying landed in it too: a
+    /// clip record and a marks list for a deleted session, found only by the
+    /// seven-day backstop.
+    #[tokio::test]
+    async fn a_clip_request_does_not_bring_a_dropped_stream_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        let stream_dir = tmp.path().join("origin").join("feed");
+        put_seg(&s, "feed", "seg-00001.m4s", 64).await;
+        s.remove_stream("feed").await;
+
+        let ask = ClipRequest {
+            pre_secs: 5,
+            post_secs: 5,
+            clips: vec![ClipAsk {
+                at: "2026-09-07T23:06:53.200Z".into(),
+                name: "late".into(),
+            }],
+        };
+        assert!(
+            matches!(s.admit_clips("feed", &ask), Err(ClipRefusal::NoStream)),
+            "a clip was admitted for a stream the relay does not hold"
+        );
+        assert!(
+            !stream_dir.exists(),
+            "a clip request re-created a dropped stream"
+        );
+        let late_mark = marks::NewMark {
+            at: 1_790_000_000_000,
+            name: String::new(),
+            colour: String::new(),
+            exported: false,
+        };
+        assert!(matches!(
+            s.add_mark("feed", late_mark).await,
+            Err(marks::MarkRefusal::NoStream)
+        ));
+        assert!(!stream_dir.exists(), "a mark after the clip request landed");
+    }
+
+    /// A drop waits for a clip admission in progress, for the reason it waits
+    /// for a marks write: an admission that had passed its check could make
+    /// `clips/` behind `remove_dir_all`'s walk and outlive the session.
+    #[tokio::test]
+    async fn a_drop_waits_for_a_clip_admission_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Arc::new(store(&tmp, 0));
+        ingested(&tmp, "feed");
+        let stream_dir = tmp.path().join("origin").join("feed");
+
+        // Held on a thread of its own, as admission holds it on the blocking
+        // pool, and never across an await here.
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let admission = s.clip_admission.clone();
+        let admitting = std::thread::spawn(move || {
+            let _admitting = admission.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+
+        let dropping = tokio::spawn({
+            let s = s.clone();
+            async move { s.remove_stream("feed").await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            stream_dir.exists(),
+            "the drop went ahead under a clip admission in progress"
+        );
+        release_tx.send(()).unwrap();
+        admitting.join().unwrap();
+        dropping.await.unwrap();
+        assert!(!stream_dir.exists(), "the drop did not happen once free");
     }
 
     /// A restart must not sweep the clips up as debris.
@@ -4772,6 +4914,7 @@ seg-1.m4s
     async fn a_clip_the_edge_gave_up_on_stops_being_pending() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         s.record_clip_requests(
             "feed",
             &ClipRequest {
@@ -4805,6 +4948,7 @@ seg-1.m4s
     async fn a_second_mark_with_the_same_name_is_not_swallowed() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         let ask = |at: &str| ClipRequest {
             pre_secs: 5,
             post_secs: 5,
@@ -4836,6 +4980,7 @@ seg-1.m4s
     async fn a_clip_can_be_deleted_and_stops_being_counted() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
         s.record_clip_requests(
             "feed",
             &ClipRequest {

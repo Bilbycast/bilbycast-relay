@@ -81,7 +81,7 @@ they are not either/or.
 | `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |
-| `POST` | `/origin/{stream}/clips` | Player asks for one or more clips around marked moments (viewer or ingest token, always) |
+| `POST` | `/origin/{stream}/clips` | Player asks for one or more clips around marked moments; `410` once the relay holds no directory for the stream (viewer or ingest token, always) |
 | `GET` | `/origin/{stream}/clips` | List this stream's clips and their state — the edge's work queue, and the portal's listing (viewer or ingest token, always) |
 | `PUT` | `/origin/{stream}/clips/{name}.mp4` | Edge uploads a finished clip (ingest token, always; refused if no record asked for it) |
 | `GET` | `/origin/{stream}/clips/{name}.mp4` | Download a finished clip — streamed, `Range` supported (viewer or ingest token, always) |
@@ -660,11 +660,15 @@ makes it, the manager's drop removes it. A viewer token outlives the session,
 so a mark posted after the drop is refused with `404` rather than bringing the
 directory back for the backstop alone to find; the player keeps such a mark
 pending and posts it once the directory exists, which also covers a mark made
-in the seconds before the first segment lands. Reading a stream with no
-directory is an empty list. Writes queue on one store-wide lock, waited for as
-tasks rather than on the blocking pool's threads: each write syncs the file and
-its directory while holding it, and threads parked behind it would starve every
-other file operation on the relay, segment ingest included. A `marks.json` that will not parse (a hand edit, a
+in the seconds before the first segment lands. A clip request after the drop is
+refused too (see "Clip export"), so it cannot make the directory for such a
+mark to land in, and the drop waits for a marks write or a clip admission
+already under way, so neither can recreate `marks/` or `clips/` behind it.
+Reading a stream with no directory is an empty list. Writes queue on one
+store-wide lock, waited for as tasks rather than on the blocking pool's
+threads: each write syncs the file and its directory while holding it, and
+threads parked behind it would starve every other file operation on the relay,
+segment ingest included. A `marks.json` that will not parse (a hand edit, a
 disk fault) is set aside as `marks.json.unreadable-<time>` by the first request
 of any kind — a read included — and the list starts again empty. A read or
 write that fails is `503` with `Retry-After`; `500` is kept for a relay with no
@@ -789,8 +793,13 @@ the same name are two clips: the second becomes `… (2)`. Re-requesting the
 
 **A request is a job, not a file.** `POST /origin/{stream}/clips` answers `202`
 and records each clip as pending; the edge polls the list, cuts, and `PUT`s the
-result. A clip it cannot produce is reported `failed` with a reason, so it stops
-reading as "still being cut" — the portal shows the reason. See the edge's
+result. A request for a stream the relay holds no directory for — a session the
+manager has deleted, under a viewer token that outlived it — is `410` with a
+sentence the player shows, and makes no directory: `clips/` is only ever
+created inside a stream ingest has made. (Not `404`, which the player reads as
+a relay without clip export.) A clip it cannot produce is reported `failed`
+with a reason, so it stops reading as "still being cut" — the portal shows the
+reason. See the edge's
 [replay.md](../../bilbycast-edge/docs/replay.md#clip-export) for how the cut is
 made and what it will not do.
 

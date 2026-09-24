@@ -26,9 +26,13 @@
 //! Ingest makes that directory and the manager's drop removes it; a mark
 //! arriving after the drop — a viewer token is stateless and outlives the
 //! session — is refused with `404` rather than bringing the directory back,
-//! where nothing but the backstop would ever find it again. Reading a stream
-//! with no directory is an empty list, not an error: a player opened before
-//! the first segment lands must not conclude the relay has no marks at all.
+//! where nothing but the backstop would ever find it again. A clip request
+//! is refused on the same rule, so it cannot bring the directory back for a
+//! mark to land in either, and the drop holds the marks lock: a write in
+//! flight lands before the directory goes, and goes with it, or finds it
+//! gone. Reading a stream with no directory is an empty list, not an error:
+//! a player opened before the first segment lands must not conclude the
+//! relay has no marks at all.
 //!
 //! **Writers queue as tasks, not threads.** The lock is a `tokio` mutex taken
 //! before a write goes to the blocking pool and held until it is done there —
@@ -240,8 +244,11 @@ fn load_or_set_aside(path: &FsPath, stream: &str) -> std::io::Result<MarkSet> {
 /// data is synced before the rename, and the directory after it.
 ///
 /// `marks/` is created here; the stream directory above it never is. That one
-/// is ingest's to make and the manager's to remove, and a write that loses a
-/// race with `remove_stream` must fail rather than put it back.
+/// is ingest's to make and the manager's to remove. `remove_stream` holds the
+/// marks lock, so no write here races it. Retirement and the seven-day
+/// backstop remove `marks/` and an emptied stream directory without it, and
+/// can still take either from under a write; that write must then fail rather
+/// than put the stream back.
 fn store(path: &FsPath, set: &MarkSet) -> std::io::Result<()> {
     let dir = path
         .parent()
@@ -333,9 +340,9 @@ impl OriginStore {
         let held = self.lock_marks().await;
         blocking(stream, move || {
             let _held = held;
-            // Checked under the lock, and `store` creates nothing above
-            // `marks/`, so a list cannot outlive the stream it belongs to.
-            // See the module header.
+            // Checked under the lock, which `remove_stream` takes as well, and
+            // `store` creates nothing above `marks/`: a list cannot outlive
+            // the stream it belongs to. See the module header.
             if !stream_dir.is_dir() {
                 return Err(MarkRefusal::NoStream);
             }
@@ -958,6 +965,37 @@ mod tests {
         .expect_err("a list was written for a stream with no directory");
         assert_eq!(refused.kind(), std::io::ErrorKind::NotFound);
         assert!(!stream_dir.exists(), "a write re-created a dropped stream");
+    }
+
+    /// A drop waits for a marks write in progress, so the write lands before
+    /// the directory goes, and goes with it, or finds no directory. Without
+    /// the lock a write that had passed its check could make `marks/` behind
+    /// `remove_dir_all`'s walk, whose last rmdir then failed and left the
+    /// list behind with a `201` sent for it.
+    #[tokio::test]
+    async fn a_drop_waits_for_a_marks_write_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(store(&tmp));
+        ingested(&tmp, "feed");
+        let stream_dir = tmp.path().join("origin/feed");
+
+        let writing = s.lock_marks().await;
+        let dropping = tokio::spawn({
+            let s = s.clone();
+            async move { s.remove_stream("feed").await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            stream_dir.exists(),
+            "the drop went ahead under a marks write in progress"
+        );
+        drop(writing);
+        dropping.await.unwrap();
+        assert!(!stream_dir.exists(), "the drop did not happen once free");
+        assert!(matches!(
+            s.add_mark("feed", at(T0)).await,
+            Err(MarkRefusal::NoStream)
+        ));
     }
 
     /// Marks writers waiting for the lock wait as tasks, not on threads of
