@@ -1272,11 +1272,16 @@ Host: x
 ///
 /// Three things only a real listener can show. The routes are reached at all —
 /// `marks` is a static segment beside the `{file}` capture every segment GET
-/// goes through, and a mark that fell through to the object route would come
-/// back 404 or 405 with nothing in the log. The gate holds on a relay whose
-/// read gate is at its shipped default (off): marks are a shared write surface,
-/// so they must not ride the flag a CDN pull needs open. And a poll with the
-/// current validator costs a 304, which is what makes polling affordable.
+/// goes through, and a request that fell through to the object route would
+/// come back with nothing in the log: 400 to a GET (the object route's name
+/// check wants a `.`, and `marks` has none — which is also exactly what a
+/// relay predating the list answers, and what the player takes as "no shared
+/// marks here"), 405 to a POST (that route has only PUT and GET), and 404 to a
+/// PATCH or DELETE of `marks/{id}` (no route has three segments there). The
+/// gate holds on a relay whose read gate is at its shipped default (off):
+/// marks are a shared write surface, so they must not ride the flag a CDN pull
+/// needs open. And a poll with the current validator costs a 304, which is
+/// what makes polling affordable.
 #[tokio::test]
 async fn shared_marks_work_over_http_and_need_a_viewer_token() {
     use std::net::SocketAddr;
@@ -1377,6 +1382,22 @@ async fn shared_marks_work_over_http_and_need_a_viewer_token() {
     let other = token::mint_viewer_token(SECRET, "elsewhere", exp).unwrap();
     let ingest = token::mint_ingest_token(SECRET, "feed", exp).unwrap();
 
+    // The feed is being ingested: marks are written only into a stream the
+    // relay holds a directory for.
+    let (st, _, body) = req(
+        addr,
+        "PUT",
+        "/origin/feed/seg-00001.m4s",
+        Some("x"),
+        Some(&ingest),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st, 201,
+        "the segment PUT that gives the feed its directory failed: {body}"
+    );
+
     // 1. No credential, another stream's, or the edge's: refused, every verb.
     for (method, path, payload) in [
         ("GET", "/origin/feed/marks", None),
@@ -1445,7 +1466,56 @@ async fn shared_marks_work_over_http_and_need_a_viewer_token() {
     let (_, _, body) = req(addr, "GET", "/origin/feed/marks", None, Some(&viewer), None).await;
     assert!(body.contains("\"marks\":[]"), "a deleted mark is still listed: {body}");
 
-    // 7. The segment route beside it is untouched.
-    let (st, _, _) = req(addr, "GET", "/origin/feed/seg-00001.m4s", None, None, None).await;
-    assert_eq!(st, 404, "the object route was disturbed by the marks routes");
+    // 7. A feed the relay holds nothing for — not ingested yet, or dropped by
+    // the manager — reads as an empty list and refuses a mark with 404, which
+    // the player keeps pending and retries. Its directory is not created.
+    let (st, _, body) = req(
+        addr,
+        "GET",
+        "/origin/elsewhere/marks",
+        None,
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st, 200,
+        "a feed with no directory did not read as an empty list: {body}"
+    );
+    assert!(body.contains("\"marks\":[]"), "{body}");
+    let (st, _, _) = req(
+        addr,
+        "POST",
+        "/origin/elsewhere/marks",
+        Some(MARK),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st, 404,
+        "a mark was written for a feed the relay holds nothing for"
+    );
+    let (st, _, body) = req(
+        addr,
+        "GET",
+        "/origin/elsewhere/marks",
+        None,
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(
+        body.contains("\"marks\":[]"),
+        "a refused mark was stored after all: {body}"
+    );
+
+    // 8. The segment route beside it is untouched: what was PUT comes back.
+    let (st, _, body) = req(addr, "GET", "/origin/feed/seg-00001.m4s", None, None, None).await;
+    assert_eq!(
+        st, 200,
+        "the object route was disturbed by the marks routes"
+    );
+    assert_eq!(body, "x");
 }

@@ -22,6 +22,14 @@
 //! the session when the manager drops the stream (`remove_stream`), and has
 //! the same seven-day backstop under a manager that never comes back.
 //!
+//! **A list is written only into a stream directory that already exists.**
+//! Ingest makes that directory and the manager's drop removes it; a mark
+//! arriving after the drop — a viewer token is stateless and outlives the
+//! session — is refused with `404` rather than bringing the directory back,
+//! where nothing but the backstop would ever find it again. Reading a stream
+//! with no directory is an empty list, not an error: a player opened before
+//! the first segment lands must not conclude the relay has no marks at all.
+//!
 //! **Viewers learn about each other's changes by polling** `GET`, which answers
 //! `304` while the list is unchanged. At six viewers polling every few seconds
 //! that is a handful of header exchanges a second, and it keeps the relay free
@@ -43,7 +51,7 @@ use axum::response::{IntoResponse, Response};
 use super::{MARKS_DIR, OriginStore, PART_SUFFIX, if_none_match_matches};
 use crate::distribution::DistributionState;
 
-const MARKS_FILE: &str = "marks.json";
+pub(super) const MARKS_FILE: &str = "marks.json";
 
 /// How many marks one stream may hold.
 ///
@@ -57,6 +65,11 @@ pub const MAX_MARKS_PER_STREAM: usize = 500;
 ///
 /// A mark's name is a label on a list row and in a tooltip, not a note.
 pub const MAX_MARK_NAME_CHARS: usize = 120;
+
+/// What a refused name is told. Shown to the operator verbatim, so it says
+/// both rules `valid_name` applies, and the limit as it is: 120 is allowed.
+const NAME_REFUSED: &str =
+    "a mark's name must be at most 120 characters of plain text — no tabs or line breaks";
 
 /// Largest body a marks request may send. One mark is well under 300 bytes.
 const MAX_MARKS_JSON_BYTES: usize = 16 * 1024;
@@ -146,6 +159,12 @@ pub enum MarkRefusal {
     Invalid(&'static str),
     TooMany,
     NotFound,
+    /// The relay holds no directory for the stream: nothing has been
+    /// ingested yet, or the manager has dropped it. See the module header.
+    NoStream,
+    /// A read or a write failed. Answered `503`, which the player retries:
+    /// `500` is kept for the one refusal it must not retry, a token gate with
+    /// no secret to check against.
     Io(std::io::Error),
 }
 
@@ -181,21 +200,72 @@ fn load(path: &FsPath) -> std::io::Result<MarkSet> {
     }
 }
 
-/// Replace the list whole or not at all — the same temp-then-rename the clip
-/// records use, and for the same reason: a crash inside a truncating write
-/// leaves a file that parses as nothing, and here that is every viewer's marks.
+/// Read a stream's list, setting aside one that will not parse. Call only
+/// under the store's marks lock: the rename must not race a writer.
+///
+/// Unreadable is set aside rather than overwritten: it is the one copy of
+/// everyone's marks, and whoever looks at the disk later deserves the chance
+/// to recover it. The list starts again empty rather than refusing every
+/// request for the rest of the session.
+fn load_or_set_aside(path: &FsPath, stream: &str) -> std::io::Result<MarkSet> {
+    match load(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let aside = path.with_extension(format!(
+                "json.unreadable-{}",
+                chrono::Utc::now().format("%Y%m%dT%H%M%S")
+            ));
+            tracing::warn!(
+                stream = %stream, error = %e, kept_as = %aside.display(),
+                "origin: marks file would not parse; set aside and starting a new list"
+            );
+            let _ = std::fs::rename(path, &aside);
+            Ok(MarkSet::default())
+        }
+        other => other,
+    }
+}
+
+/// Replace the list whole or not at all, and durably.
+///
+/// The same temp-then-rename the clip records use, and for the same reason: a
+/// crash inside a truncating write leaves a file that parses as nothing, and
+/// here that is every viewer's marks. The rename alone covers this process
+/// dying; it does not cover the host losing power, where a filesystem without
+/// ext4's flush-on-replace can put the new name on data that never reached
+/// the disk — exactly the empty file the rename was meant to rule out. So the
+/// data is synced before the rename, and the directory after it.
+///
+/// `marks/` is created here; the stream directory above it never is. That one
+/// is ingest's to make and the manager's to remove, and a write that loses a
+/// race with `remove_stream` must fail rather than put it back.
 fn store(path: &FsPath, set: &MarkSet) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("origin: marks path has no directory"))?;
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
     }
     let body = serde_json::to_vec(set).map_err(std::io::Error::other)?;
     let tmp = path.with_extension(format!("json{PART_SUFFIX}"));
-    std::fs::write(&tmp, body)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = write_synced(&tmp, &body).and_then(|()| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    // Best effort: the list is already in place, and a directory that cannot
+    // be opened for a sync is no reason to report the mark as lost.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
+}
+
+fn write_synced(path: &FsPath, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(body)?;
+    f.sync_all()
 }
 
 impl OriginStore {
@@ -206,8 +276,16 @@ impl OriginStore {
 
     /// The stream's list as it stands. Blocking: call from the blocking pool.
     ///
-    /// Takes no lock. Every write lands by rename, so a reader sees the whole
-    /// old list or the whole new one.
+    /// Reads without the lock: every write lands by rename, so a reader sees
+    /// the whole old list or the whole new one. The lock is taken only to
+    /// recover a file that will not parse, which is set aside here exactly as
+    /// a write would set it aside. Left to the writes, a broken list stayed
+    /// broken for as long as nobody marked anything — and a player that could
+    /// not read the list had no way to know a write would fix it.
+    ///
+    /// Read again under the lock before anything is renamed: a writer may have
+    /// set the file aside and stored a fresh one in the meantime, and moving
+    /// that one out of the way would lose a mark.
     pub fn list_marks(&self, stream: &str) -> std::io::Result<MarkSet> {
         let Some(path) = self.marks_path(stream) else {
             return Err(std::io::Error::new(
@@ -215,7 +293,13 @@ impl OriginStore {
                 "origin: unsafe stream name",
             ));
         };
-        load(&path)
+        match load(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let _writing = self.marks_lock.lock().unwrap_or_else(|e| e.into_inner());
+                load_or_set_aside(&path, stream)
+            }
+            other => other,
+        }
     }
 
     /// Read, change and write back, under the store's marks lock.
@@ -236,26 +320,13 @@ impl OriginStore {
         // and without it two viewers marking in the same instant would each
         // read the same list and the second write would drop the first mark.
         let _writing = self.marks_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut set = match load(&path) {
-            Ok(s) => s,
-            // Unreadable is set aside rather than overwritten: it is the one
-            // copy of everyone's marks, and whoever looks at the disk later
-            // deserves the chance to recover it. The list starts again empty
-            // rather than refusing every write for the rest of the session.
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                let aside = path.with_extension(format!(
-                    "json.unreadable-{}",
-                    chrono::Utc::now().format("%Y%m%dT%H%M%S")
-                ));
-                tracing::warn!(
-                    stream = %stream, error = %e, kept_as = %aside.display(),
-                    "origin: marks file would not parse; set aside and starting a new list"
-                );
-                let _ = std::fs::rename(&path, &aside);
-                MarkSet::default()
-            }
-            Err(e) => return Err(MarkRefusal::Io(e)),
-        };
+        // Checked under the lock, and `store` creates nothing above `marks/`,
+        // so a list cannot outlive the stream it belongs to. See the module
+        // header.
+        if !self.cfg.root.join(stream).is_dir() {
+            return Err(MarkRefusal::NoStream);
+        }
+        let mut set = load_or_set_aside(&path, stream)?;
         let (out, changed) = f(&mut set)?;
         if changed {
             if set.epoch.is_empty() {
@@ -284,9 +355,7 @@ impl OriginStore {
             ));
         }
         if !valid_name(&new.name) {
-            return Err(MarkRefusal::Invalid(
-                "a mark's name must be under 120 characters of text",
-            ));
+            return Err(MarkRefusal::Invalid(NAME_REFUSED));
         }
         if !valid_colour(&new.colour) {
             return Err(MarkRefusal::Invalid("a mark's colour must be #rrggbb"));
@@ -320,9 +389,7 @@ impl OriginStore {
             return Err(MarkRefusal::NotFound);
         }
         if edit.name.as_deref().is_some_and(|n| !valid_name(n)) {
-            return Err(MarkRefusal::Invalid(
-                "a mark's name must be under 120 characters of text",
-            ));
+            return Err(MarkRefusal::Invalid(NAME_REFUSED));
         }
         if edit.colour.as_deref().is_some_and(|c| !valid_colour(c)) {
             return Err(MarkRefusal::Invalid("a mark's colour must be #rrggbb"));
@@ -419,12 +486,24 @@ fn refusal(stream: &str, r: MarkRefusal) -> Response {
         )
             .into_response(),
         MarkRefusal::NotFound => (StatusCode::NOT_FOUND, no_store, "no such mark").into_response(),
+        // 404 is what the player keeps a new mark pending on and tries again,
+        // so a mark made in the seconds before the first segment lands is
+        // posted once it has.
+        MarkRefusal::NoStream => (
+            StatusCode::NOT_FOUND,
+            no_store,
+            "the relay holds nothing for this feed to mark",
+        )
+            .into_response(),
         MarkRefusal::Io(e) => {
             tracing::warn!(stream = %stream, error = %e, "origin: marks could not be read or written");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                no_store,
-                "could not update the marks",
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::CACHE_CONTROL, "no-store"),
+                    (header::RETRY_AFTER, "3"),
+                ],
+                "could not read or write the marks",
             )
                 .into_response()
         }
@@ -584,6 +663,12 @@ mod tests {
         .unwrap()
     }
 
+    /// Give `stream` the directory ingest would have made: marks are written
+    /// only into one that exists.
+    fn ingested(tmp: &tempfile::TempDir, stream: &str) {
+        std::fs::create_dir_all(tmp.path().join("origin").join(stream)).unwrap();
+    }
+
     fn at(ms: i64) -> NewMark {
         NewMark {
             at: ms,
@@ -597,6 +682,7 @@ mod tests {
     fn a_mark_one_viewer_makes_is_the_list_every_viewer_reads() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
+        ingested(&tmp, "feed");
         assert!(s.list_marks("feed").unwrap().marks.is_empty());
         assert_eq!(s.list_marks("feed").unwrap().etag(), "\"marks-none\"");
 
@@ -619,6 +705,7 @@ mod tests {
     fn the_same_instant_twice_is_one_mark_and_no_new_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
+        ingested(&tmp, "feed");
         let (_, first) = s.add_mark("feed", at(T0)).unwrap();
         let etag = s.list_marks("feed").unwrap().etag();
         let (set, again) = s.add_mark("feed", at(T0)).unwrap();
@@ -635,6 +722,7 @@ mod tests {
     fn edits_apply_only_what_they_name_and_a_no_op_keeps_the_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
+        ingested(&tmp, "feed");
         let (_, id) = s.add_mark("feed", at(T0)).unwrap();
         let set = s
             .edit_mark(
@@ -685,6 +773,7 @@ mod tests {
     fn deleting_twice_succeeds_twice() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
+        ingested(&tmp, "feed");
         let (_, id) = s.add_mark("feed", at(T0)).unwrap();
         assert!(s.delete_mark("feed", &id).unwrap().marks.is_empty());
         let rev = s.list_marks("feed").unwrap().rev;
@@ -696,6 +785,7 @@ mod tests {
     fn malformed_marks_are_refused_before_they_are_stored() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
+        ingested(&tmp, "feed");
         // Seconds where milliseconds were meant: a mark nobody could place.
         assert!(matches!(
             s.add_mark("feed", at(1_790_000_000)),
@@ -709,10 +799,20 @@ mod tests {
         ));
         let mut bad = at(T0);
         bad.name = "x".repeat(MAX_MARK_NAME_CHARS + 1);
-        assert!(matches!(
-            s.add_mark("feed", bad),
-            Err(MarkRefusal::Invalid(_))
-        ));
+        let Err(MarkRefusal::Invalid(why)) = s.add_mark("feed", bad) else {
+            panic!("a name past the limit was stored");
+        };
+        // The operator is shown this, so it must state the limit as it is.
+        assert!(
+            why.contains(&format!("at most {MAX_MARK_NAME_CHARS} characters")),
+            "{why}"
+        );
+        let mut exactly = at(T0 + 1);
+        exactly.name = "x".repeat(MAX_MARK_NAME_CHARS);
+        assert!(
+            s.add_mark("feed", exactly).is_ok(),
+            "a name at the limit was refused"
+        );
         let mut bad = at(T0);
         bad.name = "line\nbreak".into();
         assert!(matches!(
@@ -736,6 +836,7 @@ mod tests {
     fn a_stream_is_capped() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
+        ingested(&tmp, "feed");
         for i in 0..MAX_MARKS_PER_STREAM as i64 {
             s.add_mark("feed", at(T0 + i)).unwrap();
         }
@@ -749,9 +850,12 @@ mod tests {
     fn a_list_started_again_does_not_answer_an_old_validator() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
+        ingested(&tmp, "feed");
         s.add_mark("feed", at(T0)).unwrap();
         let old = s.list_marks("feed").unwrap().etag();
         std::fs::remove_dir_all(tmp.path().join("origin/feed")).unwrap();
+        // A new session under the same name ingests, and is marked.
+        ingested(&tmp, "feed");
         s.add_mark("feed", at(T0 + 1)).unwrap();
         let new = s.list_marks("feed").unwrap();
         assert_eq!(
@@ -765,26 +869,100 @@ mod tests {
         );
     }
 
+    /// A list that will not parse — a hand edit, or a zero-length file after
+    /// a power cut — is recovered by the first request of any kind.
+    ///
+    /// Recovery used to happen on a write only, while a read answered an
+    /// error. A player that could not read the list never wrote to it, so a
+    /// feed nobody happened to mark stayed broken for every viewer.
     #[test]
-    fn an_unreadable_list_is_set_aside_not_overwritten() {
+    fn an_unreadable_list_is_set_aside_by_a_read_not_overwritten() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         let dir = tmp.path().join("origin/feed").join(MARKS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(MARKS_FILE), b"{not json").unwrap();
-        assert!(
-            s.list_marks("feed").is_err(),
-            "a corrupt list read as empty"
+        let unreadable = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains("unreadable"))
+                .count()
+        };
+
+        let listed = s
+            .list_marks("feed")
+            .expect("a corrupt list was an error to a read, not recovered");
+        assert!(listed.marks.is_empty());
+        assert_eq!(
+            unreadable(),
+            1,
+            "the unreadable list was destroyed rather than kept for recovery"
         );
+        assert!(
+            !dir.join(MARKS_FILE).exists(),
+            "the corrupt file is still in place"
+        );
+
         s.add_mark("feed", at(T0)).unwrap();
         assert_eq!(s.list_marks("feed").unwrap().marks.len(), 1);
-        let kept = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().contains("unreadable"));
+        assert_eq!(unreadable(), 1, "a healthy list was set aside as well");
+    }
+
+    /// A stream the relay holds no directory for — nothing ingested yet, or
+    /// dropped by the manager — reads as an empty list and is never written.
+    ///
+    /// A viewer token is stateless and outlives the session, so a mark could
+    /// arrive after the drop and quietly re-create the directory, where only
+    /// the seven-day backstop would ever find it.
+    #[test]
+    fn a_stream_the_relay_does_not_hold_is_read_as_empty_and_never_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let stream_dir = tmp.path().join("origin/feed");
+
+        let listed = s.list_marks("feed").unwrap();
+        assert!(listed.marks.is_empty());
+        assert_eq!(listed.etag(), "\"marks-none\"");
+        assert!(matches!(
+            s.add_mark("feed", at(T0)),
+            Err(MarkRefusal::NoStream)
+        ));
         assert!(
-            kept,
-            "the unreadable list was destroyed rather than kept for recovery"
+            !stream_dir.exists(),
+            "a refused mark created the stream's directory"
+        );
+
+        // The one write that can lose that race — the store itself — makes
+        // `marks/` and nothing above it.
+        let refused = super::store(
+            &stream_dir.join(MARKS_DIR).join(MARKS_FILE),
+            &MarkSet::default(),
+        )
+        .expect_err("a list was written for a stream with no directory");
+        assert_eq!(refused.kind(), std::io::ErrorKind::NotFound);
+        assert!(!stream_dir.exists(), "a write re-created a dropped stream");
+    }
+
+    /// `500` is the token gate's alone, the one refusal the player takes as
+    /// "this relay has no shared marks" for good. A disk that failed once
+    /// must read as worth trying again.
+    #[test]
+    fn a_failed_read_or_write_is_retryable_and_not_the_gates_500() {
+        let r = refusal("feed", MarkRefusal::Io(std::io::Error::other("disk")));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers().get(header::RETRY_AFTER).map(|v| v.as_bytes()),
+            Some(&b"3"[..])
+        );
+        assert_eq!(
+            r.headers().get(header::CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(&b"no-store"[..])
+        );
+        // What the player keeps a new mark pending on.
+        assert_eq!(
+            refusal("feed", MarkRefusal::NoStream).status(),
+            StatusCode::NOT_FOUND
         );
     }
 
@@ -810,6 +988,8 @@ mod tests {
             s.add_mark("feed", at(T0)).unwrap();
         }
         // Restart: adoption treats anything that is not a segment as debris.
+        // What keeps `marks/` out of that is `is_session_subdir`, pinned by
+        // its own test in `origin.rs`; this checks the outcome.
         let s = store(&tmp);
         assert_eq!(
             s.list_marks("feed").unwrap().marks.len(),
@@ -830,6 +1010,15 @@ mod tests {
         assert!(
             s.list_marks("feed").unwrap().marks.is_empty(),
             "the session's marks outlived it"
+        );
+        // And a viewer still holding a token cannot bring them back.
+        assert!(matches!(
+            s.add_mark("feed", at(T0 + 1)),
+            Err(MarkRefusal::NoStream)
+        ));
+        assert!(
+            !tmp.path().join("origin/feed").exists(),
+            "a mark after the drop re-created the stream's directory"
         );
     }
 
