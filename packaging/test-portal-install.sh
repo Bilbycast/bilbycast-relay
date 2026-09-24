@@ -134,5 +134,22 @@ PY
 check "config with an origin is valid"  "$(cfgjson '"https://relay.example"')" "https://relay.example"
 check "config without one is valid"     "$(cfgjson '')"                        "empty"
 
+echo
+echo "== the unit lets account sync write Authelia's users directory, and nothing else =="
+# ProtectSystem=strict makes everything read-only; without this line every
+# account-sync write fails with EROFS and no account or link is ever made.
+UNIT=./bilbycast-portal.service
+check "the users directory is writable, and optional" \
+  "$(grep -c '^ReadWritePaths=-/etc/authelia/users$' "$UNIT")" "1"
+check "no other path is writable" "$(grep -c '^ReadWritePaths=' "$UNIT")" "1"
+# The group-keeping fchown is in @privileged, and a filtered call kills the
+# process (SIGSYS) rather than failing — so it must be given back, and after
+# the line that takes it away, or it is taken away again.
+deny=$(grep -n '^SystemCallFilter=~.*@privileged' "$UNIT" | cut -d: -f1)
+allow=$(grep -n '^SystemCallFilter=@chown$' "$UNIT" | cut -d: -f1)
+check "fchown is allowed after @privileged is denied" \
+  "$([ -n "$deny" ] && [ -n "$allow" ] && [ "$allow" -gt "$deny" ] && echo yes || echo no)" "yes"
+check "and no capability comes with it" "$(grep -c '^CapabilityBoundingSet=$' "$UNIT")" "1"
+
 echo "-- $PASS passed, $FAIL failed --"
 [ "$FAIL" -eq 0 ]

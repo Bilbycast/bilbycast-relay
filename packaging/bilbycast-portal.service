@@ -26,12 +26,23 @@ TimeoutStopSec=10
 # ── Hardening ──
 # Stricter than the relay's, because the portal does even less: it reads one
 # config file, listens on loopback, and makes outbound HTTPS calls to the
-# manager. Nothing here needs to write anywhere.
+# manager and to Authelia. It writes to one place, and only when account sync
+# (the optional `accounts` block) is configured: Authelia's users directory.
 ProtectSystem=strict
-# Read-only, unlike the relay's: the portal never persists anything. It holds
-# no node identity to write back, so a writable /etc/bilbycast would only
-# widen what a compromise could reach.
+# Read-only, unlike the relay's: the portal holds no node identity to write
+# back, so a writable /etc/bilbycast would only widen what a compromise could
+# reach.
 ReadOnlyPaths=/etc/bilbycast
+# Account sync replaces Authelia's user file by writing a temp file beside it
+# and renaming it over the original, so it needs the directory, not just the
+# file. Whatever can write here can add or change Authelia accounts, which is
+# why it is this directory and nothing else. The `-` lets a portal without
+# account sync, and so without the directory, start; it also means a directory
+# created after the portal started stays read-only until a restart. A
+# users_file anywhere else needs its own ReadWritePaths= in a drop-in
+# (`systemctl edit bilbycast-portal`), never an edit here, which the installer
+# overwrites on every upgrade. Not under /home or /tmp: those are hidden below.
+ReadWritePaths=-/etc/authelia/users
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -55,6 +66,11 @@ MemoryDenyWriteExecute=false
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# Given back after the line above takes it away. Account sync keeps the users
+# file's group across a rewrite with fchown, and a call this filter denies does
+# not fail, it kills the process. With no capabilities (above), it can only
+# hand a file the portal owns to a group the portal is already in.
+SystemCallFilter=@chown
 
 # One viewer at a time clicking a link. Nothing like the relay's connection
 # count, so the default ceiling is ample and left alone.
