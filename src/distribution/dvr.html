@@ -1076,6 +1076,10 @@
     // operator had just revoked at the top of their list — a foreground tab
     // on a dead picture reads as a viewer for as long as it stays open.
     stopBeating();
+    // And the loop, which restarts a paused picture on every frame: a device
+    // displaced by another sign-in went on replaying its mark, sound and all,
+    // under the notice saying it had stopped.
+    stopLoop(true);
     errEl.textContent = "";
     errEl.appendChild(document.createTextNode(lead));
     var href = portalReturn();
@@ -2197,6 +2201,19 @@
     m.exported = !!m.exported;
   }
 
+  /// The longest name the relay keeps, in characters.
+  var MARK_NAME_MAX = 120;
+
+  /// A name as the relay will take it. Its rule (`valid_name`) counts
+  /// characters — code points, hence `Array.from` — and refuses Unicode's
+  /// control characters, so a tab or a line break pasted from a spreadsheet
+  /// becomes a space rather than costing the name, and a long one is cut
+  /// rather than refused.
+  function relayMarkName(name) {
+    return Array.from(String(name || "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " "))
+      .slice(0, MARK_NAME_MAX).join("");
+  }
+
   function saveMarks() {
     // Shared, the relay is the copy that matters, and a local one would only
     // come back as a stale second list on a relay that lost the feature.
@@ -2255,9 +2272,12 @@
     marks = marks.filter(function (m) { return m.id !== id; });
     forgetEdits(id);
     if (gone && gone.pending) {
-      // Not on the relay yet, but its POST may already be on the way: let
-      // `sendMark` delete it the moment it lands, or it comes straight back.
+      // Not on the relay as far as this page knows, but its POST may have
+      // landed — still on the way, or there already with its reply lost. Held
+      // where `sendMark` and `adoptMarks` both look, so the relay's copy is
+      // deleted however the POST turns out, rather than coming straight back.
       gone.deleted = true;
+      marksDeletedPending.push(gone);
     } else if (marksShared === true) {
       marksDeleting[id] = true;
       sendDelete(id);
@@ -2270,6 +2290,7 @@
     saveMarks();
     syncExportBar();
     renderMarks();
+    endLoopIfGone();
   }
 
   function recolourMark(id, css) {
@@ -2285,11 +2306,11 @@
   function renameMark(id, name) {
     var m = marks.filter(function (x) { return x.id === id; })[0];
     if (!m) return;
-    m.name = name;
+    m.name = relayMarkName(name);
     saveMarks();
     // Not sent per keystroke: a short pause, or leaving the field, sends
     // what is there.
-    queueEdit(m, { name: name }, NAME_SEND_MS);
+    queueEdit(m, { name: m.name }, NAME_SEND_MS);
     renderFlags();      // the title on the bar follows the name
   }
 
@@ -2344,29 +2365,50 @@
   // This page's own changes are drawn at once and sent behind the drawing:
   //
   //  * a new mark is **pending** — drawn, under a `tmp-` id — until the relay
-  //    answers with its real one. A failed POST is retried from the next poll,
-  //    and the relay treats a repeated instant as the same mark, so a retry
-  //    cannot duplicate it.
+  //    names it. A failed POST is retried from the next poll, and the relay
+  //    treats a repeated instant as the same mark, so a retry cannot
+  //    duplicate it. What the operator changes meanwhile is noted on the mark
+  //    (`dirty`) and owed as an edit once it has a name — from the POST's
+  //    reply, or, when that reply is lost, from the first list that shows the
+  //    relay holding the instant.
   //  * a rename or recolour waits in `marksPending` until it is acknowledged,
   //    and is laid over every list the relay sends meanwhile — otherwise a poll
   //    landing mid-word would put the old name back under the cursor.
-  //  * a delete waits in `marksDeleting`, so a poll cannot resurrect it.
+  //  * a delete waits in `marksDeleting`, so a poll cannot resurrect it. A
+  //    pending mark deleted before its POST settled waits in
+  //    `marksDeletedPending`, so the relay's copy goes too if the POST landed.
   //
-  // A relay without the route (404/405), one with no token secret (500), or a
-  // page with no token (401) leaves this device on `localStorage`, exactly as
-  // before. Anything else — a dropped connection, a 502 from a tunnel — is
-  // simply tried again on the next poll.
+  // Every reply carries the whole list and its revision, and replies arrive in
+  // whatever order the network delivers them. A list older than the one drawn
+  // is ignored: a poll sent before a delete and answered after it would
+  // otherwise put the mark back.
+  //
+  // A relay that predates the list (400: its object route wants a `.` in the
+  // name, and `marks` has none), one with no token secret (500), a page with
+  // no token (401), or a 404/405 leaves this device on `localStorage`, exactly
+  // as before — and asks again about once a minute, so a relay upgraded or
+  // given its secret mid-session is picked up without a reload. Anything else
+  // — a dropped connection, a 503 from a relay whose disk failed it, a 502 from
+  // a tunnel — is simply tried again on the next poll.
   var MARKS_POLL_MS = 3000;
+  /// What a relay answers when it has no shared list for this page.
+  var MARKS_LOCAL_STATUS = [400, 401, 404, 405, 500];
+  /// Polls between asks while on `localStorage`: about a minute.
+  var MARKS_REPROBE_POLLS = 20;
   var NAME_SEND_MS = 600;
   /// null: not known yet · true: the relay holds them · false: this device only.
   var marksShared = null;
   var marksEtag = null;
+  /// The lifetime (from the validator) and the revision of the list drawn.
+  var marksEpoch = null, marksRev = -1;
   var marksPolling = false;
+  var marksLocalPolls = 0;
   var marksPending = {};
   var marksEditTimers = {};
   var marksEditing = {};
   var marksDeleting = {};
-  /// A newer list arrived while the operator was typing in the old one.
+  var marksDeletedPending = [];
+  /// A newer list arrived while the rows were in use.
   var marksListDeferred = false;
   /// Marks older than this stay behind when `localStorage` is carried into
   /// the shared list. No DVR window reaches back a day, so all they would add
@@ -2397,20 +2439,26 @@
   }
 
   function pollMarks() {
-    if (marksPolling || marksShared === false || accessExpired) return;
+    if (marksPolling || accessExpired) return;
+    if (marksShared === false) {
+      // On this device's own list. Asked again now and then rather than
+      // never: a relay upgraded, or given its token secret, mid-session
+      // should not need every open player reloaded.
+      if (++marksLocalPolls < MARKS_REPROBE_POLLS) return;
+      marksLocalPolls = 0;
+    }
     if (typeof fetch !== "function") { marksShared = false; return; }
     marksPolling = true;
     marksRequest("marks", "GET").then(function (r) {
       if (r.status === 304) return null;
       if (r.ok) return marksReply(r);
-      if (marksShared === null &&
-          (r.status === 401 || r.status === 404 || r.status === 405 || r.status === 500)) {
+      if (marksShared === null && MARKS_LOCAL_STATUS.indexOf(r.status) >= 0) {
         marksShared = false;
       }
       return null;
     }).then(function (res) {
       if (res) {
-        if (marksShared === null) becomeShared();
+        if (marksShared !== true) becomeShared();
         adoptMarks(res.body, res.etag);
       }
       // After a 304 too: this is also the retry for anything that did not
@@ -2430,6 +2478,9 @@
       // Whole milliseconds, which is what the relay stores. Marks written by
       // an older page carry the fraction `wallClockAt` produces.
       m.at = Math.round(m.at);
+      // And a name it will take. The page before this one put no limit on
+      // the field, and a name the relay refused used to cost the mark.
+      m.name = relayMarkName(m.name);
       m.id = "tmp-" + (++markSeq);
       m.pending = true;
       carried.push(m);
@@ -2441,7 +2492,12 @@
     try {
       var raw = window.localStorage.getItem(MARKS_KEY);
       if (raw) {
-        window.localStorage.setItem(MARKS_KEY + ".migrated", raw);
+        // The first list set aside is the device's whole list from before
+        // sharing, and nothing replaces it. A later one — marks made while
+        // the relay could not be reached, carried when it came back — is
+        // kept beside it.
+        var later = window.localStorage.getItem(MARKS_KEY + ".migrated") === null ? "" : "." + now;
+        window.localStorage.setItem(MARKS_KEY + ".migrated" + later, raw);
         window.localStorage.removeItem(MARKS_KEY);
       }
     } catch (e) { /* blocked: the carried marks are in memory either way */ }
@@ -2454,11 +2510,64 @@
     }));
   }
 
+  /// The rows are in use in a way a redraw would break: a name field holds
+  /// the cursor (and the caret with it), or a colour palette is open under the
+  /// operator's finger. A button that merely kept focus after being pressed —
+  /// Chrome leaves it there — is not: holding the list for that kept marks
+  /// other viewers had deleted on screen, loop buttons and all.
+  function listBusy() {
+    var ae = document.activeElement;
+    return !!(ae && ae.tagName === "INPUT" && ae.type === "text" && markList.contains(ae)) ||
+      markList.querySelector("li.picking") !== null;
+  }
+
+  /// Redraw the rows now, or as soon as they are no longer in use. The flags
+  /// on the bar are safe to move either way.
+  function redrawMarks() {
+    if (listBusy()) {
+      marksListDeferred = true;
+      renderFlags();
+      return;
+    }
+    renderMarks();
+  }
+
+  /// A pending mark the relay has named: give it the name, and owe the relay
+  /// what the operator changed while it had none. Only that — the relay's
+  /// copy may be another viewer's mark at the same instant, and every other
+  /// field on it is theirs.
+  function settleMark(m, real) {
+    var was = m.id;
+    // The same object, so the rows drawn from it go on finding the mark.
+    m.id = real;
+    delete m.pending;
+    if (lastMarkId === was) lastMarkId = real;
+    if (exportPicked[was]) { delete exportPicked[was]; exportPicked[real] = true; }
+    var dirty = m.dirty, owed = null;
+    delete m.dirty;
+    for (var k in dirty) (owed || (owed = {}))[k] = m[k];
+    if (owed) queueEdit(m, owed, 0);
+  }
+
+  function forgetDeletedPending(m) {
+    marksDeletedPending = marksDeletedPending.filter(function (g) { return g !== m; });
+  }
+
   /// Replace the list with the relay's, keeping what this page still owes it.
   function adoptMarks(body, etag) {
     if (!body || !Array.isArray(body.marks)) return;
+    // Within one list's lifetime — its epoch, from the validator — the
+    // revision only rises, so a reply older than the list drawn is one the
+    // network delivered late. A different epoch, or none (`marks-none`: no
+    // file behind it), is a list removed or started again, and is taken.
+    var em = /^"marks-(.+)-\d+"$/.exec(etag || "");
+    var epoch = em ? em[1] : "";
+    var rev = typeof body.rev === "number" ? body.rev : 0;
+    if (epoch === marksEpoch && rev < marksRev) return;
+    marksEpoch = epoch;
+    marksRev = rev;
     if (etag) marksEtag = etag;
-    var next = [], held = {};
+    var next = [], byAt = {};
     body.marks.forEach(function (x) {
       if (!x || typeof x.id !== "string" || typeof x.at !== "number" || !isFinite(x.at)) return;
       if (marksDeleting[x.id]) return;
@@ -2466,13 +2575,41 @@
       normaliseMark(m);
       var owed = marksPending[x.id];
       if (owed) for (var k in owed) m[k] = owed[k];
-      held[m.at] = true;
+      byAt[m.at] = m;
       next.push(m);
     });
-    // This page's marks the relay has not acknowledged. One it already lists —
-    // the POST landed, its reply has not — is the relay's copy.
+    // Pending marks deleted before their POST settled. The relay holding the
+    // instant is that POST having landed, so its copy goes as well — now, or
+    // from `sendMark` once the reply is in. Not holding it once the POST is
+    // over, it never landed.
+    marksDeletedPending = marksDeletedPending.filter(function (g) {
+      var x = byAt[g.at];
+      if (!x) return !!g.sending;
+      next.splice(next.indexOf(x), 1);
+      delete byAt[g.at];
+      if (g.sending) return true;
+      marksDeleting[x.id] = true;
+      sendDelete(x.id);
+      return false;
+    });
+    // This page's marks the relay has not acknowledged.
     marks.forEach(function (m) {
-      if (m.pending && !m.deleted && !held[m.at]) next.push(m);
+      if (!m.pending || m.deleted) return;
+      var x = byAt[m.at];
+      if (!x) { next.push(m); return; }
+      var i = next.indexOf(x);
+      if (m.sending) {
+        // The POST landed and its reply is on the way, and that reply settles
+        // the mark. Until then it stays this object, in place of the relay's
+        // copy, so it is drawn once and what is typed into its row lands.
+        if (i >= 0) next[i] = m;
+        return;
+      }
+      // The POST landed and its reply was lost: this list is the only news
+      // of it the page will get.
+      settleMark(m, x.id);
+      var owed = marksPending[x.id];
+      if (owed) for (var k in owed) x[k] = owed[k];
     });
     var before = marksSignature();
     marks = next;
@@ -2481,17 +2618,10 @@
       if (!marks.some(function (m) { return String(m.id) === id; })) delete exportPicked[id];
     }
     // Another viewer deleted the mark this page is looping around.
-    if (loop && !marks.some(function (m) { return m.at === loop.at; })) stopLoop(true);
+    endLoopIfGone();
     if (marksSignature() === before) return;
     if (exportMode) syncExportBar();
-    // Redrawing the list under a cursor loses the cursor, and the caret with
-    // it. The flags are safe to move; the rows wait for the field to be left.
-    if (markList.contains(document.activeElement)) {
-      marksListDeferred = true;
-      renderFlags();
-      return;
-    }
-    renderMarks();
+    redrawMarks();
   }
 
   /// POST a pending mark. Retried from `flushMarks` until the relay has it.
@@ -2507,33 +2637,38 @@
         // see.
         return r.text().catch(function () { return ""; }).then(function (t) {
           t = (t || "").trim();
+          var why = t && t.length < 300 ? t : "The relay would not keep that mark (" + r.status + ").";
+          if (m.deleted) { forgetDeletedPending(m); return null; }
+          // Unless it is only the name. The instant is the mark: it is sent
+          // once more without the name rather than lost with it.
+          if (r.status === 400 && sent.name && !m.nameRefused) {
+            m.nameRefused = true;
+            m.name = "";
+            if (m.dirty) delete m.dirty.name;
+            redrawMarks();
+            fail(why + " The mark was kept without its name.");
+            return { retry: true };
+          }
           marks = marks.filter(function (x) { return x !== m; });
-          renderMarks();
-          fail(t && t.length < 300 ? t : "The relay would not keep that mark (" + r.status + ").");
+          redrawMarks();
+          endLoopIfGone();
+          fail(why);
           return null;
         });
       }
       return null;
     }).then(function (res) {
       m.sending = false;
+      if (res && res.retry) { sendMark(m); return; }
       if (!res || !res.body || typeof res.body.id !== "string") return;
-      var was = m.id, real = res.body.id;
-      // The same object keeps its row's handlers pointed at the right mark.
-      m.id = real;
-      delete m.pending;
-      if (lastMarkId === was) lastMarkId = real;
-      if (exportPicked[was]) { delete exportPicked[was]; exportPicked[real] = true; }
       if (m.deleted) {
-        marksDeleting[real] = true;
-        sendDelete(real);
+        forgetDeletedPending(m);
+        m.id = res.body.id;
+        delete m.pending;
+        marksDeleting[m.id] = true;
+        sendDelete(m.id);
       } else {
-        // Named, recoloured or exported while the POST was out: owed as an
-        // edit, now that there is an id to send it to.
-        var owed = {}, any = false;
-        ["name", "colour", "exported"].forEach(function (k) {
-          if (m[k] !== sent[k]) { owed[k] = m[k]; any = true; }
-        });
-        if (any) queueEdit(m, owed, 0);
+        settleMark(m, res.body.id);
       }
       adoptMarks(res.body, res.etag);
     }).catch(function () { m.sending = false; });
@@ -2541,8 +2676,15 @@
 
   /// Owe the relay an edit to `m`, sent after `delayMs`.
   function queueEdit(m, fields, delayMs) {
-    // A pending mark's POST carries all of it; `sendMark` settles the rest.
-    if (marksShared !== true || !m || m.pending) return;
+    if (marksShared !== true || !m) return;
+    if (m.pending) {
+      // No id to send it to yet. The POST carries what the mark held when it
+      // went; what changes after is noted here, and owed once the relay has
+      // named the mark — see `settleMark`.
+      var dirty = m.dirty || (m.dirty = {});
+      for (var f in fields) dirty[f] = true;
+      return;
+    }
     var id = m.id;
     var owed = marksPending[id] || (marksPending[id] = {});
     for (var k in fields) owed[k] = fields[k];
@@ -2624,7 +2766,7 @@
     });
     markList.addEventListener("focusout", function () {
       setTimeout(function () {
-        if (marksListDeferred && !markList.contains(document.activeElement)) renderMarks();
+        if (marksListDeferred && !listBusy()) renderMarks();
       }, 0);
     });
   }
@@ -2644,12 +2786,16 @@
   // playing.
   //
   // The bounds are re-derived at every check rather than latched. The loop
-  // holds its mark by wall clock, like everything else here, so the window
-  // rolling past the in point, the live edge reaching the out point, or
-  // another viewer deleting the mark all land in the next check.
+  // holds its mark by wall clock, like everything else here, and asks the
+  // list for it each time, so the window rolling past the in point, the live
+  // edge reaching the out point, or the mark being deleted — here, by another
+  // viewer, or by the relay refusing it — all land in the next check.
   //
   // Its speed and length are this device's, not the feed's: two operators
-  // looping the same mark are each studying something different.
+  // looping the same mark are each studying something different. They are
+  // held by the page and kept in `localStorage` as well where it is allowed,
+  // so a browser that refuses site data still loops at the speed it was
+  // asked for, until the page is closed.
   var LOOP_PRE_KEY = "bilbycast.dvr.loop.pre";
   var LOOP_POST_KEY = "bilbycast.dvr.loop.post";
   var LOOP_RATE_KEY = "bilbycast.dvr.loop.rate";
@@ -2675,13 +2821,27 @@
     if (!isFinite(n) || n < 0 || n > LOOP_MAX_SECS) return dflt;
     return n;
   }
-  function loopPre() { return loopSecs(LOOP_PRE_KEY, LOOP_PRE_DEFAULT); }
-  function loopPost() { return loopSecs(LOOP_POST_KEY, LOOP_POST_DEFAULT); }
-  function loopRate() {
+  function storedLoopRate() {
     var raw = null;
     try { raw = window.localStorage.getItem(LOOP_RATE_KEY); } catch (e) { /* blocked */ }
     var n = parseFloat(raw);
     return LOOP_RATES.indexOf(n) >= 0 ? n : LOOP_RATE_DEFAULT;
+  }
+  /// The loop's settings as this page holds them: read from storage once, and
+  /// set here before storage is asked to keep them. Read back from storage on
+  /// every use instead, a browser refusing site data left every speed button
+  /// and both seconds fields without effect.
+  var loopCfg = {
+    pre: loopSecs(LOOP_PRE_KEY, LOOP_PRE_DEFAULT),
+    post: loopSecs(LOOP_POST_KEY, LOOP_POST_DEFAULT),
+    rate: storedLoopRate()
+  };
+  function loopPre() { return loopCfg.pre; }
+  function loopPost() { return loopCfg.post; }
+  function loopRate() { return loopCfg.rate; }
+  function keepLoopSetting(key, value) {
+    try { window.localStorage.setItem(key, value); }
+    catch (e) { /* blocked: this page keeps it, the next starts from the default */ }
   }
 
   /// The reachable mark nearest the playhead, either side — what the
@@ -2699,10 +2859,15 @@
     return best;
   }
 
+  /// Is there still a mark at this instant? A loop holds its mark by instant.
+  function markAt(at) {
+    return marks.some(function (m) { return m.at === at; });
+  }
+
   /// In and out points on main's clock, or null once the mark cannot be
-  /// reached.
+  /// reached, or is gone.
   function loopBounds() {
-    if (!loop) return null;
+    if (!loop || !markAt(loop.at)) return null;
     var t = mainTimeAtWall(loop.at);
     var r = range(main);
     if (t === null || !r || t < r.start || t > r.end) return null;
@@ -2714,7 +2879,11 @@
   }
 
   function startLoop(m) {
-    if (!m || !markIsReachable(m)) return;
+    // A player whose access has ended starts nothing. It still holds its
+    // credential in memory, so playback would go on — under the notice
+    // saying it had stopped.
+    if (accessExpired) return;
+    if (!m || !markAt(m.at) || !markIsReachable(m)) return;
     if (loopPre() + loopPost() <= 0) {
       fail("A loop of zero seconds is not a loop — set the seconds either side in Settings.");
       return;
@@ -2722,6 +2891,10 @@
     fail("");
     if (loop) stopLoop();
     stopShuttle();
+    // The loop's speed lives in `playbackRate` alone. A shuttle's seek rate
+    // left in `rate` came back as a fast-forward the moment a scrub resumed
+    // "what was playing" after the loop had ended.
+    rate = 1;
     if (mode === "live" || mode === "shuttle" || mode === "jog") setMode("scrub");
     proxy.pause();
     loop = { at: m.at, raf: null };
@@ -2750,6 +2923,11 @@
     if (pause) main.pause();
     showLoopState();
     syncRateButtons();
+  }
+
+  /// A loop whose mark has just gone ends now, not at the next frame.
+  function endLoopIfGone() {
+    if (loop && !loopBounds()) stopLoop(true);
   }
 
   function loopFrame() {
@@ -2812,26 +2990,27 @@
   document.getElementById("loopStop").addEventListener("click", function () { stopLoop(true); });
   document.querySelectorAll("[data-loop-rate]").forEach(function (b) {
     b.addEventListener("click", function () {
-      try { window.localStorage.setItem(LOOP_RATE_KEY, b.dataset.loopRate); }
-      catch (e) { /* this loop still changes speed; the next one forgets */ }
+      loopCfg.rate = parseFloat(b.dataset.loopRate);
+      keepLoopSetting(LOOP_RATE_KEY, b.dataset.loopRate);
       if (loop) main.playbackRate = loopRate();
       showLoopState();
       render();
     });
   });
-  function wireLoopSecs(input, key, read) {
-    input.value = read();
+  function wireLoopSecs(input, key, field) {
+    input.value = loopCfg[field];
     input.addEventListener("change", function () {
       var n = parseInt(input.value, 10);
       if (!isFinite(n) || n < 0) n = 0;
       if (n > LOOP_MAX_SECS) n = LOOP_MAX_SECS;
       input.value = n;
-      try { window.localStorage.setItem(key, String(n)); } catch (e) { /* blocked */ }
+      loopCfg[field] = n;
+      keepLoopSetting(key, String(n));
       showLoopState();
     });
   }
-  wireLoopSecs(document.getElementById("loopPre"), LOOP_PRE_KEY, loopPre);
-  wireLoopSecs(document.getElementById("loopPost"), LOOP_POST_KEY, loopPost);
+  wireLoopSecs(document.getElementById("loopPre"), LOOP_PRE_KEY, "pre");
+  wireLoopSecs(document.getElementById("loopPost"), LOOP_POST_KEY, "post");
   showLoopState();
 
   // ── clip export ──────────────────────────────────────────────────────────
@@ -3052,6 +3231,16 @@
       });
     });
 
+  /// Does the mark a row was drawn for still exist? A row drawn from an older
+  /// list — held back while the operator typed — may name one another viewer
+  /// has deleted since. Going to it, or looping around it, would act on
+  /// nothing; the rows are redrawn instead, which shows why.
+  function stillListed(m) {
+    if (marks.some(function (x) { return x.id === m.id || x.at === m.at; })) return true;
+    redrawMarks();
+    return false;
+  }
+
   function renderMarks() {
     marksListDeferred = false;
     document.body.dataset.marks = marks.length ? "1" : "0";
@@ -3087,14 +3276,14 @@
       at.textContent = fmtTimeOfDay(m.at).slice(0, 8);
       at.title = reachable ? "Go to this mark" : "Past the end of the window";
       at.disabled = !reachable;
-      at.addEventListener("click", function () { goToMark(m); });
+      at.addEventListener("click", function () { if (stillListed(m)) goToMark(m); });
 
       var name = document.createElement("input");
       name.type = "text";
       name.value = m.name;
       name.placeholder = "Name this mark";
       // The relay's limit, so a long label stops here rather than being refused.
-      name.maxLength = 120;
+      name.maxLength = MARK_NAME_MAX;
       name.setAttribute("data-id", String(m.id));
       name.addEventListener("input", function () { renameMark(m.id, name.value); });
       name.addEventListener("change", function () { flushEdit(m.id); });
@@ -3130,6 +3319,8 @@
       swatch.addEventListener("click", function () {
         var open = li.classList.toggle("picking");
         swatch.setAttribute("aria-expanded", open ? "true" : "false");
+        // A list held back while the palette was open is drawn as it closes.
+        if (!open && marksListDeferred && !listBusy()) renderMarks();
       });
 
       // Exported already. Worth showing because the drawer is the only place
@@ -3165,6 +3356,7 @@
       lp.disabled = !reachable;
       lp.innerHTML = LOOP_ICON;
       lp.addEventListener("click", function () {
+        if (!stillListed(m)) return;
         if (loop && loop.at === m.at) stopLoop(true); else startLoop(m);
       });
 
@@ -4488,6 +4680,9 @@
   async function stRunAll() {
     var btn = document.getElementById("stRun");
     btn.disabled = true;
+    // The self-test drives main itself. A loop left running snaps every seek
+    // it makes back to the in point, and the shuttle figures with it.
+    stopLoop();
     stOut.textContent = "";
     stSay("device   " + (navigator.userAgent || "?"));
     stSay("screen   " + screen.width + "x" + screen.height +

@@ -1,13 +1,17 @@
-// Smoke test for the DVR player page.
+// Behavioural tests for the DVR player page.
 //
-// `dvr.html` is ~770 lines of hand-written transport logic that nothing in CI
-// parses or executes. This drives the real page in jsdom against stubbed media
-// elements and a stubbed hls.js, so a typo'd identifier, a wrong arity, or a
-// transport-state regression fails here rather than on a tablet.
+// `dvr.html` is thousands of lines of hand-written transport, marks and loop
+// logic, and the Rust tests in `mod.rs` can only read it as text. This drives
+// the real page in jsdom against stubbed media elements, a stubbed hls.js and
+// an in-memory relay, so a typo'd identifier, a wrong arity, or a regression
+// in the transport or the shared marks fails here rather than on a tablet.
 //
-// Skips (does not fail) when jsdom is absent, so it stays opt-in:
+// CI runs it in the `dvr-page` job with `DVR_PAGE_REQUIRE_JSDOM=1`, which
+// makes a missing jsdom a failure rather than a skip. Locally it still skips
+// without jsdom, so `node --test` works anywhere:
 //
-//   cd src/distribution && docker run --rm -v "$PWD:/w" -w /w node:22-alpine \
+//   cd src/distribution && docker run --rm -e DVR_PAGE_REQUIRE_JSDOM=1 \
+//     -v "$PWD:/w" -w /w node:22-alpine \
 //     sh -c 'npm i --no-save --silent jsdom && node --test tests/dvr_page.test.cjs'
 
 const { test } = require("node:test");
@@ -18,7 +22,10 @@ const path = require("node:path");
 let JSDOM;
 try {
   ({ JSDOM } = require("jsdom"));
-} catch {
+} catch (e) {
+  // Where the suite is meant to run, a skip would be a green run that tested
+  // nothing.
+  if (process.env.DVR_PAGE_REQUIRE_JSDOM === "1") throw e;
   test("dvr page (skipped: jsdom not installed)", () => {});
   return;
 }
@@ -43,16 +50,30 @@ const HTML = fs
 /// fragment — `T0` at media time 0 — which is what marks and loops convert
 /// through. `opts.fetch` stands in for the network; without it the page has no
 /// `fetch` at all, as jsdom ships none. `opts.storage` is in `localStorage`
-/// before the page's script runs.
+/// before the page's script runs, and `opts.blockStorage` makes every access
+/// to it throw, as a browser with site data blocked does. `opts.token` is the
+/// viewer token in the page's URL, as the portal hands it out.
+/// `opts.nativeHls` leaves hls.js unsupported, so the page plays the way
+/// Safari on iOS does: no request headers, the token in the query instead.
+///
+/// hls.js's event handlers are kept on `window.hlsHandlers`, so a test can
+/// raise the errors the real one would.
 function loadPage(opts = {}) {
   const dom = new JSDOM(HTML, {
     runScripts: "outside-only",
     pretendToBeVisual: true,
     // An origin, so `localStorage` exists: marks fall back to it.
-    url: "https://relay.test/dvr/bigshow",
+    url: "https://relay.test/dvr/bigshow" +
+      (opts.token ? "?token=" + encodeURIComponent(opts.token) : ""),
   });
   const { window } = dom;
   for (const [k, v] of Object.entries(opts.storage || {})) window.localStorage.setItem(k, v);
+  if (opts.blockStorage) {
+    Object.defineProperty(window, "localStorage", {
+      get() { throw new window.DOMException("blocked", "SecurityError"); },
+      configurable: true,
+    });
+  }
 
   const levels = opts.clock
     ? [{
@@ -65,11 +86,12 @@ function loadPage(opts = {}) {
         },
       }]
     : undefined;
+  window.hlsHandlers = {};
   window.Hls = function () {
     return {
       loadSource() {},
       attachMedia() {},
-      on() {},
+      on(ev, cb) { (window.hlsHandlers[ev] = window.hlsHandlers[ev] || []).push(cb); },
       destroy() {},
       liveSyncPosition: 100,
       levels,
@@ -77,7 +99,7 @@ function loadPage(opts = {}) {
     };
   };
   if (opts.fetch) window.fetch = opts.fetch;
-  window.Hls.isSupported = () => true;
+  window.Hls.isSupported = () => !opts.nativeHls;
   window.Hls.Events = { ERROR: "hlsError", MANIFEST_PARSED: "hlsManifestParsed" };
 
   for (const id of ["main", "proxy"]) {
@@ -208,34 +230,53 @@ test("scrubbing during a forward shuttle leaves a running transport", (t) => {
 
 // ── shared marks ─────────────────────────────────────────────────────────────
 
+/// The viewer token the shared-marks pages are opened with.
+const TOKEN = "tkn";
+
 /// The relay's marks surface, in memory, with the same contract: one list per
-/// stream, ids minted here, a repeated instant is the same mark, and a `GET`
-/// with the current validator answers 304.
-function fakeRelay() {
-  const relay = { marks: [], rev: 0, calls: [], seq: 0 };
-  const etag = () => '"marks-test-' + relay.rev + '"';
-  const json = (status, body) => ({
-    status,
-    ok: status >= 200 && status < 300,
-    headers: { get: (h) => (h.toLowerCase() === "etag" ? etag() : null) },
-    json: async () => body,
-    text: async () => JSON.stringify(body),
-  });
+/// stream, ids minted here, a repeated instant is the same mark, a `GET` with
+/// the current validator answers 304, a name is refused on the relay's own
+/// rule, and every verb wants the viewer token — `Authorization: Bearer`, or
+/// `?token=` where the page cannot set a header — or answers 401.
+///
+/// Replies can be made to arrive out of turn. A verb in `relay.hold` is acted
+/// on at once but its reply — the list as it stood then — is parked until
+/// `relay.release()`. A verb in `relay.lose` is acted on and its reply never
+/// arrives: the fetch rejects, as a dropped connection does.
+///
+/// `opts.refuseNames` refuses every name, for the one path a name is sent on.
+function fakeRelay(opts = {}) {
+  const relay = {
+    marks: [], rev: 0, seq: 0, calls: [], auth: [],
+    hold: new Set(), held: [], lose: new Set(), failNext: 0,
+  };
+  const etag = () => '"marks-7e57-' + relay.rev + '"';
+  // The validator is taken when the reply is made, so a held reply carries
+  // the one it was made with.
+  const json = (status, body) => {
+    const tag = etag();
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      headers: { get: (h) => (h.toLowerCase() === "etag" ? tag : null) },
+      json: async () => body,
+      text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
+    };
+  };
   const list = (status, extra = {}) =>
     json(status, { rev: relay.rev, marks: relay.marks.map((m) => ({ ...m })), ...extra });
-  relay.fetch = async (url, init = {}) => {
-    const method = init.method || "GET";
-    relay.calls.push(method + " " + url);
-    const m = /^\/origin\/bigshow\/marks(?:\/([0-9a-f]+))?$/.exec(url);
-    if (!m) return json(404, {});
-    const id = m[1];
-    const body = init.body ? JSON.parse(init.body) : null;
+  const nameRefused = (n) =>
+    (opts.refuseNames && n) || [...n].length > 120 || /[\u0000-\u001f\u007f-\u009f]/.test(n);
+  const NAME_REFUSED = "a mark's name must be at most 120 characters of plain text";
+
+  function act(method, id, body, headers) {
     if (method === "GET") {
-      if ((init.headers || {})["If-None-Match"] === etag()) return json(304, null);
+      if (headers["If-None-Match"] === etag()) return json(304, null);
       return list(200);
     }
     if (method === "POST") {
       assert.ok(Number.isInteger(body.at), "a mark was sent with a fractional instant: " + body.at);
+      if (nameRefused(body.name || "")) return json(400, NAME_REFUSED);
       let mark = relay.marks.find((x) => x.at === body.at);
       if (!mark) {
         relay.seq += 1;
@@ -249,7 +290,8 @@ function fakeRelay() {
     }
     const mark = relay.marks.find((x) => x.id === id);
     if (method === "PATCH") {
-      if (!mark) return json(404, {});
+      if (!mark) return json(404, "no such mark");
+      if (body.name !== undefined && nameRefused(body.name)) return json(400, NAME_REFUSED);
       Object.assign(mark, body);
       relay.rev += 1;
       return list(200);
@@ -259,7 +301,56 @@ function fakeRelay() {
       relay.rev += 1;
       return list(200);
     }
-    return json(405, {});
+    return json(405, "");
+  }
+
+  relay.fetch = async (url, init = {}) => {
+    const method = init.method || "GET";
+    const headers = init.headers || {};
+    relay.calls.push(method + " " + url);
+    relay.auth.push(headers.Authorization || null);
+    const [path, query = ""] = url.split("?");
+    const m = /^\/origin\/bigshow\/marks(?:\/([0-9a-f]+))?$/.exec(path);
+    if (!m) return json(404, {});
+    const viaQuery = new URLSearchParams(query).get("token");
+    if (headers.Authorization !== "Bearer " + TOKEN && viaQuery !== TOKEN) {
+      return json(401, "viewer token required");
+    }
+    if (relay.failNext) {
+      const status = relay.failNext;
+      relay.failNext = 0;
+      return json(status, "could not read or write the marks");
+    }
+    const reply = act(method, m[1], init.body ? JSON.parse(init.body) : null, headers);
+    if (relay.lose.has(method)) throw new TypeError("the connection dropped before the reply");
+    if (relay.hold.has(method)) return new Promise((resolve) => relay.held.push(() => resolve(reply)));
+    return reply;
+  };
+  relay.release = () => {
+    const held = relay.held;
+    relay.held = [];
+    held.forEach((go) => go());
+  };
+  return relay;
+}
+
+/// A relay from before the list, answering as its router did: `marks` falls
+/// through to the object route, whose name check wants a `.` (400 to a GET)
+/// and which has no POST (405), and nothing routes three segments after
+/// `/origin` (404).
+function olderRelay() {
+  const relay = { calls: [] };
+  relay.fetch = async (url, init = {}) => {
+    const method = init.method || "GET";
+    relay.calls.push(method + " " + url);
+    const path = url.split("?")[0];
+    const status = /^\/origin\/bigshow\/marks$/.test(path) ? (method === "GET" ? 400 : 405) : 404;
+    return {
+      status,
+      ok: false,
+      headers: { get: () => null },
+      text: async () => (status === 400 ? "invalid object name" : ""),
+    };
   };
   return relay;
 }
@@ -276,44 +367,54 @@ const key = (w, k) =>
 /// A poll now, rather than in three seconds: the page fetches on becoming visible.
 const poll = (w) => w.document.dispatchEvent(new w.Event("visibilitychange"));
 const rows = (w) => [...w.document.querySelectorAll("#markList li")];
+const flags = (w) =>
+  [...w.document.querySelectorAll("#markbar i")].filter((i) => i.style.display === "block");
+const typeName = (w, input, text) => {
+  input.value = text;
+  input.dispatchEvent(new w.Event("input", { bubbles: true }));
+};
+const MARKS_KEY = "bilbycast.dvr.marks.bigshow";
 
 test("a mark made by one viewer appears for another watching the same feed", async (t) => {
   const relay = fakeRelay();
-  const a = loadPage({ clock: true, fetch: relay.fetch });
-  const b = loadPage({ clock: true, fetch: relay.fetch });
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
   t.after(() => { closePage(a); closePage(b); });
   await settle();
 
+  // The POST lands, and its reply is held: the maker's next poll sees the
+  // relay's copy while its own is still pending.
+  relay.hold.add("POST");
   key(a, "m");
   assert.equal(rows(a).length, 1, "the mark is not drawn until the relay answers");
   await settle();
   assert.equal(relay.marks.length, 1, "the mark never reached the relay");
   assert.equal(relay.marks[0].at, T0 + 50_000, "the mark is not the wall clock at the playhead");
+  poll(a);
+  await settle();
+  assert.equal(rows(a).length, 1, "the maker's pending copy and the relay's copy both show");
+  relay.hold.clear();
+  relay.release();
+  await settle();
+  assert.equal(rows(a).length, 1, "the POST's reply doubled the mark");
 
   poll(b);
   await settle();
   assert.equal(rows(b).length, 1, "the second viewer does not see the first viewer's mark");
-  const flags = [...b.document.querySelectorAll("#markbar i")].filter((i) => i.style.display === "block");
-  assert.equal(flags.length, 1, "no flag on the second viewer's bar");
-
-  // And nothing is doubled once the first viewer's own poll comes round.
-  poll(a);
-  await settle();
-  assert.equal(rows(a).length, 1, "the maker's pending copy and the relay's copy both show");
+  assert.equal(flags(b).length, 1, "no flag on the second viewer's bar");
 });
 
 test("a rename, and then a delete, reach the other viewer", async (t) => {
   const relay = fakeRelay();
-  const a = loadPage({ clock: true, fetch: relay.fetch });
-  const b = loadPage({ clock: true, fetch: relay.fetch });
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
   t.after(() => { closePage(a); closePage(b); });
   await settle();
   key(a, "m");
   await settle();
 
   const name = a.document.querySelector("#markList li input[type=text]");
-  name.value = "Keeper's save";
-  name.dispatchEvent(new a.Event("input", { bubbles: true }));
+  typeName(a, name, "Keeper's save");
   name.dispatchEvent(new a.Event("change", { bubbles: true }));
   await settle();
   assert.equal(relay.marks[0].name, "Keeper's save", "the rename was not sent");
@@ -336,17 +437,19 @@ test("a rename, and then a delete, reach the other viewer", async (t) => {
 
 test("a list arriving mid-word does not move the cursor or the name", async (t) => {
   const relay = fakeRelay();
-  const a = loadPage({ clock: true, fetch: relay.fetch });
-  const b = loadPage({ clock: true, fetch: relay.fetch });
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
   t.after(() => { closePage(a); closePage(b); });
   await settle();
   key(a, "m");
   await settle();
 
+  // The rename stays owed for the whole test, so the only thing that can
+  // keep "Goa" on screen is the page laying it over the relay's lists.
+  relay.hold.add("PATCH");
   const name = a.document.querySelector("#markList li input[type=text]");
   name.focus();
-  name.value = "Goa";
-  name.dispatchEvent(new a.Event("input", { bubbles: true }));
+  typeName(a, name, "Goa");
   // Someone else marks something while this is being typed.
   b.document.getElementById("main").currentTime = 20;
   key(b, "m");
@@ -354,27 +457,233 @@ test("a list arriving mid-word does not move the cursor or the name", async (t) 
   poll(a);
   await settle();
   assert.equal(a.document.activeElement, name, "a poll redrew the list under the cursor");
-  assert.equal(name.value, "Goa", "a poll put the old name back mid-word");
-  const flags = [...a.document.querySelectorAll("#markbar i")].filter((i) => i.style.display === "block");
-  assert.equal(flags.length, 2, "the other viewer's mark did not reach the bar");
+  assert.equal(flags(a).length, 2, "the other viewer's mark did not reach the bar");
+  assert.ok(
+    flags(a).some((f) => f.title === "Goa"),
+    "the list put the old name back on the bar mid-word"
+  );
 
   name.blur();
   await settle();
   assert.equal(rows(a).length, 2, "leaving the field did not bring the list up to date");
+  assert.equal(relay.marks.find((m) => m.at === T0 + 50_000).name, "", "fixture: the rename landed");
+  assert.equal(
+    rows(a)[1].querySelector("input[type=text]").value,
+    "Goa",
+    "the redrawn row shows the relay's old name, not the one still being sent"
+  );
 });
 
-test("an older relay leaves marks on this device, as before", async (t) => {
-  const w = loadPage({
-    clock: true,
-    fetch: async () => ({ status: 404, ok: false, headers: { get: () => null } }),
-  });
+test("a list is held back for a name being typed, not for a button that kept focus", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => { closePage(a); closePage(b); });
+  await settle();
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+
+  // Chrome leaves focus on a pressed button.
+  const lp = b.document.querySelector("#markList li .loop");
+  lp.focus();
+  click(b, "#markList li .loop");
+  assert.equal(b.document.activeElement, lp, "fixture: the loop button should hold focus");
+
+  click(a, "#markList li .del");
+  await settle();
+  poll(b);
+  await settle();
+  assert.equal(rows(b).length, 0, "a deleted mark's row stayed because a button in the list had focus");
+
+  // Held back for a name field, the rows are stale — and a stale row's loop
+  // button must not loop around a mark that has gone.
+  b.document.getElementById("main").currentTime = 30;
+  key(b, "m");
+  await settle();
+  poll(a);
+  await settle();
+  const name = b.document.querySelector("#markList li input[type=text]");
+  name.focus();
+  click(a, "#markList li .del");
+  await settle();
+  poll(b);
+  await settle();
+  assert.equal(rows(b).length, 1, "fixture: the list should wait for the name field");
+  click(b, "#markList li .loop");
+  assert.equal(b.document.body.dataset.loop, "0", "a stale row started a loop around a deleted mark");
+  const main = b.document.getElementById("main");
+  main.currentTime = 70;
+  click(b, "#markList li .at");
+  assert.equal(main.currentTime, 70, "a stale row went to a mark that has been deleted");
+});
+
+test("a mark whose POST landed but whose reply was lost keeps what was typed into it", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => closePage(a));
+  await settle();
+
+  relay.lose.add("POST");
+  key(a, "m");
+  await settle();
+  relay.lose.clear();
+  assert.equal(relay.marks.length, 1, "fixture: the POST should have landed");
+
+  // Named and recoloured while the page still holds it as pending.
+  typeName(a, a.document.querySelector("#markList li input[type=text]"), "Goal");
+  click(a, "#markList li .palette button[aria-label=Blue]");
+  await settle();
+  poll(a);
+  await settle();
+  assert.deepEqual(
+    [relay.marks.length, relay.marks[0].name, relay.marks[0].colour],
+    [1, "Goal", "#4da3ff"],
+    "what was typed while the reply was lost never reached the relay"
+  );
+  assert.equal(rows(a).length, 1);
+  assert.equal(rows(a)[0].querySelector("input[type=text]").value, "Goal");
+});
+
+test("a pending mark deleted after its POST landed unseen is deleted on the relay", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => closePage(a));
+  await settle();
+
+  relay.lose.add("POST");
+  key(a, "m");
+  await settle();
+  relay.lose.clear();
+  click(a, "#markList li .del");
+  await settle();
+  assert.equal(rows(a).length, 0);
+
+  poll(a);
+  await settle();
+  assert.equal(relay.marks.length, 0, "the relay kept a mark deleted while its POST's reply was lost");
+  poll(a);
+  await settle();
+  assert.equal(rows(a).length, 0, "the deleted mark came back");
+});
+
+test("a list older than the one drawn does not bring a deleted mark back", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => closePage(a));
+  await settle();
+  key(a, "m");
+  await settle();
+
+  // A poll leaves before the delete, and its reply arrives after the delete's.
+  relay.rev += 1;
+  relay.hold.add("GET");
+  poll(a);
+  await settle();
+  relay.hold.clear();
+  click(a, "#markList li .del");
+  await settle();
+  assert.equal(relay.marks.length, 0, "fixture: the delete should have landed");
+  relay.release();
+  await settle();
+  assert.equal(rows(a).length, 0, "a late reply put a deleted mark back");
+  assert.equal(flags(a).length, 0, "a late reply put a deleted mark back on the bar");
+});
+
+test("marks travel with the viewer token, in a header where hls.js is in play", async (t) => {
+  const relay = fakeRelay();
+  const w = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => closePage(w));
+  await settle();
+  key(w, "m");
+  await settle();
+  assert.equal(relay.marks.length, 1, "the mark did not reach the relay with the token");
+  assert.ok(relay.auth.every((a) => a === "Bearer " + TOKEN), "a marks request went without the header");
+  assert.ok(relay.calls.every((c) => !c.includes("token=")), "the token went into a URL as well");
+});
+
+test("marks travel with the viewer token in the query where the page plays native HLS", async (t) => {
+  const relay = fakeRelay();
+  relay.marks.push({ id: "a1", at: T0 + 10_000, name: "Kick-off", colour: "#ffb020", exported: false });
+  relay.rev = 1;
+  const w = loadPage({ token: TOKEN, fetch: relay.fetch, nativeHls: true });
+  t.after(() => closePage(w));
+  await settle();
+  assert.equal(rows(w).length, 1, "the shared list was not read");
+  assert.ok(relay.calls.length > 0 && relay.calls.every((c) => c.includes("?token=" + TOKEN)),
+    "a marks request went without the token in its query: " + relay.calls);
+  assert.ok(relay.auth.every((a) => a === null), "a header was sent where the page cannot set one");
+});
+
+test("a page with no token keeps its marks on the device", async (t) => {
+  const relay = fakeRelay();
+  const w = loadPage({ clock: true, fetch: relay.fetch });
+  t.after(() => closePage(w));
+  await settle();
+  key(w, "m");
+  await settle();
+  assert.equal(relay.marks.length, 0, "a mark was sent without a token");
+  assert.equal(JSON.parse(w.localStorage.getItem(MARKS_KEY) || "[]").length, 1,
+    "refused the shared list, the mark was not kept locally");
+});
+
+test("an older relay leaves marks on this device, and is not asked every poll", async (t) => {
+  const relay = olderRelay();
+  const w = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
   t.after(() => closePage(w));
   await settle();
   key(w, "m");
   await settle();
   assert.equal(rows(w).length, 1);
-  const stored = JSON.parse(w.localStorage.getItem("bilbycast.dvr.marks.bigshow") || "[]");
+  const stored = JSON.parse(w.localStorage.getItem(MARKS_KEY) || "[]");
   assert.equal(stored.length, 1, "with no shared list the mark was not kept locally");
+  poll(w);
+  await settle();
+  poll(w);
+  await settle();
+  assert.deepEqual(
+    relay.calls,
+    ["GET /origin/bigshow/marks"],
+    "a relay without the list was asked again on the next poll, or sent a mark"
+  );
+});
+
+test("a page on its own marks asks again now and then, and joins a list that appears", async (t) => {
+  const older = olderRelay();
+  const relay = fakeRelay();
+  let upgraded = false;
+  const w = loadPage({
+    clock: true,
+    token: TOKEN,
+    fetch: (u, i) => (upgraded ? relay.fetch(u, i) : older.fetch(u, i)),
+  });
+  t.after(() => closePage(w));
+  await settle();
+  key(w, "m");
+  await settle();
+
+  upgraded = true;
+  for (let i = 0; i < 19; i++) poll(w);
+  await settle();
+  assert.equal(relay.calls.length, 0, "a relay without the list was asked again on every poll");
+  poll(w);
+  await settle();
+  assert.equal(relay.marks.length, 1, "the list the relay now has was never joined");
+  assert.equal(relay.marks[0].at, T0 + 50_000);
+});
+
+test("a relay that fails a read is asked again on the next poll", async (t) => {
+  const relay = fakeRelay();
+  relay.failNext = 503;
+  const w = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => closePage(w));
+  await settle();
+  poll(w);
+  await settle();
+  key(w, "m");
+  await settle();
+  assert.equal(relay.marks.length, 1, "one failed read left the page on its own marks for good");
 });
 
 test("marks already on the device are carried into the shared list once", async (t) => {
@@ -384,23 +693,67 @@ test("marks already on the device are carried into the shared list once", async 
     { id: 1, at: T0 + 20_000.4, name: "Earlier", colour: "#ffb020" },
     // Two days old: no window reaches it.
     { id: 2, at: T0 - 2 * 86_400_000, name: "Last week", colour: "#ff4d4f" },
+    // Names the old page never limited, which the relay would refuse.
+    { id: 3, at: T0 + 30_000, name: "Goal\tscored", colour: "#ffb020" },
+    { id: 4, at: T0 + 40_000, name: "y".repeat(150), colour: "#ffb020" },
   ]);
   const w = loadPage({
     clock: true,
+    token: TOKEN,
     fetch: relay.fetch,
-    storage: { "bilbycast.dvr.marks.bigshow": stored },
+    storage: { [MARKS_KEY]: stored },
   });
   t.after(() => closePage(w));
   await settle();
   assert.deepEqual(
     relay.marks.map((m) => [m.at, m.name, m.colour]),
-    [[T0 + 20_000, "Earlier", "#ffb020"]],
-    "the device's recent mark was not carried over, or the old one was"
+    [
+      [T0 + 20_000, "Earlier", "#ffb020"],
+      [T0 + 30_000, "Goal scored", "#ffb020"],
+      [T0 + 40_000, "y".repeat(120), "#ffb020"],
+    ],
+    "the device's recent marks were not carried over as the relay takes them, or the old one was"
   );
-  assert.equal(w.localStorage.getItem("bilbycast.dvr.marks.bigshow"), null,
+  assert.equal(w.localStorage.getItem(MARKS_KEY), null,
     "the local list is still live, so it would be carried again");
-  assert.equal(w.localStorage.getItem("bilbycast.dvr.marks.bigshow.migrated"), stored,
+  assert.equal(w.localStorage.getItem(MARKS_KEY + ".migrated"), stored,
     "the local list was thrown away rather than kept aside");
+});
+
+test("a later carry never replaces the list first kept aside", async (t) => {
+  const relay = fakeRelay();
+  const first = JSON.stringify([{ id: 1, at: T0 - 3 * 86_400_000, name: "Old", colour: "#ffb020" }]);
+  const later = JSON.stringify([{ id: 1, at: T0 + 20_000, name: "", colour: "#ff4d4f" }]);
+  const w = loadPage({
+    clock: true,
+    token: TOKEN,
+    fetch: relay.fetch,
+    storage: { [MARKS_KEY + ".migrated"]: first, [MARKS_KEY]: later },
+  });
+  t.after(() => closePage(w));
+  await settle();
+  assert.equal(relay.marks.length, 1, "fixture: the later mark should have been carried");
+  assert.equal(w.localStorage.getItem(MARKS_KEY + ".migrated"), first,
+    "the device's original list was overwritten");
+  const beside = Object.keys(w.localStorage).filter((k) => k.startsWith(MARKS_KEY + ".migrated."));
+  assert.deepEqual(beside.map((k) => w.localStorage.getItem(k)), [later],
+    "the later list was not kept beside the first");
+});
+
+test("a name the relay refuses costs the name, not the mark", async (t) => {
+  const relay = fakeRelay({ refuseNames: true });
+  const w = loadPage({
+    clock: true,
+    token: TOKEN,
+    fetch: relay.fetch,
+    storage: { [MARKS_KEY]: JSON.stringify([{ id: 1, at: T0 + 20_000, name: "Earlier", colour: "#ffb020" }]) },
+  });
+  t.after(() => closePage(w));
+  await settle();
+  assert.deepEqual(relay.marks.map((m) => [m.at, m.name]), [[T0 + 20_000, ""]],
+    "a refused name took its mark with it");
+  assert.equal(rows(w).length, 1);
+  assert.match(w.document.getElementById("err").textContent, /kept without its name/);
 });
 
 // ── loop around a mark ───────────────────────────────────────────────────────
@@ -460,10 +813,62 @@ test("the loop's length comes from settings, and O toggles it", (t) => {
   assert.equal(main.paused, true, "stopping the loop did not hold the picture");
 });
 
+test("with site data blocked, the loop's speed and length still take effect", (t) => {
+  const w = loadPage({ clock: true, blockStorage: true });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  const pre = w.document.getElementById("loopPre");
+  pre.value = "10";
+  pre.dispatchEvent(new w.Event("change"));
+  key(w, "m");
+  key(w, "o");
+  assert.equal(main.currentTime, 40, "the seconds-before setting did nothing without storage");
+  click(w, '#loopBar [data-loop-rate="0.25"]');
+  main.dispatchEvent(new w.Event("timeupdate"));
+  assert.equal(main.playbackRate, 0.25, "the speed buttons did nothing without storage");
+  assert.equal(
+    w.document.querySelector('#loopBar [data-loop-rate="0.25"]').getAttribute("aria-pressed"),
+    "true"
+  );
+});
+
+test("a loop started during a shuttle ends into normal speed, not back into the shuttle", (t) => {
+  const w = loadPage({ clock: true });
+  t.after(() => closePage(w));
+  key(w, "m");
+  click(w, "#btnFf");
+  click(w, "#btnFf");                  // 4x
+  key(w, "o");
+  assert.equal(w.document.body.dataset.loop, "1", "fixture: the loop should have started");
+
+  const scrub = w.document.getElementById("scrub");
+  scrub.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  scrub.value = "500";
+  scrub.dispatchEvent(new w.Event("input", { bubbles: true }));
+  w.dispatchEvent(new w.Event("pointerup"));
+  assert.notEqual(
+    w.document.body.dataset.mode,
+    "shuttle",
+    "leaving the loop by the scrub bar started a shuttle nobody asked for"
+  );
+  assert.ok(w.document.getElementById("main").playbackRate <= 1);
+});
+
+test("deleting the looped mark on this device ends the loop", (t) => {
+  const w = loadPage({ clock: true });          // no fetch: marks are local
+  t.after(() => closePage(w));
+  key(w, "m");
+  key(w, "o");
+  assert.equal(w.document.body.dataset.loop, "1", "fixture: the loop should have started");
+  click(w, "#markList li .del");
+  w.document.getElementById("main").dispatchEvent(new w.Event("timeupdate"));
+  assert.equal(w.document.body.dataset.loop, "0", "the loop outlived its mark");
+});
+
 test("another viewer deleting the looped mark ends the loop", async (t) => {
   const relay = fakeRelay();
-  const a = loadPage({ clock: true, fetch: relay.fetch });
-  const b = loadPage({ clock: true, fetch: relay.fetch });
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
   t.after(() => { closePage(a); closePage(b); });
   await settle();
   key(a, "m");
@@ -478,4 +883,34 @@ test("another viewer deleting the looped mark ends the loop", async (t) => {
   poll(b);
   await settle();
   assert.equal(b.document.body.dataset.loop, "0", "the loop outlived its mark");
+});
+
+test("a loop ends when access does, and cannot be started again", (t) => {
+  const w = loadPage({ clock: true, token: TOKEN });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  key(w, "m");
+  key(w, "o");
+  assert.equal(w.document.body.dataset.loop, "1", "fixture: the loop should have started");
+
+  // The relay refuses the credential, as it does once access is withdrawn.
+  for (const cb of w.hlsHandlers.hlsError || []) {
+    cb("hlsError", { details: "fragLoadError", fatal: false, response: { code: 403 } });
+  }
+  assert.match(w.document.getElementById("err").textContent, /expired/, "fixture: no expiry notice");
+  assert.equal(w.document.body.dataset.loop, "0", "the loop played on after access ended");
+  main.dispatchEvent(new w.Event("timeupdate"));
+  assert.equal(main.paused, true, "the picture restarted under the expiry notice");
+  key(w, "o");
+  assert.equal(w.document.body.dataset.loop, "0", "a loop started after access ended");
+});
+
+test("the self-test ends a loop before it drives the player", (t) => {
+  const w = loadPage({ clock: true });
+  t.after(() => closePage(w));
+  key(w, "m");
+  key(w, "o");
+  assert.equal(w.document.body.dataset.loop, "1", "fixture: the loop should have started");
+  click(w, "#stRun");
+  assert.equal(w.document.body.dataset.loop, "0", "the self-test ran with a loop fencing the transport");
 });

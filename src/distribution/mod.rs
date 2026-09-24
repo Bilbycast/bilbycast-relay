@@ -2765,6 +2765,30 @@ mod tests {
         );
     }
 
+    /// Shared marks go out with the viewer's credential, by both carriers.
+    ///
+    /// The relay refuses a marks request without one, and the page takes a
+    /// refusal on its first poll as "no shared marks here" — so a request that
+    /// lost its credential would put every viewer back on device-only marks,
+    /// which is exactly the page from before the feature, and nothing would
+    /// look broken. The jsdom suite drives both carriers; this keeps the check
+    /// in the ordinary `cargo test`.
+    #[test]
+    fn marks_requests_carry_the_viewers_credential() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "marksRequest");
+        assert!(
+            f.contains(
+                r#"if (TOKEN_IN_HEADER && TOKEN) headers.Authorization = "Bearer " + TOKEN;"#
+            ),
+            "marks are requested without the header carrier: {f}"
+        );
+        assert!(
+            f.contains("fetch(url(STREAM, path),"),
+            "marks are requested past `url()`, which carries the token for native HLS: {f}"
+        );
+    }
+
     /// A sprite sheet must be fetched with the viewer's credential.
     ///
     /// The origin refuses an unauthenticated GET, and a CSS
