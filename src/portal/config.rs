@@ -213,6 +213,21 @@ impl PortalConfig {
         if !self.manager_url.starts_with("https://") && !self.manager_url.starts_with("http://") {
             return Err("manager_url must start with https:// or http://".into());
         }
+        // Parsed the way the HTTP client will parse it, as `authelia_url` is.
+        // A `user:password@` here never worked: reqwest turns it into a Basic
+        // `Authorization` header ahead of the service token's Bearer one, and
+        // the manager reads the first. What it did do is put a password in the
+        // log, since `manager_url` is printed at startup and in the plaintext
+        // refusal below. So it is refused, and neither message repeats the URL.
+        let url = reqwest::Url::parse(&self.manager_url)
+            .map_err(|e| format!("manager_url is not a valid URL: {e}"))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(
+                "manager_url cannot carry credentials (a user:password@ part): the portal \
+                 authenticates to the manager with its service token"
+                    .into(),
+            );
+        }
         // `manager_token` rides on every request to this URL as a bearer
         // credential, so plaintext hands the portal's service identity to
         // anyone on the path. Gated the way every other credential-bearing
@@ -343,7 +358,10 @@ mod tests {
             .expect_err("plaintext must be refused by default");
         assert!(err.contains("BILBYCAST_ALLOW_INSECURE"), "{err}");
 
-        assert!(cfg.validate_with(true).is_ok(), "the opt-in must actually allow it");
+        assert!(
+            cfg.validate_with(true).is_ok(),
+            "the opt-in must actually allow it"
+        );
 
         // https needs no opt-in.
         cfg.manager_url = "https://manager.internal".into();
@@ -425,6 +443,54 @@ mod tests {
         c.player_origins = vec!["https://relay.example/".into()];
         c.normalise();
         assert!(c.allows_player_origin("https://relay.example"));
+    }
+
+    /// A `user:password@` in `manager_url` is refused however the rest of the
+    /// URL reads, plaintext opt-in or not, and the refusal does not repeat
+    /// the password. Everything that validated before still does.
+    #[test]
+    fn a_manager_url_carrying_credentials_is_refused() {
+        for (url, allow_insecure) in [
+            ("https://portal:s3cret@manager.example", false),
+            ("https://portal@manager.example", false),
+            ("https://:s3cret@manager.example", false),
+            ("https://portal:s3cret@manager.example:8443/prefix", false),
+            // Refused for the credentials, before the plaintext check can
+            // print the URL in its own message.
+            ("http://portal:s3cret@manager.internal", false),
+            ("http://portal:s3cret@manager.internal", true),
+        ] {
+            let mut c = ok();
+            c.manager_url = url.into();
+            let Err(err) = c.validate_with(allow_insecure) else {
+                panic!("{url} was accepted");
+            };
+            assert!(err.contains("cannot carry credentials"), "{url}: {err}");
+            assert!(
+                !err.contains("s3cret"),
+                "{url}: the refusal repeats the password: {err}"
+            );
+        }
+
+        for (url, allow_insecure) in [
+            ("https://manager.example", false),
+            ("https://manager.example:8443", false),
+            ("https://manager.example/prefix", false),
+            ("https://[2001:db8::1]:8443", false),
+            ("http://manager.internal", true),
+            ("http://127.0.0.1:8443", true),
+        ] {
+            let mut c = ok();
+            c.manager_url = url.into();
+            assert_eq!(c.validate_with(allow_insecure), Ok(()), "{url} was refused");
+        }
+
+        let mut c = ok();
+        c.manager_url = "https://manager.example:99999".into();
+        let err = c
+            .validate_with(false)
+            .expect_err("an unparseable URL was accepted");
+        assert!(err.starts_with("manager_url is not a valid URL"), "{err}");
     }
 
     /// The token must not reach a log through `{:?}`. Everything else still

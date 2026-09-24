@@ -165,7 +165,10 @@ as watching, because the player's `POST /api/beat` is refused the same way. See
 
 A `manager_url` on plain `http://` is refused at startup unless
 `BILBYCAST_ALLOW_INSECURE=1` is set: the portal sends its manager token on every
-request to that URL, so plaintext hands out its service identity.
+request to that URL, so plaintext hands out its service identity. One carrying
+a `user:password@` is refused either way. It never worked, since the manager
+reads the Basic credential it becomes instead of the portal's token, and the
+URL is printed in the startup log.
 
 The portal follows no redirects, from the manager, from Authelia or from a
 relay's origin. A `3xx` is handled as that service refusing; from the manager
