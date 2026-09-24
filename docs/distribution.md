@@ -690,11 +690,17 @@ name back. A list that arrives while a name field has the cursor, or a colour
 palette is open, moves the flags at once but leaves the rows alone until the
 field is left or the palette closed; a row drawn from the older list checks
 that its mark still exists before going to it or looping around it. A palette
-closes on a press anywhere outside its own row (asked of the press, not of
-focus, which Safari and iOS never give a button), when the drawer closes, and
-when another palette opens; a press on another row closes it without redrawing
-under the finger and leaves the list to the next poll, and a palette that has
-held a list back for 30 s is taken as left open and closed. Every reply
+closes on a press outside the list (asked of the press, not of focus, which
+Safari and iOS never give a button), on a tap on another row, when the drawer
+closes, and when another palette opens. A tap on another row closes it only
+once the tap's click has been aimed: the palette is a line of its own row, so
+closing it on the press lifted every row below it first, and in Chrome a tap on
+one mark's × deleted the mark below it. Only a press outside the drawer draws
+the held-back list at once — anywhere in the drawer, a redraw could still move
+what the finger is on (an emptied list lifts the export controls) — and the
+rest leave it to the next poll. A palette that has held a list back for 30 s
+(counted from when it opened, if the list was already waiting for a name field
+or another palette) is taken as left open and closed. Every reply
 carries the whole list and its revision, and a list older than the one drawn —
 a poll answered after a later delete's reply — is ignored. So is a list with
 no file behind it (`"marks-none"`) once a real one has been drawn: it is either

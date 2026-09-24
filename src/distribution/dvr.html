@@ -2411,6 +2411,8 @@
   /// A newer list arrived while the rows were in use, and since when (on
   /// `performance.now()`).
   var marksListDeferred = false, marksDeferredSince = 0;
+  /// When the colour palette open now was opened, on the same clock.
+  var paletteOpenedAt = 0;
   /// How long an open colour palette may hold a newer list back. A palette
   /// open this long was left open, not in use: choosing a colour closes it.
   var PALETTE_HOLD_MS = 30000;
@@ -2566,8 +2568,9 @@
   /// swatch or a redraw closed it: one left open by a tap elsewhere, or by
   /// closing the drawer, held back every list after it for as long as the
   /// page stayed open. Without `now` the list waits for the next poll — a tap
-  /// inside the list has to reach the row it landed on, and redrawing the
-  /// rows under it would take that row away before the tap completes.
+  /// in the drawer has to reach what it landed on, and redrawing the rows
+  /// under it would take that row away, or move the export controls, before
+  /// the tap completes.
   function closePalettes(now) {
     markList.querySelectorAll("li.picking").forEach(function (li) {
       li.classList.remove("picking");
@@ -2578,26 +2581,51 @@
   }
 
   /// A list held back is drawn at the first poll that finds the rows free:
-  /// a palette closed by a tap inside the list leaves it to this, and a list
-  /// that has not changed since is not drawn by anything else. One held back
-  /// only by a palette for `PALETTE_HOLD_MS` is drawn anyway, and the palette
-  /// closed. A name field is never taken from under the cursor.
+  /// a palette closed by a tap inside the drawer leaves it to this, and a
+  /// list that has not changed since is not drawn by anything else. One held
+  /// back only by a palette for `PALETTE_HOLD_MS` is drawn anyway, and the
+  /// palette closed — counted from when that palette opened if the list was
+  /// waiting already, since a list held for a name field or for an earlier
+  /// palette says nothing about whether this one is in use. A name field is
+  /// never taken from under the cursor.
   function releaseHeldList() {
     if (!marksListDeferred) return;
     if (!listBusy()) { renderMarks(); return; }
-    if (!nameFieldFocused() && performance.now() - marksDeferredSince > PALETTE_HOLD_MS) {
+    var heldSince = Math.max(marksDeferredSince, paletteOpenedAt);
+    if (!nameFieldFocused() && performance.now() - heldSince > PALETTE_HOLD_MS) {
       closePalettes(true);
     }
   }
 
-  // A press anywhere but the open palette's own row closes it. Captured, so
-  // nothing on the page can stop it on the way, and on the press rather than
-  // on focus, which a tap on Safari or iOS never moves.
+  // A press outside the list closes an open palette. Captured, so nothing on
+  // the page can stop it on the way, and on the press rather than on focus,
+  // which a tap on Safari or iOS never moves. The list fills the middle of
+  // the drawer and scrolls within it, so closing the palette moves nothing
+  // outside it; the list it held back is drawn at once only for a press
+  // outside the drawer, because an emptied list gives its place to a shorter
+  // note and would lift the export controls from under the finger.
   document.addEventListener("pointerdown", function (e) {
     if (!paletteOpen()) return;
     var el = e.target && e.target.nodeType === 1 ? e.target : null;
-    if (el && el.closest("#markList li.picking")) return;
-    closePalettes(!(el && markList.contains(el)));
+    if (el && markList.contains(el)) return;
+    closePalettes(!(el && el.closest("#drawer")));
+  }, true);
+
+  // A press inside the list closes the palette only once its click has been
+  // aimed. The palette is a line of its own row, so closing it lifts every
+  // row below by most of a row: closed on the press, a tap's click was
+  // hit-tested after the move and landed on the row below — a tap on one
+  // mark's × deleted the next mark, for every viewer — and a mouse click,
+  // pressed and released over different rows, went nowhere. A captured click
+  // already has its target. It also keeps one palette open at a time, a
+  // keyboard's Enter on a swatch included. A press that never becomes a
+  // click, such as a scroll of the list, leaves the palette to
+  // `PALETTE_HOLD_MS`.
+  document.addEventListener("click", function (e) {
+    if (!paletteOpen()) return;
+    var el = e.target && e.target.nodeType === 1 ? e.target : null;
+    if (!el || !markList.contains(el) || el.closest("#markList li.picking")) return;
+    closePalettes(false);
   }, true);
 
   /// A pending mark the relay has named: give it the name, and owe the relay
@@ -3395,11 +3423,11 @@
         palette.appendChild(b);
       });
       swatch.addEventListener("click", function () {
-        // One palette at a time. A press elsewhere has already closed any
-        // other, but a keyboard's Enter arrives as a click with no press.
-        if (!li.classList.contains("picking")) closePalettes(false);
+        // Any other palette is closed already, by the captured click that
+        // brought this one here.
         var open = li.classList.toggle("picking");
         swatch.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) paletteOpenedAt = performance.now();
         // A list held back while the palette was open is drawn as it closes.
         if (!open && marksListDeferred && !listBusy()) renderMarks();
       });

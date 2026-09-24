@@ -573,12 +573,19 @@ test("a tap outside the open palette closes it and brings the list up to date", 
 
 test("a tap inside the palette's own row does not close it", async (t) => {
   const { b } = await paletteHoldingAList(t);
-  b.document.querySelector("#markList li .palette button")
-    .dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  const colour = b.document.querySelector("#markList li .palette button");
+  colour.dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
   assert.ok(b.document.querySelector("#markList li.picking"), "pressing a colour closed the palette first");
+  colour.dispatchEvent(new b.Event("click", { bubbles: true }));
+  assert.ok(b.document.querySelector("#markList li.picking"), "choosing a colour was taken as a tap elsewhere");
 });
 
-test("a tap on another row closes the palette without redrawing under it, and the next poll does", async (t) => {
+/// jsdom lays nothing out, so it cannot show a tap landing on the wrong row;
+/// what it can pin is the class that lays the palette out. A palette closed
+/// on the press lifts every row below it before the tap's click is aimed, and
+/// in Chrome a tap on the next row's × then deleted the row below that. The
+/// tap itself was checked in headless Chrome over the DevTools protocol.
+test("a tap on another row closes the palette once its click is aimed, and the next poll redraws", async (t) => {
   const relay = fakeRelay();
   const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
   const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
@@ -592,7 +599,7 @@ test("a tap on another row closes the palette without redrawing under it, and th
   await settle();
   assert.deepEqual(rowAts(b), [30_000, 50_000], "fixture");
 
-  click(b, "#markList li:nth-child(2) .swatch");
+  click(b, "#markList li:nth-child(1) .swatch");
   a.document.querySelectorAll("#markList li .del")[1].dispatchEvent(new a.Event("click", { bubbles: true }));
   await settle();
   a.document.getElementById("main").currentTime = 20;
@@ -602,14 +609,101 @@ test("a tap on another row closes the palette without redrawing under it, and th
   await settle();
   assert.deepEqual(rowAts(b), [30_000, 50_000], "fixture: the palette should hold the list");
 
-  const tapped = rows(b)[0];
-  tapped.querySelector("input[type=text]").dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  // The row below the open palette.
+  const tapped = rows(b)[1];
+  const name = tapped.querySelector("input[type=text]");
+  name.dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  assert.ok(
+    rows(b)[0].classList.contains("picking"),
+    "the palette closed on the press, lifting the row under the finger before the click was aimed"
+  );
+  name.dispatchEvent(new b.Event("click", { bubbles: true }));
   assert.equal(b.document.querySelector("#markList li.picking"), null, "the palette stayed open");
-  assert.equal(rows(b)[0], tapped, "the rows were redrawn under the tap, taking the row it landed on");
+  assert.equal(rows(b)[1], tapped, "the rows were redrawn under the tap, taking the row it landed on");
 
   poll(b);
   await settle();
   assert.deepEqual(rowAts(b), [20_000, 30_000], "the list stayed held back once the palette had closed");
+});
+
+test("a press in the drawer outside the list closes the palette and leaves the list to the next poll", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => { closePage(a); closePage(b); });
+  await settle();
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  click(b, "#markList li .swatch");
+  // The only mark goes, so the list the palette holds back is an empty one.
+  click(a, "#markList li .del");
+  await settle();
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [50_000], "fixture: the palette should hold the list");
+
+  b.document.getElementById("btnExport").dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  assert.equal(b.document.querySelector("#markList li.picking"), null, "the palette stayed open");
+  // Drawn now, the empty list would give its place to the shorter note and
+  // lift the export button from under the finger.
+  assert.equal(b.document.body.dataset.marks, "1", "the list was drawn under a press on the export controls");
+  assert.deepEqual(rowAts(b), [50_000], "the list was drawn under a press on the export controls");
+  poll(b);
+  await settle();
+  assert.equal(b.document.body.dataset.marks, "0", "the list stayed held back once the palette had closed");
+});
+
+/// A palette opened on a list already held back — here for a name field, as
+/// holding MARK leaves one focused (and Android keeps it focused with the
+/// keyboard put away) — is timed from its own opening. Timed from the list's
+/// arrival, it was closed by the first poll after it opened, lifting the rows
+/// below under a finger on its way to a colour.
+test("a palette opened on a list held back for long is not closed by the next poll", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => { closePage(a); closePage(b); });
+  await settle();
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  const real = b.performance.now.bind(b.performance);
+  let skew = 0;
+  b.performance.now = () => real() + skew;
+
+  rows(b)[0].querySelector("input[type=text]").focus();
+  a.document.getElementById("main").currentTime = 20;
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  skew = 40_000;
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [50_000], "fixture: the list should wait for the name field");
+
+  // Chrome on Android moves focus to a tapped button.
+  const swatch = rows(b)[0].querySelector(".swatch");
+  swatch.dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  swatch.focus();
+  swatch.dispatchEvent(new b.Event("click", { bubbles: true }));
+  await settle();
+  assert.ok(b.document.querySelector("#markList li.picking"), "fixture: the palette did not open");
+
+  skew = 41_000;
+  poll(b);
+  await settle();
+  assert.ok(b.document.querySelector("#markList li.picking"), "the first poll after the palette opened closed it");
+  assert.deepEqual(rowAts(b), [50_000], "the first poll after the palette opened redrew the rows");
+
+  skew = 71_000;
+  poll(b);
+  await settle();
+  assert.equal(b.document.querySelector("#markList li.picking"), null, "the palette was never closed");
+  assert.deepEqual(rowAts(b), [20_000, 50_000], "a palette left open held the list back indefinitely");
 });
 
 test("closing the drawer closes an open palette and brings the list up to date", async (t) => {
