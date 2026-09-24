@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 /// gets copied around while someone is debugging.
 pub const TOKEN_ENV: &str = "BILBYCAST_PORTAL_TOKEN";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` is written out by hand below, not derived: a derived one would
+/// print `manager_token`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PortalConfig {
     /// Where to listen. **Loopback by default**: the only supported way in is
     /// through the authenticating proxy on the same host, and a portal reachable
@@ -86,6 +88,43 @@ pub struct PortalConfig {
     /// mails the relay itself, with its own wording for both cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mail: Option<super::mail::MailConfig>,
+}
+
+/// Everything but the token, which is the portal's service credential: its
+/// holder can have the manager mint a viewer token for any entitled user. One
+/// `?cfg` in a log line must not be how it leaks.
+impl std::fmt::Debug for PortalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured, so a field added to the struct is a compile error here
+        // rather than a field this silently leaves out (or a secret it prints).
+        let Self {
+            listen_addr,
+            manager_url,
+            manager_token,
+            username_header,
+            logout_url,
+            trusted_proxies,
+            player_origins,
+            accounts,
+            mail,
+        } = self;
+        let token = if manager_token.trim().is_empty() {
+            "<unset>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("PortalConfig")
+            .field("listen_addr", listen_addr)
+            .field("manager_url", manager_url)
+            .field("manager_token", &token)
+            .field("username_header", username_header)
+            .field("logout_url", logout_url)
+            .field("trusted_proxies", trusted_proxies)
+            .field("player_origins", player_origins)
+            .field("accounts", accounts)
+            .field("mail", mail)
+            .finish()
+    }
 }
 
 fn default_listen() -> String {
@@ -386,6 +425,22 @@ mod tests {
         c.player_origins = vec!["https://relay.example/".into()];
         c.normalise();
         assert!(c.allows_player_origin("https://relay.example"));
+    }
+
+    /// The token must not reach a log through `{:?}`. Everything else still
+    /// does, so the impl stays useful for debugging.
+    #[test]
+    fn debug_output_redacts_the_manager_token() {
+        let mut c = ok();
+        c.manager_token = "s3cret-service-token".into();
+        for shown in [format!("{c:?}"), format!("{c:#?}")] {
+            assert!(!shown.contains("s3cret"), "the token leaked: {shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+            assert!(shown.contains("https://manager.example"), "{shown}");
+            assert!(shown.contains("remote-user"), "{shown}");
+        }
+        c.manager_token = "  ".into();
+        assert!(format!("{c:?}").contains("<unset>"));
     }
 
     #[test]
