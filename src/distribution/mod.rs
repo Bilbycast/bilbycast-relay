@@ -999,11 +999,12 @@ mod tests {
         assert!(html.contains("--thumb: 18px;"), "the thumb size is not named once");
 
         // Every layer that must agree with the playhead, and the thumb itself,
-        // take their geometry from that one value.
+        // take their geometry from that one value: the shading, the ruler, the
+        // flags, and the looped span.
         assert_eq!(
             html.matches("left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2);")
                 .count(),
-            3,
+            4,
             "a layer on the bar is still drawn edge to edge"
         );
         assert!(
@@ -2600,11 +2601,14 @@ mod tests {
             beat.contains("if (beatTimer !== null) { stopBeating(); startBeating(); }"),
             "a cadence change restarts a beat that was stopped: {beat}"
         );
+        // The beat's own listener, found by what it does: the shared-marks
+        // poll registers one too, and it comes first in the file.
         let focus = html
             .split(r#"addEventListener("visibilitychange""#)
-            .nth(1)
-            .and_then(|after| after.split("});").next())
-            .expect("no visibilitychange listener");
+            .skip(1)
+            .filter_map(|after| after.split("});").next())
+            .find(|body| body.contains("beat"))
+            .expect("no visibilitychange listener for the beat");
         assert!(
             focus.contains("beatTimer !== null"),
             "a refocus beats after the beat was stopped: {focus}"
@@ -2758,6 +2762,30 @@ mod tests {
         assert!(
             f.contains("if (next) thumbs = next"),
             "a failed reparse drops the working index: {f}"
+        );
+    }
+
+    /// Shared marks go out with the viewer's credential, by both carriers.
+    ///
+    /// The relay refuses a marks request without one, and the page takes a
+    /// refusal on its first poll as "no shared marks here" — so a request that
+    /// lost its credential would put every viewer back on device-only marks,
+    /// which is exactly the page from before the feature, and nothing would
+    /// look broken. The jsdom suite drives both carriers; this keeps the check
+    /// in the ordinary `cargo test`.
+    #[test]
+    fn marks_requests_carry_the_viewers_credential() {
+        let html = include_str!("dvr.html");
+        let f = js_fn(html, "marksRequest");
+        assert!(
+            f.contains(
+                r#"if (TOKEN_IN_HEADER && TOKEN) headers.Authorization = "Bearer " + TOKEN;"#
+            ),
+            "marks are requested without the header carrier: {f}"
+        );
+        assert!(
+            f.contains("fetch(url(STREAM, path),"),
+            "marks are requested past `url()`, which carries the token for native HLS: {f}"
         );
     }
 
@@ -3025,12 +3053,15 @@ mod tests {
         // a new preference is welcome and a new secret is not. Comments are
         // skipped — this section explains itself in prose, and prose stores
         // nothing.
-        const NON_SECRET_KEYS: [&str; 5] = [
+        const NON_SECRET_KEYS: [&str; 8] = [
             "MARKS_KEY",
             "LOWRES_KEY",
             "QUALITY_KEY",
             "CLIP_PRE_KEY",
             "CLIP_POST_KEY",
+            "LOOP_PRE_KEY",
+            "LOOP_POST_KEY",
+            "LOOP_RATE_KEY",
         ];
         for line in html.lines().filter(|l| {
             let t = l.trim_start();
