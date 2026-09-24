@@ -57,8 +57,8 @@
 //! has nobody to report to, so a relay failure on it is logged at ERROR and
 //! that is all.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -97,11 +97,22 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// A conversation that stalls is dropped rather than held open...
 const SMTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// ...and so is one that keeps talking. Authelia is done in well under a
-/// second; this is what stops a client sending `NOOP` forever from holding a
-/// connection slot, and with it Authelia's mail, hostage.
+/// second; this bounds an authenticated session, which only a holder of the
+/// listener secret can have.
 const SESSION_DEADLINE: Duration = Duration::from_secs(60);
-/// Connections served at once. Past this a new one is told `421` and closed.
+/// A connection that has not authenticated gets far less: this long, and
+/// this many commands, `AUTH` included. Authelia authenticates in its first
+/// two round trips — `EHLO`, then `AUTH` — so this costs it nothing, and a
+/// client that idles or chats instead is not Authelia.
+const PRE_AUTH_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_PRE_AUTH_COMMANDS: u8 = 6;
+/// Connections served at once. Past this the oldest connection that has not
+/// authenticated is closed to make room — Authelia authenticates at once, so
+/// it is never the one closed — and only when every connection has
+/// authenticated is a new one told `421` and closed.
 const MAX_CONNECTIONS: usize = 16;
+/// How long a connection that made room waits for the slot it freed.
+const ROOM_WAIT: Duration = Duration::from_secs(2);
 /// Messages accepted and not yet relayed. Past this `DATA` is answered `451`.
 const MAX_IN_FLIGHT: usize = 8;
 /// Failed `AUTH` attempts, and unrecognised commands, before a connection is
@@ -113,12 +124,15 @@ const MAX_UNKNOWN_COMMANDS: u8 = 3;
 const MIN_LISTEN_PASSWORD: usize = 32;
 
 const AUTH_FIRST: &[u8] = b"530 5.7.0 Authentication required\r\n";
+const AUTH_SOONER: &[u8] = b"421 4.7.0 authenticate first; closing\r\n";
+const FULL: &[u8] = b"421 4.3.2 too many connections, try again later\r\n";
 const AUTH_INVALID: &[u8] = b"535 5.7.8 authentication credentials invalid\r\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailConfig {
-    /// Where Authelia delivers. Loopback only: the listener speaks no TLS, so
-    /// the secret Authelia authenticates with must not cross a network.
+    /// Where Authelia delivers: `127.0.0.1` or `[::1]`, the only addresses
+    /// Authelia's SMTP client sends a password to without TLS. The listener
+    /// speaks no TLS, so the secret must not cross a network either.
     #[serde(default = "default_listen")]
     pub listen_addr: String,
 
@@ -132,7 +146,9 @@ pub struct MailConfig {
 
     /// The relay that actually delivers, e.g. `smtp-relay.brevo.com`.
     pub relay_host: String,
-    /// 587 unless set, or 465 with `implicit_tls`.
+    /// 587 unless set, or 465 with `implicit_tls`. 465 itself is refused
+    /// without `implicit_tls`: a relay there never says the greeting STARTTLS
+    /// waits for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_port: Option<u16>,
     pub relay_username: String,
@@ -218,10 +234,14 @@ impl MailConfig {
             .listen_addr
             .parse()
             .map_err(|_| "mail.listen_addr must be host:port".to_string())?;
-        if !addr.ip().is_loopback() {
+        if addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST)
+            && addr.ip() != IpAddr::V6(Ipv6Addr::LOCALHOST)
+        {
             return Err(
-                "mail.listen_addr must be a loopback address: the listener speaks no TLS, so \
-                 the secret Authelia authenticates with would cross the network in clear"
+                "mail.listen_addr must be 127.0.0.1 or [::1]: the listener speaks no TLS, and \
+                 Authelia's SMTP client sends its password without TLS only to 127.0.0.1, ::1 or \
+                 localhost, so on any other address, loopback or not, Authelia cannot \
+                 authenticate"
                     .into(),
             );
         }
@@ -239,6 +259,13 @@ impl MailConfig {
         }
         if self.relay_port == Some(0) {
             return Err("mail.relay_port cannot be 0".into());
+        }
+        if self.relay_port == Some(465) && !self.implicit_tls {
+            return Err(
+                "mail.relay_port 465 is implicit TLS (submissions): set mail.implicit_tls to \
+                 true. Without it the portal waits for a STARTTLS greeting that never comes"
+                    .into(),
+            );
         }
         if self.relay_username.is_empty() {
             return Err("mail.relay_username is required".into());
@@ -908,6 +935,14 @@ enum Auth {
     Closed,
 }
 
+/// Connections that have not authenticated yet, oldest first, each with the
+/// switch that closes it.
+#[derive(Default)]
+struct Unauthenticated {
+    next: u64,
+    sessions: VecDeque<(u64, oneshot::Sender<()>)>,
+}
+
 /// The listener Authelia delivers to, and what its connections share.
 pub struct Interceptor {
     cfg: MailConfig,
@@ -917,8 +952,12 @@ pub struct Interceptor {
     relay: Arc<dyn Relay>,
     connections: Arc<Semaphore>,
     in_flight: Arc<Semaphore>,
-    /// [`SESSION_DEADLINE`]; a field so a test need not wait that long.
+    /// Held for a moment at a time, never across an `await`.
+    unauthenticated: std::sync::Mutex<Unauthenticated>,
+    /// [`SESSION_DEADLINE`] and [`PRE_AUTH_DEADLINE`]; fields so a test need
+    /// not wait that long.
     session_deadline: Duration,
+    pre_auth_deadline: Duration,
 }
 
 impl Interceptor {
@@ -935,7 +974,44 @@ impl Interceptor {
             relay,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            unauthenticated: Default::default(),
             session_deadline: SESSION_DEADLINE,
+            pre_auth_deadline: PRE_AUTH_DEADLINE,
+        }
+    }
+
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Unauthenticated> {
+        // Nothing panics while holding it, but a poisoned list is still a
+        // list: the listener must not stop over it.
+        self.unauthenticated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Count a new connection among the unauthenticated: its id, and what
+    /// fires when it is closed to make room.
+    fn arrive(&self) -> (u64, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let mut w = self.waiting();
+        let id = w.next;
+        w.next += 1;
+        w.sessions.push_back((id, tx));
+        (id, rx)
+    }
+
+    /// Stop counting `id`: it has authenticated, or ended.
+    fn leave(&self, id: u64) {
+        self.waiting().sessions.retain(|(s, _)| *s != id);
+    }
+
+    /// Close the oldest unauthenticated connection, if there is one.
+    fn make_room(&self) -> bool {
+        match self.waiting().sessions.pop_front() {
+            Some((_, close)) => {
+                let _ = close.send(());
+                true
+            }
+            None => false,
         }
     }
 
@@ -953,31 +1029,54 @@ impl Interceptor {
                         // Cannot happen while bound to loopback; cheap to keep true.
                         continue;
                     }
-                    let Ok(permit) = self.connections.clone().try_acquire_owned() else {
-                        if !full {
-                            tracing::warn!(
-                                limit = MAX_CONNECTIONS,
-                                "the notification mail listener is full; turning connections \
-                                 away until one closes"
-                            );
-                            full = true;
+                    // With every slot taken, a connection that has not
+                    // authenticated gives way: it is not Authelia, which
+                    // authenticates at once, so idle sockets cannot keep
+                    // Authelia's mail out.
+                    let permit = match self.connections.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) if self.make_room() => None,
+                        Err(_) => {
+                            if !full {
+                                tracing::warn!(
+                                    limit = MAX_CONNECTIONS,
+                                    "the notification mail listener is full of authenticated \
+                                     connections; turning new ones away until one closes"
+                                );
+                                full = true;
+                            }
+                            // Written without waiting, on the non-blocking std
+                            // socket: a client that never reads must not stall
+                            // the accept loop. (tokio's `try_write` would not
+                            // do: a socket the reactor has not yet seen
+                            // writable answers WouldBlock.)
+                            if let Ok(mut s) = stream.into_std() {
+                                let _ = std::io::Write::write(&mut s, FULL);
+                            }
+                            continue;
                         }
-                        // Written without waiting, on the non-blocking std
-                        // socket: a client that never reads must not stall
-                        // the accept loop. (tokio's `try_write` would not do:
-                        // a socket the reactor has not yet seen writable
-                        // answers WouldBlock.)
-                        if let Ok(mut s) = stream.into_std() {
-                            let _ = std::io::Write::write(
-                                &mut s,
-                                b"421 4.3.2 too many connections, try again later\r\n",
-                            );
-                        }
-                        continue;
                     };
                     full = false;
                     let this = self.clone();
                     tokio::spawn(async move {
+                        let permit = match permit {
+                            Some(permit) => permit,
+                            // The slot the closed connection frees.
+                            None => match tokio::time::timeout(
+                                ROOM_WAIT,
+                                this.connections.clone().acquire_owned(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(permit)) => permit,
+                                _ => {
+                                    let mut stream = stream;
+                                    let _ = tokio::time::timeout(ROOM_WAIT, stream.write_all(FULL))
+                                        .await;
+                                    return;
+                                }
+                            },
+                        };
                         let _permit = permit;
                         this.serve_conn(stream).await;
                     });
@@ -990,12 +1089,20 @@ impl Interceptor {
         }
     }
 
-    /// One connection, cut off at the session deadline however it is going.
+    /// One connection, cut off at the session deadline however it is going,
+    /// or sooner to make room while it has not authenticated.
     async fn serve_conn<S>(self: Arc<Self>, stream: S)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let _ = tokio::time::timeout(self.session_deadline, self.converse(stream)).await;
+        let (id, closed) = self.arrive();
+        tokio::select! {
+            _ = tokio::time::timeout(self.session_deadline, self.converse(stream, id)) => {}
+            // Once it authenticates its switch is dropped, which disables this
+            // branch rather than firing it.
+            Ok(()) = closed => {}
+        }
+        self.leave(id);
     }
 
     /// Does `presented` match the listener secret? Constant time, and without
@@ -1080,7 +1187,7 @@ impl Interceptor {
 
     /// The SMTP conversation. Enough of RFC 5321 and RFC 4954 for Authelia,
     /// and nothing more.
-    async fn converse<S>(self: &Arc<Self>, stream: S) -> std::io::Result<()>
+    async fn converse<S>(self: &Arc<Self>, stream: S, id: u64) -> std::io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1089,11 +1196,23 @@ impl Interceptor {
         let mut buf = Vec::new();
         let mut msg = Incoming::default();
         let mut authenticated = false;
-        let (mut auth_failures, mut unknown) = (0u8, 0u8);
+        let (mut auth_failures, mut unknown, mut before_auth) = (0u8, 0u8, 0u8);
+        let auth_by = tokio::time::Instant::now() + self.pre_auth_deadline;
 
         write.write_all(b"220 bilbycast-portal ESMTP\r\n").await?;
         loop {
-            match read_line(&mut reader, &mut buf).await {
+            let read = if authenticated {
+                read_line(&mut reader, &mut buf).await
+            } else {
+                match tokio::time::timeout_at(auth_by, read_line(&mut reader, &mut buf)).await {
+                    Ok(read) => read,
+                    Err(_) => {
+                        write.write_all(AUTH_SOONER).await?;
+                        return Ok(());
+                    }
+                }
+            };
+            match read {
                 Line::Read => {}
                 Line::TooLong => {
                     write.write_all(b"500 5.5.2 line too long\r\n").await?;
@@ -1106,6 +1225,13 @@ impl Interceptor {
             if speaks_http(&upper) {
                 tracing::warn!("closed a notification mail connection that spoke HTTP");
                 return Ok(());
+            }
+            if !authenticated {
+                before_auth += 1;
+                if before_auth > MAX_PRE_AUTH_COMMANDS {
+                    write.write_all(AUTH_SOONER).await?;
+                    return Ok(());
+                }
             }
             if upper.starts_with("EHLO") {
                 msg = Incoming::default();
@@ -1125,12 +1251,16 @@ impl Interceptor {
                         .await?;
                     continue;
                 }
-                match self
-                    .authenticate(&line, &mut reader, &mut write, &mut buf)
-                    .await?
-                {
+                let exchange = self.authenticate(&line, &mut reader, &mut write, &mut buf);
+                let Ok(outcome) = tokio::time::timeout_at(auth_by, exchange).await else {
+                    write.write_all(AUTH_SOONER).await?;
+                    return Ok(());
+                };
+                match outcome? {
                     Auth::Accepted => {
                         authenticated = true;
+                        // No longer one that gives way to a newcomer.
+                        self.leave(id);
                         write.write_all(b"235 2.7.0 authenticated\r\n").await?;
                     }
                     Auth::Refused(reply) => {
@@ -1784,11 +1914,20 @@ mod tests {
     fn the_listener_must_be_loopback_and_clear_text_relaying_is_this_host_only() {
         let mut c = cfg();
         assert_eq!(c.validate(), Ok(()));
+        c.listen_addr = "[::1]:2525".into();
+        assert_eq!(c.validate(), Ok(()));
         c.listen_addr = "0.0.0.0:2525".into();
         assert!(
             c.validate().is_err(),
             "a public listener would put its secret on the network"
         );
+        // Loopback, but not an address Authelia will send a password to in
+        // clear: it could never authenticate.
+        for other in ["127.0.0.2:2525", "[::ffff:127.0.0.1]:2525"] {
+            c.listen_addr = other.into();
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("127.0.0.1 or [::1]"), "{other}: {err}");
+        }
 
         let mut c = cfg();
         c.starttls = Some(false);
@@ -1830,6 +1969,14 @@ mod tests {
         assert_eq!(c.port(), 2587);
         c.relay_port = Some(0);
         assert!(c.validate().is_err());
+
+        // 465 is implicit TLS; STARTTLS there waits for a greeting that
+        // never comes, and every send would time out.
+        c.relay_port = Some(465);
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("mail.implicit_tls"), "{err}");
+        c.implicit_tls = true;
+        assert_eq!(c.validate(), Ok(()));
     }
 
     /// The config in production before the listener demanded a password must
@@ -2106,12 +2253,14 @@ mod tests {
         assert!(relay.sent.lock().await.is_empty());
     }
 
-    /// Resetting the idle timer with a NOOP does not buy a connection forever.
+    /// Resetting the idle timer with a NOOP does not buy a connection forever,
+    /// even one that has authenticated.
     #[tokio::test]
     async fn a_conversation_that_never_ends_is_cut_off() {
         let mut i = interceptor(Default::default(), Default::default());
         i.session_deadline = Duration::from_millis(300);
         let mut c = connect(Arc::new(i)).await;
+        c.authenticate().await;
         let started = Instant::now();
         loop {
             c.send("NOOP").await;
@@ -2123,6 +2272,100 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// A connection that has not authenticated has seconds, not the session's
+    /// minute; one that has is not held to it.
+    #[tokio::test]
+    async fn a_client_that_does_not_authenticate_soon_is_closed() {
+        let mut i = interceptor(Default::default(), Default::default());
+        i.pre_auth_deadline = Duration::from_millis(200);
+        let i = Arc::new(i);
+        let mut idle = connect(i.clone()).await;
+        let started = Instant::now();
+        let r = idle.reply().await.expect("closed without an answer");
+        assert!(r.starts_with("421"), "{r}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(idle.reply().await, None);
+
+        let mut authed = connect(i).await;
+        authed.authenticate().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(authed.say("NOOP").await.starts_with("250"));
+    }
+
+    /// Nor may it talk instead: a few commands, `EHLO` and `AUTH` among them,
+    /// and it must have authenticated.
+    #[tokio::test]
+    async fn a_client_that_chats_instead_of_authenticating_is_closed() {
+        let mut c = connect(Arc::new(interceptor(
+            Default::default(),
+            Default::default(),
+        )))
+        .await;
+        for _ in 0..MAX_PRE_AUTH_COMMANDS {
+            assert!(c.say("NOOP").await.starts_with("250"));
+        }
+        let r = c.say("NOOP").await;
+        assert!(r.starts_with("421"), "{r}");
+        assert_eq!(c.reply().await, None);
+    }
+
+    /// Sixteen local sockets that connect and say nothing fill every slot.
+    /// Authelia, connecting after them, is still served: the oldest of them
+    /// gives way, and Authelia's mail goes out.
+    #[tokio::test]
+    async fn idle_unauthenticated_connections_cannot_keep_authelia_out() {
+        let relay = Arc::new(Captured::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Arc::new(interceptor(Default::default(), relay.clone())).serve(listener));
+
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
+            assert!(c.reply().await.unwrap().starts_with("220"));
+            idle.push(c);
+        }
+
+        let mut authelia = Client::over(TcpStream::connect(addr).await.unwrap());
+        let greeting = authelia.reply().await.expect("turned away");
+        assert!(greeting.starts_with("220"), "{greeting}");
+        authelia.say("EHLO authelia").await;
+        authelia.authenticate().await;
+        let r = authelia.deliver(&authelia_message("bea@example.com")).await;
+        assert!(r.starts_with("250"), "{r}");
+        settle().await;
+        assert_eq!(relay.sent.lock().await.len(), 1);
+        assert_eq!(
+            idle[0].reply().await,
+            None,
+            "the oldest idle connection is the one closed"
+        );
+    }
+
+    /// Room is made only from connections that have not authenticated: an
+    /// Authelia that is already in keeps its connection whatever arrives.
+    #[tokio::test]
+    async fn an_authenticated_connection_never_gives_way() {
+        let relay = Arc::new(Captured::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Arc::new(interceptor(Default::default(), relay.clone())).serve(listener));
+
+        let mut authelia = Client::over(TcpStream::connect(addr).await.unwrap());
+        assert!(authelia.reply().await.unwrap().starts_with("220"));
+        authelia.authenticate().await;
+        let mut others = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
+            assert!(c.reply().await.unwrap().starts_with("220"));
+            others.push(c);
+        }
+        let r = authelia.deliver(&authelia_message("bea@example.com")).await;
+        assert!(r.starts_with("250"), "{r}");
+        settle().await;
+        assert_eq!(relay.sent.lock().await.len(), 1);
     }
 
     /// The whole conversation, over a real socket, the way Authelia holds it.
