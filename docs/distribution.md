@@ -682,9 +682,17 @@ over every list that arrives, so a poll landing mid-word cannot put the old
 name back. A list that arrives while a name field has the cursor, or a colour
 palette is open, moves the flags at once but leaves the rows alone until the
 field is left or the palette closed; a row drawn from the older list checks
-that its mark still exists before going to it or looping around it. Every
-reply carries the whole list and its revision, and a list older than the one
-drawn — a poll answered after a later delete's reply — is ignored.
+that its mark still exists before going to it or looping around it. A palette
+closes on a press anywhere outside its own row (asked of the press, not of
+focus, which Safari and iOS never give a button), when the drawer closes, and
+when another palette opens; a press on another row closes it without redrawing
+under the finger and leaves the list to the next poll, and a palette that has
+held a list back for 30 s is taken as left open and closed. Every reply
+carries the whole list and its revision, and a list older than the one drawn —
+a poll answered after a later delete's reply — is ignored. So is a list with
+no file behind it (`"marks-none"`) once a real one has been drawn: it is either
+older than that list, or the list really gone, and either way the next write
+starts a new one.
 
 Anyone who may watch may edit or delete any mark: the gate is the stream's
 viewer token, as for requesting a clip, and the relay's tokens name a stream,
@@ -706,6 +714,9 @@ each name one the relay accepts (a tab becomes a space, a long name is cut to
 120 characters) and dropping a name the relay still refuses rather than the
 mark; the device's list is kept aside under `….migrated`, and a later carry
 never replaces that first copy but is kept beside it as `….migrated.<time>`.
+A carry that happens mid-session keeps what the operator was doing: marks
+ticked for export stay ticked, the mark just made is still the one holding
+`MARK` offers to name, and a loop around a carried mark goes on.
 Note the viewing token deliberately uses `sessionStorage`: a credential has no
 business outliving its tab, and a test asserts the two do not get confused.
 

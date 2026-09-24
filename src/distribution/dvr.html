@@ -2408,8 +2408,12 @@
   var marksEditing = {};
   var marksDeleting = {};
   var marksDeletedPending = [];
-  /// A newer list arrived while the rows were in use.
-  var marksListDeferred = false;
+  /// A newer list arrived while the rows were in use, and since when (on
+  /// `performance.now()`).
+  var marksListDeferred = false, marksDeferredSince = 0;
+  /// How long an open colour palette may hold a newer list back. A palette
+  /// open this long was left open, not in use: choosing a colour closes it.
+  var PALETTE_HOLD_MS = 30000;
   /// Marks older than this stay behind when `localStorage` is carried into
   /// the shared list. No DVR window reaches back a day, so all they would add
   /// is a column of greyed-out rows on every other viewer's screen. The old
@@ -2439,6 +2443,7 @@
   }
 
   function pollMarks() {
+    releaseHeldList();
     if (marksPolling || accessExpired) return;
     if (marksShared === false) {
       // On this device's own list. Asked again now and then rather than
@@ -2472,23 +2477,33 @@
   function becomeShared() {
     marksShared = true;
     var now = Date.now();
-    var carried = [];
+    var carried = [], ids = {};
     marks.forEach(function (m) {
       if (now - m.at > MIGRATE_MAX_AGE_MS) return;
       // Whole milliseconds, which is what the relay stores. Marks written by
-      // an older page carry the fraction `wallClockAt` produces.
-      m.at = Math.round(m.at);
+      // an older page carry the fraction `wallClockAt` produces. A loop holds
+      // its mark by instant, so it moves with it, or the loop would find no
+      // mark there and stop.
+      var at = Math.round(m.at);
+      if (loop && loop.at === m.at) loop.at = at;
+      m.at = at;
       // And a name it will take. The page before this one put no limit on
       // the field, and a name the relay refused used to cost the mark.
       m.name = relayMarkName(m.name);
-      m.id = "tmp-" + (++markSeq);
+      ids[m.id] = "tmp-" + (++markSeq);
+      m.id = ids[m.id];
       m.pending = true;
       carried.push(m);
     });
     marks = carried;
-    // Keyed by the ids just replaced.
-    exportPicked = {};
-    lastMarkId = null;
+    // What was keyed by the ids just replaced follows them. This runs
+    // mid-session as well as at load — a page on its own list asks again
+    // about once a minute — so marks may be ticked for export and one waiting
+    // to be named. A mark left behind for its age leaves both.
+    var picked = {};
+    for (var old in exportPicked) if (ids[old]) picked[ids[old]] = true;
+    exportPicked = picked;
+    lastMarkId = lastMarkId !== null && ids[lastMarkId] ? ids[lastMarkId] : null;
     try {
       var raw = window.localStorage.getItem(MARKS_KEY);
       if (raw) {
@@ -2510,27 +2525,80 @@
     }));
   }
 
-  /// The rows are in use in a way a redraw would break: a name field holds
-  /// the cursor (and the caret with it), or a colour palette is open under the
-  /// operator's finger. A button that merely kept focus after being pressed —
-  /// Chrome leaves it there — is not: holding the list for that kept marks
-  /// other viewers had deleted on screen, loop buttons and all.
-  function listBusy() {
+  /// A name field in the list holds the cursor, and the caret with it.
+  function nameFieldFocused() {
     var ae = document.activeElement;
-    return !!(ae && ae.tagName === "INPUT" && ae.type === "text" && markList.contains(ae)) ||
-      markList.querySelector("li.picking") !== null;
+    return !!(ae && ae.tagName === "INPUT" && ae.type === "text" && markList.contains(ae));
+  }
+
+  /// A colour palette is open. Asked of the row, never of focus: Safari and
+  /// iOS do not focus a button on a tap, so a palette open under the
+  /// operator's finger there has no focus anywhere near it.
+  function paletteOpen() {
+    return markList.querySelector("li.picking") !== null;
+  }
+
+  /// The rows are in use in a way a redraw would break: a name field holds
+  /// the cursor, or a colour palette is open. A button that merely kept focus
+  /// after being pressed — Chrome leaves it there — is not: holding the list
+  /// for that kept marks other viewers had deleted on screen, loop buttons
+  /// and all.
+  function listBusy() {
+    return nameFieldFocused() || paletteOpen();
   }
 
   /// Redraw the rows now, or as soon as they are no longer in use. The flags
   /// on the bar are safe to move either way.
   function redrawMarks() {
     if (listBusy()) {
+      if (!marksListDeferred) marksDeferredSince = performance.now();
       marksListDeferred = true;
       renderFlags();
       return;
     }
     renderMarks();
   }
+
+  /// Close every open colour palette, and with `now`, draw a list one was
+  /// holding back.
+  ///
+  /// A palette holds the rows while it is open, and once nothing but its own
+  /// swatch or a redraw closed it: one left open by a tap elsewhere, or by
+  /// closing the drawer, held back every list after it for as long as the
+  /// page stayed open. Without `now` the list waits for the next poll — a tap
+  /// inside the list has to reach the row it landed on, and redrawing the
+  /// rows under it would take that row away before the tap completes.
+  function closePalettes(now) {
+    markList.querySelectorAll("li.picking").forEach(function (li) {
+      li.classList.remove("picking");
+      var s = li.querySelector(".swatch");
+      if (s) s.setAttribute("aria-expanded", "false");
+    });
+    if (now && marksListDeferred && !listBusy()) renderMarks();
+  }
+
+  /// A list held back is drawn at the first poll that finds the rows free:
+  /// a palette closed by a tap inside the list leaves it to this, and a list
+  /// that has not changed since is not drawn by anything else. One held back
+  /// only by a palette for `PALETTE_HOLD_MS` is drawn anyway, and the palette
+  /// closed. A name field is never taken from under the cursor.
+  function releaseHeldList() {
+    if (!marksListDeferred) return;
+    if (!listBusy()) { renderMarks(); return; }
+    if (!nameFieldFocused() && performance.now() - marksDeferredSince > PALETTE_HOLD_MS) {
+      closePalettes(true);
+    }
+  }
+
+  // A press anywhere but the open palette's own row closes it. Captured, so
+  // nothing on the page can stop it on the way, and on the press rather than
+  // on focus, which a tap on Safari or iOS never moves.
+  document.addEventListener("pointerdown", function (e) {
+    if (!paletteOpen()) return;
+    var el = e.target && e.target.nodeType === 1 ? e.target : null;
+    if (el && el.closest("#markList li.picking")) return;
+    closePalettes(!(el && markList.contains(el)));
+  }, true);
 
   /// A pending mark the relay has named: give it the name, and owe the relay
   /// what the operator changed while it had none. Only that — the relay's
@@ -2558,11 +2626,21 @@
     if (!body || !Array.isArray(body.marks)) return;
     // Within one list's lifetime — its epoch, from the validator — the
     // revision only rises, so a reply older than the list drawn is one the
-    // network delivered late. A different epoch, or none (`marks-none`: no
-    // file behind it), is a list removed or started again, and is taken.
+    // network delivered late. A different epoch is a list started again, and
+    // is taken.
+    //
+    // None (`marks-none`: no file behind it) is taken only until a real list
+    // has been drawn. After that it is either older than the list drawn — a
+    // poll answered before the feed's first mark was written and delivered
+    // after that write's reply, which wiped the new mark and ended a loop
+    // around it — or the list really gone: the stream dropped, which ends
+    // the session and its access with it, or an unreadable file set aside.
+    // Either way the list drawn stays until the next write, which starts a
+    // new lifetime, replaces it.
     var em = /^"marks-(.+)-\d+"$/.exec(etag || "");
     var epoch = em ? em[1] : "";
     var rev = typeof body.rev === "number" ? body.rev : 0;
+    if (!epoch && marksEpoch) return;
     if (epoch === marksEpoch && rev < marksRev) return;
     marksEpoch = epoch;
     marksRev = rev;
@@ -3317,6 +3395,9 @@
         palette.appendChild(b);
       });
       swatch.addEventListener("click", function () {
+        // One palette at a time. A press elsewhere has already closed any
+        // other, but a keyboard's Enter arrives as a click with no press.
+        if (!li.classList.contains("picking")) closePalettes(false);
         var open = li.classList.toggle("picking");
         swatch.setAttribute("aria-expanded", open ? "true" : "false");
         // A list held back while the palette was open is drawn as it closes.
@@ -3491,7 +3572,8 @@
     btnNextMark.disabled = !markRelative(1);
     btnLoop.disabled = !loop && !nearestMarkToPlayhead();
     // Rows drawn from an older list would be matched to the wrong marks by
-    // index. They are redrawn as soon as the operator leaves the field.
+    // index. They are redrawn as soon as the operator leaves the name field
+    // or the palette — see `releaseHeldList`.
     if (marksListDeferred) return;
     var rows = markList.children;
     for (var i = 0; i < rows.length && i < marks.length; i++) {
@@ -3526,6 +3608,9 @@
   function closeDrawer() {
     document.body.dataset.drawer = "0";
     btnMark.setAttribute("aria-pressed", "false");
+    // A palette nobody can see is not in use, and left open it would hold
+    // the list back until the drawer came out again.
+    closePalettes(true);
   }
   /// Keep the picture badge honest about what is on screen.
   function syncQualityBadge() {

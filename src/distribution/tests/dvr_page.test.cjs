@@ -237,7 +237,9 @@ const TOKEN = "tkn";
 /// stream, ids minted here, a repeated instant is the same mark, a `GET` with
 /// the current validator answers 304, a name is refused on the relay's own
 /// rule, and every verb wants the viewer token — `Authorization: Bearer`, or
-/// `?token=` where the page cannot set a header — or answers 401.
+/// `?token=` where the page cannot set a header — or answers 401. A list never
+/// written has no file behind it, and its validator says so: `"marks-none"`,
+/// where every later one names the list's lifetime and revision.
 ///
 /// Replies can be made to arrive out of turn. A verb in `relay.hold` is acted
 /// on at once but its reply — the list as it stood then — is parked until
@@ -250,7 +252,7 @@ function fakeRelay(opts = {}) {
     marks: [], rev: 0, seq: 0, calls: [], auth: [],
     hold: new Set(), held: [], lose: new Set(), failNext: 0,
   };
-  const etag = () => '"marks-7e57-' + relay.rev + '"';
+  const etag = () => (relay.rev === 0 ? '"marks-none"' : '"marks-7e57-' + relay.rev + '"');
   // The validator is taken when the reply is made, so a held reply carries
   // the one it was made with.
   const json = (status, body) => {
@@ -519,6 +521,142 @@ test("a list is held back for a name being typed, not for a button that kept foc
   assert.equal(main.currentTime, 70, "a stale row went to a mark that has been deleted");
 });
 
+/// Two viewers of one list, `b` with a colour palette open on its one row, and
+/// a list waiting for `b` that the palette is holding back: `a` has deleted
+/// the mark the row is for and made one at media time 20.
+///
+/// The palette is opened the way Safari and iOS open it — a tap that moves no
+/// focus, because neither ever focuses a button — so nothing here can lean on
+/// focus to decide whether the palette is in use.
+async function paletteHoldingAList(t) {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => { closePage(a); closePage(b); });
+  await settle();
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+
+  click(b, "#markList li .swatch");
+  assert.ok(b.document.querySelector("#markList li.picking"), "fixture: the palette did not open");
+  assert.notEqual(b.document.activeElement.className, "swatch", "fixture: the swatch took focus");
+
+  click(a, "#markList li .del");
+  await settle();
+  a.document.getElementById("main").currentTime = 20;
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  return { relay, a, b };
+}
+
+/// The instants `b`'s rows are for, relative to `T0`.
+const rowAts = (w) => rows(w).map((li) => Number(li.querySelector(".loop").dataset.at) - T0);
+
+test("a list is held back for a colour palette that is open, and moves the flags", async (t) => {
+  const { b } = await paletteHoldingAList(t);
+  // A redraw would take the palette away under the operator's finger.
+  assert.ok(b.document.querySelector("#markList li.picking"), "a poll closed a palette in use");
+  assert.deepEqual(rowAts(b), [50_000], "a poll redrew the rows under an open palette");
+  assert.equal(flags(b).length, 1, "the bar did not move to the new list");
+});
+
+test("a tap outside the open palette closes it and brings the list up to date", async (t) => {
+  const { b } = await paletteHoldingAList(t);
+  b.document.body.dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  assert.equal(b.document.querySelector("#markList li.picking"), null, "the palette stayed open");
+  assert.deepEqual(rowAts(b), [20_000], "the list stayed held back after the palette was left");
+});
+
+test("a tap inside the palette's own row does not close it", async (t) => {
+  const { b } = await paletteHoldingAList(t);
+  b.document.querySelector("#markList li .palette button")
+    .dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  assert.ok(b.document.querySelector("#markList li.picking"), "pressing a colour closed the palette first");
+});
+
+test("a tap on another row closes the palette without redrawing under it, and the next poll does", async (t) => {
+  const relay = fakeRelay();
+  const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  const b = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => { closePage(a); closePage(b); });
+  await settle();
+  key(a, "m");
+  a.document.getElementById("main").currentTime = 30;
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [30_000, 50_000], "fixture");
+
+  click(b, "#markList li:nth-child(2) .swatch");
+  a.document.querySelectorAll("#markList li .del")[1].dispatchEvent(new a.Event("click", { bubbles: true }));
+  await settle();
+  a.document.getElementById("main").currentTime = 20;
+  key(a, "m");
+  await settle();
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [30_000, 50_000], "fixture: the palette should hold the list");
+
+  const tapped = rows(b)[0];
+  tapped.querySelector("input[type=text]").dispatchEvent(new b.Event("pointerdown", { bubbles: true }));
+  assert.equal(b.document.querySelector("#markList li.picking"), null, "the palette stayed open");
+  assert.equal(rows(b)[0], tapped, "the rows were redrawn under the tap, taking the row it landed on");
+
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [20_000, 30_000], "the list stayed held back once the palette had closed");
+});
+
+test("closing the drawer closes an open palette and brings the list up to date", async (t) => {
+  const { b } = await paletteHoldingAList(t);
+  b.document.body.dataset.drawer = "1";
+  key(b, "Escape");
+  assert.equal(b.document.body.dataset.drawer, "0", "fixture: Escape did not close the drawer");
+  assert.equal(b.document.querySelector("#markList li.picking"), null, "the palette outlived the drawer");
+  assert.deepEqual(rowAts(b), [20_000], "the drawer reopens on the list from before");
+});
+
+test("a palette nobody touches for half a minute stops holding the list back", async (t) => {
+  const { b } = await paletteHoldingAList(t);
+  const real = b.performance.now.bind(b.performance);
+  let skew = 0;
+  b.performance.now = () => real() + skew;
+
+  skew = 10_000;
+  poll(b);
+  await settle();
+  assert.deepEqual(rowAts(b), [50_000], "the list was released while the palette might be in use");
+
+  skew = 31_000;
+  poll(b);
+  await settle();
+  assert.equal(b.document.querySelector("#markList li.picking"), null, "the palette was never closed");
+  assert.deepEqual(rowAts(b), [20_000], "a palette left open held the list back indefinitely");
+});
+
+test("opening one palette closes any other", async (t) => {
+  const relay = fakeRelay();
+  const w = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
+  t.after(() => closePage(w));
+  await settle();
+  key(w, "m");
+  w.document.getElementById("main").currentTime = 20;
+  key(w, "m");
+  await settle();
+  const swatches = w.document.querySelectorAll("#markList li .swatch");
+  // By keyboard: a click with no pointerdown before it.
+  swatches[0].dispatchEvent(new w.Event("click", { bubbles: true }));
+  swatches[1].dispatchEvent(new w.Event("click", { bubbles: true }));
+  const open = [...w.document.querySelectorAll("#markList li.picking")];
+  assert.deepEqual(open.map((li) => rows(w).indexOf(li)), [1], "two palettes were open at once");
+  assert.equal(swatches[0].getAttribute("aria-expanded"), "false");
+});
+
 test("a mark whose POST landed but whose reply was lost keeps what was typed into it", async (t) => {
   const relay = fakeRelay();
   const a = loadPage({ clock: true, token: TOKEN, fetch: relay.fetch });
@@ -589,6 +727,40 @@ test("a list older than the one drawn does not bring a deleted mark back", async
   await settle();
   assert.equal(rows(a).length, 0, "a late reply put a deleted mark back");
   assert.equal(flags(a).length, 0, "a late reply put a deleted mark back on the bar");
+});
+
+test("a list from before the feed's first mark does not wipe that mark or its loop", async (t) => {
+  const relay = fakeRelay();
+  // Something between the page and the relay that does not pass the
+  // validator on. The relay itself answers a poll carrying `"marks-none"`
+  // with a 304 while it has no list, so without this a poll from before the
+  // first mark could not come back as a list at all.
+  const noValidator = (u, init = {}) => {
+    const headers = { ...(init.headers || {}) };
+    delete headers["If-None-Match"];
+    return relay.fetch(u, { ...init, headers });
+  };
+  const a = loadPage({ clock: true, token: TOKEN, fetch: noValidator });
+  t.after(() => closePage(a));
+  await settle();
+
+  // A poll the relay answers while it still has no list at all, delivered
+  // after the reply to the feed's first mark.
+  relay.hold.add("GET");
+  poll(a);
+  await settle();
+  relay.hold.clear();
+  key(a, "m");
+  await settle();
+  assert.equal(relay.marks.length, 1, "fixture: the mark should have landed");
+  click(a, "#markList li .loop");
+  assert.equal(a.document.body.dataset.loop, "1", "fixture: the loop should have started");
+
+  relay.release();
+  await settle();
+  assert.equal(rows(a).length, 1, "a list from before the first mark wiped it");
+  assert.equal(flags(a).length, 1, "a list from before the first mark took its flag off the bar");
+  assert.equal(a.document.body.dataset.loop, "1", "a list from before the first mark ended its loop");
 });
 
 test("marks travel with the viewer token, in a header where hls.js is in play", async (t) => {
@@ -671,6 +843,57 @@ test("a page on its own marks asks again now and then, and joins a list that app
   await settle();
   assert.equal(relay.marks.length, 1, "the list the relay now has was never joined");
   assert.equal(relay.marks[0].at, T0 + 50_000);
+});
+
+test("joining a list mid-session keeps the export selection, the mark to name, and a loop", async (t) => {
+  const older = olderRelay();
+  const relay = fakeRelay();
+  let upgraded = false;
+  const w = loadPage({
+    clock: true,
+    token: TOKEN,
+    fetch: (u, i) => (upgraded ? relay.fetch(u, i) : older.fetch(u, i)),
+    // Written by the previous page, with the fraction `wallClockAt` gives.
+    storage: { [MARKS_KEY]: JSON.stringify([{ id: 1, at: T0 + 20_000.4, name: "", colour: "#ffb020" }]) },
+  });
+  t.after(() => closePage(w));
+  await settle();
+  key(w, "m");                          // at media time 50: the one to name
+  await settle();
+
+  // Looping around the older mark, both ticked for export.
+  click(w, "#markList li .loop");
+  assert.equal(w.document.body.dataset.loop, "1", "fixture: the loop should have started");
+  click(w, "#btnExport");
+  for (const pick of w.document.querySelectorAll("#markList li .pick")) {
+    pick.checked = true;
+    pick.dispatchEvent(new w.Event("change", { bubbles: true }));
+  }
+  const exportCount = w.document.getElementById("exportCount");
+  assert.equal(exportCount.textContent, "2 selected", "fixture: both marks should be ticked");
+
+  // The relay is upgraded, and the next ask joins its list.
+  upgraded = true;
+  for (let i = 0; i < 20; i++) poll(w);
+  await settle();
+  assert.equal(relay.marks.length, 2, "fixture: both marks should have been carried");
+  assert.equal(exportCount.textContent, "2 selected", "joining the list cleared the export selection");
+  assert.ok(
+    [...w.document.querySelectorAll("#markList li .pick")].every((p) => p.checked),
+    "joining the list unticked the rows"
+  );
+  assert.equal(w.document.body.dataset.loop, "1", "joining the list ended a loop around a carried mark");
+
+  // Holding MARK opens the list on the mark just made, ready to name.
+  w.document.getElementById("btnMark").dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 500));
+  const named = w.document.activeElement;
+  assert.equal(named.tagName, "INPUT", "the list opened with no row to name");
+  assert.equal(
+    Number(named.closest("li").querySelector(".loop").dataset.at),
+    T0 + 50_000,
+    "the list opened on the wrong mark"
+  );
 });
 
 test("a relay that fails a read is asked again on the next poll", async (t) => {
