@@ -348,15 +348,18 @@ them round, without Authelia ever loading a file in between. It is settled by
 repetition: a login that would collide with what an untouched entry holds is
 held back first, then, between two logins wanting one address, the later in
 the manager's (username) order; a held-back move leaves its account on its old
-address, which can hold back another login in turn. A login is **refused** —
-its link request answered with the reason — only when what stands in its way is
-a hand-made account, a username, or an account the manager itself lists with
-that address. When its address is held only by a managed account the manager
-is moving off it, which could not move this cycle, it **waits**: logged once as
-``portal login `<name>` was not written to Authelia: another Authelia account
-still holds its email or username, and the manager is moving that account off
-it; it is written once that has happened``, its request left outstanding, and
-written on a later cycle once the way is clear.
+address, which can hold back another login in turn. A login that lost to one
+held back later in the same settling, and so has nothing left in its way, is
+then written after all.
+
+Every login held back is **refused** — its link request answered with the
+reason — because something holds what it wanted in the file as written: a
+hand-made account, a username, a login going ahead, or a managed account whose
+own move was held back. Such an account stays on its old address for as long as
+whatever blocked it does, so the way does not clear by itself: change the
+logins in the manager, or the hand-made account in the file, and press **Send
+password link** again. For example, pointing a login at an address a hand-made
+account has, and giving its old address to a new login, refuses both.
 
 ### When an account is removed
 
@@ -516,9 +519,8 @@ characters become spaces — and cut to at most 300 bytes.
 | With `mail`: the relay did not answer | `the mail relay did not answer within 20s` |
 
 A `429` from Authelia never appears here: that request is not answered at all
-until Authelia takes it. Nor does a login that is [waiting](#what-a-sync-does-to-authelias-file)
-for another account to move off its address, or one whose write failed: those
-requests stay outstanding and are tried again.
+until Authelia takes it. Nor does a login whose write failed: its request stays
+outstanding and is tried again.
 
 **When the portal cannot write the users file at all** — it cannot be read or
 parsed, an entry in it would not survive a rewrite, replacing it would lock

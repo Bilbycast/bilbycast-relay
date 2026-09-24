@@ -380,11 +380,13 @@ next poll. Collisions that would make Authelia refuse the file under
 `search.email` (an email or username another account holds,
 case-insensitively) are never written, judged against the file *as the write
 leaves it* by a fixed point (`resolve` in `accounts.rs`), so a freed address
-can be claimed and swaps/rotations land in one write; a login blocked only by a
-managed account the manager is moving off that address waits (unacknowledged)
-rather than being refused. Only `<<` (a YAML merge key to Authelia's parser)
-and keys that would not round-trip through serde_yaml_ng are refused as
-usernames — numeric IDs are written quoted. The file has two writers (Authelia
+can be claimed and swaps/rotations land in one write, and a claim that lost a
+tie to one dropped later is let through afterwards; every login still held back
+is refused with the reason (nothing waits: a managed account whose own move was
+held back stays put until the file or the manager's list changes). Only `<<`
+(a YAML merge key to Authelia's parser) and keys that would not round-trip
+through serde_yaml_ng are refused as usernames — numeric IDs are written
+quoted. The file has two writers (Authelia
 rewrites it on a password change), so writes happen only on change: a `0600`
 temp file given the old mode and (by `fchown`, best effort) group, refused if
 it would take the file from Authelia's owner/group (a group change only matters

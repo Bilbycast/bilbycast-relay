@@ -54,9 +54,11 @@
 //! file this cycle writes would hold such a pair; the login is reported
 //! instead. That is judged against the file as it will be, not as it was, so
 //! an address one account gives up can go to another in the same write, and
-//! two accounts can swap theirs. A login whose address is held only by an
-//! account the manager is moving off it, which could not move this cycle,
-//! waits rather than being refused.
+//! two accounts can swap theirs. A login held back is refused with the reason,
+//! whoever holds what it wanted — an account the manager is moving off that
+//! address too, when the move itself is held back: that account stays where it
+//! is until the file or the manager's list changes, so the way never clears
+//! by itself.
 //!
 //! # Two things Authelia will not tell us
 //!
@@ -329,8 +331,8 @@ pub struct Plan {
     /// alone, and logged so the operator can be told why an edit did nothing.
     pub foreign: Vec<String>,
     /// Logins that were not written, and why: an email or a username another
-    /// account already holds, a username the file cannot hold as it is, or an
-    /// address still on an account that is moving off it.
+    /// account already holds in the file as written, or a username the file
+    /// cannot hold as it is.
     pub conflicts: Vec<(String, &'static str)>,
     /// Removals held back because the manager, too old to say what it deleted,
     /// reported no logins at all.
@@ -357,11 +359,6 @@ const NAME_TAKEN: &str = "another Authelia account already has this username, in
                           or as its email, so the portal did not create it";
 const UNWRITABLE_NAME: &str = "this username cannot be written into Authelia's user file as it \
                                is, so the portal did not create it";
-/// Logged, never sent to the manager: the login's request stays outstanding
-/// and is tried again next cycle.
-const WAITING: &str = "another Authelia account still holds its email or username, and the \
-                       manager is moving that account off it; it is written once that has \
-                       happened";
 
 fn is_managed(entry: &Value, group: &str) -> bool {
     entry
@@ -443,8 +440,6 @@ struct Claim<'a> {
 struct Hold<'a> {
     /// The account's name.
     owner: &'a str,
-    /// Held as its email rather than its username.
-    as_email: bool,
     /// The claim it comes from; `None` for what an entry keeps as it is.
     claim: Option<usize>,
 }
@@ -470,13 +465,11 @@ fn holds<'a>(
     for (name, email) in kept {
         holds.entry(name.to_lowercase()).or_default().push(Hold {
             owner: name,
-            as_email: false,
             claim: None,
         });
         if let Some(email) = email.filter(|_| !moving.contains(name.as_str())) {
             holds.entry(email.to_lowercase()).or_default().push(Hold {
                 owner: name,
-                as_email: true,
                 claim: None,
             });
         }
@@ -484,13 +477,11 @@ fn holds<'a>(
     for (i, c) in claims.iter().enumerate().filter(|(i, _)| alive[*i]) {
         holds.entry(c.email.to_lowercase()).or_default().push(Hold {
             owner: c.name,
-            as_email: true,
             claim: Some(i),
         });
         if c.new {
             holds.entry(c.name.to_lowercase()).or_default().push(Hold {
                 owner: c.name,
-                as_email: false,
                 claim: Some(i),
             });
         }
@@ -508,6 +499,11 @@ fn others<'h, 'a>(holds: &'h Holds<'a>, key: &str, c: &Claim) -> Vec<&'h Hold<'a
         .collect()
 }
 
+/// What a claim needs to itself: its address, and a new account's username.
+fn keys<'a>(c: &Claim<'a>) -> impl Iterator<Item = &'a str> {
+    std::iter::once(c.email).chain(c.new.then_some(c.name))
+}
+
 /// Which claims can be written together, and who holds what once they are.
 ///
 /// Judged against the file as the write would leave it, so a managed account
@@ -517,14 +513,18 @@ fn others<'h, 'a>(holds: &'h Holds<'a>, key: &str, c: &Claim) -> Vec<&'h Hold<'a
 /// claims on one name, the later in the manager's order. A dropped move leaves
 /// its account on its old address, which can drop another claim in turn.
 /// Every round drops something or ends, so it ends.
+///
+/// A claim can lose a tie to one that is itself dropped in a later round, and
+/// then nothing is in its way. Those are let through afterwards, lowest in the
+/// manager's order first, each against what the ones before it hold: a claim
+/// whose keys are free collides with nothing, and a move let through only
+/// frees an address. So every claim left out has something in its way in the
+/// file as written, and its login is refused with the reason rather than left
+/// to wait.
 fn resolve<'a>(
     kept: &'a [(String, Option<&'a str>)],
     claims: &[Claim<'a>],
 ) -> (Vec<bool>, Holds<'a>) {
-    let keys = |c: &Claim<'a>| {
-        let name = c.new.then_some(c.name);
-        std::iter::once(c.email).chain(name)
-    };
     let mut alive = vec![true; claims.len()];
     loop {
         let held = holds(kept, claims, &alive);
@@ -547,35 +547,31 @@ fn resolve<'a>(
             }
         }
         if next == alive {
-            return (alive, held);
+            break;
         }
         alive = next;
     }
+    loop {
+        let held = holds(kept, claims, &alive);
+        let free = (0..claims.len()).find(|&i| {
+            !alive[i] && keys(&claims[i]).all(|k| others(&held, k, &claims[i]).is_empty())
+        });
+        match free {
+            Some(i) => alive[i] = true,
+            None => return (alive, held),
+        }
+    }
 }
 
-/// Why a claim `resolve` dropped was not written: the reason to answer its
-/// link request with, or `None` when it should wait. It waits when every
-/// holder in its way is a managed account the manager lists with another
-/// address — one that could not move this cycle, and may next — or when
-/// nobody holds it once the write is done.
-fn refusal_for(c: &Claim, held: &Holds, moving_to: &HashMap<&str, &str>) -> Option<&'static str> {
-    // Held for good: by a claim going ahead, by a username, or as an address
-    // its account is not being moved off.
-    let fixed = |key: &str| {
-        others(held, key, c).iter().any(|h| {
-            h.claim.is_some()
-                || !h.as_email
-                || moving_to
-                    .get(h.owner)
-                    .is_none_or(|to| to.to_lowercase() == key.to_lowercase())
-        })
-    };
-    if fixed(c.email) {
-        Some(EMAIL_TAKEN)
-    } else if c.new && fixed(c.name) {
-        Some(NAME_TAKEN)
+/// Why a claim `resolve` dropped was not written: something holds its address,
+/// or a new account's username, in the file as written — a kept entry, a
+/// claim going ahead, or a move that could not go ahead and so leaves its
+/// account where it is.
+fn refusal_for(c: &Claim, held: &Holds) -> &'static str {
+    if others(held, c.email, c).is_empty() {
+        NAME_TAKEN
     } else {
-        None
+        EMAIL_TAKEN
     }
 }
 
@@ -692,21 +688,14 @@ pub fn plan(
     // it will be.
     let mut claims = Vec::new();
     let mut claim_of = vec![None; accounts.len()];
-    // The address the manager wants each managed account on.
-    let mut moving_to: HashMap<&str, &str> = HashMap::new();
     for (i, a) in accounts.iter().enumerate() {
         let Some(email) = usable_email(a).filter(|_| plausible_username(&a.username)) else {
             continue;
         };
         let new = match slot(&a.username) {
             Slot::New if creatable_key(&a.username) => true,
-            Slot::Ours(entry) => {
-                moving_to.insert(&a.username, email);
-                if str_field(entry, "email") == Some(email) {
-                    continue;
-                }
-                false
-            }
+            Slot::Ours(entry) if str_field(entry, "email") == Some(email) => continue,
+            Slot::Ours(_) => false,
             Slot::New | Slot::Foreign => continue,
         };
         claim_of[i] = Some(claims.len());
@@ -717,12 +706,11 @@ pub fn plan(
         });
     }
     let (alive, held) = resolve(&kept, &claims);
-    // A claim that was not written: answered with the reason, or left to wait.
+    // A claim that was not written, and why.
     let dropped = |p: &mut Plan, a: &ManagerAccount, c: usize| {
-        let why = refusal_for(&claims[c], &held, &moving_to);
-        p.conflicts
-            .push((a.username.clone(), why.unwrap_or(WAITING)));
-        why
+        let why = refusal_for(&claims[c], &held);
+        p.conflicts.push((a.username.clone(), why));
+        Some(why)
     };
 
     for (i, a) in accounts.iter().enumerate() {
@@ -2379,37 +2367,88 @@ users:
         assert!(p.conflicts.is_empty());
     }
 
-    /// A move a hand-made account blocks keeps its old address, so a login
-    /// that wanted that address waits — unrefused, its request outstanding —
-    /// while the blocked one is refused: the hand-made holder is going nowhere.
+    /// A move a hand-made account blocks keeps its old address, and keeps it
+    /// for as long as that account and the manager's list stay as they are.
+    /// So a login that wanted the old address is refused too, with the
+    /// reason, rather than left waiting for a way that never clears.
     #[test]
-    fn a_blocked_move_keeps_its_address_and_whoever_wanted_it_waits() {
+    fn a_blocked_move_keeps_its_address_and_whoever_wanted_it_is_refused() {
         let at = "2026-09-24T08:00:00Z";
         let doc = file(
             "users:\n  alpha:\n    email: a@example.com\n    groups: [bilbycast-portal]\n  \
              hand:\n    email: h@example.com\n    groups: []\n",
         );
-        let p = plan(
-            &users(&doc),
-            &[
-                asking(acct("alpha", Some("h@example.com")), at),
-                asking(acct("newbie", Some("a@example.com")), at),
-            ],
-            Some(&[]),
-            G,
-        );
+        let logins = [
+            asking(acct("alpha", Some("h@example.com")), at),
+            asking(acct("newbie", Some("a@example.com")), at),
+        ];
+        let p = plan(&users(&doc), &logins, Some(&[]), G);
         assert!(p.add.is_empty() && p.update.is_empty(), "{p:?}");
         assert_eq!(
             refused(&p),
-            [("alpha", EMAIL_TAKEN)],
-            "newbie's request was used up on an address that is still moving"
+            [("alpha", EMAIL_TAKEN), ("newbie", EMAIL_TAKEN)],
+            "newbie's request was left outstanding for an address that is going nowhere"
         );
         assert_eq!(
             p.conflicts,
             [
                 ("alpha".to_string(), EMAIL_TAKEN),
-                ("newbie".to_string(), WAITING)
+                ("newbie".to_string(), EMAIL_TAKEN)
             ]
+        );
+    }
+
+    /// Addresses passed along — one onto two's, two onto the one a hand-made
+    /// account holds: two cannot move, so one cannot either, and both are
+    /// refused.
+    #[test]
+    fn a_rotation_a_hand_made_account_blocks_is_refused_whole() {
+        let at = "2026-09-24T08:00:00Z";
+        let doc = file(
+            "users:\n  hand:\n    email: z@example.com\n    groups: []\n  \
+             one:\n    email: x@example.com\n    groups: [bilbycast-portal]\n  \
+             two:\n    email: y@example.com\n    groups: [bilbycast-portal]\n",
+        );
+        let p = plan(
+            &users(&doc),
+            &[
+                asking(acct("one", Some("y@example.com")), at),
+                asking(acct("two", Some("z@example.com")), at),
+            ],
+            Some(&[]),
+            G,
+        );
+        assert!(p.update.is_empty(), "{p:?}");
+        assert_eq!(refused(&p), [("one", EMAIL_TAKEN), ("two", EMAIL_TAKEN)]);
+    }
+
+    /// A login can lose a tie to one that is itself held back later in the
+    /// same settling. Nothing is then in its way, so it is written in this
+    /// write, not refused and not left to wait.
+    #[test]
+    fn a_login_that_lost_a_tie_to_one_held_back_later_is_written() {
+        let at = "2026-09-24T08:00:00Z";
+        let doc = managed(&[("gamma", "x@example.com")]);
+        let p = plan(
+            &users(&doc),
+            &[
+                // Wants gamma's address, and has zed's address as its name.
+                asking(acct("a@example.com", Some("x@example.com")), at),
+                // Beats gamma to the address gamma is moving to …
+                acct("aa", Some("y@example.com")),
+                // … so gamma stays on x@, which holds a@example.com back.
+                asking(acct("gamma", Some("y@example.com")), at),
+                // Lost a@example.com to that login before it was held back.
+                asking(acct("zed", Some("a@example.com")), at),
+            ],
+            Some(&[]),
+            G,
+        );
+        assert_eq!(names(&p.add), ["aa", "zed"]);
+        assert!(p.update.is_empty(), "{p:?}");
+        assert_eq!(
+            refused(&p),
+            [("a@example.com", EMAIL_TAKEN), ("gamma", EMAIL_TAKEN)]
         );
     }
 
