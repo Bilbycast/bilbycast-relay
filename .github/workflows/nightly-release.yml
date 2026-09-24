@@ -255,12 +255,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      # Shared canonical-manifest builder lives in the SDK repo.
+      # Shared canonical-manifest builder lives in the SDK repo. Nothing here
+      # pushes to it, so its checkout keeps no credential.
       - name: Checkout bilbycast-gateway-sdk (manifest script)
         uses: actions/checkout@v5
         with:
           repository: Bilbycast/bilbycast-gateway-sdk
           path: bilbycast-gateway-sdk
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
