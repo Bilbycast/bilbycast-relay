@@ -388,6 +388,20 @@ fn is_session_subdir(name: &std::ffi::OsStr) -> bool {
     name == std::ffi::OsStr::new(CLIPS_DIR) || name == std::ffi::OsStr::new(MARKS_DIR)
 }
 
+/// A dropped stream's directory, renamed to this prefix plus the stream's name
+/// while it is deleted — see [`remove_stream`](OriginStore::remove_stream).
+///
+/// `+` is outside every stream id `sanitize_stream_id` admits, so no stream
+/// can be named like one. One left on disk — the relay stopped mid-delete, or
+/// the delete failed — is finished by adoption at the next start and by the
+/// sweep, and is never taken for a stream.
+const REMOVING_PREFIX: &str = "removing+";
+
+fn is_removal(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|n| n.starts_with(REMOVING_PREFIX))
+}
+
 /// Why a clip request was not admitted.
 ///
 /// Every arm is something an operator can act on, and the handler turns each
@@ -725,6 +739,10 @@ impl OriginStore {
     /// unreadable file from a previous run must not stop the relay coming up,
     /// and a segment that cannot be indexed is simply one the store does not
     /// know it has — which the playlist trim then declines to advertise.
+    ///
+    /// A dropped stream's directory still under its [`REMOVING_PREFIX`] name
+    /// is deleted here, not adopted: the drop that renamed it did not live to
+    /// finish.
     fn adopt_existing(&self) {
         let root = match std::fs::read_dir(&self.cfg.root) {
             Ok(r) => r,
@@ -740,6 +758,15 @@ impl OriginStore {
 
         for entry in root.flatten() {
             if !entry.path().is_dir() {
+                continue;
+            }
+            if is_removal(&entry.file_name()) {
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    tracing::warn!(
+                        dir = %entry.path().display(), error = %e,
+                        "origin: could not finish removing a dropped stream"
+                    );
+                }
                 continue;
             }
             let Some(stream) = entry.file_name().to_str().map(str::to_string) else {
@@ -1578,32 +1605,64 @@ impl OriginStore {
             }
             None => self.cfg.root.join(stream),
         };
-        // Under both locks that write into a stream's session files, each of
-        // which checks the stream directory exists before it writes. Without
-        // them a write that had passed its check could make `marks/` or
-        // `clips/` again behind `remove_dir_all`'s walk; the final rmdir then
-        // failed, and a marks list or a clip request outlived its session
-        // with a success sent for it. Marks and admissions for every stream
-        // wait out one removal, which is rare, and both are made by hand.
-        let marks = self.lock_marks().await;
-        let admission = self.clip_admission.clone();
-        let target = dir.clone();
-        let removed = tokio::task::spawn_blocking(move || {
-            let _marks = marks;
-            let _admitting = admission.lock().unwrap_or_else(|e| e.into_inner());
-            std::fs::remove_dir_all(&target)
-        })
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        // Moved aside first, then deleted with no lock held. Held across the
+        // whole `remove_dir_all`, the store-wide locks kept every other
+        // session's marks and exports waiting while a session delete took
+        // thousands of segments with it. One the delete leaves behind is the
+        // sweep's to finish.
+        let (path, removed) = match self.set_stream_aside(stream, &dir).await {
+            Ok(None) => return,
+            Ok(Some(aside)) => {
+                let removed = tokio::fs::remove_dir_all(&aside).await;
+                (aside, removed)
+            }
+            Err(e) => (dir, Err(e)),
+        };
         if let Err(e) = removed
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
-                dir = %dir.display(),
+                dir = %path.display(),
                 error = %e,
                 "origin: could not remove stream directory"
             );
         }
+    }
+
+    /// Rename a stream's directory to its [`REMOVING_PREFIX`] name, and say
+    /// where it went.
+    ///
+    /// Under both locks that write into a stream's session files, each of
+    /// which checks the stream directory exists before it writes: a write
+    /// under way lands before the move and goes with the stream, and one
+    /// after it finds no directory and is refused, rather than having the
+    /// directory moved from under it halfway. A rename is one step however
+    /// large the window, so that is all they are held for.
+    ///
+    /// `None` when there was nothing to move, or when the rename failed and
+    /// the directory was deleted where it stands instead, under the locks —
+    /// a rename can fail where a delete does not, on a full volume or onto an
+    /// earlier removal of the same stream that is not finished yet.
+    async fn set_stream_aside(
+        &self,
+        stream: &str,
+        dir: &FsPath,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let marks = self.lock_marks().await;
+        let admission = self.clip_admission.clone();
+        let from = dir.to_path_buf();
+        let aside = self.cfg.root.join(format!("{REMOVING_PREFIX}{stream}"));
+        tokio::task::spawn_blocking(move || {
+            let _marks = marks;
+            let _admitting = admission.lock().unwrap_or_else(|e| e.into_inner());
+            match std::fs::rename(&from, &aside) {
+                Ok(()) => Ok(Some(aside)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => std::fs::remove_dir_all(&from).map(|()| None),
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
     }
 
     /// The session is over, but its clips are not.
@@ -1761,12 +1820,20 @@ impl OriginStore {
     /// * and the stream directory itself, once it holds nothing and no stream
     ///   is using it — a clips- or marks-only directory is in no eviction path
     ///   and is not re-adopted on restart, so without this it is permanent.
+    ///
+    /// It also finishes deleting a dropped stream whose directory is still
+    /// under its [`REMOVING_PREFIX`] name: nothing else will, short of a
+    /// restart.
     async fn reclaim_clip_debris(&self) {
         let Ok(mut root) = tokio::fs::read_dir(&self.cfg.root).await else {
             return;
         };
         let now = std::time::SystemTime::now();
         while let Ok(Some(entry)) = root.next_entry().await {
+            if is_removal(&entry.file_name()) {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+                continue;
+            }
             let Some(stream) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
@@ -4840,8 +4907,10 @@ seg-1.m4s
     }
 
     /// A drop waits for a clip admission in progress, for the reason it waits
-    /// for a marks write: an admission that had passed its check could make
-    /// `clips/` behind `remove_dir_all`'s walk and outlive the session.
+    /// for a marks write: an admission that had passed its check would have
+    /// the directory moved from under it halfway, or, where the drop deletes
+    /// in place, could make `clips/` behind `remove_dir_all`'s walk and
+    /// outlive the session.
     #[tokio::test]
     async fn a_drop_waits_for_a_clip_admission_in_progress() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4874,6 +4943,97 @@ seg-1.m4s
         admitting.join().unwrap();
         dropping.await.unwrap();
         assert!(!stream_dir.exists(), "the drop did not happen once free");
+    }
+
+    /// A drop holds the store-wide locks for one rename, not for the delete.
+    /// Held across a `remove_dir_all` of the whole window, they kept every
+    /// other session's marks and exports waiting while thousands of segments
+    /// went. A window the relay stopped before deleting is deleted at the
+    /// next start, not adopted as a stream.
+    #[tokio::test]
+    async fn a_drop_holds_the_locks_only_to_move_the_stream_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        put_seg(&s, "feed", "seg-00000.m4s", 64).await;
+        put_seg(&s, "feed", "seg-00001.m4s", 64).await;
+        let dir = tmp.path().join("origin").join("feed");
+
+        let aside = s
+            .set_stream_aside("feed", &dir)
+            .await
+            .unwrap()
+            .expect("the stream was deleted under the locks, not moved aside");
+        assert!(
+            !dir.exists(),
+            "the stream directory is still where writers look for it"
+        );
+        assert!(
+            aside.join("seg-00000.m4s").exists(),
+            "the window was deleted under the locks"
+        );
+        assert!(
+            s.marks_lock.try_lock().is_ok(),
+            "the marks lock outlived the move"
+        );
+        assert!(
+            s.clip_admission.try_lock().is_ok(),
+            "the admission lock outlived the move"
+        );
+
+        // The relay stops before the delete.
+        drop(s);
+        let s = store(&tmp, 0);
+        assert!(
+            !aside.exists(),
+            "a restart left a dropped stream's window on disk"
+        );
+        assert!(
+            s.usage().is_empty(),
+            "a restart adopted a dropped stream's window"
+        );
+    }
+
+    /// A rename can fail where a delete does not — here onto an earlier
+    /// removal of the same stream that is not finished — and the drop must
+    /// still happen.
+    #[tokio::test]
+    async fn a_drop_that_cannot_move_the_stream_aside_deletes_it_where_it_stands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        put_seg(&s, "feed", "seg-00000.m4s", 64).await;
+        let earlier = tmp
+            .path()
+            .join("origin")
+            .join(format!("{REMOVING_PREFIX}feed"));
+        std::fs::create_dir(&earlier).unwrap();
+        std::fs::write(earlier.join("seg-00000.m4s"), [0u8; 64]).unwrap();
+
+        s.remove_stream("feed").await;
+        assert!(
+            !tmp.path().join("origin").join("feed").exists(),
+            "a drop that could not rename the stream left it in place"
+        );
+        assert_eq!(s.total_bytes(), 0);
+    }
+
+    /// A drop whose delete failed, or stopped with the relay still running,
+    /// is finished by the sweep rather than left to the next restart.
+    #[tokio::test]
+    async fn the_sweep_finishes_a_drop_left_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        let left = tmp
+            .path()
+            .join("origin")
+            .join(format!("{REMOVING_PREFIX}feed"));
+        std::fs::create_dir_all(left.join(MARKS_DIR)).unwrap();
+        std::fs::write(left.join("seg-00000.m4s"), [0u8; 64]).unwrap();
+
+        s.sweep().await;
+        assert!(
+            !left.exists(),
+            "the sweep left a dropped stream's window on disk"
+        );
     }
 
     /// A restart must not sweep the clips up as debris.

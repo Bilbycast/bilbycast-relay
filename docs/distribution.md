@@ -265,6 +265,10 @@ could only be applied at startup. Three things it has to get right:
 * A `.part` is discarded: it is a PUT interrupted by the very restart being
   recovered from, and truncated by definition.
 
+A directory named `removing+{stream}` is a drop the relay stopped in the middle
+of (see `drop_origin_streams` below). It is deleted, never adopted as a stream:
+`+` is outside every stream id, so nothing else can carry the name.
+
 Manifests and `init.mp4` are memory-only and still die with the process. The
 edge re-publishes both — that is what `init_last_upload` exists for on that
 side — so the gap is a segment or two, and the trim above keeps the playlist
@@ -663,7 +667,10 @@ pending and posts it once the directory exists, which also covers a mark made
 in the seconds before the first segment lands. A clip request after the drop is
 refused too (see "Clip export"), so it cannot make the directory for such a
 mark to land in, and the drop waits for a marks write or a clip admission
-already under way, so neither can recreate `marks/` or `clips/` behind it.
+already under way, so neither can recreate `marks/` or `clips/` behind it. It
+holds the marks lock and the clip-admission lock only while it renames the
+stream's directory aside; the delete comes after, so a session delete taking a
+multi-gigabyte window with it holds up no other session's marks or exports.
 Reading a stream with no directory is an empty list. Writes queue on one
 store-wide lock, waited for as tasks rather than on the blocking pool's
 threads: each write syncs the file and its directory while holding it, and
@@ -1386,9 +1393,18 @@ See `../../testbed/configs/relay-distribution.json`:
 
   Each name is queued on an unbounded channel the origin task drains, calling
   `remove_stream`: the stream leaves the registry, its bytes are subtracted from
-  the node total, and its directory is `remove_dir_all`'d — segments, manifest
-  and init together, immediately, not aged out. There is no undo, and nothing
-  re-adopts the directory on the next restart because it is gone.
+  the node total, and its directory is renamed to `removing+{stream}` and then
+  `remove_dir_all`'d — segments, manifest and init together, immediately, not
+  aged out. Only the rename is made under the store's marks and clip-admission
+  locks, so a write under way lands before it and goes with the stream, or
+  finds the stream gone; the delete runs after they are released, so a window
+  of thousands of segments holds up no other session's marks or exports. If the
+  rename fails (a full volume, or an unfinished earlier removal of the same
+  stream in the way), the directory is deleted where it stands, under the
+  locks. There is no undo, and nothing re-adopts the directory on the next
+  restart: a `removing+…` directory the relay stopped in the middle of
+  deleting, or failed to delete, is finished at the next start and by the
+  30 s sweep, and never adopted as a stream.
 
   Applied **after** `origin_policy` / `origin_stream_policies` in the same push,
   so a manager that both re-states the override set and drops a session's

@@ -969,9 +969,11 @@ mod tests {
 
     /// A drop waits for a marks write in progress, so the write lands before
     /// the directory goes, and goes with it, or finds no directory. Without
-    /// the lock a write that had passed its check could make `marks/` behind
-    /// `remove_dir_all`'s walk, whose last rmdir then failed and left the
-    /// list behind with a `201` sent for it.
+    /// the lock a write that had passed its check would have the directory
+    /// moved from under it halfway — or, where the drop cannot rename and
+    /// deletes in place, could make `marks/` behind `remove_dir_all`'s walk,
+    /// whose last rmdir then failed and left the list behind with a `201`
+    /// sent for it.
     #[tokio::test]
     async fn a_drop_waits_for_a_marks_write_in_progress() {
         let tmp = tempfile::tempdir().unwrap();

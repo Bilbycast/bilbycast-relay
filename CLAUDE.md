@@ -143,7 +143,7 @@ This separation prevents head-of-line blocking between control, TCP, and UDP pla
 | `tokio::join!` | Bidirectional TCP copy (both directions concurrent) |
 | `tokio::spawn` | Per-connection and per-stream task isolation |
 
-No `RwLock` anywhere, and no lock on the opaque forwarding path. Four `Mutex`
+No `RwLock` anywhere, and no lock on the opaque forwarding path. Five `Mutex`
 fields exist in the runtime code, and two of them are in always-compiled modules
 — so this is not a distribution-only exception: `RelayStats::prev_sample`
 (`std::sync`, `stats.rs`) is taken only inside `compute_bandwidth_bps`, on the
@@ -152,16 +152,23 @@ fields exist in the runtime code, and two of them are in always-compiled modules
 receiver to the origin task; `StreamOrigin::order`, the **per-stream**
 eviction queue (`tokio::sync`, `distribution/origin.rs`, `viewer-distribution`
 builds only), is held for queue surgery on the CMAF segment PUT/evict path and
-dropped before the file I/O it schedules; and `OriginStore::clip_admission`
+dropped before the file I/O it schedules; `OriginStore::clip_admission`
 (`std::sync`, `distribution/origin.rs`, `viewer-distribution` builds only)
 serialises `admit_clips` — count, byte budget and record filed as one
 operation, held across the synchronous `read_dir` / `read` / `stat` of every
-record and the temp-then-rename write of each new one. That is safe in an async
-server because its only caller, `POST /origin/{stream}/clips`, runs it on
-`tokio::task::spawn_blocking`, so the lock never parks a runtime worker; and it
-is one lock for the whole store rather than one per stream because admission
-happens when an operator presses Export, never on the segment path, so there is
-nothing to contend for.
+record and the temp-then-rename write of each new one; and
+`OriginStore::marks_lock` (`tokio::sync`, same file and builds) serialises
+every write of a stream's `marks/marks.json`. `clip_admission` is safe in an
+async server because everything that takes it — `POST /origin/{stream}/clips`
+and `remove_stream` — does so on `tokio::task::spawn_blocking`, so it never
+parks a runtime worker; `marks_lock` is a `tokio` mutex, waited for as a future
+and held through the blocking write, because a write holds it across two fsyncs
+and every waiter on a `std` one would hold a blocking-pool thread. Both are one
+lock for the whole store rather than one per stream because admission and marks
+happen when an operator presses a button, never on the segment path, so there
+is nothing to contend for; `remove_stream` takes both, so a write under way
+lands before a drop or finds the stream gone, but only for the rename that
+moves the stream's directory aside, never for the delete after it.
 
 ### Security Architecture
 
@@ -240,7 +247,7 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   panics str0m ("Pt locked multiple times: 111") once a session negotiates both
   H.264 and Opus (a WHEP client offering audio, or a server answering a
   default-codec offer). The fix drops the RTX slot on that one profile.
-- **Origin** (`PUT/GET /origin/{stream}/{file}`, plus the **clip** surface at `/origin/{stream}/clips` (POST request / GET list), `…/clips/{file}` (PUT / GET / DELETE) and `…/clips/{file}/failed` (POST), plus the **shared marks** list at `/origin/{stream}/marks` (GET with `ETag`/304 / POST) and `…/marks/{id}` (PATCH / DELETE) — `src/distribution/origin/marks.rs`, one `{stream}/marks/marks.json` per stream (fsynced; written only into a stream directory ingest has made, so a write after the manager's drop is `404`, not a resurrected directory, and the drop waits for a write under way; writers queue on a store-wide `tokio` mutex held through the blocking write, so waiting costs a task rather than a blocking-pool thread; an unparseable file is set aside by any request, a read included; I/O failure is `503`), viewer token only, fails closed without a `token_secret`, kept and dropped with `clips/`; the DVR page polls it every 3 s and falls back to `localStorage` on a relay without it — `400`/`401`/`404`/`405`/`500` on the first poll, `400` being what a relay predating the list answers — asking again about once a minute): **disk-backed** store with time-based retention, a per-stream byte bound, a segment floor and an idle grace on top of retention (`origin_idle_grace_secs`, default 60 s, per-stream overridable like the rest of the policy) past which a silent stream is retired — its media deleted and its in-memory state dropped, a non-empty `clips/` or `marks/` kept — swept every 30 s independently of ingest; the same sweep enforces a free-space floor on the origin volume (`origin_min_free_bytes`, default 5 GiB, `0` disables; evicts oldest-first round-robin across every stream down to four segments each, because the relay owns the disk and no health payload reports free space to the manager) and reclaims clip debris (`.part` uploads and record-less `.mp4`s after 1 h, anything in `clips/`, and a `marks/` list untouched on a stream nothing is ingesting, after 7 d — a backstop under the manager's 24 h post-session clock, never a policy). Clips are cut on the edge and PUT here (256 MiB each, 100 and 4 GiB per stream, 60 s pre+post); a clip request for a stream with no directory is `410` and never re-creates it, and the drop waits for an admission under way. Every clip verb ignores both `require_origin_token` and `require_ingest_token` and fails closed without a `token_secret`: request / list / GET / DELETE accept an ingest **or** viewer token (`require_clip_credential`), while PUT and `…/failed` accept the ingest token only (`require_clip_ingest`). Manifests and init segments stay in memory (rewritten every segment, never evicted). Retention is manager-owned at runtime, node-wide plus per-stream overrides
+- **Origin** (`PUT/GET /origin/{stream}/{file}`, plus the **clip** surface at `/origin/{stream}/clips` (POST request / GET list), `…/clips/{file}` (PUT / GET / DELETE) and `…/clips/{file}/failed` (POST), plus the **shared marks** list at `/origin/{stream}/marks` (GET with `ETag`/304 / POST) and `…/marks/{id}` (PATCH / DELETE) — `src/distribution/origin/marks.rs`, one `{stream}/marks/marks.json` per stream (fsynced; written only into a stream directory ingest has made, so a write after the manager's drop is `404`, not a resurrected directory, and the drop waits for a write under way; writers queue on a store-wide `tokio` mutex held through the blocking write, so waiting costs a task rather than a blocking-pool thread; an unparseable file is set aside by any request, a read included; I/O failure is `503`), viewer token only, fails closed without a `token_secret`, kept and dropped with `clips/`; the DVR page polls it every 3 s and falls back to `localStorage` on a relay without it — `400`/`401`/`404`/`405`/`500` on the first poll, `400` being what a relay predating the list answers — asking again about once a minute): **disk-backed** store with time-based retention, a per-stream byte bound, a segment floor and an idle grace on top of retention (`origin_idle_grace_secs`, default 60 s, per-stream overridable like the rest of the policy) past which a silent stream is retired — its media deleted and its in-memory state dropped, a non-empty `clips/` or `marks/` kept — swept every 30 s independently of ingest; the same sweep enforces a free-space floor on the origin volume (`origin_min_free_bytes`, default 5 GiB, `0` disables; evicts oldest-first round-robin across every stream down to four segments each, because the relay owns the disk and no health payload reports free space to the manager) and reclaims clip debris (`.part` uploads and record-less `.mp4`s after 1 h, anything in `clips/`, and a `marks/` list untouched on a stream nothing is ingesting, after 7 d — a backstop under the manager's 24 h post-session clock, never a policy). Clips are cut on the edge and PUT here (256 MiB each, 100 and 4 GiB per stream, 60 s pre+post); a clip request for a stream with no directory is `410` and never re-creates it, and the drop waits for an admission under way. The drop holds the marks and admission locks only to rename the stream's directory to `removing+{stream}`, and deletes it once they are released, so a multi-gigabyte window holds up no other session's marks or exports; a `removing+…` directory a stopped relay or a failed delete leaves behind is finished at the next start and by the 30 s sweep, never adopted as a stream. Every clip verb ignores both `require_origin_token` and `require_ingest_token` and fails closed without a `token_secret`: request / list / GET / DELETE accept an ingest **or** viewer token (`require_clip_credential`), while PUT and `…/failed` accept the ingest token only (`require_clip_ingest`). Manifests and init segments stay in memory (rewritten every segment, never evicted). Retention is manager-owned at runtime, node-wide plus per-stream overrides
   of the edge's CMAF PUTs; front with a CDN for scale.
 - **Players**: two, and they are not variants of each other. `GET /watch/{stream}`
   (`player.html`) is the WHEP one — sub-second, live-only, no buffer, no
