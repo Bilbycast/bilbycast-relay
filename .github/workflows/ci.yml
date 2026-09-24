@@ -168,3 +168,39 @@ jobs:
 
       - name: Portal install/upgrade logic
         run: bash packaging/test-portal-install.sh
+
+  # ---------------------------------------------------------------
+  # The DVR page's jsdom suite.
+  #
+  # `dvr.html` is thousands of lines of hand-written player logic that no
+  # cargo command executes — `mod.rs` can only read it as text — and the
+  # shared marks and the loop around a mark live entirely inside it.
+  # `tests/dvr_page.test.cjs` drives the real page against an in-memory
+  # relay; before this job it ran only when somebody remembered to run it
+  # by hand. It skips when jsdom is absent, which is right on a laptop and
+  # wrong here — a job that lost its install step would pass having tested
+  # nothing — so `DVR_PAGE_REQUIRE_JSDOM=1` turns the skip into a failure.
+  #
+  # A job of its own: it needs no cargo cache and has no reason to wait
+  # behind nine cargo invocations. jsdom is installed `--no-save`, so no
+  # package.json or lockfile enters the repo (`.gitignore` covers the
+  # `node_modules/` it leaves behind).
+  # ---------------------------------------------------------------
+  dvr-page:
+    name: DVR page (jsdom)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          # jsdom 30 wants 22.22.2 or later on the 22 line; `22` resolves to
+          # the newest 22.x.
+          node-version: 22
+
+      - name: jsdom suite
+        working-directory: src/distribution
+        run: |
+          npm i --no-save --no-audit --no-fund jsdom@30
+          DVR_PAGE_REQUIRE_JSDOM=1 node --test tests/dvr_page.test.cjs
