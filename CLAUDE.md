@@ -353,8 +353,12 @@ the manager keeps by trigger when a username's last login is deleted, until the
 portal acknowledges each on `POST …/accounts/removed-applied` (90-day prune as a
 backstop) — and a username in `removed[]` *and* `accounts[]` has changed hands,
 so its managed entry is **replaced** (dropped and recreated with a fresh hash in
-the same write). A record is acknowledged only after the write that applied it
-lands (at once when nothing needed writing); an in-process set of applied
+the same write). A record is acknowledged only once the write that applied it
+has landed *and* the next cycle's fresh read still shows it (`Effect` in
+`accounts.rs`: no managed entry of that name for a removal, none still holding
+the dropped password for a replacement) — at once when nothing needed writing;
+a read showing Authelia wrote the old entry back (a stale copy saved before it
+reloaded) applies the record again. An in-process set of applied
 `(username, removed_at)` stops a failed acknowledgement from replacing the
 account twice, and a 404 from a manager without the route is logged once.
 Against a manager too old to send `removed`, absence removes, except that an

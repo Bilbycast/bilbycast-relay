@@ -388,18 +388,27 @@ For each record the portal does one of three things:
 
 The portal tells the manager it has applied a record on
 `POST /api/v1/dvr/portal/accounts/removed-applied` with its `username` and
-`removed_at`, echoed verbatim — only after the write that applied it has landed,
-or at once when there was nothing to write — and the manager then forgets it,
-unless a newer removal of the same username has replaced it meanwhile. A write
-that fails, or loses its race with Authelia, is tried again next cycle. The
-portal remembers each record it has applied for as long as it runs, so an
-acknowledgement that fails is retried every cycle **without replacing the
-account again** — its new holder may have set a password by then. That memory
-does not survive a restart: a portal restarted between replacing an account and
-getting the acknowledgement through replaces it once more, and the new holder
-sets their password again. The manager prunes a record nobody acknowledges
-after 90 days, so a portal that does not poll for that long never removes that
-account; remove it by hand.
+`removed_at`, echoed verbatim, and the manager then forgets it, unless a newer
+removal of the same username has replaced it meanwhile. It says so **only once
+a later read of the file still shows the record applied** — no managed entry of
+that name after a removal, none still holding the password the write dropped
+after a replacement — or at once when there was nothing to write. A landed
+write is not Authelia having loaded it: Authelia rewrites the whole file from
+what it has loaded whenever anyone sets a password, so a password set in the
+moment before it reloads puts the removed or replaced entry back, password and
+all. The next cycle's read finds that, logs ``Authelia wrote back an account the
+portal had removed or replaced …``, and applies the record again. A write-back
+after that read is not caught; nor, for a replacement, whose check is the
+password, is an entry written back after its last holder changed that password
+in the same moment. A write that fails, or loses its race with Authelia, is
+tried again next cycle. The portal remembers each record it has applied for as
+long as it runs, so an acknowledgement that fails is retried every cycle
+**without replacing the account again** — its new holder may have set a
+password by then. That memory does not survive a restart: a portal restarted
+between replacing an account and getting the acknowledgement through replaces
+it once more, and the new holder sets their password again. The manager prunes
+a record nobody acknowledges after 90 days, so a portal that does not poll for
+that long never removes that account; remove it by hand.
 
 A manager that sends `removed` but has no `removed-applied` route answers the
 acknowledgement 404. The portal logs that once — ``the manager has no route to

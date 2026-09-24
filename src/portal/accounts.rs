@@ -33,10 +33,15 @@
 //! the username is given out again meanwhile, so a username in `removed` *and*
 //! in `accounts` has changed hands: its entry is replaced — dropped and made
 //! afresh in the same write — or the old holder's password would open the new
-//! holder's feeds. A removal is acknowledged only once the write that applied
-//! it has landed, and the process remembers what it has applied, so a failed
-//! acknowledgement is retried without replacing the account a second time,
-//! perhaps after its new owner has set a password.
+//! holder's feeds.
+//!
+//! A removal that takes a write is acknowledged only once that write has
+//! landed *and* the next cycle's read of the file still shows it: Authelia
+//! saving a copy of its database it loaded before that write puts the old
+//! entry back, and then the removal is applied again. One that needs no write
+//! is acknowledged at once. The process remembers what it has applied, so a
+//! failed acknowledgement is retried without replacing the account a second
+//! time, perhaps after its new owner has set a password.
 //!
 //! # Passwords are Authelia's
 //!
@@ -319,10 +324,10 @@ pub struct Plan {
     /// entry is dropped, and made afresh in `add` when the new login can have
     /// an account at all, so nothing set on the old one survives.
     pub replace: Vec<String>,
-    /// The manager's removal records this plan settles, each with whether
-    /// settling it takes this cycle's write. One that needs no write — no
-    /// managed account of that name — is settled already.
-    pub removals: Vec<(Removal, bool)>,
+    /// The manager's removal records this plan settles, each with what this
+    /// cycle's write does for it. `None` — no managed account of that name —
+    /// needs no write, and is settled already.
+    pub removals: Vec<(Removal, Option<Effect>)>,
     /// Links to ask Authelia for now.
     pub links: Vec<Link>,
     /// Link requests to answer with a reason.
@@ -337,6 +342,32 @@ pub struct Plan {
     /// Removals held back because the manager, too old to say what it deleted,
     /// reported no logins at all.
     pub held_back: usize,
+}
+
+/// What a write does for a removal record, and so what a later read of the
+/// file must still show before the manager is told. Authelia saving a copy of
+/// its database it loaded before that write — anyone setting a password in the
+/// moment before it reloads — writes the old entry back, password and all.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// The managed entry of that name is dropped.
+    Removed,
+    /// The managed entry of that name, holding this password, is dropped;
+    /// one made afresh for the new holder may take its place.
+    Replaced(Option<String>),
+}
+
+impl Effect {
+    /// Does `users` still show it? A removal left no managed entry of that
+    /// name; a replacement left none holding the password it dropped.
+    fn shown(&self, users: &Mapping, name: &str, group: &str) -> bool {
+        let entry = users.get(name).filter(|e| is_managed(e, group));
+        match (self, entry) {
+            (_, None) => true,
+            (Effect::Removed, Some(_)) => false,
+            (Effect::Replaced(dropped), Some(e)) => str_field(e, "password") != dropped.as_deref(),
+        }
+    }
 }
 
 impl Plan {
@@ -608,15 +639,26 @@ pub fn plan(
             // settled with nothing to write.
             let mut acted = HashSet::new();
             for r in removed {
-                let write = ours(&r.username);
-                if write && acted.insert(r.username.as_str()) {
-                    if listed.contains(r.username.as_str()) {
-                        p.replace.push(r.username.clone());
+                let name = r.username.as_str();
+                let effect = ours(name).then(|| {
+                    if listed.contains(name) {
+                        let password = by_name
+                            .get(name)
+                            .and_then(|(e, _)| str_field(e, "password"));
+                        Effect::Replaced(password.map(str::to_string))
                     } else {
-                        p.remove.push(r.username.clone());
+                        Effect::Removed
+                    }
+                });
+                if let Some(effect) = &effect
+                    && acted.insert(name)
+                {
+                    match effect {
+                        Effect::Replaced(_) => p.replace.push(r.username.clone()),
+                        Effect::Removed => p.remove.push(r.username.clone()),
                     }
                 }
-                p.removals.push((r.clone(), write));
+                p.removals.push((r.clone(), effect));
             }
         }
         None => {
@@ -1182,10 +1224,15 @@ struct Memory {
     /// cannot be unsent, so an acknowledgement that fails is retried from
     /// here, never by asking Authelia for another.
     served: HashMap<(String, String), Served>,
-    /// Removal records a landed write has applied, kept until the manager
-    /// stops listing them. Never applied twice: a replaced account may have a
-    /// password its new owner set since, so an acknowledgement that fails is
-    /// retried from here, never by replacing the account again.
+    /// Removal records a landed write has applied, with what the next read
+    /// of the file must still show before they count as applied. One whose
+    /// effect that read no longer shows is applied again.
+    unverified: HashMap<Removal, Effect>,
+    /// Removal records applied, and seen to stay applied on a later read (or
+    /// needing no write at all), kept until the manager stops listing them.
+    /// Never applied twice: a replaced account may have a password its new
+    /// owner set since, so an acknowledgement that fails is retried from here,
+    /// never by replacing the account again.
     applied: HashSet<Removal>,
     /// A removal acknowledgement has failed, and the log has said so.
     removal_ack_failing: bool,
@@ -1282,12 +1329,6 @@ async fn sync_once(
     let answer = resp.json::<AccountsResponse>().await?;
     let accounts = answer.accounts;
     let removed = answer.removed;
-    let unapplied: Option<Vec<Removal>> = removed.as_ref().map(|r| {
-        r.iter()
-            .filter(|r| !memory.applied.contains(*r))
-            .cloned()
-            .collect()
-    });
 
     let path = cfg.users_file.clone();
     let snap = match tokio::task::spawn_blocking(move || read_users_file(&path)).await? {
@@ -1298,12 +1339,34 @@ async fn sync_once(
         }
     };
     let empty = Mapping::new();
-    let p = plan(
-        snap.users().unwrap_or(&empty),
-        &accounts,
-        unapplied.as_deref(),
-        &cfg.managed_group,
-    );
+    let users = snap.users().unwrap_or(&empty);
+
+    // Last cycle's removals and replacements, checked against a read taken
+    // since. Still there, they are applied, and the manager is told below;
+    // gone, Authelia has written the old entry back, and the record is
+    // planned again.
+    let listed = removed.as_deref().unwrap_or_default();
+    for (r, effect) in std::mem::take(&mut memory.unverified) {
+        if !listed.contains(&r) {
+            continue;
+        }
+        if effect.shown(users, &r.username, &cfg.managed_group) {
+            memory.applied.insert(r);
+        } else {
+            tracing::warn!(
+                username = %r.username,
+                "Authelia wrote back an account the portal had removed or replaced — it saved \
+                 a copy it loaded before that write; applying the removal again"
+            );
+        }
+    }
+    let unapplied: Option<Vec<Removal>> = removed.as_ref().map(|r| {
+        r.iter()
+            .filter(|r| !memory.applied.contains(*r))
+            .cloned()
+            .collect()
+    });
+    let p = plan(users, &accounts, unapplied.as_deref(), &cfg.managed_group);
     memory.note(&p);
 
     let mut out = Outcome::default();
@@ -1360,9 +1423,18 @@ async fn sync_once(
             .collect()
     };
 
-    for (r, needs_write) in &p.removals {
-        if landed || !needs_write {
-            memory.applied.insert(r.clone());
+    // Applied only once a later read still shows it: a landed rename is not
+    // Authelia having loaded the file.
+    for (r, effect) in &p.removals {
+        match effect {
+            // Nothing written, so nothing for Authelia to write back.
+            None => {
+                memory.applied.insert(r.clone());
+            }
+            Some(effect) if landed => {
+                memory.unverified.insert(r.clone(), effect.clone());
+            }
+            Some(_) => {}
         }
     }
     if let Some(removed) = &removed {
@@ -1957,7 +2029,10 @@ users:
         );
         assert_eq!(
             p.removals,
-            [(removed[0].clone(), true), (removed[1].clone(), false)],
+            [
+                (removed[0].clone(), Some(Effect::Removed)),
+                (removed[1].clone(), None)
+            ],
             "the hand-made one's record is settled with nothing to write"
         );
 
@@ -1984,7 +2059,16 @@ users:
         assert_eq!(p.replace, ["a.smith"]);
         assert!(p.remove.is_empty() && p.update.is_empty(), "{p:?}");
         assert_eq!(names(&p.add), ["a.smith"]);
-        assert_eq!(p.removals, [(removed[0].clone(), true)]);
+        assert_eq!(
+            p.removals,
+            [(
+                removed[0].clone(),
+                Some(Effect::Replaced(Some(
+                    "$argon2id$v=19$m=19456,t=2,p=1$chosen-by-alex".into()
+                )))
+            )],
+            "the password to look for if Authelia writes Alex's entry back"
+        );
         assert!(
             p.links.is_empty() && p.refused.is_empty(),
             "a new account's link waits a cycle, and is not refused: {p:?}"
@@ -2544,7 +2628,7 @@ users:
         assert_eq!(p.foreign, ["12345"]);
         let p = plan(&users(&doc), &[], Some(&gone(&["12345"])), G);
         assert!(p.remove.is_empty(), "a key that is not text is never ours");
-        assert!(!p.removals[0].1, "and its record needs no write");
+        assert_eq!(p.removals[0].1, None, "and its record needs no write");
     }
 
     #[test]
@@ -3211,9 +3295,20 @@ users:
         doc["users"][user]["password"].as_str().unwrap().to_string()
     }
 
-    /// A username removed and given out again is replaced once. If telling
-    /// the manager fails, the retry tells it again and replaces nothing: the
-    /// new holder may have chosen a password in the meantime.
+    fn removal_acks(r: &Rig) -> Vec<serde_json::Value> {
+        r.stub
+            .lock()
+            .unwrap()
+            .removal_acks
+            .iter()
+            .map(|a| a["username"].clone())
+            .collect()
+    }
+
+    /// A username removed and given out again is replaced once, and the
+    /// manager is told only once a later read of the file still shows it. If
+    /// telling the manager fails, the retry tells it again and replaces
+    /// nothing: the new holder may have chosen a password in the meantime.
     #[tokio::test]
     async fn a_removal_is_applied_once_and_acknowledged_until_the_manager_forgets_it() {
         let answer = serde_json::json!({
@@ -3231,19 +3326,22 @@ users:
         assert_eq!(out.replaced, 1);
         let fresh = password(&r, "a.smith");
         assert_ne!(fresh, "x", "the last holder's password survived");
-        {
-            let s = r.stub.lock().unwrap();
-            let acked: Vec<_> = s
-                .removal_acks
-                .iter()
-                .map(|a| a["username"].clone())
-                .collect();
-            assert_eq!(acked, ["a.smith", "never.made"]);
-            assert_eq!(
-                s.removal_acks[0]["removed_at"], "2026-09-24T08:00:00.123456Z",
-                "echoed verbatim"
-            );
-        }
+        assert_eq!(
+            removal_acks(&r),
+            ["never.made"],
+            "only the record that needed no write is told at once"
+        );
+
+        // The next read still shows the replacement, so the manager is told
+        // now; it fails again.
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(out.replaced, 0);
+        assert_eq!(removal_acks(&r), ["never.made", "a.smith", "never.made"]);
+        assert_eq!(
+            r.stub.lock().unwrap().removal_acks[1]["removed_at"],
+            "2026-09-24T08:00:00.123456Z",
+            "echoed verbatim"
+        );
 
         // Sam sets a password; the manager still lists both, as neither
         // acknowledgement got through.
@@ -3259,13 +3357,55 @@ users:
             "set-by-sam",
             "a retried acknowledgement replaced the account a second time"
         );
-        assert_eq!(r.stub.lock().unwrap().removal_acks.len(), 4);
+        assert_eq!(removal_acks(&r).len(), 5);
 
         // Forgotten by the manager, forgotten here.
         r.stub.lock().unwrap().answer["removed"] = serde_json::json!([]);
         sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
         assert!(memory.applied.is_empty());
-        assert_eq!(r.stub.lock().unwrap().removal_acks.len(), 4);
+        assert_eq!(removal_acks(&r).len(), 5);
+    }
+
+    /// Authelia saving a copy of its database it loaded before the portal's
+    /// write — someone setting a password in the moment before it reloads —
+    /// puts a removed entry and a replaced one back, old password and all. The
+    /// next read sees that, and both are applied again rather than
+    /// acknowledged.
+    #[tokio::test]
+    async fn a_removal_authelia_writes_back_is_applied_again_not_acknowledged() {
+        let answer = serde_json::json!({
+            "accounts": [{ "username": "a.smith", "email": "sam@example.com" }],
+            "removed": [
+                { "username": "a.smith", "removed_at": "2026-09-24T08:00:00Z" },
+                { "username": "b.jones", "removed_at": "2026-09-24T08:00:01Z" },
+            ],
+        });
+        let r = rig(TWO_MANAGED, answer, None).await;
+        let mut memory = Memory::default();
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!((out.replaced, out.removed), (1, 1));
+        assert!(removal_acks(&r).is_empty(), "told before a later read");
+
+        // Authelia writes back the file it loaded before that write.
+        std::fs::write(&r.cfg.users_file, TWO_MANAGED).unwrap();
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(
+            (out.replaced, out.removed),
+            (1, 1),
+            "the entries Authelia wrote back were left in place"
+        );
+        assert_ne!(password(&r, "a.smith"), "x", "Alex's password works again");
+        let doc = read_users_file(&r.cfg.users_file).unwrap().doc;
+        assert!(doc["users"]["b.jones"].is_null(), "Bea's account is back");
+        assert!(
+            removal_acks(&r).is_empty(),
+            "a removal that did not hold was acknowledged"
+        );
+
+        // This time the next read still shows both.
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!((out.replaced, out.removed), (0, 0));
+        assert_eq!(removal_acks(&r), ["a.smith", "b.jones"]);
     }
 
     /// Not acknowledged until it is in the file: the manager would forget a
@@ -3305,6 +3445,9 @@ users:
         let mut memory = Memory::default();
         let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
         assert_eq!(out.removed, 1);
+        // Told once the next read still shows it.
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(out.removed, 0);
         assert!(memory.removal_ack_failing);
         let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
         assert_eq!(out.removed, 0);
