@@ -68,7 +68,7 @@ pub struct PortalConfig {
     /// cookie. That is exactly the shape a CSRF wants, so the list is explicit
     /// and **empty means nobody** — a portal that has not been told which
     /// player to trust simply does not offer renewal, and viewers fall back to
-    /// signing in again when their three hours are up.
+    /// signing in again when their thirty minutes are up.
     ///
     /// Wildcards are not accepted, and could not be: a response carrying
     /// `Access-Control-Allow-Credentials` may not answer `*`.

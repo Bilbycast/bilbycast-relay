@@ -106,19 +106,31 @@ an older binary, and skew between the two is the kind nobody goes looking for.
 
 The portal is swapped while the relay is down, then started again **only after
 the relay's health probe passes**, so it never comes up beside a relay that is
-about to be rolled back. If the relay fails its probe both roll back together.
-If the relay is fine but the portal will not start, the portal is left stopped
-and the failure is printed: it is not the data plane, and viewers unable to
-sign in is a smaller failure than putting the relay back a version to rescue
-them.
+about to be rolled back — and only if it was running before. If the relay fails
+its probe both roll back together, unit file included. If the relay is fine but
+the portal will not start, the portal is left stopped and the failure is
+printed: it is not the data plane, and viewers unable to sign in is a smaller
+failure than putting the relay back a version to rescue them.
 
 Upgrading a relay with a *lean* tarball on a host that runs a portal warns and
 leaves the portal alone rather than deleting it.
 
-The script replaces the portal's **binary** only. It leaves `portal.json`, the
-installed unit file and Authelia as they are, so a change that needs any of
-them is yours to make first. A portal that already runs account sync or `mail`
-needs exactly that for this release — see
+The script replaces the portal's **binary**, and its **unit file** when the
+release's differs from the one `install-relay.sh` put at
+`/etc/systemd/system/bilbycast-portal.service` — then runs
+`systemctl daemon-reload`. A release can need something new from systemd (this
+one does: a writable users directory and `SystemCallFilter=@chown`), and a new
+binary under an old unit would fail where the new unit would not. Your own
+changes belong in a drop-in (`systemctl edit bilbycast-portal`), which lives in
+`bilbycast-portal.service.d/` and is kept; an edit to the unit file itself is
+replaced, and the replaced file is kept at
+`/opt/bilbycast/portal/bilbycast-portal.service.previous` (beside the binary).
+A portal running from a unit anywhere else is left alone, with a warning that
+names what this release's unit needs.
+
+It leaves `portal.json` and Authelia as they are, so a change that needs either
+is yours to make first. A portal that already runs account sync or `mail` needs
+exactly that for this release — see
 [Upgrading a portal that already runs account sync or mail](#upgrading-a-portal-that-already-runs-account-sync-or-mail).
 
 ## Configuring
@@ -253,13 +265,19 @@ the route answers 404, and the portal logs that the sync is failing.
 Every `interval_secs` the portal asks the manager for
 `GET /api/v1/dvr/portal/accounts?interval_secs=<interval_secs>` — one row per
 username, with its email, display name, any outstanding link request and
-whether a link has ever been sent to it without error, plus a `removed` list of
-usernames whose last login has been deleted. The interval rides along on every
-poll so the manager can tell a portal that asks slowly from one that has
-stopped asking; its Portal logins panel says which. The portal then reads
-Authelia's user file,
-works out what to change, writes the file if anything did, asks Authelia for
-the links that are due, and tells the manager how each one went on
+whether a link has ever been sent to it without error, plus `removed`: each
+username whose last login has been deleted, with when (`removed_at`), kept by
+the manager until the portal says it has applied it. The interval rides along
+on every poll so the manager can tell a portal that asks slowly from one that
+has stopped asking; its Portal logins panel says which. When the previous cycle
+could not read or write Authelia's user file, the poll also carries
+`&sync_error=<why>` — one line, at most 300 bytes — and the manager shows it in
+the Portal logins panel; a poll after a cycle that wrote, had nothing to write,
+or lost only a race with Authelia's own write carries none. The portal then
+reads Authelia's user file, works out what to change, writes the file if
+anything did, tells the manager which removals it has applied on
+`POST /api/v1/dvr/portal/accounts/removed-applied`, asks Authelia for the links
+that are due, and tells the manager how each one went on
 `POST /api/v1/dvr/portal/accounts/link-sent`.
 
 ### What a sync does to Authelia's file
@@ -273,9 +291,10 @@ the links that are due, and tells the manager how each one went on
   256 random bits rather than a guessable password.
 * **An account carrying `managed_group`** follows the manager: its `email` and
   `displayname` are rewritten when the manager's differ. Its `password`,
-  `disabled` and any other groups you give it are left as they are. An empty
-  display name from the manager leaves the file's display name alone, and a
-  `null` email leaves the file's email alone.
+  `disabled` and any other groups you give it are left as they are — unless the
+  username changed hands (below). An empty display name from the manager leaves
+  the file's display name alone, and a `null` email leaves the file's email
+  alone.
 * **A hand-made account** — any entry without `managed_group`, including one
   with the same name as a manager login — is **never rewritten or removed**. A
   link asked for one is answered with a reason instead of being sent (see
@@ -284,6 +303,11 @@ the links that are due, and tells the manager how each one went on
   are not applied to it``. That is how a hand-made `dvr-test` survives. An entry
   whose key YAML reads as something other than text — an unquoted `12345:` — is
   never the portal's, whatever its groups say.
+* **A username the manager removed and gave out again** — in `removed` and in
+  `accounts` at once — is a different person under the same name. Its managed
+  account is **replaced**: dropped and created afresh like a new login's, in the
+  same write, so no password the last holder chose survives. See
+  [When an account is removed](#when-an-account-is-removed).
 
 A login with no email, or one that is not a plausible address, simply gets no
 account. Three kinds of login are held back as well, each logged once as
@@ -294,8 +318,11 @@ account. Three kinds of login are held back as well, each logged once as
   email is not changed to it;
 * one whose username another account already has in another case, or has as its
   email — no account is made;
-* one whose username YAML would read as something else — `<<`, a number,
-  `true` / `false`, `null` — no account is made. Existing accounts are never
+* `<<`, which Authelia's parser reads as a YAML merge key — no account is made.
+  Any other username is written as a quoted key where YAML would read it as
+  something else (`'12345':`, `'true':`, `'@bob':`), so a staff or membership
+  number is a username like any other. A username whose written key would not
+  read back as the same text is held back too. Existing accounts are never
   judged by this rule.
 
 Those rules exist because, with `search.email` on (which
@@ -305,25 +332,69 @@ hand-made accounts included — and a refused file locks everyone out the next
 time Authelia starts. The manager enforces the same uniqueness for new logins;
 this is the check for what is already in the file.
 
+The check is made against **the file as this cycle's write will leave it**, not
+as it was, so an address one managed account is moving off can go to another
+login in the same write, and two accounts can swap addresses, or three pass
+them round, without Authelia ever loading a file in between. It is settled by
+repetition: a login that would collide with what an untouched entry holds is
+held back first, then, between two logins wanting one address, the later in
+the manager's (username) order; a held-back move leaves its account on its old
+address, which can hold back another login in turn. A login is **refused** —
+its link request answered with the reason — only when what stands in its way is
+a hand-made account, a username, or an account the manager itself lists with
+that address. When its address is held only by a managed account the manager
+is moving off it, which could not move this cycle, it **waits**: logged once as
+``portal login `<name>` was not written to Authelia: another Authelia account
+still holds its email or username, and the manager is moving that account off
+it; it is written once that has happened``, its request left outstanding, and
+written on a later cycle once the way is clear.
+
 ### When an account is removed
 
 **Only when the manager says the login is gone**: the username is in the
-answer's `removed` list and in no row of its `accounts`. The manager records
-that on its own, by trigger, whenever the last login for a username is deleted
-by any path — a delete, a group removal — and forgets it when the username is
-added again or after 90 days. Being missing from `accounts` is not enough: a
-database restored from an older backup is missing everything created since,
-and deleting an account takes the password its owner chose with it.
+answer's `removed` list. The manager records that on its own, by trigger,
+whenever the last login for a username is deleted by any path — a delete, a
+group removal — and keeps the record until the portal acknowledges it, even
+when the username is added again in the meantime. Being missing from `accounts`
+is not enough: a database restored from an older backup is missing everything
+created since, and deleting an account takes the password its owner chose with
+it.
 
-Two consequences:
+For each record the portal does one of three things:
 
-* **Deleting a login and adding it again within one `interval_secs`** leaves
-  the Authelia account, and its password, in place: the portal never sees a
-  poll where the username was removed. To start a person over, delete the
-  login, wait for a sync to remove the account (the log line
-  `portal accounts synced to Authelia` shows `removed=1`), then add it again.
-* A portal that does not poll for 90 days after a login is deleted never
-  removes that account; remove it by hand.
+* **The username is not in `accounts`**: the managed account is removed.
+* **The username is in `accounts` again** — deleted and re-added, in this group
+  or another, before the portal applied the removal: the managed account is
+  **replaced**, dropped and made afresh with a new unusable password and the
+  current email and display name, in one write. The last holder's password no
+  longer works; the new holder sets their own through the invitation, which
+  goes out on a later cycle like any new account's. Removing a login and adding
+  the same username again is therefore a clean start, however quickly it is
+  done.
+* **There is no managed account of that name** — none at all, or a hand-made
+  one: nothing is written.
+
+The portal tells the manager it has applied a record on
+`POST /api/v1/dvr/portal/accounts/removed-applied` with its `username` and
+`removed_at`, echoed verbatim — only after the write that applied it has landed,
+or at once when there was nothing to write — and the manager then forgets it,
+unless a newer removal of the same username has replaced it meanwhile. A write
+that fails, or loses its race with Authelia, is tried again next cycle. The
+portal remembers each record it has applied for as long as it runs, so an
+acknowledgement that fails is retried every cycle **without replacing the
+account again** — its new holder may have set a password by then. That memory
+does not survive a restart: a portal restarted between replacing an account and
+getting the acknowledgement through replaces it once more, and the new holder
+sets their password again. The manager prunes a record nobody acknowledges
+after 90 days, so a portal that does not poll for that long never removes that
+account; remove it by hand.
+
+A manager that sends `removed` but has no `removed-applied` route answers the
+acknowledgement 404. The portal logs that once — ``the manager has no route to
+acknowledge a removal on, so it is older than this portal; its removal records
+stay until it is upgraded, and none is applied twice meanwhile`` — and carries
+on; any other failure is logged once as ``could not tell the manager a removal
+was applied (…); retrying without applying it again``.
 
 **Against an older manager**, one whose answer has no `removed` key at all, the
 portal falls back to the earlier rule: a managed account is removed when its
@@ -331,8 +402,9 @@ username is no longer in `accounts` — **except when `accounts` is empty**, whi
 removes nobody and logs ``the manager reports no portal logins at all; leaving N
 Authelia account(s) alone rather than deleting every one. Remove them by hand if
 that is really what was wanted.`` Under that rule the account behind the very
-last login is never removed. A `removed` entry without a `username` fails the
-whole poll rather than being guessed at.
+last login is never removed, and a login deleted and added again within one
+`interval_secs` keeps its account and password. A `removed` entry without a
+`username` or a `removed_at` fails the whole poll rather than being guessed at.
 
 ### Password links
 
@@ -435,7 +507,17 @@ characters become spaces — and cut to at most 300 bytes.
 | With `mail`: the relay did not answer | `the mail relay did not answer within 20s` |
 
 A `429` from Authelia never appears here: that request is not answered at all
-until Authelia takes it.
+until Authelia takes it. Nor does a login that is [waiting](#what-a-sync-does-to-authelias-file)
+for another account to move off its address, or one whose write failed: those
+requests stay outstanding and are tried again.
+
+**When the portal cannot write the users file at all** — it cannot be read or
+parsed, an entry in it would not survive a rewrite, replacing it would lock
+Authelia out, or the write itself fails — no login's request says why, because
+none has been refused. So the portal sends the reason with its next poll as
+`sync_error` (the same one line, at most 300 bytes, as the log's `not rewriting
+…` or `not replacing …`), and the manager shows it in the Portal logins panel
+until a poll arrives without it.
 
 ### `authelia_url` and its path
 
@@ -450,15 +532,21 @@ A trailing `/` is trimmed. The URL must be `http://` or `https://`, and plain
 of everyone being invited, and whoever can read it can forge the request that
 mails them a link. It cannot carry a `user:password@`, a query or a fragment.
 
-At startup the portal asks `<authelia_url>/api/health` once. A wrong path logs
-``Authelia's health check did not answer at accounts.authelia_url; its path must
-be the path of Authelia's own server.address, and every password link will fail
-until it is``; an Authelia that is not listening logs ``could not reach Authelia
-at accounts.authelia_url; password links will fail until it answers there``.
-Neither stops the portal. The second can appear at boot when Authelia simply
-has not started yet — with [the ordering `mail` needs](#startup-and-ordering),
-Authelia starts after the portal — and means something only if links then fail
-with `could not reach Authelia`.
+At startup the portal asks `<authelia_url>/api/health`, and only Authelia's own
+`{"status":"OK"}` counts as an answer: an Authelia served at the root answers a
+path under `/auth` with its sign-in page and a `200`, which is not one. At boot
+Authelia is expected to be late — with [the ordering `mail`
+needs](#startup-and-ordering) it starts after the portal — so the portal asks
+again every 10 seconds, quietly, and logs one error only if two minutes pass
+without that answer: ``Authelia's health check did not answer at
+accounts.authelia_url (<status>, and not Authelia's own OK); its path must be
+the path of Authelia's own server.address, and every password link will fail
+until it is``, or, when nothing is listening, ``could not reach Authelia at
+accounts.authelia_url (<error>); password links will fail until it answers
+there``. Syncing runs meanwhile, and neither stops the portal. The probe cannot
+catch the opposite mistake — an Authelia served under `/auth` with the path
+left off `authelia_url` answers its health check either way — which shows up as
+links that name the wrong path.
 
 ### The link names `public_host`
 
@@ -504,10 +592,12 @@ it only when something changed. There is no lock the two share, so the portal:
   — the old file's group;
 * refuses the write, with a message naming the fix, if the replacement would
   take the file from Authelia: when it would land in another group while the
-  mode grants the group anything, or when it changes an owner other than root
-  and either the mode gives the group no read-write or `/etc/passwd` and
-  `/etc/group` show the old owner is not in the group (an owner absent from
-  those files — a container's user — is not judged);
+  group grants something everyone else does not (a root-owned `0644` file in
+  root's group is replaced as it is), or when it changes an owner other than
+  root and either the mode gives the group no read-write or this host's
+  `/etc/passwd` and `/etc/group` show the old owner is not in the group (an
+  owner absent from those files — a directory-service user, or a container's
+  uid no host user shares — is not judged);
 * flushes the temp file to disk, checks the inode, time and length once more,
   renames it over the original, and flushes the directory.
 
@@ -631,21 +721,29 @@ needs to be readable, let alone writable, by it. Substitute the user Authelia
 really runs as for `authelia`.
 
 After the portal's first write the file belongs to `bilbycast-portal`, so
-Authelia reaches it only through the group. If `/etc/passwd` and `/etc/group`
-show that Authelia's user is not in the group, the portal refuses that first
-write rather than lock Authelia out, and the log says what to do:
-``not replacing <file>: … Authelia reaches the file through its group once the
-portal has written it: put Authelia's user in that group (`usermod -aG <group>
-<user>`, then restart Authelia), make the file mode 660, and make its directory
-setgid to the group``. An Authelia running as root needs no group membership.
+Authelia reaches it only through the group. The portal refuses a write that
+would lock Authelia out, and each refusal names its own fix:
+
+* the file's group is one the portal is not in, so the replacement could not
+  keep it: ``… Give the file a group the portal is in: `chgrp <gid> <file>`, and
+  put Authelia's user in that group too unless Authelia runs as root``. A
+  root-owned file whose group grants nothing beyond what everyone else has —
+  root's `0644`, as root makes it — is not refused: nobody reaches it through
+  that group, and a root Authelia needs neither group nor mode;
+* the group cannot read and write it: ``… `chmod g+rw <file>` ``;
+* this host's `/etc/passwd` and `/etc/group` do not put the file's owner in its
+  group: ``… `usermod -aG <gid> <Authelia's user>`, then restart Authelia. That
+  check reads this host's account files only, so for an Authelia in a
+  container, or one given the group by SupplementaryGroups=, add the host user
+  with uid <uid> to the group as well``.
 
 **systemd.** The packaged unit runs with `ProtectSystem=strict` and lets the
 portal write one place: `ReadWritePaths=-/etc/authelia/users`. The leading `-`
 lets a portal without account sync start when the directory does not exist; it
 also means a directory created after the portal started stays read-only until
 the portal restarts. A `users_file` anywhere else needs its own drop-in, never an
-edit to the unit, which `install-relay.sh --with-portal` rewrites whenever it
-runs:
+edit to the unit, which `install-relay.sh --with-portal` and `upgrade-relay.sh`
+both replace with the packaged one, keeping drop-ins:
 
 ```sh
 systemctl edit bilbycast-portal
@@ -671,7 +769,9 @@ needs none. **Mount the directory, not the file**: the portal replaces the
 file by renaming a new one over it, and a bind mount of a single file keeps
 showing the file it was made with, so Authelia would never see a change — and
 its own writes would go to the orphan. The `/etc/passwd` check does not judge a
-container's user the host does not know.
+container's uid the host does not know, but it judges one a host user shares
+as that host user — typically uid 1000 — so with `group_add:` also add that
+host user to the `bilbycast-portal` group, or the portal refuses the write.
 
 ## Rewriting Authelia's email (`mail`)
 
@@ -705,10 +805,10 @@ around it.
 
 | Key | Default | |
 |---|---|---|
-| `listen_addr` | `127.0.0.1:2525` | Where Authelia delivers: `host:port`, and a loopback address — the listener speaks no TLS, so the secret Authelia authenticates with must not cross a network. |
+| `listen_addr` | `127.0.0.1:2525` | Where Authelia delivers: `host:port` on `127.0.0.1` or `[::1]`. The listener speaks no TLS, and Authelia's SMTP client sends its password without TLS only to `127.0.0.1`, `::1` or `localhost`, so any other address — `127.0.0.2` included — is refused: Authelia could never authenticate there. |
 | `listen_password_file` | required | A file holding the secret Authelia authenticates with. Read once at startup and trimmed; it must be one line with no control characters and at least 32 characters (`openssl rand -hex 32`). Both the portal and Authelia read it. |
 | `relay_host` | required | The relay that delivers, e.g. `smtp-relay.brevo.com`. |
-| `relay_port` | `587`, or `465` with `implicit_tls` | `0` is refused. |
+| `relay_port` | `587`, or `465` with `implicit_tls` | `0` is refused, and so is `465` without `implicit_tls: true` — a relay there speaks TLS from the first byte and never sends the greeting STARTTLS waits for. |
 | `relay_username` | required | The relay login — Brevo's SMTP login, not the account email. |
 | `relay_password_file` | required | A file holding the relay password (Brevo's SMTP key). Read once at startup, trimmed. |
 | `from` | required | The From on every rewritten email: `Name <address>`, with the name in double quotes if it contains any of `, ( ) : ; @ [ ] \ "`. Its address must be Authelia's `notifier.smtp.sender` address, and its domain authenticated at the relay. |
@@ -757,9 +857,10 @@ notifier:
 AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE=/etc/bilbycast/portal-mail-listener   # = mail.listen_password_file
 ```
 
-* **`address`** must name the literal loopback address — `127.0.0.1`, `::1` or
-  `localhost` — and the port of `mail.listen_addr`. Authelia's SMTP client sends
-  a password without TLS only to those names.
+* **`address`** must name `mail.listen_addr` — `127.0.0.1` or `::1` as it is
+  written there, or `localhost` where that resolves to it — and its port.
+  Authelia's SMTP client sends a password without TLS only to those names,
+  which is why the portal accepts no other listen address.
 * **`username`** can be any non-empty name; the listener checks only the
   password. Without a username Authelia does not authenticate at all, and the
   listener refuses its mail.
@@ -826,7 +927,13 @@ It speaks enough SMTP for Authelia and nothing more:
 * `AUTH PLAIN` and `AUTH LOGIN` only; `MAIL`, `RCPT` and `DATA` before a
   successful `AUTH` get `530`. Three failed `AUTH`s, or three unrecognised
   commands, close the connection. No STARTTLS is offered.
-* 16 connections at once; the next is told `421` and closed.
+* Before `AUTH` succeeds: 10 seconds, and 6 commands (`EHLO` and `AUTH`
+  included), then `421` and the connection is closed. Authelia authenticates in
+  its first two round trips.
+* 16 connections at once. When all 16 are taken, the oldest connection that has
+  not authenticated is closed to make room, so sockets that connect and say
+  nothing cannot keep Authelia out; only when all 16 have authenticated is a
+  newcomer told `421` and closed.
 * 60 seconds per session, however it is going, and 30 seconds idle.
 * One recipient per message (`452` for a second).
 * 64 KiB per line (`500`) and 1 MiB per message (`552`).
@@ -866,11 +973,11 @@ to go.
 
 Earlier builds of account sync and `mail` took a config this build refuses, and
 wrote emails this build words differently. `upgrade-relay.sh` swaps the portal
-**binary** and restarts it; it does not touch `portal.json`, Authelia, or the
-installed **unit file**. Do all of this before the upgrade. Steps 1, 4 and 5
-decide whether the new binary starts at all — when it does not, the script
-prints that the portal did not come back and leaves it stopped — and the rest
-decide whether it goes on working as it did:
+**binary**, refreshes the packaged **unit file** (see [Upgrading](#upgrading))
+and restarts it; it does not touch `portal.json` or Authelia. Do all of this
+before the upgrade. Steps 1, 4 and 5 decide whether the new binary starts at
+all — when it does not, the script prints that the portal did not come back and
+leaves it stopped — and the rest decide whether it goes on working as it did:
 
 1. **Create the listener secret** and add it to the `mail` block — it is now
    required, and without it the portal refuses to start with
@@ -904,8 +1011,10 @@ decide whether it goes on working as it did:
    otherwise set it to what that value is, or leave it out and the emails make
    no claim.
 
-4. **Check `mail.from`.** It must now parse as `Name <address>`, with a name
-   containing `, ( ) : ; @ [ ] \ "` in double quotes.
+4. **Check `mail.from`, `mail.listen_addr` and `mail.relay_port`.** `from`
+   must now parse as `Name <address>`, with a name containing
+   `, ( ) : ; @ [ ] \ "` in double quotes; `listen_addr` must be on
+   `127.0.0.1` or `[::1]`; and `relay_port: 465` needs `"implicit_tls": true`.
 
 5. **Check `accounts.authelia_url`.** The default is unchanged,
    `http://127.0.0.1:9091/auth`, and so is the rule that `http://` is for this
@@ -920,13 +1029,15 @@ decide whether it goes on working as it did:
    email is another's username, so check the hand-made ones first. Add the `After=` / `Wants=` drop-in to
    `authelia.service`.
 
-7. **Install the new unit.** It adds `ReadWritePaths=-/etc/authelia/users` and
-   `SystemCallFilter=@chown`, and `upgrade-relay.sh` does not install it. Copy
-   `bilbycast-portal.service` from the distribution tarball to
-   `/etc/systemd/system/` (or re-run `install-relay.sh … --with-portal`), keep
-   any drop-in you already use for the users directory, and
-   `systemctl daemon-reload`. On a unit of your own, add
-   `SystemCallFilter=@chown` after any line denying `@privileged`.
+7. **Move edits of the unit file into a drop-in.** The new unit adds
+   `ReadWritePaths=-/etc/authelia/users` and `SystemCallFilter=@chown`, and
+   `upgrade-relay.sh` now installs it over the packaged
+   `/etc/systemd/system/bilbycast-portal.service` — earlier versions of the
+   script did not — keeping drop-ins and the file it replaced. A change made in
+   the unit file itself belongs in `systemctl edit bilbycast-portal` first. On a
+   unit of your own elsewhere, which the script leaves alone, add
+   `ReadWritePaths=` for the users directory and `SystemCallFilter=@chown` after
+   any line denying `@privileged`, then `systemctl daemon-reload`.
 
 8. **Check the users file's permissions** against
    [File permissions](#file-permissions). The portal now refuses a write that
@@ -949,6 +1060,10 @@ Two behaviours change without any config:
   the manager's address. A request for a hand-made account is answered with
   `this username is an Authelia account managed by hand; the portal only sends
   links for accounts it created`.
+* **A username given out again is a new account.** Against a manager that keeps
+  removal records until they are acknowledged, a login removed and added again
+  before the portal applied the removal gets its account replaced, with a new
+  unusable password; the earlier build kept the account and its password.
 
 ## Clips
 
