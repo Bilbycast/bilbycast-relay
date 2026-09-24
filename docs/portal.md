@@ -125,8 +125,17 @@ changes belong in a drop-in (`systemctl edit bilbycast-portal`), which lives in
 `bilbycast-portal.service.d/` and is kept; an edit to the unit file itself is
 replaced, and the replaced file is kept at
 `/opt/bilbycast/portal/bilbycast-portal.service.previous` (beside the binary).
-A portal running from a unit anywhere else is left alone, with a warning that
-names what this release's unit needs.
+
+The unit file is replaced only while it still runs what the packaged one runs:
+the same `ExecStart=`, `User=`, `Group=`, `WorkingDirectory=` and
+`EnvironmentFile=` lines, which no release has changed. One where any of those
+was edited — a portal installed with `PORTAL_ROOT`, whose `ExecStart=` was
+changed to name the binary there, or one given another config or token file —
+would start something else under the packaged unit, so it is left alone, like a
+portal running from a unit anywhere else, with a warning that names what this
+release's unit needs. Its binary is still upgraded: the script finds it from
+the unit file's own `ExecStart=`, not a drop-in's, which is why a moved binary
+is named in the unit file itself.
 
 It leaves `portal.json` and Authelia as they are, so a change that needs either
 is yours to make first. A portal that already runs account sync or `mail` needs
@@ -742,8 +751,9 @@ portal write one place: `ReadWritePaths=-/etc/authelia/users`. The leading `-`
 lets a portal without account sync start when the directory does not exist; it
 also means a directory created after the portal started stays read-only until
 the portal restarts. A `users_file` anywhere else needs its own drop-in, never an
-edit to the unit, which `install-relay.sh --with-portal` and `upgrade-relay.sh`
-both replace with the packaged one, keeping drop-ins:
+edit to the unit, which `install-relay.sh --with-portal` replaces with the
+packaged one, and `upgrade-relay.sh` too unless what it runs was edited (see
+[Upgrading](#upgrading)); both keep drop-ins:
 
 ```sh
 systemctl edit bilbycast-portal
@@ -1034,10 +1044,13 @@ leaves it stopped — and the rest decide whether it goes on working as it did:
    `upgrade-relay.sh` now installs it over the packaged
    `/etc/systemd/system/bilbycast-portal.service` — earlier versions of the
    script did not — keeping drop-ins and the file it replaced. A change made in
-   the unit file itself belongs in `systemctl edit bilbycast-portal` first. On a
-   unit of your own elsewhere, which the script leaves alone, add
-   `ReadWritePaths=` for the users directory and `SystemCallFilter=@chown` after
-   any line denying `@privileged`, then `systemctl daemon-reload`.
+   the unit file itself belongs in `systemctl edit bilbycast-portal` first —
+   except a moved binary's `ExecStart=`, which the script reads from the unit
+   file to find the binary it upgrades. On a unit the script leaves alone — one
+   of your own elsewhere, or one whose `ExecStart=`, `User=`, `Group=`,
+   `WorkingDirectory=` or `EnvironmentFile=` you edited — add `ReadWritePaths=`
+   for the users directory and `SystemCallFilter=@chown` after any line denying
+   `@privileged`, then `systemctl daemon-reload`.
 
 8. **Check the users file's permissions** against
    [File permissions](#file-permissions). The portal now refuses a write that

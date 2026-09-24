@@ -44,8 +44,8 @@
 #   5. Compares against the running version; no-op if equal.
 #   6. Stops the service, swaps the binary atomically (mv -Tf), starts
 #      the service. A viewer portal on the same host is upgraded with it:
-#      its binary, and its packaged unit file when that changed (drop-ins
-#      are kept).
+#      its binary, and its packaged unit file when that changed and still
+#      runs what the packaged one runs (drop-ins are kept).
 #   7. Polls /health. On failure, restores the previous binary and
 #      restarts (unless --no-rollback).
 #   8. Exits 0 only when the new version reports healthy.
@@ -461,23 +461,35 @@ PORTAL_UNIT_PREV=""
 # The unit carries what a release needs from systemd — the users directory
 # account sync writes, the fchown it keeps that file's group with — so a new
 # binary under the old unit can fail where the new one would not. It is
-# refreshed only where install-relay.sh put it; a unit of the operator's own
-# elsewhere is theirs, and named. Changes of their own to the packaged one
-# belong in a drop-in (`systemctl edit bilbycast-portal`), which lives beside
-# it in `.d/` and is kept; an edit to the file itself is replaced, and the
-# replaced file is kept next to the binary.
+# refreshed only where install-relay.sh put it, and only while it still runs
+# what the packaged one runs: the same ExecStart=, User=, Group=,
+# WorkingDirectory= and EnvironmentFile= lines, which no release has changed.
+# A unit that differs there was written or edited by hand — a binary moved
+# with PORTAL_ROOT, another config or token file — and the packaged one would
+# start something else; like a unit of the operator's own elsewhere, it is
+# theirs, and named. Other changes of their own to the packaged one belong in
+# a drop-in (`systemctl edit bilbycast-portal`), which lives beside it in `.d/`
+# and is kept; an edit to the file itself is replaced, and the replaced file
+# is kept next to the binary.
 refresh_portal_unit() {  # $1 = the unit the new tarball carries, or empty
-    local new_unit="$1" installed="${SYSTEMD_UNIT_DIR}/${PORTAL_UNIT_NAME}.service" loaded
+    local new_unit="$1" installed="${SYSTEMD_UNIT_DIR}/${PORTAL_UNIT_NAME}.service" loaded why=""
+    local runs='^(ExecStart|User|Group|WorkingDirectory|EnvironmentFile)='
     if [[ -z "${new_unit}" ]]; then
         echo "  note: this tarball carries no ${PORTAL_UNIT_NAME}.service; the installed unit is left as it is" >&2
         return 0
     fi
     loaded="$(systemctl show --property=FragmentPath --value "${PORTAL_UNIT_NAME}" 2>/dev/null || true)"
     if [[ "${loaded}" != "${installed}" ]]; then
-        echo "WARNING: ${PORTAL_UNIT_NAME} runs from '${loaded}', not the packaged ${installed}," >&2
-        echo "         so its unit is left alone. Compare it with ${new_unit} from this release:" >&2
-        echo "         account sync needs ReadWritePaths= on the users directory, and" >&2
-        echo "         SystemCallFilter=@chown after any line denying @privileged." >&2
+        why="runs from '${loaded}', not the packaged ${installed}"
+    elif [[ "$(grep -E "${runs}" "${installed}")" != "$(grep -E "${runs}" "${new_unit}")" ]]; then
+        why="runs from ${installed}, but its ExecStart=, User=, Group=,"$'\n'
+        why+="         WorkingDirectory= or EnvironmentFile= is not the packaged unit's"
+    fi
+    if [[ -n "${why}" ]]; then
+        echo "WARNING: ${PORTAL_UNIT_NAME} ${why}," >&2
+        echo "         so its unit is left alone. This release's unit (packaging/${PORTAL_UNIT_NAME}.service" >&2
+        echo "         in its tarball) adds what account sync needs: ReadWritePaths= on the users" >&2
+        echo "         directory, and SystemCallFilter=@chown after any line denying @privileged." >&2
         return 0
     fi
     if cmp -s "${new_unit}" "${installed}"; then

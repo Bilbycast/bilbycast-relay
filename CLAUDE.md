@@ -397,8 +397,10 @@ The packaged unit gives write access to `/etc/authelia/users` only
 (`ReadWritePaths=-…`) and re-allows `SystemCallFilter=@chown` after denying
 `@privileged` — a denied `fchown` is SIGSYS, not an error. `upgrade-relay.sh`
 refreshes that packaged unit (drop-ins kept, `daemon-reload`, restored on
-rollback) and leaves a unit installed elsewhere alone; `test-portal-install.sh`
-pins it.
+rollback) only while its `ExecStart=`/`User=`/`Group=`/`WorkingDirectory=`/
+`EnvironmentFile=` lines are the release's, and leaves a hand-edited unit (a
+`PORTAL_ROOT` binary, say) or one installed elsewhere alone, with a warning;
+`test-portal-install.sh` pins it.
 
 **Mail interception** (`src/portal/mail.rs`, optional `mail` config block):
 Authelia sends one email for an invitation and a reset, so with `mail` it is

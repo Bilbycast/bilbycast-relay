@@ -170,16 +170,25 @@ refresh() {  # $1 = scratch root, $2 = the unit systemd reports loading, $3 = th
     refresh_portal_unit "$3"
     echo "prev=$PORTAL_UNIT_PREV" >> "$CALLS" ) 2>"$1/stderr" >/dev/null
 }
-scenario() {  # $1 = name; leaves an old packaged unit with a drop-in in place
+scenario() {  # $1 = name; leaves the unit before account sync, with a drop-in, in place
   local root="$WORK/unit-$1"
   mkdir -p "$root/units/bilbycast-portal.service.d" "$root/opt"
-  printf '[Service]\nExecStart=/old\n' > "$root/units/bilbycast-portal.service"
+  # The packaged unit as the release before account sync shipped it: this one
+  # without the two lines account sync added.
+  grep -v -e '^ReadWritePaths=' -e '^SystemCallFilter=@chown$' ./bilbycast-portal.service \
+    > "$root/units/bilbycast-portal.service"
+  cp "$root/units/bilbycast-portal.service" "$root/before"
   printf '[Service]\nReadWritePaths=/srv/authelia/users\n' \
     > "$root/units/bilbycast-portal.service.d/override.conf"
   : > "$root/calls"
   echo "$root"
 }
+untouched() {  # $1 = scratch root: yes when the installed unit is as the scenario left it
+  cmp -s "$1/before" "$1/units/bilbycast-portal.service" && echo yes || echo no
+}
 R=$(scenario changed)
+check "the unit before account sync differs from this release's" \
+  "$(cmp -s ./bilbycast-portal.service "$R/before" && echo same || echo differs)" "differs"
 refresh "$R" "$R/units/bilbycast-portal.service" ./bilbycast-portal.service
 check "an outdated packaged unit is replaced by this release's" \
   "$(cmp -s ./bilbycast-portal.service "$R/units/bilbycast-portal.service" && echo yes || echo no)" "yes"
@@ -187,7 +196,7 @@ check "and systemd is told" "$(grep -c '^daemon-reload$' "$R/calls")" "1"
 check "the drop-in is kept" "$(grep -c '^ReadWritePaths=/srv/authelia/users$' \
   "$R/units/bilbycast-portal.service.d/override.conf")" "1"
 check "the replaced unit is kept beside the binary, for a rollback" \
-  "$(grep -c '^ExecStart=/old$' "$R/opt/bilbycast-portal.service.previous")" "1"
+  "$(cmp -s "$R/before" "$R/opt/bilbycast-portal.service.previous" && echo yes || echo no)" "yes"
 check "and named for the rollback" "$(grep -c "^prev=$R/opt/bilbycast-portal.service.previous\$" "$R/calls")" "1"
 
 R=$(scenario same)
@@ -198,14 +207,34 @@ check "nor copied aside" "$(grep -c '^prev=$' "$R/calls")" "1"
 
 R=$(scenario foreign)
 refresh "$R" /lib/systemd/system/bilbycast-portal.service ./bilbycast-portal.service
-check "a unit of the operator's own elsewhere is left alone" \
-  "$(grep -c '^ExecStart=/old$' "$R/units/bilbycast-portal.service")" "1"
+check "a unit of the operator's own elsewhere is left alone" "$(untouched "$R")" "yes"
+check "and said so" "$(grep -c 'left alone' "$R/stderr")" "1"
+
+# A unit at the packaged path that no longer runs what the packaged one runs
+# was edited by hand: replacing it would start a binary, a config or a token
+# file the operator moved away from.
+hand_edited() {  # $1 = name, $2 = sed expression applied to the installed unit
+  local root; root=$(scenario "$1")
+  sed -i "$2" "$root/units/bilbycast-portal.service"
+  cp "$root/units/bilbycast-portal.service" "$root/before"
+  refresh "$root" "$root/units/bilbycast-portal.service" ./bilbycast-portal.service
+  echo "$root"
+}
+R=$(hand_edited moved 's#^ExecStart=/opt/bilbycast/portal/bilbycast-portal #ExecStart=/usr/local/bin/bilbycast-portal #')
+check "a binary moved by PORTAL_ROOT is really named in the unit" \
+  "$(grep -c '^ExecStart=/usr/local/bin/bilbycast-portal --config ' "$R/before")" "1"
+check "a unit edited to run a binary elsewhere is left alone" "$(untouched "$R")" "yes"
+check "and said so" "$(grep -c 'left alone' "$R/stderr")" "1"
+check "and systemd is not reloaded" "$(grep -c 'daemon-reload' "$R/calls")" "0"
+check "nor is anything copied aside" "$(grep -c '^prev=$' "$R/calls")" "1"
+R=$(hand_edited token 's#^EnvironmentFile=/etc/bilbycast/portal.env$#EnvironmentFile=/root/portal.env#')
+check "a unit edited to read another token file is left alone" \
+  "$(grep -c '^EnvironmentFile=/root/portal.env$' "$R/units/bilbycast-portal.service")" "1"
 check "and said so" "$(grep -c 'left alone' "$R/stderr")" "1"
 
 R=$(scenario lean)
 refresh "$R" "$R/units/bilbycast-portal.service" ""
-check "a tarball without a unit changes nothing" \
-  "$(grep -c '^ExecStart=/old$' "$R/units/bilbycast-portal.service")" "1"
+check "a tarball without a unit changes nothing" "$(untouched "$R")" "yes"
 
 # Called where it matters: after the portal binary is swapped, before the
 # portal is started again, and undone by a rollback.

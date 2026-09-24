@@ -41,8 +41,10 @@ ReadOnlyPaths=/etc/bilbycast
 # created after the portal started stays read-only until a restart. A
 # users_file anywhere else needs its own ReadWritePaths= in a drop-in
 # (`systemctl edit bilbycast-portal`), never an edit here: install-relay.sh
-# --with-portal and upgrade-relay.sh both replace this file with the packaged
-# one, and keep drop-ins. Not under /home or /tmp: those are hidden below.
+# --with-portal replaces this file with the packaged one, and so does
+# upgrade-relay.sh while its ExecStart=, User=, Group=, WorkingDirectory= and
+# EnvironmentFile= are still the packaged ones; both keep drop-ins. Not under
+# /home or /tmp: those are hidden below.
 ReadWritePaths=-/etc/authelia/users
 ProtectHome=true
 PrivateTmp=true
