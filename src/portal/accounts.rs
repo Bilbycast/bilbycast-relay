@@ -304,14 +304,13 @@ pub fn plan(users: &Mapping, accounts: &[ManagerAccount], group: &str) -> Plan {
     p
 }
 
-/// A hash nobody holds the password for.
+/// A hash nobody holds the password for. argon2 draws the salt itself.
 fn unusable_password_hash() -> anyhow::Result<String> {
-    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    use argon2::PasswordHasher;
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
-    let salt = SaltString::generate(&mut OsRng);
     let hash = argon2::Argon2::default()
-        .hash_password(&secret, &salt)
+        .hash_password(&secret)
         .map_err(|e| anyhow::anyhow!("argon2: {e}"))?;
     Ok(hash.to_string())
 }
