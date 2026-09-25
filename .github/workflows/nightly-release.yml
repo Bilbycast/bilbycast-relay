@@ -223,8 +223,11 @@ jobs:
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"
           echo "Packaged ${TARBALL} ($(du -h ${TARBALL} | cut -f1))"
 
+      # v7 pairs with download-artifact@v8 in the release job below, as in
+      # bilbycast-edge's release. `archive` is left at its default (true): the
+      # path lists four files, and v7 uploads unzipped only a single file.
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bilbycast-relay-${{ matrix.artifact_suffix }}
           path: |
@@ -283,8 +286,12 @@ jobs:
           path: bilbycast-gateway-sdk
           persist-credentials: false
 
+      # No `name`, `pattern` or `artifact-ids`, so every artefact of this run
+      # lands flat in artifacts/ (merge-multiple); the four builds' file names
+      # are disjoint. Since v8 a digest mismatch fails this step rather than
+      # logging a warning, which is what a signing job wants.
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
