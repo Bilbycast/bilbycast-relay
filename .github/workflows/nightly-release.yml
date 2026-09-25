@@ -257,10 +257,29 @@ jobs:
 
       # Shared canonical-manifest builder lives in the SDK repo. Nothing here
       # pushes to it, so its checkout keeps no credential.
+      #
+      # Pinned to a commit, not the SDK's default branch. This job runs
+      # scripts/build-manifest.sh, holding `id-token: write`, and cosign then
+      # signs whatever it wrote to manifest.json. That signature is what
+      # install-relay.sh and upgrade-relay.sh trust. Unpinned, a push to SDK
+      # main changed the script the next relay release ran with no commit in
+      # this repo. The pin is SDK main as of 2026-09-25 (a 2026-09-09 commit),
+      # the one v0.14.0 was released with. build-manifest.sh has not changed
+      # there since 9faa5f1 (2026-07-17), which taught it the
+      # `-linux-distribution` suffix.
+      #
+      # To bump, do it deliberately: `gh api
+      # repos/Bilbycast/bilbycast-gateway-sdk/branches/main --jq .commit.sha`,
+      # read `gh api repos/Bilbycast/bilbycast-gateway-sdk/compare/<old>...<new>`
+      # for scripts/build-manifest.sh, and replace the SHA below. A new
+      # artefact suffix here needs the SDK change first and then this bump:
+      # the script exits non-zero on a tarball name it cannot parse, so a
+      # stale pin fails the release rather than leaving the tarball out.
       - name: Checkout bilbycast-gateway-sdk (manifest script)
         uses: actions/checkout@v5
         with:
           repository: Bilbycast/bilbycast-gateway-sdk
+          ref: b44b98efdbb638a8b797979e302c4c3e20b6cdee # SDK main as of 2026-09-25
           path: bilbycast-gateway-sdk
           persist-credentials: false
 
