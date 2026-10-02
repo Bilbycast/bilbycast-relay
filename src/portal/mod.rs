@@ -51,6 +51,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod clickthrough;
 pub mod clients;
 pub mod config;
 pub mod mail;
@@ -180,6 +181,13 @@ pub fn router(state: PortalState) -> Router {
         // Public and unauthenticated on purpose: a health check that needed a
         // signed-in user would report the proxy's health, not the portal's.
         .route("/healthz", get(healthz))
+        // The page an emailed password link points at. Public and
+        // unauthenticated of necessity — whoever follows it has no password
+        // yet — and deliberately inert: see `clickthrough`.
+        .route(
+            clickthrough::PATH,
+            get(clickthrough::page).post(clickthrough::go),
+        )
         .route("/", get(page))
         .route("/portal.js", get(portal_js))
         // One tap back to a feed whose credential ran out. The player links

@@ -165,6 +165,19 @@ pub struct MailConfig {
     /// Where a viewer signs in, named in the emails.
     pub sign_in_url: String,
 
+    /// Where this portal answers, for the page an emailed link points at —
+    /// e.g. `https://watch.example.com`. Defaults to [`sign_in_url`], which is
+    /// the same host in every deployment that has one.
+    ///
+    /// Set `click_through: false` to email Authelia's own link instead. That
+    /// is what every portal did before 0.15.1, and it means a mail scanner
+    /// that opens links spends them before their owner arrives — see
+    /// [`super::clickthrough`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub click_through_base: Option<String>,
+    #[serde(default = "default_true")]
+    pub click_through: bool,
+
     /// Who the emails say they come from, in their wording and in the default
     /// subjects.
     #[serde(default = "default_brand")]
@@ -198,6 +211,10 @@ pub struct MailConfig {
 fn default_listen() -> String {
     "127.0.0.1:2525".to_string()
 }
+fn default_true() -> bool {
+    true
+}
+
 fn default_brand() -> String {
     "Bilbycast".to_string()
 }
@@ -211,6 +228,13 @@ enum Outbound {
 }
 
 impl MailConfig {
+    /// The base the set-password page is served under.
+    pub fn click_through_base(&self) -> &str {
+        self.click_through_base
+            .as_deref()
+            .unwrap_or(&self.sign_in_url)
+    }
+
     pub fn normalise(&mut self) {
         self.relay_host = self.relay_host.trim().to_string();
         self.from = self.from.trim().to_string();
@@ -753,26 +777,35 @@ pub async fn handle(
     };
 
     let result = match extract_link(&msg.data) {
-        Some(link) => match rewrite(
-            cfg,
-            pending_entry.kind,
-            &pending_entry.display_name,
-            &to,
-            &link,
-        ) {
-            Ok(message) => {
-                let envelope = message.envelope().clone();
-                relay.send(envelope, message.formatted()).await
+        // The email carries our own page rather than Authelia's link, so that
+        // mail security opening it spends nothing — `clickthrough` says why.
+        Some(link) => {
+            let link = if cfg.click_through {
+                super::clickthrough::wrap(cfg.click_through_base(), &link)
+            } else {
+                link
+            };
+            match rewrite(
+                cfg,
+                pending_entry.kind,
+                &pending_entry.display_name,
+                &to,
+                &link,
+            ) {
+                Ok(message) => {
+                    let envelope = message.envelope().clone();
+                    relay.send(envelope, message.formatted()).await
+                }
+                Err(e) => {
+                    // Still the person's link, in Authelia's words rather than ours.
+                    tracing::warn!(
+                        to = %to, error = %e,
+                        "could not compose the rewritten email; relaying Authelia's unchanged"
+                    );
+                    pass_through(relay, msg).await
+                }
             }
-            Err(e) => {
-                // Still the person's link, in Authelia's words rather than ours.
-                tracing::warn!(
-                    to = %to, error = %e,
-                    "could not compose the rewritten email; relaying Authelia's unchanged"
-                );
-                pass_through(relay, msg).await
-            }
-        },
+        }
         None => {
             // Authelia changed its message, or this was not the mail we
             // expected. Send what it wrote rather than nothing at all.
@@ -1423,6 +1456,8 @@ mod tests {
             relay_password_file: "/dev/null".into(),
             from: "Example Notifications <noreply@portal.example>".into(),
             sign_in_url: "https://watch.portal.example".into(),
+            click_through_base: None,
+            click_through: true,
             brand: default_brand(),
             link_lifetime: None,
             invite_subject: None,
@@ -1641,9 +1676,16 @@ mod tests {
             let body = readable(body);
             assert!(body.contains(subject), "wrong subject for {kind:?}: {body}");
             assert!(body.contains(phrase), "wrong wording for {kind:?}");
+            // The link travels inside our own page's URL, not as Authelia's:
+            // a scanner that opens what is in the email must spend nothing.
             assert!(
-                body.contains("reset-password/step2?token="),
-                "the link did not travel"
+                body.contains("/set-password?u="),
+                "the email does not point at the click-through page"
+            );
+            assert!(body.contains("step2%3Ftoken%3D"), "the link did not travel");
+            assert!(
+                !body.contains("/auth/reset-password/step2?token="),
+                "Authelia's one-time link is still in the email for a scanner to open"
             );
             assert!(
                 body.contains("Bea Jones"),
@@ -1793,6 +1835,26 @@ mod tests {
         c.invite_subject = Some("Welcome aboard".into());
         let message = rewrite(&c, LinkKind::Invite, "Bea", "bea@example.com", LINK).unwrap();
         assert_eq!(message.headers().get_raw("Subject"), Some("Welcome aboard"));
+    }
+
+    /// `click_through: false` is the pre-0.15.1 behaviour, kept for a portal
+    /// whose mail nobody scans — and for proving what the default changes.
+    #[tokio::test]
+    async fn the_raw_link_can_still_be_emailed_when_asked_for() {
+        let mut c = cfg();
+        c.click_through = false;
+        let pending = PendingLinks::default();
+        let _rx = pending
+            .expect("bea@example.com", LinkKind::Invite, "Bea")
+            .await;
+        let relay = Captured::default();
+        handle(&c, &pending, &relay, authelia_message("bea@example.com"))
+            .await
+            .unwrap();
+        let sent = relay.sent.lock().await;
+        let body = readable(&sent.first().expect("nothing was relayed").1);
+        assert!(body.contains("/auth/reset-password/step2?token="), "{body}");
+        assert!(!body.contains("/set-password?u="));
     }
 
     #[tokio::test]

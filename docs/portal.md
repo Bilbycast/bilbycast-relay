@@ -628,6 +628,9 @@ access_control:
       policy: one_factor
 ```
 
+If the portal sends password links, one rule has to come *before* this one — see
+[the link is not sent for a scanner to open](#the-link-is-not-sent-for-a-scanner-to-open).
+
 ### The file has two writers
 
 Authelia rewrites the file whenever someone sets a password; the portal writes
@@ -677,6 +680,56 @@ The managed mark is an Authelia **group**, not a key of the portal's own,
 because Authelia keeps the fields it knows when it rewrites the file and would
 drop anything else — the account would be orphaned by its owner's first
 password change.
+
+### The link is not sent for a scanner to open
+
+Authelia's set-password link is **one-time**, and the page it points at submits
+the token as soon as it loads. Mail security that opens links to check them
+therefore *spends* the link: measured on 2026-10-02, an invitation to a
+Microsoft 365 mailbox was consumed by `172.186.9.0` (AS8075, Microsoft) seconds
+after delivery, and its owner was told the token "may have expired" two minutes
+later. Every recipient behind that kind of filtering would hit it, and the
+failure reads as expiry rather than as what it is.
+
+So the email points at a page this portal serves instead, at
+`<click_through_base>/set-password`, carrying Authelia's URL as a parameter.
+That page:
+
+* does nothing on `GET` but render HTML — a scanner that fetches it, follows it
+  or renders it with JavaScript spends nothing;
+* holds the URL **percent-encoded in a hidden field**, so there is no
+  URL-shaped string in the markup for a scraper to pull out and open, and no
+  `<a>` to follow; and
+* moves on only when somebody presses the button, which is a form `POST`.
+
+It is a bounded defence, not an absolute one: a scanner that submitted forms
+would still spend the link. None of the ones that cause this do.
+
+The URL arrives in a query string anybody can write, so the page follows it
+only when it is `click_through_base` plus Authelia's own reset path — otherwise
+this would be an open redirect on your own domain. Anything else answers `400`.
+
+| Key | Default | |
+|---|---|---|
+| `click_through` | `true` | `false` emails Authelia's own link, as every portal did before this existed. |
+| `click_through_base` | `sign_in_url` | Where this portal answers, e.g. `https://watch.example.com`. |
+
+**Authelia must let that page through unauthenticated** — whoever follows the
+link has no password yet, so there is nobody to authenticate:
+
+```yaml
+access_control:
+  rules:
+    - domain: 'watch.example.com'
+      resources:
+        - '^/set-password'
+      policy: bypass
+    - domain: 'watch.example.com'
+      policy: one_factor
+```
+
+Without the bypass the link lands on the sign-in page, which is the one place
+its owner cannot get past.
 
 ### What Authelia needs
 

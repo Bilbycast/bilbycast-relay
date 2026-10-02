@@ -17,10 +17,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::HeaderMap,
     routing::{get, post},
-    Json, Router,
 };
 use bilbycast_relay::portal::{self, PortalConfig, PortalState};
 use serde::Deserialize;
@@ -236,6 +236,135 @@ fn client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
+/// A browser that stops at the redirect instead of following it — the test
+/// cares that the button sends somebody to Authelia, not that the host exists.
+fn client_no_redirect() -> reqwest::Client {
+    install_provider();
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+/// `u=<percent-encoded>`, as the page's own form would send it. Built with the
+/// module's encoder so the test cannot disagree with it.
+fn form_body(url: &str) -> String {
+    portal::clickthrough::wrap("", url)
+        .split_once('?')
+        .unwrap()
+        .1
+        .to_string()
+}
+
+/// A portal that sends password links, for the click-through page below.
+async fn mail_harness(base: &str) -> String {
+    let mut cfg = PortalConfig {
+        listen_addr: "127.0.0.1:0".into(),
+        manager_url: "http://127.0.0.1:1".into(),
+        manager_token: SERVICE_TOKEN.into(),
+        username_header: "remote-user".into(),
+        trusted_proxies: ["127.0.0.1".parse().unwrap()].into_iter().collect(),
+        player_origins: Vec::new(),
+        accounts: None,
+        mail: Some(portal::mail::MailConfig {
+            listen_addr: "127.0.0.1:2525".into(),
+            listen_password_file: "/dev/null".into(),
+            relay_host: "smtp.example".into(),
+            relay_port: None,
+            relay_username: "u".into(),
+            relay_password_file: "/dev/null".into(),
+            from: "Example <noreply@portal.example>".into(),
+            sign_in_url: base.into(),
+            click_through_base: None,
+            click_through: true,
+            brand: "Example".into(),
+            link_lifetime: None,
+            invite_subject: None,
+            reset_subject: None,
+            starttls: None,
+            implicit_tls: false,
+        }),
+        logout_url: None,
+    };
+    cfg.normalise();
+    let state = portal_state(cfg);
+    let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paddr = pl.local_addr().unwrap();
+    let app = portal::router(state).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(async move {
+        let _ = axum::serve(pl, app).await;
+    });
+    format!("http://{paddr}")
+}
+
+/// The page an emailed password link points at.
+///
+/// The whole point is that fetching it does nothing. Mail security opens links
+/// to check them, and Authelia's own link is spent the moment it is opened —
+/// measured against a Microsoft 365 mailbox on 2026-10-02, where the scan
+/// consumed the token two minutes before its owner clicked. So a `GET` here
+/// must be inert, must carry no link onward for a crawler to follow, and must
+/// leave the token for a human to press.
+#[tokio::test]
+async fn the_set_password_page_is_inert_until_somebody_presses_the_button() {
+    let base = "https://watch.portal.example";
+    let link = format!("{base}/auth/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc.def");
+    let portal = mail_harness(base).await;
+    let query = portal::clickthrough::wrap(base, &link)
+        .split_once('?')
+        .unwrap()
+        .1
+        .to_string();
+
+    // GET: a page, and nothing a crawler can act on.
+    let r = client()
+        .get(format!("{portal}/set-password?{query}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("<form method=\"post\""),
+        "no button to press: {body}"
+    );
+    assert!(
+        !body.contains("<a "),
+        "the page offers a link a scanner would follow"
+    );
+    assert!(!body.contains("<script"), "the page runs script");
+    assert!(
+        !body.contains("reset-password/step2?token="),
+        "Authelia's link sits in the markup where a crawler can reach it"
+    );
+
+    // POST: only now does the browser go on to Authelia.
+    let r = client_no_redirect()
+        .post(format!("{portal}/set-password"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(&link))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 303, "the button did not redirect");
+    assert_eq!(r.headers()["location"], link.as_str());
+
+    // And it is not an open redirect.
+    for bad in [
+        "https://evil.test/auth/reset-password/step2?token=x",
+        "https://watch.portal.example.evil.test/auth/reset-password/step2?token=x",
+    ] {
+        let r = client_no_redirect()
+            .post(format!("{portal}/set-password"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form_body(bad))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad} was followed");
+    }
+}
+
 #[tokio::test]
 async fn a_signed_in_user_sees_their_feeds_and_the_manager_is_asked_correctly() {
     let (base, rec) = harness().await;
@@ -263,7 +392,10 @@ async fn a_signed_in_user_sees_their_feeds_and_the_manager_is_asked_correctly() 
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "/api/v1/dvr/portal/streams");
     assert_eq!(calls[0].1, format!("Bearer {SERVICE_TOKEN}"));
-    assert_eq!(calls[0].2, "a.smith", "the manager was asked about the wrong user");
+    assert_eq!(
+        calls[0].2, "a.smith",
+        "the manager was asked about the wrong user"
+    );
 }
 
 /// The header is a claim, and from an untrusted peer it is the client
@@ -298,7 +430,11 @@ async fn an_untrusted_peer_is_refused_however_convincing_the_header() {
 #[tokio::test]
 async fn a_trusted_peer_with_no_username_is_refused() {
     let (base, rec) = harness().await;
-    let r = client().get(format!("{base}/api/feeds")).send().await.unwrap();
+    let r = client()
+        .get(format!("{base}/api/feeds"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 401);
     assert!(rec.lock().unwrap().calls.is_empty());
 }
@@ -316,8 +452,16 @@ async fn watching_mints_through_the_manager_and_returns_the_link() {
         .unwrap();
     assert_eq!(r.status(), 200);
     let body: serde_json::Value = r.json().await.unwrap();
-    assert!(body["watch_url"].as_str().unwrap().starts_with("https://relay.example/dvr/"));
-    assert_eq!(body["expires_in_secs"], 10_800, "the three-hour TTL did not survive");
+    assert!(
+        body["watch_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://relay.example/dvr/")
+    );
+    assert_eq!(
+        body["expires_in_secs"], 10_800,
+        "the three-hour TTL did not survive"
+    );
 
     let calls = &rec.lock().unwrap().calls;
     assert_eq!(calls.len(), 1);
@@ -411,16 +555,26 @@ async fn the_page_and_its_script_are_both_served() {
         .unwrap_or("")
         .to_string();
     let html = r.text().await.unwrap();
-    assert!(csp.contains("script-src 'self'"), "page shipped without a script CSP");
+    assert!(
+        csp.contains("script-src 'self'"),
+        "page shipped without a script CSP"
+    );
     assert!(
         html.contains("src=\"/portal.js\""),
         "the page does not load the script from the route that serves it"
     );
     // An inline <script> block would be blocked by the CSP the page sets on
     // itself, so it must not appear.
-    assert!(!html.contains("<script>"), "page carries an inline script the CSP forbids");
+    assert!(
+        !html.contains("<script>"),
+        "page carries an inline script the CSP forbids"
+    );
 
-    let js = client().get(format!("{base}/portal.js")).send().await.unwrap();
+    let js = client()
+        .get(format!("{base}/portal.js"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(js.status(), 200);
     assert!(js.text().await.unwrap().contains("/api/feeds"));
 }
@@ -473,7 +627,11 @@ async fn an_unreachable_manager_is_not_reported_as_a_login_problem() {
 #[tokio::test]
 async fn health_needs_no_user() {
     let (base, _rec) = harness().await;
-    let r = client().get(format!("{base}/healthz")).send().await.unwrap();
+    let r = client()
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
 }
 
@@ -540,8 +698,10 @@ async fn an_allow_listed_player_is_given_a_fresh_token() {
 
     let calls = rec.lock().unwrap().calls.clone();
     assert!(
-        calls.iter().any(|(p, a, _)| p == "/api/v1/dvr/portal/token"
-            && a == &format!("Bearer {SERVICE_TOKEN}")),
+        calls
+            .iter()
+            .any(|(p, a, _)| p == "/api/v1/dvr/portal/token"
+                && a == &format!("Bearer {SERVICE_TOKEN}")),
         "renewal did not re-check entitlement through the manager: {calls:?}"
     );
 }
@@ -571,7 +731,9 @@ async fn a_feed_the_viewer_does_not_have_is_refused_without_leaking_that_it_exis
     );
     let calls = rec.lock().unwrap().calls.clone();
     assert!(
-        !calls.iter().any(|(p, _, _)| p == "/api/v1/dvr/portal/token"),
+        !calls
+            .iter()
+            .any(|(p, _, _)| p == "/api/v1/dvr/portal/token"),
         "a feed the viewer does not have was still minted: {calls:?}"
     );
 }
