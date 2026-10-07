@@ -455,6 +455,358 @@ async fn whip_ingest_depacketizes_h264_into_hub() {
     assert!(matches!(got, Ok(true)), "WHIP ingest must deliver a reassembled keyframe AU, got {got:?}");
 }
 
+// ── H.264 over str0m's own packetizer, end to end ──
+//
+// The two tests above negotiate whatever a full str0m offer leads with, which
+// is VP8: the relay sends on the first payload type it negotiated, so H.264
+// bytes travel labelled VP8, and the VP8 (de)packetizer passes a payload
+// through untouched — any byte stream at all survives it. These two keep only
+// H.264 in the offer, so str0m's RFC 6184 packetizer and depacketizer carry
+// the media, as they do for a browser. Neither depends on *which* H.264
+// payload type the answer settles on.
+
+/// GOP length and frame spacing (90 kHz) of the streams below.
+const GOP: u64 = 10;
+const FRAME_90K: u64 = 3000;
+
+/// The parameter sets of the streams below. No zero bytes, so nothing in them
+/// reads as a start code.
+const TEST_SPS: &[u8] = &[0x67, 0x42, 0xe0, 0x1f, 0x8c, 0x8d, 0x40, 0x50, 0x1e, 0xd0];
+const TEST_PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+
+/// Annex B: every NAL behind a 4-byte start code (the form str0m's
+/// depacketizer emits).
+fn annex_b(nalus: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in nalus {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(n);
+    }
+    out
+}
+
+/// A NAL of `len` bytes behind `header`, different per `seed`, with no zero
+/// byte in it.
+fn nal_body(header: u8, len: usize, seed: u64) -> Vec<u8> {
+    let mut nal = vec![header];
+    nal.extend((0..len).map(|i| 1 + ((i as u64 * 7 + seed * 13) % 250) as u8));
+    nal
+}
+
+/// The IDR slice: well past str0m's 1120-byte payload MTU, so it goes as
+/// FU-A fragments.
+fn test_idr_slice() -> Vec<u8> {
+    nal_body(0x65, 4000, 1)
+}
+
+/// Frame `k` of the stream as a decoder must receive it: every IDR behind the
+/// SPS and PPS, a P slice of its own per frame.
+fn decodable_frame(k: u64) -> Vec<u8> {
+    if k.is_multiple_of(GOP) {
+        annex_b(&[TEST_SPS, TEST_PPS, &test_idr_slice()])
+    } else {
+        annex_b(&[&nal_body(0x41, 300, k)])
+    }
+}
+
+/// Keep only H.264 — and the RTX that repairs it — in an SDP's video section.
+/// A no-op on an offer that already carries only H.264.
+fn h264_only(sdp: &str) -> String {
+    use std::collections::HashSet;
+    let pt_of = |line: &str, attr: &str| -> Option<String> {
+        let rest = line.strip_prefix(attr)?;
+        Some(rest.split_whitespace().next()?.to_string())
+    };
+    let h264 = h264_pts(sdp);
+    let mut keep: HashSet<String> = h264.iter().map(|pt| pt.to_string()).collect();
+    for line in sdp.lines() {
+        if let Some(rest) = line.strip_prefix("a=fmtp:")
+            && let Some((pt, params)) = rest.split_once(' ')
+            && let Some(apt) = params.split(';').find_map(|p| p.trim().strip_prefix("apt="))
+            && apt.parse::<u8>().is_ok_and(|apt| h264.contains(&apt))
+        {
+            keep.insert(pt.to_string());
+        }
+    }
+
+    let mut out = String::new();
+    let mut in_video = false;
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            in_video = line.starts_with("m=video");
+            if in_video {
+                // m=video <port> <proto> <fmt>... — keep the kept formats.
+                let mut parts = line.split(' ');
+                let head: Vec<&str> = parts.by_ref().take(3).collect();
+                let fmts: Vec<&str> = parts.filter(|pt| keep.contains(*pt)).collect();
+                out.push_str(&format!("{} {}\r\n", head.join(" "), fmts.join(" ")));
+                continue;
+            }
+        }
+        if in_video {
+            let pt = ["a=rtpmap:", "a=fmtp:", "a=rtcp-fb:"]
+                .iter()
+                .find_map(|attr| pt_of(line, attr));
+            if pt.is_some_and(|pt| !keep.contains(&pt)) {
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// The payload types an SDP maps to H.264.
+fn h264_pts(sdp: &str) -> std::collections::HashSet<u8> {
+    sdp.lines()
+        .filter_map(|l| l.strip_prefix("a=rtpmap:"))
+        .filter_map(|rest| rest.split_once(' '))
+        .filter(|(_, enc)| enc.starts_with("H264/"))
+        .filter_map(|(pt, _)| pt.parse().ok())
+        .collect()
+}
+
+/// The fault Chrome showed: relay WHEP video arrived, decoded never, and the
+/// browser asked for a keyframe (PLI) forever.
+///
+/// The viewer joins a stream whose sender carried its SPS / PPS on the first
+/// IDR only, after a later IDR. Every frame it receives must be one whole
+/// access unit — at its own RTP timestamp, exactly the bytes a decoder needs,
+/// with every IDR (the cached one it is primed with, and every live one)
+/// behind the SPS and PPS. Before the fix the relay RTP-packetized each NAL
+/// itself and wrote every packet to str0m as a frame, which str0m packetized
+/// again: the viewer reassembled type-28 "NAL units" from the IDR, each
+/// fragment its own frame, and no SPS or PPS ahead of an IDR that had none.
+#[tokio::test]
+async fn whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on() {
+    use bilbycast_relay::distribution::webrtc::session::{
+        SessionConfig, SessionEvent, WebrtcSession,
+    };
+    use bilbycast_relay::distribution::whep;
+
+    let hub = Arc::new(DistributionHub::new());
+    let cancel = CancellationToken::new();
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    // What the sender sends: its parameter sets on frame 0 only.
+    let sent = |k: u64| -> (Bytes, bool) {
+        let idr = k.is_multiple_of(GOP);
+        let au = match k {
+            0 => annex_b(&[TEST_SPS, TEST_PPS, &test_idr_slice()]),
+            _ if idr => annex_b(&[&test_idr_slice()]),
+            _ => decodable_frame(k),
+        };
+        (au.into(), idr)
+    };
+    // The history the viewer missed, up to an IDR without parameter sets —
+    // the keyframe it is primed with.
+    for k in 0..=GOP {
+        let (au, idr) = sent(k);
+        hub.publish("mid-join", EsFrame::video(k * FRAME_90K, au, idr));
+    }
+
+    let client_cfg = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: Some(lo), ice_lite: false };
+    let mut client = WebrtcSession::new(&client_cfg).await.unwrap();
+    let (offer_sdp, pending) = client.create_offer(true, false, false).unwrap();
+    let offer_sdp = h264_only(&offer_sdp);
+    let (whep_events, _whep_rx) = bilbycast_relay::manager::events::event_channel();
+    let handle = whep::create_and_spawn_viewer(
+        hub.clone(),
+        "mid-join".to_string(),
+        &offer_sdp,
+        Some(lo),
+        cancel.clone(),
+        whep_events,
+    )
+    .await
+    .expect("WHEP setup");
+    let h264 = h264_pts(&handle.answer_sdp);
+    assert!(!h264.is_empty(), "the answer must carry H.264:\n{}", handle.answer_sdp);
+    client.apply_answer(&handle.answer_sdp, pending).unwrap();
+
+    // The live stream, on from where the history stopped.
+    let pub_hub = hub.clone();
+    let pub_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut k = GOP;
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    k += 1;
+                    let (au, idr) = sent(k);
+                    pub_hub.publish("mid-join", EsFrame::video(k * FRAME_90K, au, idr));
+                }
+            }
+        }
+    });
+
+    // Every frame the viewer reassembles: (RTP timestamp, bytes).
+    let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
+    let client_cancel = CancellationToken::new();
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match client.poll_event(&client_cancel).await {
+                SessionEvent::MediaData { pt, data, rtp_time, .. } => {
+                    assert!(
+                        h264.contains(&*pt),
+                        "media on PT {pt}, not one of the H.264 PTs {h264:?}"
+                    );
+                    frames.push((rtp_time.numer(), data.to_vec()));
+                    let idrs = frames
+                        .iter()
+                        .filter(|(t, _)| (t / FRAME_90K).is_multiple_of(GOP))
+                        .map(|(t, _)| *t)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+                    if idrs >= 2 && frames.len() > 2 * GOP as usize {
+                        return true;
+                    }
+                }
+                SessionEvent::Disconnected => return false,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    cancel.cancel();
+    assert!(
+        matches!(done, Ok(true)),
+        "viewer must receive two IDRs' worth of frames, got {done:?} after {} frames",
+        frames.len()
+    );
+
+    for (i, (t, data)) in frames.iter().enumerate() {
+        assert_eq!(t % FRAME_90K, 0, "frame {i}: RTP timestamp {t} is not a frame's");
+        let k = t / FRAME_90K;
+        assert!(k >= GOP, "frame {i}: k={k} predates the viewer's join");
+        let expected = decodable_frame(k);
+        assert!(
+            data == &expected,
+            "frame {i} (k={k}, {}): {} bytes, NAL types {:?}; expected {} bytes, NAL types {:?}",
+            if k.is_multiple_of(GOP) { "IDR" } else { "P" },
+            data.len(),
+            nal_types(data),
+            expected.len(),
+            nal_types(&expected),
+        );
+    }
+    assert!(
+        frames.windows(2).all(|w| w[0].0 < w[1].0),
+        "one frame per access unit, timestamps rising: {:?}",
+        frames.iter().map(|(t, _)| t).collect::<Vec<_>>()
+    );
+}
+
+/// NAL types of an Annex-B buffer, for assertion messages.
+fn nal_types(au: &[u8]) -> Vec<u8> {
+    bilbycast_relay::distribution::es::split_annex_b_nalus(au)
+        .iter()
+        .map(|n| n[0] & 0x1f)
+        .collect()
+}
+
+/// WHIP ingest over str0m's H.264 packetizer: str0m hands the relay one whole
+/// Annex-B frame per `MediaData`, and the access unit must reach the hub as
+/// it came — no doubled start code — with every IDR flagged a keyframe. The
+/// keyframe test used to read the frame's first byte, a start code's zero,
+/// so no WHIP-ingested frame was ever flagged.
+#[tokio::test]
+async fn whip_ingest_publishes_whole_h264_access_units_and_flags_every_idr() {
+    use bilbycast_relay::distribution::es::au_is_idr;
+    use bilbycast_relay::distribution::webrtc::session::{
+        SessionConfig, SessionEvent, WebrtcSession,
+    };
+    use bilbycast_relay::distribution::{whep, whip_ingest};
+
+    let hub = Arc::new(DistributionHub::new());
+    let cancel = CancellationToken::new();
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let mut sub = hub.subscribe("whip-h264");
+
+    let whip_cfg = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: Some(lo), ice_lite: false };
+    let mut whip = WebrtcSession::new(&whip_cfg).await.unwrap();
+    let (offer, pending) = whip.create_offer(true, false, true).unwrap();
+    let offer = h264_only(&offer);
+    let handle = whip_ingest::create_and_spawn_ingest(
+        hub.clone(),
+        "whip-h264".to_string(),
+        &offer,
+        Some(lo),
+        cancel.clone(),
+    )
+    .await
+    .expect("WHIP ingest setup");
+    assert!(!h264_pts(&handle.answer_sdp).is_empty(), "the answer must carry H.264");
+    whip.apply_answer(&handle.answer_sdp, pending).unwrap();
+
+    // The publisher: a libwebrtc-like sender, parameter sets on every IDR.
+    let whip_cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            match whip.poll_event(&whip_cancel).await {
+                SessionEvent::Connected => break,
+                SessionEvent::Disconnected => return,
+                _ => {}
+            }
+        }
+        whip.drain_pending_events();
+        let mut k = 0;
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                _ = whip_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    whep::write_video_au(&mut whip, k * FRAME_90K, &decodable_frame(k)).await;
+                    let _ = whip.drive_udp_io().await;
+                    k += 1;
+                }
+            }
+        }
+    });
+
+    let mut frames = Vec::new();
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match sub.rx.recv().await {
+                Ok(f) => {
+                    frames.push(f);
+                    if frames.iter().filter(|f| au_is_idr(&f.data)).count() >= 2 {
+                        return true;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+    cancel.cancel();
+    assert!(
+        matches!(done, Ok(true)),
+        "two IDR access units must reach the hub, got {done:?} after {} frames; NAL types of the first: {:?}",
+        frames.len(),
+        frames.iter().take(12).map(|f| nal_types(&f.data)).collect::<Vec<_>>()
+    );
+
+    for f in &frames {
+        assert_eq!(f.pts_90k % FRAME_90K, 0, "PTS {} is not a frame's", f.pts_90k);
+        let k = f.pts_90k / FRAME_90K;
+        let expected = decodable_frame(k);
+        assert!(
+            f.data[..] == expected[..],
+            "k={k}: {} bytes, NAL types {:?}; expected {} bytes, NAL types {:?}",
+            f.data.len(),
+            nal_types(&f.data),
+            expected.len(),
+            nal_types(&expected),
+        );
+        assert_eq!(f.keyframe, k.is_multiple_of(GOP), "k={k}: keyframe flag");
+    }
+}
+
 /// Runtime config: flipping `require_viewer_token` on the control cell (as the
 /// manager's `configure_distribution` push does) changes the live WHEP gate —
 /// proving the manager-owned runtime config reaches the request handlers.

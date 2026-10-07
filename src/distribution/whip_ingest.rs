@@ -13,11 +13,16 @@
 //! (The QUIC ES ingest in [`super::ingest`] is the future lower-overhead path,
 //! but WHIP-in reuses the proven edge encoder today.)
 //!
-//! str0m delivers **one depacketized NAL unit per `MediaData`** for H.264, so
-//! this module reassembles an access unit by grouping consecutive NALs that
-//! share a presentation timestamp (mirroring bilbycast-edge's WHIP-server
-//! input), and publishes one [`EsFrame`] per AU. Opus frames pass straight
-//! through.
+//! For H.264, str0m delivers **one whole depacketized frame per `MediaData`**:
+//! the RTP packets from a partition head up to the marker bit, already Annex
+//! B — every NAL behind its own 4-byte start code. A sender that sets the
+//! marker bit before the end of its access unit (one NAL per frame, say) still
+//! arrives as several `MediaData` with one timestamp, so this module groups
+//! consecutive frames that share a presentation timestamp into one access unit
+//! and publishes one [`EsFrame`] per AU. A frame is used as it came: it gets a start code only
+//! if it is a bare NAL, and the keyframe flag comes from its NAL types —
+//! never from its first byte, which in Annex B is a start code's zero. Opus
+//! frames pass straight through.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -26,7 +31,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::es::EsFrame;
+use super::es::{EsFrame, au_is_idr};
 use super::hub::DistributionHub;
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 
@@ -74,7 +79,8 @@ pub async fn create_and_spawn_ingest(
     Ok(WhipIngestHandle { session_id, answer_sdp, cancel })
 }
 
-/// Accumulates NAL units into access units and publishes them to the hub.
+/// Accumulates depacketized frames into access units and publishes them to
+/// the hub.
 struct AuAssembler {
     stream_id: String,
     cur_pts: Option<u64>,
@@ -87,17 +93,30 @@ impl AuAssembler {
         Self { stream_id, cur_pts: None, nalus: Vec::new(), keyframe: false }
     }
 
-    /// Push one depacketized NAL. If it opens a new access unit (PTS change),
-    /// flush the previous AU first.
-    fn push(&mut self, hub: &DistributionHub, pts_90k: u64, nal: &[u8]) {
+    /// Push one depacketized frame — Annex B, as str0m emits it, or one bare
+    /// NAL. If it opens a new access unit (PTS change), flush the previous AU
+    /// first. A payload-less frame (an RTP padding probe) is no part of any
+    /// access unit and touches nothing.
+    fn push(&mut self, hub: &DistributionHub, pts_90k: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
         if self.cur_pts.is_some() && self.cur_pts != Some(pts_90k) {
             self.flush(hub);
         }
         self.cur_pts = Some(pts_90k);
-        // Annex-B: 4-byte start code + NAL payload.
-        self.nalus.extend_from_slice(&[0, 0, 0, 1]);
-        self.nalus.extend_from_slice(nal);
-        if !nal.is_empty() && (nal[0] & 0x1f) == 5 {
+        // Annex B already: append as is. Only a bare NAL is framed — the
+        // start code that used to be prefixed to every frame doubled
+        // str0m's own. No NAL header byte is zero, so a leading zero is
+        // a start code's.
+        if data[0] != 0 {
+            self.nalus.extend_from_slice(&[0, 0, 0, 1]);
+        }
+        self.nalus.extend_from_slice(data);
+        // Scan the NAL types: the keyframe test used to read `data[0]`,
+        // which in Annex B is the start code's first zero, so no WHIP or
+        // cascade frame was ever flagged a keyframe.
+        if au_is_idr(data) {
             self.keyframe = true;
         }
     }
@@ -165,7 +184,8 @@ pub(crate) async fn republish_from_session(
                 let is_video = session.video_mid == Some(mid);
                 let is_audio = session.audio_mid == Some(mid);
                 if is_video {
-                    // str0m video MediaTime is already the 90 kHz clock.
+                    // str0m video MediaTime is already the 90 kHz clock. One
+                    // `MediaData` is one whole depacketized frame, Annex B.
                     let pts_90k = rtp_time.numer();
                     asm.push(hub, pts_90k, &data);
                 } else if is_audio {
@@ -197,6 +217,57 @@ pub(crate) async fn republish_from_session(
 mod tests {
     use super::*;
 
+    /// What str0m's H.264 depacketizer hands over: one whole frame, Annex B.
+    /// It goes to the hub exactly as it came — no second start code — and an
+    /// IDR in it flags the access unit a keyframe. Both used to fail: every
+    /// frame got a start code prefixed to str0m's own, and the keyframe test
+    /// read that start code's zero.
+    #[test]
+    fn a_whole_annex_b_frame_goes_through_unchanged_and_flags_its_idr() {
+        let hub = DistributionHub::new();
+        let mut sub = hub.subscribe("s");
+        let mut asm = AuAssembler::new("s".to_string());
+
+        let idr_au: &[u8] = &[
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1f, //
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, //
+            0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, //
+        ];
+        let p_au: &[u8] = &[0, 0, 0, 1, 0x41, 0x9a, 0x21];
+        asm.push(&hub, 0, idr_au);
+        asm.push(&hub, 3600, p_au);
+        asm.flush(&hub);
+
+        let f1 = sub.rx.try_recv().unwrap();
+        assert_eq!(f1.pts_90k, 0);
+        assert!(f1.keyframe, "an IDR access unit must be flagged a keyframe");
+        assert_eq!(&f1.data[..], idr_au, "no doubled start code");
+        let f2 = sub.rx.try_recv().unwrap();
+        assert_eq!(f2.pts_90k, 3600);
+        assert!(!f2.keyframe);
+        assert_eq!(&f2.data[..], p_au);
+    }
+
+    /// An RTP padding probe arrives as a payload-less frame. It is no access
+    /// unit: it publishes nothing and does not flush the one being built.
+    #[test]
+    fn a_payload_less_frame_is_no_access_unit() {
+        let hub = DistributionHub::new();
+        let mut sub = hub.subscribe("s");
+        let mut asm = AuAssembler::new("s".to_string());
+
+        asm.push(&hub, 0, &[0, 0, 0, 1, 0x65, 0x88]);
+        asm.push(&hub, 1800, &[]);
+        asm.push(&hub, 0, &[0, 0, 0, 1, 0x65, 0x99]);
+        assert!(sub.rx.try_recv().is_err(), "the probe flushed nothing");
+        asm.flush(&hub);
+        let f = sub.rx.try_recv().unwrap();
+        assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x65, 0x99]);
+        assert!(sub.rx.try_recv().is_err(), "and published nothing of its own");
+    }
+
+    /// A sender that marks every NAL a frame of its own (bare NALs, one
+    /// timestamp) is regrouped into one access unit.
     #[test]
     fn au_assembler_groups_by_pts_and_flags_keyframe() {
         let hub = DistributionHub::new();

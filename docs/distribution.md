@@ -1254,7 +1254,12 @@ H.264 profile; the workaround is now safe on both the server and client roles.)*
 
 The relay caches the last IDR access unit per stream (`hub.rs`), so a
 late-joining viewer is primed immediately — this covers the common case
-**without** any upstream signalling. An optional enhancement forwards a viewer
+**without** any upstream signalling. The hub also keeps the stream's latest
+SPS and PPS and puts them back ahead of every IDR that arrives without its own
+(a sender need not repeat them, and an encoder with global headers sends them
+once), live and in the cache alike — otherwise a viewer that joined after the
+IDR that carried them has slices it cannot decode, and a browser asks for a
+keyframe forever. An optional enhancement forwards a viewer
 PLI to the WHIP-ingest source (the edge encoder) over an RTCP feedback channel
 to force an on-demand IDR; it is not required given the cache and is a follow-up.
 
@@ -1485,15 +1490,15 @@ as ignored at startup.
 | File | Responsibility |
 |------|----------------|
 | `mod.rs` | Subsystem assembly, axum router, per-IP viewer cap + session reaper, `run_distribution` |
-| `hub.rs` | Per-stream fan-out (`tokio::broadcast`) + lock-free keyframe cache |
-| `es.rs` | Elementary-frame types + Annex-B NAL splitter |
-| `whep.rs` | Per-viewer WHEP session + send loop (packetize → SRTP) |
-| `whip_ingest.rs` | WHIP-in: terminate DTLS/SRTP, depacketize → access units → hub |
+| `hub.rs` | Per-stream fan-out (`tokio::broadcast`) + lock-free keyframe cache + SPS / PPS restored ahead of every IDR |
+| `es.rs` | Elementary-frame types + Annex-B NAL splitter + parameter-set restore |
+| `whep.rs` | Per-viewer WHEP session + send loop (one whole access unit per str0m write; str0m packetizes → SRTP) |
+| `whip_ingest.rs` | WHIP-in: terminate DTLS/SRTP, str0m depacketizes whole frames → access units → hub |
 | `cascade.rs` | Relay-to-relay: WHEP-client pull from an upstream relay → local hub |
 | `ingest.rs` | QUIC ES ingest (future lower-overhead edge path) |
 | `origin.rs` | LL-HLS/CMAF HTTP origin; manifests in memory, segments on disk, age- and size-bounded |
 | `token.rs` | Short-lived HMAC token mint/verify (viewer + ingest scopes) |
-| `webrtc/` | Vendored str0m session wrapper + RFC 6184 H.264 packetizer |
+| `webrtc/` | Vendored str0m session wrapper (str0m does the RFC 6184 packetizing) |
 | `player.html` | Built-in browser WHEP player (live only) |
 | `dvr.html` | Browser DVR player — main + all-intra proxy, jog / shuttle / reverse |
 | `vendor/` | Vendored browser assets (hls.js); see `vendor/README.md` |
@@ -1509,6 +1514,14 @@ as ignored at startup.
 - **WHIP-in → hub**: a str0m WHIP client pushing H.264 over DTLS/SRTP, the relay
   depacketizing + reassembling access units
   (`whip_ingest_depacketizes_h264_into_hub`).
+- **H.264 over str0m's own packetizer**, with the offer cut to H.264 so neither
+  side can fall back to the VP8 payload type a full str0m offer leads with: a
+  WHEP viewer joining after the IDR that carried the parameter sets receives
+  every frame as one whole access unit at its own timestamp, each IDR behind
+  the SPS and PPS
+  (`whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on`);
+  WHIP-in publishes each frame unchanged and flags every IDR a keyframe
+  (`whip_ingest_publishes_whole_h264_access_units_and_flags_every_idr`).
 - **Cascade**: an upstream relay serving WHEP + a downstream relay pulling it
   (real HTTP signalling + real ICE/DTLS/SRTP) and republishing to its own hub
   (`cascade_pulls_upstream_whep_and_republishes`).

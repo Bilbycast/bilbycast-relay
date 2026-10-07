@@ -10,6 +10,10 @@
 //! (the edge already shipped browser-ready H.264+Opus), so the per-viewer
 //! cost collapses to RTP-packetize + SRTP-encrypt — and, decisively, the
 //! fan-out lives on the public relay instead of the NAT'd, uplink-capped edge.
+//!
+//! The RTP packetizing is str0m's: each H.264 access unit goes to str0m's
+//! writer once, whole, as Annex B. The hub has already put the stream's SPS /
+//! PPS back ahead of any IDR that lacked them (`DistributionHub::publish`).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -20,9 +24,8 @@ use str0m::media::{Frequency, MediaTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
-use super::es::{split_annex_b_nalus, EsFrame, EsKind};
+use super::es::{EsFrame, EsKind};
 use super::hub::{DistributionHub, StreamSubscription};
-use super::webrtc::rtp_h264::H264Packetizer;
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 use crate::manager::events::{category, EventSender, EventSeverity};
 
@@ -215,9 +218,8 @@ fn report_offpath(
     );
 }
 
-/// Split a video access unit into NALUs, RFC 6184-packetize, and hand each
-/// payload to str0m. Drains str0m between writes (required — consecutive
-/// writes without a poll are silently rejected).
+/// Hand one video access unit to str0m (see [`write_video_au_on`]) and count
+/// it on the stream's bytes-out.
 async fn write_video(
     session: &mut WebrtcSession,
     mid: str0m::media::Mid,
@@ -229,8 +231,20 @@ async fn write_video(
     sub.state.add_bytes_out(bytes as u64);
 }
 
-/// Packetize + send one H.264 access unit on a known (mid, pt). Returns the
-/// number of payload bytes written.
+/// Send one H.264 access unit on a known (mid, pt) as **one** str0m frame,
+/// Annex B. Returns the number of access-unit bytes written.
+///
+/// str0m's writer packetizes a frame itself (RFC 6184): the SPS / PPS go out
+/// as one STAP-A ahead of the next slice, a NAL past its MTU as FU-A, every
+/// packet carries the frame's RTP timestamp and only the frame's last one
+/// the marker bit. Each NAL used to be packetized here first and every RTP
+/// payload written as a frame of its own, so str0m packetized the packets.
+/// It fragmented each 1200-byte FU-A again at its own, smaller payload size,
+/// so a receiver reassembled type-28 "NAL units" out of every IDR and large
+/// slice, decoded no picture from them, and got every fragment as a
+/// marker-bit frame of its own. A browser received video, decoded none of it
+/// and asked for a keyframe forever. bilbycast-edge fixed the same fault in
+/// its WebRTC output (e927368).
 async fn write_video_au_on(
     session: &mut WebrtcSession,
     mid: str0m::media::Mid,
@@ -239,20 +253,13 @@ async fn write_video_au_on(
     au: &[u8],
 ) -> usize {
     let media_time = MediaTime::new(pts_90k, Frequency::NINETY_KHZ);
-    let nalus = split_annex_b_nalus(au);
-    let n = nalus.len();
-    let mut bytes = 0;
-    for (i, nalu) in nalus.iter().enumerate() {
-        let is_last = i == n - 1;
-        for payload in H264Packetizer::packetize(nalu, is_last) {
-            if let Err(e) = session.write_media(mid, pt, Instant::now(), media_time, &payload.data) {
-                tracing::trace!("video write error: {e}");
-            }
-            session.drain_outputs().await;
-            bytes += payload.data.len();
-        }
+    if let Err(e) = session.write_media(mid, pt, Instant::now(), media_time, au) {
+        tracing::trace!("video write error: {e}");
     }
-    bytes
+    // str0m requires a poll between consecutive writes — drain, or the next
+    // write_media is rejected.
+    session.drain_outputs().await;
+    au.len()
 }
 
 /// Send one H.264 access unit over a session, resolving the video (mid, pt)
