@@ -37,7 +37,7 @@ use crate::config::DistributionConfig;
 use crate::distribution_control::DistributionControl;
 use crate::manager::events::{category, EventSender, EventSeverity};
 
-use super::es::{EsFrame, EsKind};
+use super::es::{EsFrame, EsKind, MAX_FRAME_BYTES};
 use super::hub::DistributionHub;
 use super::token;
 
@@ -49,9 +49,8 @@ const KIND_AUDIO: u8 = 2;
 const KIND_EOS: u8 = 0xFF;
 const FLAG_KEYFRAME: u8 = 0x01;
 
-/// Max single ES frame the ingest will accept (a generous 4 MiB — a 4K IDR
-/// access unit is well under this).
-const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+// The frame cap, `MAX_FRAME_BYTES`, lives in `es.rs`: WHIP ingest and the
+// cascade pull build access units under the same one.
 const MAX_HELLO_BYTES: usize = 64 * 1024;
 
 /// Ingest stream opener sent by the edge.

@@ -135,6 +135,7 @@ Emitted only by a relay built with the optional `viewer-distribution` role (defa
 | info | distribution ingest closed for stream '{stream}' | A QUIC ES ingest stopped; the stream tears down | `{ stream }` |
 | warning | per-IP viewer cap ({cap}) reached from {ip} | A WHEP viewer request was rejected — per-source-IP concurrent-viewer cap (`max_viewers_per_ip`) reached | `{ ip, cap }` |
 | warning | WHEP viewer: off-path datagram dropped by the media source pin | A datagram for a live WHEP session arrived from an address other than the one that completed DTLS, and was dropped before str0m saw it. Two causes: a source-spoofed ICE reflection attempt (the relay is ICE-Lite and str0m implements no RFC 7675 consent freshness, so the pin is the control), or a legitimate viewer whose public IP changed mid-session (Wi-Fi → cellular, CGNAT pool rotation) — that viewer goes black until it re-POSTs its WHEP offer. Emitted **once per session**, so a reflection flood cannot amplify its own alarm | `{ error_code: "webrtc_offpath_source", stream, session_id, pinned_ip, source_addr, source_ip }` |
+| warning | WebRTC negotiation with {peer} failed: str0m panicked during {step}: {panic} | str0m panicked negotiating a `POST /whep/{stream}` (`peer` = `WHEP viewer`) or `POST /whip/{stream}` (`WHIP publisher`) offer — an SDP it cannot reconcile, such as one RTX PT repairing two H.264 PTs. The panic is contained (`webrtc::session::isolate_negotiation`): that one request fails with a `400`, nothing else is affected. `step` is `SDP offer` for an offer; `session setup`, `SDP offer creation` and `SDP answer` are the other isolated steps. **Rate limited** — the endpoints are public — to one event per 10 s relay-wide; `suppressed` counts the panics held back since the previous event. A malformed offer that str0m rejects without panicking raises nothing. Same `error_code` as bilbycast-edge's | `{ error_code: "webrtc_negotiation_panic", peer, stream, step, panic, ip, suppressed }` |
 
 **Source**: `src/distribution/`
 
@@ -161,10 +162,10 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `edge` | 6 | Edge QUIC connection lifecycle (now with structured details), incl. per-IP DoS cap |
 | `tunnel` | 11 | Tunnel state changes, authentication, lifecycle (waiting, unbound), per-connection DoS cap, native plain-UDP register rejections (invalid token, per-IP session cap, implausible source address, live-slot takeover), and the one-shot startup posture warning |
 | `manager` | 6 | Manager connection and credential management |
-| `distribution` | 5 | Viewer-distribution ingest lifecycle, per-IP viewer cap, and the WebRTC media source pin (only on `viewer-distribution` builds) |
-| **Total** | **28** | |
+| `distribution` | 6 | Viewer-distribution ingest lifecycle, per-IP viewer cap, the WebRTC media source pin, and str0m negotiation panics (only on `viewer-distribution` builds) |
+| **Total** | **29** | |
 
-The always-compiled `edge`, `tunnel`, and `manager` categories account for 23 events. The `distribution` category (5 events) is present only when the relay is built with the optional `viewer-distribution` role.
+The always-compiled `edge`, `tunnel`, and `manager` categories account for 23 events. The `distribution` category (6 events) is present only when the relay is built with the optional `viewer-distribution` role.
 
 ### By Severity
 

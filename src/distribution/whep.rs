@@ -17,17 +17,25 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use str0m::media::{Frequency, MediaTime};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::es::{EsFrame, EsKind};
 use super::hub::{DistributionHub, StreamSubscription};
-use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+use super::webrtc::session::{SessionConfig, WebrtcSession};
+use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
 use crate::manager::events::{category, EventSender, EventSeverity};
+
+/// How often a viewer's session is driven when no frame has arrived to drive
+/// it: answering the browser's STUN consent checks and running str0m's
+/// timeouts, ICE giving up on a departed viewer among them. A browser checks
+/// consent every few seconds, so a second's delay costs nothing.
+const IDLE_DRIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Handle returned to the HTTP signaling layer once a viewer's SDP offer has
 /// been accepted. The send loop is already running in a detached task.
@@ -95,7 +103,10 @@ pub async fn create_and_spawn_viewer(
     Ok(ViewerHandle { session_id, answer_sdp, cancel })
 }
 
-/// The per-viewer send loop.
+/// The per-viewer send loop. Every way out of it ends the viewer: the task's
+/// drop guard cancels the session's token, and the reaper in
+/// `distribution::whep_offer` then drops the session record and the per-IP
+/// slot.
 async fn viewer_loop(
     mut session: WebrtcSession,
     mut sub: StreamSubscription,
@@ -104,22 +115,23 @@ async fn viewer_loop(
     session_id: &str,
     events: &EventSender,
 ) {
-    // 1. Wait for ICE + DTLS to complete.
-    loop {
-        match session.poll_event(&cancel).await {
-            SessionEvent::Connected => {
-                tracing::info!(
-                    "WHEP viewer '{session_id}' connected on stream '{stream_id}'"
-                );
-                break;
-            }
-            SessionEvent::Disconnected => {
-                tracing::info!(
-                    "WHEP viewer '{session_id}' disconnected during setup (stream '{stream_id}')"
-                );
-                return;
-            }
-            _ => continue,
+    // 1. Wait for ICE + DTLS to complete — for `SETUP_DEADLINE` at most.
+    match await_connected(&mut session, &cancel, SETUP_DEADLINE).await {
+        Setup::Connected => {
+            tracing::info!("WHEP viewer '{session_id}' connected on stream '{stream_id}'");
+        }
+        Setup::Disconnected => {
+            tracing::info!(
+                "WHEP viewer '{session_id}' disconnected during setup (stream '{stream_id}')"
+            );
+            return;
+        }
+        Setup::TimedOut => {
+            tracing::warn!(
+                "WHEP viewer '{session_id}' did not complete ICE + DTLS within {SETUP_DEADLINE:?} \
+                 (stream '{stream_id}'); closing it"
+            );
+            return;
         }
     }
 
@@ -144,8 +156,17 @@ async fn viewer_loop(
         write_video(&mut session, video_mid, video_pt, &kf.frame, &sub).await;
     }
 
-    // 3. Main fan-out loop.
-    loop {
+    // 3. Main fan-out loop. A viewer that leaves without a DELETE — a closed
+    //    tab, a lost network — surfaces only as str0m's ICE agent giving up,
+    //    reported from whichever drain ran its timeouts. So the session is
+    //    driven when no frame comes too (a stalled stream, or one whose ingest
+    //    is gone), and the latch is checked after every write and every drive.
+    //    Before, the event was dropped and nothing drove an idle session: the
+    //    departed viewer was sent the stream, and held its per-IP slot, for as
+    //    long as the stream lived.
+    let mut idle = tokio::time::interval(IDLE_DRIVE_INTERVAL);
+    idle.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    while !session.is_disconnected() {
         tokio::select! {
             _ = cancel.cancelled() => break,
             recv = sub.rx.recv() => match recv {
@@ -161,18 +182,18 @@ async fn viewer_loop(
                         }
                     }
                     // Keep ICE/DTLS/RTCP alive between media writes.
-                    let ev = session.drive_udp_io().await;
+                    session.drive_udp_io().await;
                     report_offpath(&mut session, events, stream_id, session_id, &sub);
-                    if matches!(ev, Some(SessionEvent::Disconnected)) {
-                        break;
-                    }
                 }
                 Err(RecvError::Lagged(_)) => {
                     // Viewer fell behind — resync happens naturally on the
                     // next keyframe. Keep going.
-                    continue;
                 }
                 Err(RecvError::Closed) => break, // ingest gone
+            },
+            _ = idle.tick() => {
+                session.drive_udp_io().await;
+                report_offpath(&mut session, events, stream_id, session_id, &sub);
             }
         }
     }
@@ -259,8 +280,9 @@ async fn write_video_au_on(
     if let Err(e) = session.write_media(mid, pt, Instant::now(), media_time, au) {
         tracing::trace!("video write error: {e}");
     }
-    // str0m requires a poll between consecutive writes — drain, or the next
-    // write_media is rejected.
+    // str0m queues up to 512 writes (`MAX_PENDING_PAYLOADS`) and packetizes
+    // them only from a timeout; drain now so the unit's packets go out at once
+    // and the queue never nears that cap.
     session.drain_outputs().await;
     au.len()
 }

@@ -226,21 +226,35 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
 - **Crate shape**: modules now live in `src/lib.rs` (a library target) so
   integration tests exercise the real code; `main.rs` is a thin binary shell.
 - **Ingest** (edge → relay): **WHIP-in** (`POST /whip/{stream}`) is the
-  zero-edge-code path — point the edge's shipped, quality-gated WHIP-client
-  output at the relay; the relay terminates DTLS/SRTP, depacketizes to H.264
+  no-new-edge-media-path route — point the edge's quality-gated WHIP-client
+  output at the relay (an edge with the current codec set: see "Upgrade order"
+  under the codec-set bullet); the relay terminates DTLS/SRTP, depacketizes to H.264
   access units + Opus frames, and feeds the hub. A **QUIC ES ingest** (ALPN
   `bilbycast-distribution`, `:4486`) is the future lower-overhead path.
 - **Hub** (`src/distribution/hub.rs`): one `tokio::broadcast` fan-out per stream
   + a lock-free (`arc-swap`) keyframe cache for instant late-join, and the
   stream's latest SPS / PPS, put back ahead of every IDR that arrives without
-  its own (`es::restore_param_sets`) so a viewer can start on any IDR.
+  its own (`es::restore_param_sets`) so a viewer can start on any IDR of a
+  stream that uses **one** SPS and **one** PPS (the cache keeps the last of
+  each; str0m's packetizer puts no more than one of each ahead of a slice
+  anyway). Bounded: a set over
+  `MAX_PARAM_SET_BYTES` (1024) is never cached and retires the cached one, and
+  nothing is inserted past `MAX_PARAM_SETS_ON_THE_WIRE` (1115 = str0m's 1120-byte
+  payload MTU less the STAP-A framing; a larger STAP-A is silently dropped).
+  WHIP-in / cascade access units are capped at `es::MAX_FRAME_BYTES` (4 MiB,
+  shared with the QUIC ingest) and dropped whole past it.
 - **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
   each H.264 access unit goes to str0m's writer **once, whole, as Annex B** and
   str0m packetizes it (RFC 6184) → SRTP → browser. There is no relay-side
   packetizer: the vendored one was fed to str0m packet by packet, which
   packetized every packet again, and no browser decoded a frame (removed, as the
   edge removed its own in e927368). Vendored str0m session under
-  `src/distribution/webrtc/` (kept in sync with bilbycast-edge).
+  `src/distribution/webrtc/` (kept in sync with bilbycast-edge). A session ends
+  on `DELETE` (the `/watch` player sends a `keepalive` fetch on `pagehide`), on
+  ICE giving up on a viewer that left without one (`is_disconnected` latch,
+  checked after every write and drive; the send loop drives an idle session
+  every second), or at `webrtc::SETUP_DEADLINE` (30 s) if it never connects —
+  WHIP ingest and the cascade pull have the same deadline.
 - **Cascade** (`src/distribution/cascade.rs`): scale past one relay's viewer
   ceiling — a downstream relay is a **WHEP client** of an upstream relay
   (`create_offer` → POST `/whep/{stream}` → ICE/DTLS/SRTP → republish to local
@@ -254,11 +268,24 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   one entry per (packetization mode, profile): two entries that both match an
   offered PT make str0m panic ("Pt locked multiple times") whenever the remote
   dictates PTs, which the old "defaults + four level-5.1 extras" set did to
-  every Chrome WHEP viewer. VP8/VP9/AV1 stay out because `get_pt` takes the
-  first negotiated entry. bilbycast-edge must register the identical set (its
-  WHIP output talks to this ingest). str0m negotiation panics that remain are
-  caught (`negotiate`) and fail only that request; the per-IP WHEP slot is an
-  RAII `ViewerSlot` in `distribution/mod.rs`, released however setup ends.
+  every Chrome WHEP viewer. `get_pt` picks by codec (`send_pt`, identical to
+  the edge's: H.264 packetization-mode 1 first, mode 0 as a fallback, Opus on
+  audio); VP8/VP9/AV1 stay out because nothing here carries them.
+  bilbycast-edge must register the identical set (its WHIP output talks to this
+  ingest). str0m negotiation panics that remain are caught
+  (`isolate_negotiation`, wrapping SDP parse through `to_sdp_string`, offer
+  creation and session setup) as a typed `NegotiationPanic`, fail only that
+  request with a `400`, and raise a Warning `webrtc_negotiation_panic` event
+  (at most one per 10 s); the per-IP WHEP slot is an RAII `ViewerSlot` in
+  `distribution/mod.rs`, released however setup ends.
+  **Upgrade order — mixed versions panic.** Every earlier build (edge releases
+  through v0.113.0 and edge trees before 5f71c4c; relay releases through
+  v0.15.0) holds two entries for some pairs and panics when this set's SDP
+  dictates the PT: an old edge's WHIP output panics on this relay's answer and
+  never retries, and an old upstream relay panics on a new downstream's cascade
+  offer (leaking a per-IP slot per 3 s retry). Upgrade WHIP-publishing edges
+  first, then relays from the upstream end of each cascade
+  (`docs/distribution.md`, "Upgrade order").
 - **Origin** (`PUT/GET /origin/{stream}/{file}`, plus the **clip** surface at `/origin/{stream}/clips` (POST request / GET list), `…/clips/{file}` (PUT / GET / DELETE) and `…/clips/{file}/failed` (POST), plus the **shared marks** list at `/origin/{stream}/marks` (GET with `ETag`/304 / POST) and `…/marks/{id}` (PATCH / DELETE) — `src/distribution/origin/marks.rs`, one `{stream}/marks/marks.json` per stream (fsynced; written only into a stream directory ingest has made, so a write after the manager's drop is `404`, not a resurrected directory, and the drop waits for a write under way; writers queue on a store-wide `tokio` mutex held through the blocking write, so waiting costs a task rather than a blocking-pool thread; an unparseable file is set aside by any request, a read included; I/O failure is `503`), viewer token only, fails closed without a `token_secret`, kept and dropped with `clips/`; the DVR page polls it every 3 s and falls back to `localStorage` on a relay without it — `400`/`401`/`404`/`405`/`500` on the first poll, `400` being what a relay predating the list answers — asking again about once a minute): **disk-backed** store with time-based retention, a per-stream byte bound, a segment floor and an idle grace on top of retention (`origin_idle_grace_secs`, default 60 s, per-stream overridable like the rest of the policy) past which a silent stream is retired — its media deleted and its in-memory state dropped, a non-empty `clips/` or `marks/` kept — swept every 30 s independently of ingest; the same sweep enforces a free-space floor on the origin volume (`origin_min_free_bytes`, default 5 GiB, `0` disables; evicts oldest-first round-robin across every stream down to four segments each, because the relay owns the disk and no health payload reports free space to the manager) and reclaims clip debris (`.part` uploads and record-less `.mp4`s after 1 h, anything in `clips/`, and a `marks/` list untouched on a stream nothing is ingesting, after 7 d — a backstop under the manager's 24 h post-session clock, never a policy). Clips are cut on the edge and PUT here (256 MiB each, 100 and 4 GiB per stream, 60 s pre+post); a clip request for a stream with no directory is `410` and never re-creates it, and the drop waits for an admission under way. The drop holds the marks and admission locks only to rename the stream's directory to `removing+{stream}`, and deletes it once they are released, so a multi-gigabyte window holds up no other session's marks or exports; a `removing+…` directory a stopped relay or a failed delete leaves behind is finished at the next start and by the 30 s sweep, never adopted as a stream. Every clip verb ignores both `require_origin_token` and `require_ingest_token` and fails closed without a `token_secret`: request / list / GET / DELETE accept an ingest **or** viewer token (`require_clip_credential`), while PUT and `…/failed` accept the ingest token only (`require_clip_ingest`). Manifests and init segments stay in memory (rewritten every segment, never evicted). Retention is manager-owned at runtime, node-wide plus per-stream overrides
   of the edge's CMAF PUTs; front with a CDN for scale.
 - **Players**: two, and they are not variants of each other. `GET /watch/{stream}`

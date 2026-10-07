@@ -28,8 +28,9 @@ pub mod whep;
 pub mod whip_ingest;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::{ConnectInfo, Path, RawQuery, State};
@@ -47,6 +48,12 @@ use crate::manager::events::EventSender;
 
 use self::hub::DistributionHub;
 use self::origin::OriginStore;
+use self::webrtc::session::NegotiationPanic;
+
+/// At most one `webrtc_negotiation_panic` event per this interval. The WHEP
+/// and WHIP endpoints are public, so whoever can send an offer str0m panics on
+/// can send a thousand, and the manager's event queue is 1024 deep.
+const NEGOTIATION_PANIC_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Shared state for the distribution subsystem's HTTP surface.
 pub struct DistributionState {
@@ -65,6 +72,83 @@ pub struct DistributionState {
     /// Concurrent viewer count per source IP (public-endpoint DoS cap).
     pub viewers_by_ip: DashMap<IpAddr, AtomicU32>,
     pub events: EventSender,
+    /// Rate limit on the `webrtc_negotiation_panic` event.
+    negotiation_panics: EventGate,
+}
+
+/// A rate limit for one event: the first occurrence is reported, then at most
+/// one per `interval`, and each report carries the number held back since the
+/// one before it, so a flood is visible without being forwarded.
+struct EventGate {
+    epoch: Instant,
+    interval: Duration,
+    /// When the next report may go, in ms since `epoch`.
+    next_ms: AtomicU64,
+    held_back: AtomicU64,
+}
+
+impl EventGate {
+    fn new(interval: Duration) -> Self {
+        Self {
+            epoch: Instant::now(),
+            interval,
+            next_ms: AtomicU64::new(0),
+            held_back: AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(held back since the last report)` when an occurrence at `now`
+    /// is to be reported, else `None` (and it is counted as held back).
+    fn admit(&self, now: Instant) -> Option<u64> {
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        let next = self.next_ms.load(Ordering::Relaxed);
+        let due = now_ms + self.interval.as_millis() as u64;
+        if now_ms >= next
+            && self
+                .next_ms
+                .compare_exchange(next, due, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            return Some(self.held_back.swap(0, Ordering::Relaxed));
+        }
+        self.held_back.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// Raise the Warning event for a negotiation that str0m panicked in — rate
+/// limited by [`NEGOTIATION_PANIC_EVENT_INTERVAL`] — naming the `peer` (e.g.
+/// `"WHEP viewer"`). Any other setup error is the peer's own (a malformed
+/// SDP) and stays a log line. A relay is headless: without this, a str0m
+/// panic a public offer triggered left one `warn!` line and nothing the
+/// manager could show. bilbycast-edge raises the same `error_code`.
+fn report_negotiation_panic(
+    st: &DistributionState,
+    err: &anyhow::Error,
+    peer: &str,
+    stream_id: &str,
+    ip: IpAddr,
+) {
+    let Some(panic) = err.downcast_ref::<NegotiationPanic>() else {
+        return;
+    };
+    let Some(held_back) = st.negotiation_panics.admit(Instant::now()) else {
+        return;
+    };
+    st.events.emit_with_details(
+        crate::manager::events::EventSeverity::Warning,
+        crate::manager::events::category::DISTRIBUTION,
+        format!("WebRTC negotiation with {peer} failed: {panic}"),
+        serde_json::json!({
+            "error_code": "webrtc_negotiation_panic",
+            "peer": peer,
+            "stream": stream_id,
+            "step": panic.step,
+            "panic": panic.message,
+            "ip": ip.to_string(),
+            "suppressed": held_back,
+        }),
+    );
 }
 
 /// A live viewer session tracked for teardown + per-IP accounting.
@@ -143,6 +227,7 @@ impl DistributionState {
             ingests: DashMap::new(),
             viewers_by_ip: DashMap::new(),
             events,
+            negotiation_panics: EventGate::new(NEGOTIATION_PANIC_EVENT_INTERVAL),
         })
     }
 
@@ -515,6 +600,7 @@ async fn whep_offer(
         Err(e) => {
             // Setup failed — `slot` drops on return and gives the slot back.
             tracing::warn!("WHEP setup failed for stream '{stream_id}': {e:#}");
+            report_negotiation_panic(&st, &e, "WHEP viewer", &stream_id, ip);
             (StatusCode::BAD_REQUEST, format!("WHEP setup failed: {e}")).into_response()
         }
     }
@@ -540,6 +626,7 @@ async fn whep_delete(
 async fn whip_ingest_offer(
     State(st): State<Arc<DistributionState>>,
     Path(stream_id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -602,6 +689,7 @@ async fn whip_ingest_offer(
         }
         Err(e) => {
             tracing::warn!("WHIP ingest setup failed for stream '{stream_id}': {e:#}");
+            report_negotiation_panic(&st, &e, "WHIP publisher", &stream_id, peer.ip());
             (StatusCode::BAD_REQUEST, format!("WHIP ingest setup failed: {e}")).into_response()
         }
     }
@@ -3376,5 +3464,52 @@ mod tests {
 
         drop(elsewhere);
         assert_eq!(held(other), 0);
+    }
+
+    /// The negotiation-panic event gate reports the first occurrence, then at
+    /// most one per interval, each report counting the ones held back since
+    /// the last.
+    #[test]
+    fn the_event_gate_reports_one_per_interval_and_counts_the_rest() {
+        let gate = EventGate::new(Duration::from_secs(10));
+        let t0 = gate.epoch;
+        assert_eq!(gate.admit(t0), Some(0), "the first is reported");
+        assert_eq!(gate.admit(t0 + Duration::from_secs(1)), None);
+        assert_eq!(gate.admit(t0 + Duration::from_secs(9)), None);
+        assert_eq!(
+            gate.admit(t0 + Duration::from_secs(10)),
+            Some(2),
+            "the next, a full interval on, says how many were held back"
+        );
+        assert_eq!(gate.admit(t0 + Duration::from_secs(11)), None);
+        assert_eq!(gate.admit(t0 + Duration::from_secs(60)), Some(1));
+        assert_eq!(gate.admit(t0 + Duration::from_secs(70)), Some(0));
+    }
+
+    /// The `/watch` player tears its WHEP session down on its way out with a
+    /// `DELETE`, the only method its resource answers. It used
+    /// `navigator.sendBeacon`, which can only POST: every tab close got a 405,
+    /// and the session — its socket, its per-IP slot and the media sent to
+    /// it — outlived the viewer.
+    #[test]
+    fn the_watch_player_deletes_its_session_on_the_way_out() {
+        let html = include_str!("player.html");
+        assert!(
+            !html.contains("sendBeacon"),
+            "a beacon is a POST, and the resource takes DELETE"
+        );
+        let teardown = html
+            .split("addEventListener(\"pagehide\"")
+            .nth(1)
+            .expect("the player tears down on pagehide")
+            .split(");\n")
+            .next()
+            .unwrap();
+        assert!(
+            teardown.contains("fetch(resourceUrl")
+                && teardown.contains("method: \"DELETE\"")
+                && teardown.contains("keepalive: true"),
+            "the teardown is a keepalive DELETE of the session resource: {teardown}"
+        );
     }
 }

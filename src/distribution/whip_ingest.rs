@@ -11,7 +11,10 @@
 //! broadcast-quality-gated). Pointing that output at the relay's WHIP ingest
 //! URL is all an operator does — no new edge media path, no new quality gates.
 //! (The QUIC ES ingest in [`super::ingest`] is the future lower-overhead path,
-//! but WHIP-in reuses the proven edge encoder today.)
+//! but WHIP-in reuses the proven edge encoder today.) It does need an edge with
+//! this crate's codec set: every edge released through v0.113.0 panics in its
+//! WHIP output against this ingest's answer — upgrade edges before relays
+//! (`docs/distribution.md`, "Upgrade order").
 //!
 //! For H.264, str0m delivers **one whole depacketized frame per `MediaData`**:
 //! the RTP packets from a partition head up to the marker bit, already Annex
@@ -26,14 +29,21 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::es::{EsFrame, au_is_idr};
+use super::es::{EsFrame, MAX_FRAME_BYTES, au_is_idr};
 use super::hub::DistributionHub;
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
+
+/// The oversized-access-unit warning is logged at most once per this interval
+/// per session, with a count of the units dropped since. A publisher whose
+/// timestamp is stuck trips the cap every 4 MiB it sends.
+const OVERSIZE_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Handle returned once a WHIP ingest offer has been accepted.
 pub struct WhipIngestHandle {
@@ -88,32 +98,61 @@ struct AuAssembler {
     cur_pts: Option<u64>,
     nalus: Vec<u8>,
     keyframe: bool,
+    /// The unit at `cur_pts` went past [`MAX_FRAME_BYTES`] and was dropped;
+    /// the rest of it is discarded until the timestamp moves on.
+    oversized: bool,
+    /// Oversized units dropped since the last warning, and when that was.
+    dropped_since_warn: u64,
+    last_warn: Option<Instant>,
 }
 
 impl AuAssembler {
     fn new(stream_id: String) -> Self {
-        Self { stream_id, cur_pts: None, nalus: Vec::new(), keyframe: false }
+        Self {
+            stream_id,
+            cur_pts: None,
+            nalus: Vec::new(),
+            keyframe: false,
+            oversized: false,
+            dropped_since_warn: 0,
+            last_warn: None,
+        }
     }
 
     /// Push one depacketized frame — Annex B, as str0m emits it, or one bare
     /// NAL. If it opens a new access unit (PTS change), flush the previous AU
     /// first. A payload-less frame (an RTP padding probe) is no part of any
     /// access unit and touches nothing.
+    ///
+    /// An access unit is capped at [`MAX_FRAME_BYTES`], the QUIC ingest's
+    /// frame cap. Nothing is published until the timestamp changes, so a
+    /// publisher — or cascade upstream — whose timestamp stuck used to grow
+    /// this buffer at its send rate until the relay ran out of memory, while
+    /// its viewers got nothing. A unit that would pass the cap is dropped
+    /// whole, and the rest of it with it: publishing its tail would hand
+    /// viewers a fragment.
     fn push(&mut self, hub: &DistributionHub, pts_90k: u64, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        if self.cur_pts.is_some() && self.cur_pts != Some(pts_90k) {
+        if self.cur_pts != Some(pts_90k) {
             self.flush(hub);
+            self.cur_pts = Some(pts_90k);
+            self.oversized = false;
         }
-        self.cur_pts = Some(pts_90k);
+        if self.oversized {
+            return;
+        }
         // Annex B already: append as is. Only a bare NAL is framed — the
         // start code that used to be prefixed to every frame doubled
         // str0m's own. No NAL header byte is zero, so a leading zero is
         // a start code's.
-        if data[0] != 0 {
-            self.nalus.extend_from_slice(&[0, 0, 0, 1]);
+        let framing: &[u8] = if data[0] != 0 { &[0, 0, 0, 1] } else { &[] };
+        if self.nalus.len() + framing.len() + data.len() > MAX_FRAME_BYTES {
+            self.drop_oversized(pts_90k);
+            return;
         }
+        self.nalus.extend_from_slice(framing);
         self.nalus.extend_from_slice(data);
         // Scan the NAL types: the keyframe test used to read `data[0]`,
         // which in Annex B is the start code's first zero, so no WHIP or
@@ -133,6 +172,30 @@ impl AuAssembler {
         hub.publish(&self.stream_id, EsFrame::video(pts, au, self.keyframe));
         self.keyframe = false;
     }
+
+    /// Drop the unit being built at `pts_90k` — it would pass
+    /// [`MAX_FRAME_BYTES`] — and give its buffer back. Warns at most once per
+    /// [`OVERSIZE_WARN_INTERVAL`].
+    fn drop_oversized(&mut self, pts_90k: u64) {
+        self.nalus = Vec::new();
+        self.keyframe = false;
+        self.oversized = true;
+        self.dropped_since_warn += 1;
+        let now = Instant::now();
+        if self
+            .last_warn
+            .is_none_or(|t| now.duration_since(t) >= OVERSIZE_WARN_INTERVAL)
+        {
+            tracing::warn!(
+                "WebRTC ingest for stream '{}': access unit at pts {pts_90k} passed \
+                 {MAX_FRAME_BYTES} bytes on one RTP timestamp; dropped ({} since the last warning)",
+                self.stream_id,
+                self.dropped_since_warn,
+            );
+            self.last_warn = Some(now);
+            self.dropped_since_warn = 0;
+        }
+    }
 }
 
 async fn ingest_loop(
@@ -142,19 +205,23 @@ async fn ingest_loop(
     stream_id: &str,
     session_id: &str,
 ) {
-    // Wait for ICE + DTLS.
-    loop {
-        match session.poll_event(&cancel).await {
-            SessionEvent::Connected => {
-                tracing::info!("WHIP ingest '{session_id}' connected for stream '{stream_id}'");
-                hub.register(stream_id);
-                break;
-            }
-            SessionEvent::Disconnected => {
-                tracing::info!("WHIP ingest '{session_id}' disconnected during setup");
-                return;
-            }
-            _ => continue,
+    // Wait for ICE + DTLS — for `SETUP_DEADLINE` at most; the drop guard in
+    // `create_and_spawn_ingest` then ends the session either way.
+    match await_connected(&mut session, &cancel, SETUP_DEADLINE).await {
+        Setup::Connected => {
+            tracing::info!("WHIP ingest '{session_id}' connected for stream '{stream_id}'");
+            hub.register(stream_id);
+        }
+        Setup::Disconnected => {
+            tracing::info!("WHIP ingest '{session_id}' disconnected during setup");
+            return;
+        }
+        Setup::TimedOut => {
+            tracing::warn!(
+                "WHIP ingest '{session_id}' did not complete ICE + DTLS within \
+                 {SETUP_DEADLINE:?} (stream '{stream_id}'); closing it"
+            );
+            return;
         }
     }
 
@@ -266,6 +333,47 @@ mod tests {
         let f = sub.rx.try_recv().unwrap();
         assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x65, 0x99]);
         assert!(sub.rx.try_recv().is_err(), "and published nothing of its own");
+    }
+
+    /// A publisher whose RTP timestamp sticks — here 100 kB frames, all at
+    /// one pts — cannot grow the unit being built past `MAX_FRAME_BYTES`. The
+    /// oversized unit is dropped whole, its tail included, and the next
+    /// timestamp starts afresh. Before, every frame was appended until the
+    /// timestamp moved: 40 MB on one timestamp grew the relay by 40 MB, and
+    /// the lot was then published as one frame.
+    #[test]
+    fn an_access_unit_is_capped_at_the_frame_limit_and_dropped_whole() {
+        let hub = DistributionHub::new();
+        let mut sub = hub.subscribe("s");
+        let mut asm = AuAssembler::new("s".to_string());
+
+        let slice = vec![0x41u8; 100_000];
+        for _ in 0..(MAX_FRAME_BYTES / slice.len() + 20) {
+            asm.push(&hub, 3000, &slice);
+            assert!(
+                asm.nalus.len() <= MAX_FRAME_BYTES,
+                "buffered {} bytes on one timestamp",
+                asm.nalus.len()
+            );
+        }
+        asm.push(&hub, 6000, &[0, 0, 0, 1, 0x65, 0x88]);
+        asm.flush(&hub);
+        let f = sub.rx.try_recv().expect("the next unit goes out");
+        assert_eq!(
+            (f.pts_90k, f.keyframe),
+            (6000, true),
+            "not the oversized one, nor its tail"
+        );
+        assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65, 0x88]);
+        assert!(sub.rx.try_recv().is_err());
+
+        // A unit of exactly the limit is not oversized.
+        let mut whole = vec![0x65u8];
+        whole.resize(MAX_FRAME_BYTES - 4, 0x11);
+        asm.push(&hub, 9000, &whole);
+        asm.flush(&hub);
+        let f = sub.rx.try_recv().expect("a unit at the limit goes out");
+        assert_eq!(f.data.len(), MAX_FRAME_BYTES);
     }
 
     /// A sender that marks every NAL a frame of its own (bare NALs, one
