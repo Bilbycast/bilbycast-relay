@@ -246,9 +246,25 @@ fn client_no_redirect() -> reqwest::Client {
         .unwrap()
 }
 
-/// `u=<percent-encoded>`, as the page's own form would send it. Built with the
-/// module's encoder so the test cannot disagree with it.
-fn form_body(url: &str) -> String {
+/// The body a browser sends when the page's button is pressed: the hidden
+/// field's value, read out of the HTML and form-urlencoded. The field holds
+/// `[A-Za-z0-9-._~]` and `%XX` escapes only, so encoding it touches nothing but
+/// the `%`.
+fn form_body_from(page: &str) -> String {
+    let (_, rest) = page
+        .split_once("name=\"u\" value=\"")
+        .expect("the page has no hidden field");
+    let (value, _) = rest.split_once('"').unwrap();
+    assert!(
+        !value.contains('&'),
+        "an entity in the hidden field this test does not unescape: {value}"
+    );
+    format!("u={}", value.replace('%', "%25"))
+}
+
+/// A body the page never produced, for the refusals: `wrap` encodes the URL
+/// once, as the email's query does.
+fn forged_body(url: &str) -> String {
     portal::clickthrough::wrap("", url)
         .split_once('?')
         .unwrap()
@@ -257,7 +273,8 @@ fn form_body(url: &str) -> String {
 }
 
 /// A portal that sends password links, for the click-through page below.
-async fn mail_harness(base: &str) -> String {
+/// `public_host` is the host Authelia names in them.
+async fn mail_harness(base: &str, public_host: &str) -> String {
     let mut cfg = PortalConfig {
         listen_addr: "127.0.0.1:0".into(),
         manager_url: "http://127.0.0.1:1".into(),
@@ -265,7 +282,13 @@ async fn mail_harness(base: &str) -> String {
         username_header: "remote-user".into(),
         trusted_proxies: ["127.0.0.1".parse().unwrap()].into_iter().collect(),
         player_origins: Vec::new(),
-        accounts: None,
+        accounts: Some(portal::accounts::AccountSyncConfig {
+            users_file: "/etc/authelia/users.yml".into(),
+            authelia_url: "http://127.0.0.1:9091/auth".into(),
+            public_host: public_host.into(),
+            managed_group: "bilbycast-portal".into(),
+            interval_secs: 15,
+        }),
         mail: Some(portal::mail::MailConfig {
             listen_addr: "127.0.0.1:2525".into(),
             listen_password_file: "/dev/null".into(),
@@ -277,6 +300,7 @@ async fn mail_harness(base: &str) -> String {
             sign_in_url: base.into(),
             click_through_base: None,
             click_through: true,
+            authelia_host: None,
             brand: "Example".into(),
             link_lifetime: None,
             invite_subject: None,
@@ -297,6 +321,36 @@ async fn mail_harness(base: &str) -> String {
     format!("http://{paddr}")
 }
 
+/// Follow an emailed link as its owner would: open it, then press the button.
+/// Returns the page and the answer to the button.
+async fn press_the_button(portal: &str, emailed: &str) -> (String, reqwest::Response) {
+    let query = emailed.split_once('?').unwrap().1;
+    let r = client()
+        .get(format!("{portal}/set-password?{query}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    for (name, want) in [
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+        ("x-frame-options", "DENY"),
+    ] {
+        assert_eq!(r.headers()[name], want, "the page went out without {name}");
+    }
+    let csp = r.headers()["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    let page = r.text().await.unwrap();
+    let r = client_no_redirect()
+        .post(format!("{portal}/set-password"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body_from(&page))
+        .send()
+        .await
+        .unwrap();
+    (page, r)
+}
+
 /// The page an emailed password link points at.
 ///
 /// The whole point is that fetching it does nothing. Mail security opens links
@@ -309,21 +363,11 @@ async fn mail_harness(base: &str) -> String {
 async fn the_set_password_page_is_inert_until_somebody_presses_the_button() {
     let base = "https://watch.portal.example";
     let link = format!("{base}/auth/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc.def");
-    let portal = mail_harness(base).await;
-    let query = portal::clickthrough::wrap(base, &link)
-        .split_once('?')
-        .unwrap()
-        .1
-        .to_string();
+    let portal = mail_harness(base, "watch.portal.example").await;
 
-    // GET: a page, and nothing a crawler can act on.
-    let r = client()
-        .get(format!("{portal}/set-password?{query}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let body = r.text().await.unwrap();
+    // GET: a page, and nothing a crawler can act on. POST, as the browser
+    // sends it: only now does the browser go on to Authelia.
+    let (body, r) = press_the_button(&portal, &portal::clickthrough::wrap(base, &link)).await;
     assert!(
         body.contains("<form method=\"post\""),
         "no button to press: {body}"
@@ -334,35 +378,59 @@ async fn the_set_password_page_is_inert_until_somebody_presses_the_button() {
     );
     assert!(!body.contains("<script"), "the page runs script");
     assert!(
-        !body.contains("reset-password/step2?token="),
+        !body.contains("https://") && !body.contains("reset-password/step2?token="),
         "Authelia's link sits in the markup where a crawler can reach it"
     );
-
-    // POST: only now does the browser go on to Authelia.
-    let r = client_no_redirect()
-        .post(format!("{portal}/set-password"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form_body(&link))
-        .send()
-        .await
-        .unwrap();
     assert_eq!(r.status(), 303, "the button did not redirect");
     assert_eq!(r.headers()["location"], link.as_str());
 
-    // And it is not an open redirect.
+    // And it is not an open redirect, from the page or from a forged button.
     for bad in [
         "https://evil.test/auth/reset-password/step2?token=x",
         "https://watch.portal.example.evil.test/auth/reset-password/step2?token=x",
+        "https://watch.portal.example/api/feeds?next=/reset-password/step2&token=x",
     ] {
+        let r = client()
+            .get(portal::clickthrough::wrap(&portal, bad))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad} was offered a button");
+        assert!(!r.text().await.unwrap().contains("<form"));
+
         let r = client_no_redirect()
             .post(format!("{portal}/set-password"))
             .header("content-type", "application/x-www-form-urlencoded")
-            .body(form_body(bad))
+            .body(forged_body(bad))
             .send()
             .await
             .unwrap();
         assert_eq!(r.status(), 400, "{bad} was followed");
     }
+
+    // A forged value that cannot be a header is a refusal or a clean
+    // redirect, never a 500.
+    let r = client_no_redirect()
+        .post(format!("{portal}/set-password"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(forged_body(&format!("{link}\r\nSet-Cookie: x=1")))
+        .send()
+        .await
+        .unwrap();
+    assert!(matches!(r.status().as_u16(), 303 | 400), "{}", r.status());
+    assert!(r.headers().get("set-cookie").is_none());
+}
+
+/// Authelia on its own login host: the link names that host, the page stays
+/// on the portal's, and the button goes there.
+#[tokio::test]
+async fn the_button_reaches_authelia_on_its_own_host() {
+    let base = "https://watch.portal.example";
+    let link = "https://auth.portal.example/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc";
+    let portal = mail_harness(base, "auth.portal.example").await;
+    let (_, r) = press_the_button(&portal, &portal::clickthrough::wrap(base, link)).await;
+    assert_eq!(r.status(), 303);
+    assert_eq!(r.headers()["location"], link);
 }
 
 #[tokio::test]

@@ -703,33 +703,70 @@ That page:
 * moves on only when somebody presses the button, which is a form `POST`.
 
 It is a bounded defence, not an absolute one: a scanner that submitted forms
-would still spend the link. None of the ones that cause this do.
+would still spend the link, and so would one that decoded the `u` parameter of
+the emailed URL — which carries Authelia's URL percent-encoded — and fetched
+it. None of the ones that cause this do either.
+
+It covers the links the portal asks for, which are the only messages `mail`
+rewrites. A viewer who uses "Reset password" on Authelia's sign-in page gets
+Authelia's own email, relayed unchanged, with Authelia's own link; for someone
+behind that kind of filtering, send the link from the manager instead.
 
 The URL arrives in a query string anybody can write, so the page follows it
-only when it is `click_through_base` plus Authelia's own reset path — otherwise
-this would be an open redirect on your own domain. Anything else answers `400`.
+only when it is Authelia's reset page (`…/reset-password/step2`), over
+`https`, **on `accounts.public_host`** — the host Authelia names in every link
+the portal asks for, whether that is the portal's own host or Authelia's login
+host — with a token and no credentials or fragment. Anything else answers `400`;
+otherwise this would be an open redirect on your own domain. The same check
+runs before the email is written: a link the page would refuse, or a
+`click_through_base` it cannot be served at, is emailed as Authelia wrote it,
+with a warning in the journal naming why, rather than as a link that cannot
+work.
 
-| Key | Default | |
+| `mail` key | Default | |
 |---|---|---|
 | `click_through` | `true` | `false` emails Authelia's own link, as every portal did before this existed. |
-| `click_through_base` | `sign_in_url` | Where this portal answers, e.g. `https://watch.example.com`. |
+| `click_through_base` | `sign_in_url` | Where this portal answers, e.g. `https://watch.example.com`. Must be `https://` with a host and no credentials, query or fragment — the address carries a one-time credential; a trailing `/` is trimmed. Set but unusable, the portal refuses to start; left to default from a `sign_in_url` that is not `https`, the links go out unwrapped, with a warning. |
 
 **Authelia must let that page through unauthenticated** — whoever follows the
-link has no password yet, so there is nobody to authenticate:
+link has no password yet, so there is nobody to authenticate. The rule names
+that one path, anchored, and comes before the portal's own:
 
 ```yaml
 access_control:
+  default_policy: deny
   rules:
     - domain: 'watch.example.com'
       resources:
-        - '^/set-password'
+        - '^/set-password([?].*)?$'
       policy: bypass
     - domain: 'watch.example.com'
+      subject:
+        - 'group:bilbycast-portal'
+        - 'group:portal-staff'
       policy: one_factor
 ```
 
-Without the bypass the link lands on the sign-in page, which is the one place
-its owner cannot get past.
+Without the bypass the link lands on the sign-in page, which the person it was
+sent to cannot get past; they can still use "Reset password" there. The portal
+says what it needs at every start —
+``password links point at the set-password page: Authelia needs a `policy:
+bypass` rule …`` — because it cannot see Authelia's rules for itself.
+
+A bypassed request gets no `Remote-User` from Authelia, which is why the rule
+must name this path and nothing else: the page reads no identity, and every
+other route still needs the header Authelia sets. Point 1 of
+[Putting Authelia in front](#putting-authelia-in-front) — the proxy strips an
+inbound `Remote-User` — matters here as much as anywhere.
+
+**Keep `/set-password` out of the proxy's access log.** Its query carries a
+one-time credential that stays live until the button is pressed or Authelia's
+`jwt_lifespan` runs out, and a scanner's visit no longer spends it. Caddy writes
+no access log unless told to; with a `log` directive, add
+`log_skip /set-password`. On nginx, give it a `location = /set-password` with
+`access_log off;` and the same proxy and auth configuration as the rest — the
+same advice [distribution](distribution.md#risk-of-the-url-borne-form) gives for
+`?token=`.
 
 ### What Authelia needs
 
@@ -915,6 +952,8 @@ around it.
 | `relay_password_file` | required | A file holding the relay password (Brevo's SMTP key). Read once at startup, trimmed. |
 | `from` | required | The From on every rewritten email: `Name <address>`, with the name in double quotes if it contains any of `, ( ) : ; @ [ ] \ "`. Its address must be Authelia's `notifier.smtp.sender` address, and its domain authenticated at the relay. |
 | `sign_in_url` | required | Where a viewer signs in, named in the emails. `http://` or `https://`; a trailing `/` is trimmed. |
+| `click_through` | `true` | Email the portal's own `/set-password` page instead of Authelia's link, so a mail scanner cannot spend it. Needs an Authelia bypass rule — see [the link is not sent for a scanner to open](#the-link-is-not-sent-for-a-scanner-to-open). |
+| `click_through_base` | `sign_in_url` | Where that page is served. `https://` with a host and no credentials, query or fragment; a trailing `/` is trimmed. |
 | `brand` | `Bilbycast` | 1 to 64 characters, one line. Used in "access to *brand* live and recorded video", "your *brand* account", the header bar, the "*brand* Notifications" sign-off and the default subjects. |
 | `link_lifetime` | unset | Up to 64 characters, one line; blank means unset. When set, the emails say "This link lasts *link_lifetime*." — so it must agree with Authelia's `identity_validation.reset_password.jwt_lifespan`, which the portal cannot read. Unset, the emails make no claim about how long the link lasts. |
 | `invite_subject` | `Your <brand> account` | Up to 200 characters, one line; blank means the default. |
@@ -1004,8 +1043,10 @@ display name the manager has for the login (the username when it has none),
 greeting them by it. The invitation says they have been given access to *brand*
 live and recorded video, asks them to choose a password, and tells them to sign
 in at `sign_in_url` "with your email address or your username". The reset says
-somebody asked to reset the password on their *brand* account. Both carry
-Authelia's link unchanged, the lifetime sentence when `link_lifetime` is set,
+somebody asked to reset the password on their *brand* account. Both carry the
+link — inside the address of the portal's
+[set-password page](#the-link-is-not-sent-for-a-scanner-to-open), or Authelia's
+own when `click_through` is `false` — the lifetime sentence when `link_lifetime` is set,
 and sign off "*brand* Notifications". A name or brand is escaped in the HTML,
 and control characters in a name become spaces.
 
@@ -1148,6 +1189,24 @@ leaves it stopped — and the rest decide whether it goes on working as it did:
    [File permissions](#file-permissions). The portal now refuses a write that
    would leave Authelia unable to reach the file, where the earlier build made
    it.
+
+9. **Let the set-password page through Authelia.** With a `mail` block,
+   password links now point at the portal's own `/set-password` page — see
+   [the link is not sent for a scanner to open](#the-link-is-not-sent-for-a-scanner-to-open)
+   — and Authelia must answer that path with `policy: bypass`, in a rule
+   ahead of the portal's own:
+
+   ```yaml
+   - domain: 'watch.example.com'
+     resources:
+       - '^/set-password([?].*)?$'
+     policy: bypass
+   ```
+
+   Without it every new link lands on the sign-in page, and the manager still
+   shows it sent. To keep emailing Authelia's own link instead, set
+   `"click_through": false` in `mail`. `upgrade-relay.sh` prints this reminder
+   for a `mail` block that does not name `click_through`.
 
 Then upgrade, and **restart Authelia once the new portal is running**: the
 earlier listener offered no `AUTH`, so an Authelia configured to authenticate
@@ -1310,3 +1369,5 @@ three hours for a link grant, which cannot renew.
 | `GET /api/clips/download?session=…&name=…` | Hand a finished clip to the viewer, proxied from the relay so no viewer token appears in a link somebody is told to save. Entitlement is re-checked by the same mint the listing uses. |
 | `DELETE /api/clips` | Remove one clip on the viewer's behalf. The body names the session and the clip; the portal mints against the manager as the permission check and deletes on the relay from here, because the page's `connect-src 'self'` never lets the browser reach the origin itself. |
 | `GET /healthz` | Liveness. Deliberately needs no user — a health check that required one would be reporting on the proxy. |
+| `GET /set-password?u=…` | The page an emailed password link points at: a button and nothing else — no link, no script — so a mail scanner that opens it spends nothing. Needs no user, and needs Authelia's `bypass` rule for the path; see [the link is not sent for a scanner to open](#the-link-is-not-sent-for-a-scanner-to-open). `400` for a link the portal would not follow; `404` without `mail` and `accounts`. |
+| `POST /set-password` | The button: `303` to Authelia's reset page, only when the link is that page on `accounts.public_host`; `400` otherwise. |

@@ -166,17 +166,27 @@ pub struct MailConfig {
     pub sign_in_url: String,
 
     /// Where this portal answers, for the page an emailed link points at —
-    /// e.g. `https://watch.example.com`. Defaults to [`sign_in_url`], which is
-    /// the same host in every deployment that has one.
-    ///
-    /// Set `click_through: false` to email Authelia's own link instead. That
-    /// is what every portal did before 0.15.1, and it means a mail scanner
-    /// that opens links spends them before their owner arrives — see
-    /// [`super::clickthrough`].
+    /// e.g. `https://watch.example.com`. Defaults to
+    /// [`sign_in_url`](Self::sign_in_url), which is the portal's address in
+    /// every deployment that has one. Must be `https`: the address carries a
+    /// one-time credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub click_through_base: Option<String>,
+    /// Email the address of the portal's own set-password page rather than
+    /// Authelia's link, so a mail scanner that opens links spends nothing —
+    /// see [`super::clickthrough`]. On unless set to `false`, which emails
+    /// Authelia's own link as the portal did before the page existed. Needs an
+    /// Authelia `bypass` rule for `/set-password`, or the link lands on the
+    /// sign-in page.
     #[serde(default = "default_true")]
     pub click_through: bool,
+    /// Not a config key: the host Authelia names in the links the portal asks
+    /// for, copied from `accounts.public_host` by
+    /// [`PortalConfig::normalise`](super::config::PortalConfig::normalise).
+    /// `None` without `accounts`, when the portal asks for no links and so
+    /// has none to wrap.
+    #[serde(skip)]
+    pub authelia_host: Option<String>,
 
     /// Who the emails say they come from, in their wording and in the default
     /// subjects.
@@ -239,6 +249,12 @@ impl MailConfig {
         self.relay_host = self.relay_host.trim().to_string();
         self.from = self.from.trim().to_string();
         self.sign_in_url = self.sign_in_url.trim().trim_end_matches('/').to_string();
+        self.click_through_base = self
+            .click_through_base
+            .as_deref()
+            .map(|b| b.trim().trim_end_matches('/'))
+            .filter(|b| !b.is_empty())
+            .map(str::to_string);
         self.brand = self.brand.trim().to_string();
         for text in [
             &mut self.link_lifetime,
@@ -308,6 +324,19 @@ impl MailConfig {
         }
         if !self.sign_in_url.starts_with("https://") && !self.sign_in_url.starts_with("http://") {
             return Err("mail.sign_in_url must be an http(s) URL".into());
+        }
+        // Only when set: a `sign_in_url` the page cannot be served at — plain
+        // `http`, say — is the default, and is met at send time by emailing
+        // Authelia's own link with a warning, not by a portal that will no
+        // longer start after an upgrade.
+        if let Some(base) = &self.click_through_base
+            && !super::clickthrough::usable_base(base)
+        {
+            return Err(format!(
+                "mail.click_through_base `{base}` must be an https:// URL with a host and no \
+                 credentials, query or fragment: the set-password page is served under it, and \
+                 its address carries a one-time password link"
+            ));
         }
         one_line("mail.brand", &self.brand, 64)?;
         if let Some(l) = &self.link_lifetime {
@@ -526,8 +555,8 @@ fn clean_name(name: &str) -> String {
 }
 
 /// For everything interpolated into the HTML part, which goes out under our
-/// own domain.
-fn html_escape(s: &str) -> String {
+/// own domain — and into the set-password page, which is served under it.
+pub(super) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -780,11 +809,7 @@ pub async fn handle(
         // The email carries our own page rather than Authelia's link, so that
         // mail security opening it spends nothing — `clickthrough` says why.
         Some(link) => {
-            let link = if cfg.click_through {
-                super::clickthrough::wrap(cfg.click_through_base(), &link)
-            } else {
-                link
-            };
+            let link = super::clickthrough::email_link(cfg, link);
             match rewrite(
                 cfg,
                 pending_entry.kind,
@@ -1458,6 +1483,7 @@ mod tests {
             sign_in_url: "https://watch.portal.example".into(),
             click_through_base: None,
             click_through: true,
+            authelia_host: Some("watch.portal.example".into()),
             brand: default_brand(),
             link_lifetime: None,
             invite_subject: None,
@@ -1837,8 +1863,9 @@ mod tests {
         assert_eq!(message.headers().get_raw("Subject"), Some("Welcome aboard"));
     }
 
-    /// `click_through: false` is the pre-0.15.1 behaviour, kept for a portal
-    /// whose mail nobody scans — and for proving what the default changes.
+    /// `click_through: false` is the behaviour from before the page existed,
+    /// kept for a portal whose mail nobody scans — and for proving what the
+    /// default changes.
     #[tokio::test]
     async fn the_raw_link_can_still_be_emailed_when_asked_for() {
         let mut c = cfg();
@@ -1855,6 +1882,111 @@ mod tests {
         let body = readable(&sent.first().expect("nothing was relayed").1);
         assert!(body.contains("/auth/reset-password/step2?token="), "{body}");
         assert!(!body.contains("/set-password?u="));
+    }
+
+    /// Relay what `handle` sends for one invitation, as the recipient reads it.
+    async fn invitation_with(c: &MailConfig, msg: Incoming) -> String {
+        let pending = PendingLinks::default();
+        let _rx = pending
+            .expect("bea@example.com", LinkKind::Invite, "Bea")
+            .await;
+        let relay = Captured::default();
+        handle(c, &pending, &relay, msg).await.unwrap();
+        let sent = relay.sent.lock().await;
+        readable(&sent.first().expect("nothing was relayed").1)
+    }
+
+    /// Authelia on its own login host, which docs/portal.md describes beside
+    /// Authelia-under-a-path: the link names that host, and the page that
+    /// follows it stays on the portal's.
+    #[tokio::test]
+    async fn a_link_on_authelias_own_host_goes_through_the_portals_page() {
+        let mut c = cfg();
+        c.authelia_host = Some("auth.portal.example".into());
+        let mut msg = authelia_message("bea@example.com");
+        msg.data = String::from_utf8(msg.data)
+            .unwrap()
+            .replace("watch.portal.example/auth", "auth.portal.example")
+            .into_bytes();
+        let body = invitation_with(&c, msg).await;
+        assert!(
+            body.contains(
+                "https://watch.portal.example/set-password?u=https%3A%2F%2Fauth.portal.example%2Freset-password%2Fstep2%3Ftoken%3D"
+            ),
+            "{body}"
+        );
+    }
+
+    /// An email pointing at a page that answers `400` would spend every link,
+    /// not just the ones a scanner reaches — so a link the page would refuse
+    /// goes out as Authelia wrote it.
+    #[tokio::test]
+    async fn a_link_the_page_would_refuse_is_emailed_as_authelia_wrote_it() {
+        let raw = "/auth/reset-password/step2?token=";
+        for break_it in [
+            // Authelia named a host other than `public_host`.
+            (|c: &mut MailConfig| c.authelia_host = Some("auth.portal.example".into()))
+                as fn(&mut MailConfig),
+            // No `accounts`, so no host to hold the link to.
+            |c| c.authelia_host = None,
+            // A sign-in address the page cannot be served at.
+            |c| c.sign_in_url = "http://watch.portal.example".into(),
+        ] {
+            let mut c = cfg();
+            break_it(&mut c);
+            let body = invitation_with(&c, authelia_message("bea@example.com")).await;
+            assert!(body.contains(raw), "{body}");
+            assert!(!body.contains("/set-password?u="), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_page_is_where_click_through_base_says() {
+        let mut c = cfg();
+        c.click_through_base = Some("https://portal.other.example".into());
+        let body = invitation_with(&c, authelia_message("bea@example.com")).await;
+        assert!(
+            body.contains(
+                "https://portal.other.example/set-password?u=https%3A%2F%2Fwatch.portal.example"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("https://watch.portal.example/set-password"));
+    }
+
+    #[test]
+    fn click_through_base_is_tidied_and_must_be_https() {
+        let mut c = cfg();
+        c.click_through_base = Some("  https://portal.other.example/ ".into());
+        c.normalise();
+        assert_eq!(c.click_through_base(), "https://portal.other.example");
+        assert_eq!(c.validate(), Ok(()));
+
+        for blank in ["   ", "/"] {
+            c.click_through_base = Some(blank.into());
+            c.normalise();
+            assert_eq!(c.click_through_base, None, "{blank:?} is unset");
+        }
+        assert_eq!(c.click_through_base(), "https://watch.portal.example");
+
+        for bad in [
+            "https://",
+            "http://portal.other.example",
+            "portal.other.example",
+            "https://portal.other.example/?from=email",
+        ] {
+            let mut c = cfg();
+            c.click_through_base = Some(bad.into());
+            c.normalise();
+            let err = c.validate().expect_err(bad);
+            assert!(err.contains("mail.click_through_base"), "{err}");
+        }
+
+        // The default is not refused for being plain `http`: that is met at
+        // send time, and an upgrade must not stop a portal that started before.
+        let mut c = cfg();
+        c.sign_in_url = "http://watch.portal.example".into();
+        assert_eq!(c.validate(), Ok(()));
     }
 
     #[tokio::test]
@@ -2065,6 +2197,10 @@ mod tests {
         c.listen_password_file = "/etc/bilbycast/portal-mail-listener".into();
         assert_eq!(c.validate(), Ok(()));
         assert_eq!(c.subject(LinkKind::Invite), "Welcome");
+        // A block written before the set-password page existed gets it: the
+        // upgrade notes say so, and say what Authelia then needs.
+        assert!(c.click_through);
+        assert_eq!(c.click_through_base, None);
     }
 
     #[test]

@@ -182,6 +182,10 @@ impl PortalConfig {
         }
         if let Some(m) = &mut self.mail {
             m.normalise();
+            // The set-password page follows a link only to the host Authelia
+            // names in the links the portal asks for — and the portal asks for
+            // them with `X-Forwarded-Host: public_host`.
+            m.authelia_host = self.accounts.as_ref().map(|a| a.public_host.clone());
         }
     }
 
@@ -591,6 +595,37 @@ mod tests {
         c.normalise();
         assert_eq!(c.manager_url, "https://m.example");
         assert_eq!(c.username_header, "remote-user");
+    }
+
+    /// The set-password page holds links to the host Authelia names in them,
+    /// which is `accounts.public_host` — the portal's host or Authelia's own.
+    #[test]
+    fn the_set_password_page_learns_authelias_host_from_accounts() {
+        let mail = serde_json::json!({
+            "relay_host": "127.0.0.1",
+            "relay_username": "u",
+            "relay_password_file": "/dev/null",
+            "listen_password_file": "/dev/null",
+            "from": "Portal <noreply@example.com>",
+            "sign_in_url": "https://watch.example.com",
+        });
+        let mut c = ok();
+        c.mail = Some(serde_json::from_value(mail).unwrap());
+        c.normalise();
+        assert_eq!(c.mail.as_ref().unwrap().authelia_host, None);
+
+        c.accounts = Some(
+            serde_json::from_value(serde_json::json!({
+                "users_file": "/etc/authelia/users.yml",
+                "public_host": " auth.example.com ",
+            }))
+            .unwrap(),
+        );
+        c.normalise();
+        assert_eq!(
+            c.mail.as_ref().unwrap().authelia_host.as_deref(),
+            Some("auth.example.com")
+        );
     }
 
     /// A logout URL that is not a URL would be rendered as a link the viewer

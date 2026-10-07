@@ -16,50 +16,74 @@
 //! * **does nothing on `GET`** beyond rendering HTML — a scanner that fetches
 //!   it, follows it, or renders it with JavaScript spends nothing, because
 //!   there is nothing here to spend;
-//! * carries **no link to Authelia** at all, so there is nothing for a crawler
-//!   to follow; and
+//! * carries **no link to Authelia** in its markup, so there is nothing for a
+//!   crawler to follow; and
 //! * moves on only when somebody **presses the button**, which is a form
 //!   `POST` — the one thing automated link-checking does not do.
 //!
-//! The honest limit: a scanner that submitted forms would still spend the
-//! link. None of the ones that cause this behave that way, and the alternative
-//! — holding link state on disk so the token never leaves this process — buys
-//! little against a scanner that renders *and* clicks, at the cost of state to
-//! keep, expire and lose on a restart.
+//! The honest limits: a scanner that submitted forms would still spend the
+//! link, and so would one that decoded the `u` parameter of the emailed URL
+//! and fetched what it found. None of the ones that cause this behave either
+//! way. The alternative — holding link state on disk so the token never leaves
+//! this process — buys little against a scanner that renders *and* clicks, at
+//! the cost of state to keep, expire and lose on a restart.
+//!
+//! It covers the links the portal asks for, which are the only ones
+//! [`super::mail`] rewrites. A viewer who uses "Reset password" on Authelia's
+//! sign-in page gets Authelia's own email, relayed unchanged.
 //!
 //! # Why the whole URL travels in the query
 //!
 //! Authelia mints the link; the portal only forwards it. Carrying the URL
 //! rather than the token alone means this module needs to know nothing about
-//! Authelia's paths — but it also means the value is attacker-controlled, so
-//! [`permitted`] refuses anything that is not the configured base plus
-//! Authelia's own reset path. Without that check this would be an open
-//! redirect: a link on your own domain that bounces to anywhere.
+//! the path Authelia is served under — but it also means the value is
+//! attacker-controlled, so [`permitted`] parses it and refuses anything that is
+//! not Authelia's reset page on the host Authelia names in its links:
+//! `accounts.public_host`, which is the portal's own host when Authelia sits
+//! under a path there and Authelia's login host otherwise. Without that check
+//! this would be an open redirect: a link on your own domain that bounces to
+//! anywhere.
 
 use super::PortalState;
+use super::mail::{MailConfig, html_escape};
 use axum::extract::{Form, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
+use reqwest::Url;
 use serde::Deserialize;
 
-/// Where the email sends people, under the configured base.
+/// Where the email sends people, under `click_through_base`.
 pub const PATH: &str = "/set-password";
 
-/// The path Authelia serves the real page at. A permitted URL is the
-/// configured base followed by this.
+/// The page Authelia serves the real step at, at the end of whatever path
+/// prefix it is served under.
 const AUTHELIA_RESET_PATH: &str = "/reset-password/step2";
 
-#[derive(Debug, Deserialize)]
-pub struct LinkQuery {
-    /// The Authelia URL, percent-encoded by [`wrap`].
-    #[serde(default)]
-    pub u: String,
+/// Every answer from this route. The page carries a one-time credential in its
+/// own address, so nothing may cache it, frame it or pass that address on, and
+/// it runs nothing: no script, nothing loaded from anywhere. `form-action` is
+/// left out on purpose — browsers apply it to the redirect a form submission
+/// is answered with, and that redirect goes to Authelia's host, which need not
+/// be this one.
+fn guarded() -> [(HeaderName, &'static str); 4] {
+    [
+        (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; \
+             base-uri 'none'",
+        ),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::CACHE_CONTROL, "no-store"),
+        (header::REFERRER_POLICY, "no-referrer"),
+    ]
 }
 
+/// `u`: on the page's query, the Authelia URL as [`wrap`] encoded it; in the
+/// form, the same URL as the page's hidden field holds it.
 #[derive(Debug, Deserialize)]
-pub struct LinkForm {
+pub(super) struct Link {
     #[serde(default)]
-    pub u: String,
+    u: String,
 }
 
 /// The URL to put in an email, for a link that should survive scanning.
@@ -73,32 +97,94 @@ pub fn wrap(base: &str, authelia_link: &str) -> String {
     )
 }
 
+/// The link an email should carry: this page's, when the page would take the
+/// person on to `link` — and Authelia's own otherwise.
+///
+/// Checked here rather than trusted, because an email pointing at a page that
+/// answers `400` is worse than the problem this module exists for: a scanner
+/// spends only *some* links, and that would spend every one. So a link this
+/// page would refuse — Authelia naming a host other than
+/// `accounts.public_host` — or a base this page cannot be reached at goes out
+/// as Authelia wrote it, with a warning naming the reason.
+pub fn email_link(cfg: &MailConfig, link: String) -> String {
+    if !cfg.click_through {
+        return link;
+    }
+    let base = cfg.click_through_base();
+    if !usable_base(base) {
+        tracing::warn!(
+            base,
+            "emailing Authelia's own link: the set-password page is not reachable at an https \
+             address; set mail.click_through_base"
+        );
+        return link;
+    }
+    match cfg.authelia_host.as_deref() {
+        Some(host) if permitted(host, &link).is_some() => wrap(base, &link),
+        host => {
+            tracing::warn!(
+                expected_host = host.unwrap_or("(no accounts block)"),
+                "emailing Authelia's own link: it is not one the set-password page would follow \
+                 — its host should be accounts.public_host"
+            );
+            link
+        }
+    }
+}
+
+/// Can the page be served at `base`? An absolute `https` URL with a host and
+/// nothing a path cannot be appended to: the address carries a one-time
+/// credential, so not in clear.
+pub fn usable_base(base: &str) -> bool {
+    Url::parse(base).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some_and(|h| !h.is_empty())
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.query().is_none()
+            && u.fragment().is_none()
+    })
+}
+
 /// Is this a URL this portal is willing to send somebody to?
 ///
-/// Only the configured base, and only Authelia's reset page under it. Anything
-/// else — another host, another path, a scheme that is not https — is refused,
-/// because the value arrives in a query string anybody can write.
-pub fn permitted(base: &str, url: &str) -> bool {
-    let base = base.trim_end_matches('/');
-    let Some(rest) = url.strip_prefix(base) else {
-        return false;
-    };
-    // `rest` must begin with a path segment, or `base` matched a longer host:
-    // `https://watch.example.com.evil.test/...` starts with the base too.
-    if !rest.starts_with('/') {
-        return false;
-    }
-    rest.contains(AUTHELIA_RESET_PATH) && rest.contains("token=") && !url.contains('"')
+/// Only Authelia's reset page, over `https`, on `authelia_host`
+/// (`accounts.public_host`, the host Authelia names in every link the portal
+/// asks for), carrying a token — and nothing else that could change where it
+/// leads: no credentials, no fragment. The value arrives in a query string
+/// anybody can write, so it is parsed the way the browser will parse it, and
+/// the parsed URL is what the redirect names: there is no second reading of
+/// the string for the two to disagree about.
+pub fn permitted(authelia_host: &str, url: &str) -> Option<Url> {
+    // Parsed through a URL so both sides are compared normalised: case, IDNA
+    // and a default port spelled out in the config.
+    let want = Url::parse(&format!("https://{authelia_host}/")).ok()?;
+    let u = Url::parse(url).ok()?;
+    let ok = u.scheme() == "https"
+        && u.host_str().is_some()
+        && u.host_str() == want.host_str()
+        && u.port() == want.port()
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.fragment().is_none()
+        && u.path().ends_with(AUTHELIA_RESET_PATH)
+        && u.query_pairs().any(|(k, v)| k == "token" && !v.is_empty());
+    ok.then_some(u)
 }
 
 fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 16);
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(b as char)
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                out.push('%');
+                out.push(HEX[usize::from(b >> 4)] as char);
+                out.push(HEX[usize::from(b & 0x0f)] as char);
+            }
         }
     }
     out
@@ -106,62 +192,73 @@ fn percent_encode(s: &str) -> String {
 
 /// The inverse of [`percent_encode`], for the value the page hands back.
 ///
-/// A stray `%` that is not an escape is left alone rather than dropped: the
+/// A `%` not followed by two hex digits is left alone rather than dropped: the
 /// result is checked by [`permitted`] either way, and a mangled URL should
 /// fail that check rather than quietly become a different one.
 fn percent_decode(s: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        char::from(c)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    }
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
-            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(v);
+        let escape = if b[i] == b'%' && i + 2 < b.len() {
+            hex(b[i + 1]).zip(hex(b[i + 2]))
+        } else {
+            None
+        };
+        match escape {
+            Some((hi, lo)) => {
+                out.push((hi << 4) | lo);
                 i += 3;
-                continue;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
             }
         }
-        out.push(b[i]);
-        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
+/// The page is for links the portal asked for, so it exists only where the
+/// portal asks for them: with `mail`, and with `accounts` naming the host
+/// Authelia's links are on.
+fn configured(state: &PortalState) -> Result<(&MailConfig, &str), Response> {
+    state
+        .cfg
+        .mail
+        .as_ref()
+        .and_then(|m| Some((m, m.authelia_host.as_deref()?)))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                guarded(),
+                "this portal does not send password links",
+            )
+                .into_response()
+        })
 }
 
 /// `GET /set-password?u=…` — the page with the button.
 ///
 /// Renders for anybody. It has to: the person it is for has no password yet,
 /// so there is nobody to authenticate. Nothing here reaches Authelia.
-pub async fn page(State(state): State<PortalState>, Query(q): Query<LinkQuery>) -> Response {
-    let Some(mail) = state.cfg.mail.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            "this portal does not send password links",
-        )
-            .into_response();
+pub(super) async fn page(State(state): State<PortalState>, Query(q): Query<Link>) -> Response {
+    let (mail, host) = match configured(&state) {
+        Ok(c) => c,
+        Err(r) => return r,
     };
-    let base = mail.click_through_base();
     let brand = html_escape(&mail.brand);
-    if !permitted(base, &q.u) {
+    let Some(url) = permitted(host, &q.u) else {
         // Deliberately not "that link is wrong": a page that explains how the
         // check works is a page that helps somebody probe it.
         return (
             StatusCode::BAD_REQUEST,
+            guarded(),
             Html(shell(&brand, &format!(
                 "<p style=\"margin:0 0 14px;\">This link is not one {brand} issued, or it has been \
                  altered on its way here.</p><p style=\"margin:0;color:#52606d;font-size:14px;\">\
@@ -169,49 +266,50 @@ pub async fn page(State(state): State<PortalState>, Query(q): Query<LinkQuery>) 
             ))),
         )
             .into_response();
-    }
+    };
     let action = html_escape(PATH);
     // Encoded, not plain: a hidden field holding `https://…/step2?token=…`
     // puts the one-time link back into the markup, where a scanner that
     // scrapes URL-shaped strings — rather than following `<a>` — would find
     // and open it. Encoded, it is not a URL to anything that reads HTML, and
     // `go` decodes it on the way back.
-    let u = html_escape(&percent_encode(&q.u));
-    Html(shell(
-        &brand,
-        &format!(
-            "<p style=\"margin:0 0 20px;\">You are one step from setting your {brand} password.</p>\
-             <form method=\"post\" action=\"{action}\">\
-             <input type=\"hidden\" name=\"u\" value=\"{u}\">\
-             <button type=\"submit\" style=\"display:inline-block;background:#2563eb;color:#ffffff;\
-             border:0;border-radius:8px;padding:13px 24px;font-size:16px;font-weight:600;\
-             cursor:pointer;\">Set your password</button></form>\
-             <p style=\"margin:20px 0 0;color:#52606d;font-size:14px;\">The link works once, so \
-             this page waits for you rather than opening it by itself.</p>"
-        ),
-    ))
-    .into_response()
+    let u = html_escape(&percent_encode(url.as_str()));
+    (
+        guarded(),
+        Html(shell(
+            &brand,
+            &format!(
+                "<p style=\"margin:0 0 20px;\">You are one step from setting your {brand} password.</p>\
+                 <form method=\"post\" action=\"{action}\">\
+                 <input type=\"hidden\" name=\"u\" value=\"{u}\">\
+                 <button type=\"submit\" style=\"display:inline-block;background:#2563eb;color:#ffffff;\
+                 border:0;border-radius:8px;padding:13px 24px;font-size:16px;font-weight:600;\
+                 cursor:pointer;\">Set your password</button></form>\
+                 <p style=\"margin:20px 0 0;color:#52606d;font-size:14px;\">The link works once, so \
+                 this page waits for you rather than opening it by itself.</p>"
+            ),
+        )),
+    )
+        .into_response()
 }
 
 /// `POST /set-password` — the button. Only now does Authelia see the token.
-pub async fn go(State(state): State<PortalState>, Form(f): Form<LinkForm>) -> Response {
-    let Some(mail) = state.cfg.mail.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            "this portal does not send password links",
-        )
-            .into_response();
+pub(super) async fn go(State(state): State<PortalState>, Form(f): Form<Link>) -> Response {
+    let (_, host) = match configured(&state) {
+        Ok(c) => c,
+        Err(r) => return r,
     };
-    let url = percent_decode(&f.u);
-    if !permitted(mail.click_through_base(), &url) {
-        return (
+    match permitted(host, &percent_decode(&f.u)) {
+        // 303: the browser must GET what comes next, whatever this was. The
+        // parsed URL, not the string: it is what `permitted` judged.
+        Some(url) => (guarded(), Redirect::to(url.as_str())).into_response(),
+        None => (
             StatusCode::BAD_REQUEST,
+            guarded(),
             "that is not a link this portal issued",
         )
-            .into_response();
+            .into_response(),
     }
-    // 303: the browser must GET what comes next, whatever this was.
-    Redirect::to(&url).into_response()
 }
 
 /// The page around either message. No link, no script, no auto-submit — the
@@ -237,6 +335,9 @@ mod tests {
     use super::*;
 
     const BASE: &str = "https://watch.example.com";
+    /// `accounts.public_host` for a portal with Authelia under `/auth` on its
+    /// own host.
+    const HOST: &str = "watch.example.com";
     const LINK: &str =
         "https://watch.example.com/auth/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc.def";
 
@@ -256,35 +357,82 @@ mod tests {
     }
 
     #[test]
-    fn only_authelias_reset_page_on_our_own_host_is_followed() {
-        assert!(permitted(BASE, LINK));
+    fn only_authelias_reset_page_on_authelias_host_is_followed() {
+        assert_eq!(permitted(HOST, LINK).unwrap().as_str(), LINK);
         for bad in [
             // Somewhere else entirely.
             "https://evil.test/auth/reset-password/step2?token=x",
-            // The base as a prefix of a longer host — the reason the check
-            // demands a path separator next.
+            // The host as a prefix of a longer one.
             "https://watch.example.com.evil.test/auth/reset-password/step2?token=x",
-            // Our host, but not the page this exists for.
+            // Credentials in front of the host, either way round.
+            "https://watch.example.com@evil.test/auth/reset-password/step2?token=x",
+            "https://evil.test@watch.example.com/auth/reset-password/step2?token=x",
+            // Our host, but not the page this exists for — including one that
+            // only mentions it in the query.
             "https://watch.example.com/api/clips?token=x",
-            // No token to carry.
+            "https://watch.example.com/api/clips?next=/reset-password/step2&token=x",
+            // A fragment, which the page this exists for never carries.
+            "https://watch.example.com/auth/reset-password/step2?token=x#/elsewhere",
+            // No token to carry, or an empty one.
             "https://watch.example.com/auth/reset-password/step2",
-            // Plain HTTP, and a scheme-relative try.
+            "https://watch.example.com/auth/reset-password/step2?token=",
+            // Another port on our host.
+            "https://watch.example.com:8443/auth/reset-password/step2?token=x",
+            // Plain HTTP, a scheme-relative try, and not a URL at all.
             "http://watch.example.com/auth/reset-password/step2?token=x",
             "//watch.example.com/auth/reset-password/step2?token=x",
+            "javascript:alert(1)//watch.example.com/reset-password/step2?token=x",
             "",
         ] {
-            assert!(!permitted(BASE, bad), "{bad} would have been followed");
+            assert!(
+                permitted(HOST, bad).is_none(),
+                "{bad} would have been followed"
+            );
         }
     }
 
+    /// The layout docs/portal.md describes besides Authelia-under-a-path:
+    /// Authelia on its own login host, which is then `public_host` and the host
+    /// of every link — while the page itself stays on the portal's host.
     #[test]
-    fn a_url_that_could_break_out_of_the_hidden_field_is_refused() {
-        // Belt and braces: the value is escaped into the form anyway, but a
-        // quote has no business in a URL we minted.
-        assert!(!permitted(
-            BASE,
-            "https://watch.example.com/auth/reset-password/step2?token=a\"><script>x</script>"
-        ));
+    fn authelia_on_its_own_host_is_followed_there_and_only_there() {
+        let link = "https://auth.example.com/reset-password/step2?token=abc";
+        assert!(permitted("auth.example.com", link).is_some());
+        assert!(permitted(HOST, link).is_none());
+        assert!(permitted("auth.example.com", LINK).is_none());
+        assert!(wrap(BASE, link).starts_with("https://watch.example.com/set-password?u="));
+    }
+
+    #[test]
+    fn the_host_is_compared_as_a_browser_reads_it() {
+        let shouted = "https://WATCH.Example.COM/auth/reset-password/step2?token=x";
+        assert!(permitted("watch.example.com", shouted).is_some());
+        assert!(permitted("Watch.Example.Com", LINK).is_some());
+        assert!(permitted("watch.example.com:443", LINK).is_some());
+        let ported = "https://watch.example.com:8443/auth/reset-password/step2?token=x";
+        assert!(permitted("watch.example.com:8443", ported).is_some());
+    }
+
+    /// What the redirect names is the parsed URL, which never carries a byte a
+    /// `Location` header cannot — so a hostile value is a `400` or a harmless
+    /// `303`, never a `500` or a second header.
+    #[test]
+    fn nothing_permitted_can_break_the_location_header() {
+        for nasty in [
+            "https://watch.example.com/auth/reset-password/step2?token=a\r\nSet-Cookie: x=1",
+            "https://watch.example.com/auth/reset-password/step2?token=a\0b",
+            "https://watch.example.com/auth/reset-password/step2?token=a\u{7f}b\u{1}c",
+            "https://watch.example.com/auth/reset-password/step2?token=a b\"<c>",
+        ] {
+            if let Some(url) = permitted(HOST, nasty) {
+                assert!(
+                    url.as_str().bytes().all(|b| b.is_ascii_graphic()),
+                    "{nasty:?} became {:?}",
+                    url.as_str()
+                );
+                assert!(axum::http::HeaderValue::from_str(url.as_str()).is_ok());
+            }
+        }
     }
 
     #[test]
@@ -292,31 +440,42 @@ mod tests {
         for url in [
             LINK,
             "https://watch.example.com/auth/reset-password/step2?token=a.b-c_d~e",
+            "https://watch.example.com/auth/reset-password/step2?token=a+b/c==&x=%2B",
         ] {
             assert_eq!(percent_decode(&percent_encode(url)), url);
         }
-        // A mangled escape fails `permitted` rather than turning into something
-        // else that might pass it.
-        assert!(!permitted(
-            BASE,
-            &percent_decode("https://watch.example.com/%zz")
-        ));
+        // Anything that is not `%` and two hex digits stays as it was, so a
+        // mangled escape fails `permitted` rather than turning into something
+        // else that might pass it. `u8::from_str_radix` alone would read `+A`
+        // as ten.
+        for kept in ["abc%4", "abc%", "%zz", "%+A", "%-1", "% 1"] {
+            assert_eq!(percent_decode(kept), kept);
+        }
+        assert_eq!(percent_decode("%2b%2B"), "++");
     }
 
     #[test]
-    fn the_page_offers_a_form_and_no_link() {
-        let body = shell(
-            "GRS",
-            "<form method=\"post\" action=\"/set-password\"></form>",
-        );
-        assert!(
-            !body.contains("<a "),
-            "a crawler would follow a link: {body}"
-        );
-        assert!(
-            !body.contains("<script"),
-            "a scanner that runs JS must find nothing to run"
-        );
-        assert!(body.contains("noindex"));
+    fn the_page_is_served_only_at_an_https_address() {
+        for ok in [
+            "https://watch.example.com",
+            "https://watch.example.com/portal",
+        ] {
+            assert!(usable_base(ok), "{ok} refused");
+        }
+        for bad in [
+            "",
+            "/",
+            "https:",
+            "https:/",
+            "https://",
+            "watch.example.com",
+            "http://watch.example.com",
+            "https://u:p@watch.example.com",
+            "https://watch.example.com/?from=email",
+            "https://watch.example.com/#top",
+            "javascript:alert(1)//",
+        ] {
+            assert!(!usable_base(bad), "{bad:?} accepted");
+        }
     }
 }

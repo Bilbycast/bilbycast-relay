@@ -556,6 +556,23 @@ if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
         chmod "$(stat -c '%a' "${PORTAL_BINARY}")" "${PORTAL_BINARY}.new"
         mv -Tf "${PORTAL_BINARY}.new" "${PORTAL_BINARY}"
         refresh_portal_unit "$(find staging -maxdepth 4 -name "${PORTAL_UNIT_NAME}.service" -type f | head -1)"
+        # A `mail` block that does not name `click_through` gets it on, and
+        # the page it emails needs an Authelia rule this script cannot add.
+        # Report, never block — see the distribution notice above.
+        if jq -e '.mail and (.mail | has("click_through") | not)' \
+            /etc/bilbycast/portal.json > /dev/null 2>&1; then
+            echo
+            echo "  This portal rewrites Authelia's mail, and password links now point"
+            echo "  at its own /set-password page so a mail scanner cannot spend them."
+            echo "  Authelia must let that page through before the portal's own rule:"
+            echo "      - domain: '<portal host>'"
+            echo "        resources: ['^/set-password([?].*)?\$']"
+            echo "        policy: bypass"
+            echo "  Without it the links land on the sign-in page. To keep emailing"
+            echo "  Authelia's own link instead, set \"click_through\": false in mail."
+            echo "  See docs/portal.md, \"The link is not sent for a scanner to open\"."
+            echo
+        fi
     elif [[ -n "${PORTAL_BINARY}" && -z "${NEW_PORTAL}" ]]; then
         echo "WARNING: ${PORTAL_UNIT_NAME} is installed but this tarball carries no" >&2
         echo "         portal binary — it ships in the distribution variant. The" >&2

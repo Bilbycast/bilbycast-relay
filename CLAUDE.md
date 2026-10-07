@@ -430,7 +430,17 @@ sync has just asked a link for (matched within `PENDING_TTL`, 30 s) is
 rewritten as an invitation (the manager's `first_link`) or a reset around
 Authelia's own link, then relayed through `relay_host` with `lettre` (STARTTLS
 by default, or `implicit_tls`, which `relay_port: 465` requires). Everything
-else is relayed byte for byte. The listener requires `AUTH PLAIN`/`LOGIN` with
+else is relayed byte for byte. With `click_through` (default on) the link in
+the rewritten email is the portal's own **public, unauthenticated**
+`<click_through_base>/set-password?u=…` (`src/portal/clickthrough.rs`): an inert
+`GET` (a form, no `<a>`, no script) so a mail scanner cannot spend Authelia's
+one-time link, and a `POST` that 303s only to `…/reset-password/step2` over
+https on `accounts.public_host` (copied into `MailConfig::authelia_host` by
+`PortalConfig::normalise`; `permitted` parses with `Url` and the redirect names
+the parsed URL). `email_link` runs the same check before the email is written
+and falls back to Authelia's own link rather than emailing one the page would
+refuse. Needs an Authelia `bypass` rule for `^/set-password([?].*)?$`, which
+the portal cannot see — it says so at startup and `upgrade-relay.sh` reminds. The listener requires `AUTH PLAIN`/`LOGIN` with
 the secret in the **required** `listen_password_file` (≥ 32 chars; Authelia
 gets the same file as
 `AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE`), refuses any envelope sender but
