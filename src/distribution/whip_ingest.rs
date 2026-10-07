@@ -72,8 +72,10 @@ pub async fn create_and_spawn_ingest(
     let loop_stream = stream_id.clone();
     let loop_sid = session_id.clone();
     tokio::spawn(async move {
-        ingest_loop(session, hub, loop_cancel.clone(), &loop_stream, &loop_sid).await;
-        loop_cancel.cancel();
+        // Cancel our own token however this task ends, a panic included, so
+        // the reaper in `whip_ingest_offer` always drops the session record.
+        let _cancel_on_exit = loop_cancel.clone().drop_guard();
+        ingest_loop(session, hub, loop_cancel, &loop_stream, &loop_sid).await;
     });
 
     Ok(WhipIngestHandle { session_id, answer_sdp, cancel })

@@ -1,3 +1,7 @@
 # Vendored browser assets are upstream artefacts - keep them byte-for-byte
 # as published so a checksum against upstream stays meaningful.
 src/distribution/vendor/hls.min.js -text
+
+# SDP fixtures for the WebRTC negotiation tests, two of them captured from real
+# peers. SDP lines end in CRLF on the wire; keep them that way.
+tests/fixtures/webrtc/*.sdp -text

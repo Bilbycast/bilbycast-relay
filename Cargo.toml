@@ -129,9 +129,10 @@ arc-swap = "1.9.2"
 #
 # 0.23.1 -> 0.24.1 at compile time: no code change. The breaking changes miss
 # this crate. `enable_opus` / `enable_pcmu` / ... gained a `use_red` argument
-# (RED, #982), and none of them is called here. `BweKind` variants gained named
-# fields (#1048), but no BWE is configured and `handle_event` ends in
-# `_ => None`. The new `Codec::Red` / `Codec::Tele` variants are not matched,
+# (RED, #982); none of them was called here at the bump, and the codec set
+# below now calls `enable_opus(true, false)`, RED off. `BweKind` variants
+# gained named fields (#1048), but no BWE is configured and `handle_event` ends
+# in `_ => None`. The new `Codec::Red` / `Codec::Tele` variants are not matched,
 # and `MediaKind` is still `Audio | Video`. Every builder, SDP, writer and event
 # call in `distribution::{webrtc::session, whep, whip_ingest, cascade}` keeps
 # its 0.23 signature. The per-media write queue cap rose from 100 to 512 and is
@@ -169,15 +170,26 @@ arc-swap = "1.9.2"
 # reading, the suites in `tests/distribution.rs` (str0m at both ends) and
 # offline SDP probes.
 #
-# Still true on 0.24.1: the built-in H.264 entries are clamped to level 3.1,
-# and `match_h264_score` is byte-identical to 0.23.1, so the level-5.1 block in
-# `WebrtcSession::new` stays. KNOWN DEFECT, which predates this bump and is
-# unchanged by it: that block makes `accept_offer` panic ("Pt locked multiple
-# times: 102") on a recvonly or sendrecv offer whose H.264 PT matches both a
-# built-in entry and an extra. A browser WHEP offer is one. It reproduces on
-# 0.23.1 and 0.24.1. Tests miss it because their "browser" is another
-# `WebrtcSession` with the same extras. It is not fixed here because a fix
-# changes the answer SDP and needs its own interop run.
+# Codec set. str0m 0.24.1's built-in H.264 entries are still level 3.1, so
+# `WebrtcSession::new` re-registers them at level 5.1: Opus (no RED) plus those
+# seven entries with the same PT, RTX PT, packetization mode and profile
+# (`H264_LEVEL_5_1` in `webrtc/session.rs`), and no other codec. It used to
+# keep str0m's whole default set and add four level-5.1 H.264 extras. Since
+# 0.22 (#1016) an H.264 level mismatch only lowers the match score, so an
+# offered PT matched a built-in entry and an extra alike; wherever the remote
+# dictates the PTs (a recvonly or sendrecv offer, a recvonly answer to our
+# sendonly offer) str0m locked it twice and panicked ("Pt locked multiple
+# times: 102") — every Chrome WHEP viewer. The default set also put VP8 first,
+# so between two `WebrtcSession`s `get_pt` sent H.264 on PT 96, labelled VP8.
+# What changes on the wire: answers list only the H.264 (+ RTX) PTs the offer
+# gave H.264, with our level 5.1, and only Opus for audio; our offers list only
+# those seven H.264 entries and Opus. bilbycast-edge registers the identical
+# set, because its WHIP output negotiates with this crate's WHIP ingest. Tested
+# in `tests/distribution.rs` against a captured Chrome 124 WHEP offer, a
+# captured Chrome publisher offer, an ffmpeg 8.1-shaped WHIP offer and
+# single-PT answers; not yet re-run live against a browser. A negotiation
+# panic str0m still has (an offer whose one RTX PT repairs two H.264 PTs) is
+# caught in `webrtc::session::negotiate` and fails that one request.
 #
 # KNOWN GAP, also predating this bump: unlike bilbycast-edge, this crate
 # carries no `[patch.crates-io]` and no vendored `is`, so it builds against

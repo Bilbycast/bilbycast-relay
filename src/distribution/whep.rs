@@ -74,19 +74,22 @@ pub async fn create_and_spawn_viewer(
     let loop_stream = stream_id.clone();
     let loop_sid = session_id.clone();
     tokio::spawn(async move {
+        // Cancel our own token however this task ends — natural exit (viewer
+        // disconnect / ingest gone) or a panic unwinding out of str0m — so any
+        // lifecycle watcher (the per-IP reaper, the session registry cleanup)
+        // fires on explicit DELETE, natural end and a crash alike. A plain
+        // `cancel()` after the loop is skipped by a panic, and the viewer's
+        // per-IP slot leaked with it.
+        let _cancel_on_exit = loop_cancel.clone().drop_guard();
         viewer_loop(
             session,
             subscription,
-            loop_cancel.clone(),
+            loop_cancel,
             &loop_stream,
             &loop_sid,
             &events,
         )
         .await;
-        // Cancel our own token on natural exit (viewer disconnect / ingest
-        // gone) so any lifecycle watcher — the per-IP reaper, the session
-        // registry cleanup — fires on both explicit DELETE and natural end.
-        loop_cancel.cancel();
     });
 
     Ok(ViewerHandle { session_id, answer_sdp, cancel })
