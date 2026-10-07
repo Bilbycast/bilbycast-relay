@@ -766,8 +766,8 @@ what it needs at every start —
 bypass` rule …`` — because it cannot see Authelia's rules for itself.
 
 A bypassed request gets no `Remote-User` from Authelia, which is why the rule
-must name this path and nothing else: the page reads no identity, and every
-other route still needs the header Authelia sets. Point 1 of
+must name this path and nothing else: the page reads no identity, and everything
+else must stay behind Authelia. Point 1 of
 [Putting Authelia in front](#putting-authelia-in-front) — the proxy strips an
 inbound `Remote-User` — matters here as much as anywhere.
 
