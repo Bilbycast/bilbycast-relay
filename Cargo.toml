@@ -137,17 +137,16 @@ arc-swap = "1.9.2"
 # its 0.23 signature. The per-media write queue cap rose from 100 to 512 and is
 # now ordered by send time; we drain after every write, so it holds one entry.
 #
-# 0.23.1 -> 0.24.1 in behaviour. All of these are upstream defaults; none is
-# overridden here.
-# - Receive reordering now has a deadline (#1041/#1057): 2 s for video, 1 s for
-#   audio. An incomplete frame at the head of the buffer now holds every later
-#   frame until it completes or expires. Before, 30 complete video frames (15
-#   audio) queued behind it released it, about 1 s at 30 fps. This reaches WHIP
-#   ingest and the cascade pull: when a packet is lost and the publisher offers
-#   no NACK/RTX, video stalls for up to 2 s and is then released in a burst.
-#   `RtcConfig::set_reordering_timeout_{video,audio}(None)` restores count-only
-#   release. It is deliberately not set here; that decision is shared with the
-#   edge.
+# 0.23.1 -> 0.24.1 in behaviour. All but the first are upstream defaults left
+# as they are.
+# - Receive reordering now has a deadline by default (#1041/#1057): 2 s for
+#   video, 1 s for audio. An incomplete frame at the head of the buffer holds
+#   every later frame until it completes or expires, where 30 complete video
+#   frames (15 audio) queued behind it used to release it, about 1 s at 30 fps.
+#   On WHIP ingest and the cascade pull, a packet lost by a publisher with no
+#   NACK/RTX stalled video 2.03 s instead of 1.02 s (measured). So
+#   `WebrtcSession::new` sets `set_reordering_timeout_{video,audio}(None)`,
+#   restoring count-only release exactly, as the edge does.
 # - transport-cc is negotiated per payload type: an answer carries
 #   `a=rtcp-fb:<pt> transport-cc` only for a PT the offer gave it to. Checked
 #   against `WebrtcSession::accept_offer`: the answer to an ffmpeg-shaped WHIP
