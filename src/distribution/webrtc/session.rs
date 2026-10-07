@@ -92,11 +92,11 @@ pub struct SessionConfig {
 /// **Why this exists.** ICE-Lite mints a *peer-reflexive* remote candidate from
 /// any STUN Binding Request that carries a correct MESSAGE-INTEGRITY, and — in
 /// lite mode — marks the resulting pair nominated the instant the request sets
-/// USE-CANDIDATE (`is-0.11.0/src/agent.rs`: `pair.nominate(self.ice_lite)`
+/// USE-CANDIDATE (`is-0.11.1/src/agent.rs`: `pair.nominate(self.ice_lite)`
 /// forces `NominationState::Success`, then `evaluate_nomination` picks the
 /// highest-**PRIORITY** nominated pair — and PRIORITY is an attribute the
 /// sender chooses). str0m then routes every DTLS/SRTP transmit to that pair's
-/// address (`str0m-0.22.0/src/lib.rs`, the `send_addr` branch of
+/// address (`str0m-0.24.1/src/lib.rs`, the `send_addr` branch of
 /// `poll_output`).
 ///
 /// The relay hands its ICE ufrag/pwd to whoever POSTs a WHEP offer, in the 201
@@ -494,10 +494,10 @@ impl WebrtcSession {
 
     /// Drain str0m's pending output queue, sending any queued UDP transmits
     /// to the wire. This MUST be called between consecutive `write_media`
-    /// calls — str0m queues writes in `to_payload` (cap 100) and only
-    /// drains them via `handle_timeout`, which is reached from a
-    /// `Output::Timeout` poll cycle. Without this drain, the inner H.264
-    /// fragmentation loop overflows the queue after 100 writes and every
+    /// calls — str0m queues writes in `to_payload` (cap 512 since str0m
+    /// 0.24; 100 before) and only drains them via `handle_timeout`, which is
+    /// reached from a `Output::Timeout` poll cycle. Without this drain, the
+    /// inner H.264 fragmentation loop overflows the queue at the cap and every
     /// subsequent `write_media` returns `Err("Consecutive calls to write()
     /// without poll_output() in between")`. We feed an `Input::Timeout`
     /// so the per-write payload queue is processed eagerly. Cheap when

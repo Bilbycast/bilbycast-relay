@@ -114,25 +114,82 @@ arc-swap = "1.9.2"
 # is str0m (same as bilbycast-edge) with the OpenSSL DTLS backend — the pure-Rust
 # dimpl DTLS stalls on localhost active↔passive handshakes (see edge Cargo.toml).
 [dependencies.str0m]
-# 0.23.1, moved in lockstep with bilbycast-edge (both ends of a WHEP session
-# must agree). 0.23.0 -> 0.23.1 is a dependency-only patch: `sctp-proto`
-# ^0.10.3 -> ^0.10.4, nothing else in the index entry moves. 0.22 -> 0.23 is API-only and reaches nothing here: the three
-# upstream changes (`DirectApi::send_pli_feedback` #1025, the RRTR -> DLRR
-# responder #1022, the RRTR originator-SSRC fix #1027) are additive or private,
-# and `src/media/` + `src/rtc.rs` are untouched. The last change that DID reach
-# this crate remains `MediaData.data` becoming `Arc<[u8]>` in 0.20 — see
-# `distribution::webrtc::session`. Full audit of 0.20/0.21/0.22/0.23 lives in
-# bilbycast-edge/Cargo.toml under `[dependencies.str0m]`.
+# 0.24.1, moved in lockstep with bilbycast-edge (both ends of a WHEP session
+# must agree). The lockfile moves `str0m` 0.23.1 -> 0.24.1 and `is` 0.11.0 ->
+# 0.11.1 and nothing else: `dimpl` 0.7.4 and `sctp-proto` 0.10.5 already met
+# the raised floors. MSRV is still 1.85.0, and the `openssl` / `vendored`
+# features are unchanged, so `viewer-distribution-vendored` still unifies
+# str0m's OpenSSL into the static build. Earlier steps are audited in
+# bilbycast-edge/Cargo.toml; the last change that needed code here is still
+# `MediaData.data` becoming `Arc<[u8]>` in 0.20.
 #
-# KNOWN GAP, pre-dating this bump: unlike bilbycast-edge, this crate carries no
-# `[patch.crates-io]` and no vendored `is`, so it builds against upstream's
-# strict ICE parser and its WHIP ingest REJECTS Binding Requests with no
-# PRIORITY attribute — which is what ffmpeg's WHIP muxer sends. An ffmpeg
-# publisher can therefore feed the edge but not this relay's WHIP ingest. The
-# earlier "in lockstep with bilbycast-edge" comment here was never true of the
-# `is` patchlevel. Fixing it means vendoring `is` here too (or upstreaming the
-# permissive parser); tracked separately so it gets its own interop run.
-version = "0.23.1"
+# Correction: 0.23.0 -> 0.23.1 was not dependency-only, as this note used to
+# say. It also shipped #1029, bounds checks on malformed SRTP/SRTCP/RTCP/SCTP
+# input — parse hardening with nothing to adapt.
+#
+# 0.23.1 -> 0.24.1 at compile time: no code change. The breaking changes miss
+# this crate. `enable_opus` / `enable_pcmu` / ... gained a `use_red` argument
+# (RED, #982), and none of them is called here. `BweKind` variants gained named
+# fields (#1048), but no BWE is configured and `handle_event` ends in
+# `_ => None`. The new `Codec::Red` / `Codec::Tele` variants are not matched,
+# and `MediaKind` is still `Audio | Video`. Every builder, SDP, writer and event
+# call in `distribution::{webrtc::session, whep, whip_ingest, cascade}` keeps
+# its 0.23 signature. The per-media write queue cap rose from 100 to 512 and is
+# now ordered by send time; we drain after every write, so it holds one entry.
+#
+# 0.23.1 -> 0.24.1 in behaviour. All of these are upstream defaults; none is
+# overridden here.
+# - Receive reordering now has a deadline (#1041/#1057): 2 s for video, 1 s for
+#   audio. An incomplete frame at the head of the buffer now holds every later
+#   frame until it completes or expires. Before, 30 complete video frames (15
+#   audio) queued behind it released it, about 1 s at 30 fps. This reaches WHIP
+#   ingest and the cascade pull: when a packet is lost and the publisher offers
+#   no NACK/RTX, video stalls for up to 2 s and is then released in a burst.
+#   `RtcConfig::set_reordering_timeout_{video,audio}(None)` restores count-only
+#   release. It is deliberately not set here; that decision is shared with the
+#   edge.
+# - transport-cc is negotiated per payload type: an answer carries
+#   `a=rtcp-fb:<pt> transport-cc` only for a PT the offer gave it to. Checked
+#   against `WebrtcSession::accept_offer`: the answer to an ffmpeg-shaped WHIP
+#   offer carried it on 0.23.1 and drops it on 0.24.1. Chrome and str0m peers
+#   offer it, so their answers keep it. Nothing here runs BWE.
+# - SSRC-0 bandwidth probes no longer re-arm an immediate RTCP timeout (#1052),
+#   which could spin the session loop on Chrome WHIP ingest.
+# - An offer's `a=msid:-` is no longer echoed in the answer (#1060), and stopped
+#   m-lines carry no msid or ssrc lines (#1063). RED and telephone-event are
+#   opt-in, so answers are otherwise unchanged.
+# - `is` 0.11.1 matches the transport protocol when it invalidates a candidate
+#   (#1035). A controlled ICE-lite agent now marks a pair Succeeded when it
+#   answers a Binding Request (#1039). Only `has_viable_remote_candidate` /
+#   `Rtc::accepts` read that state, and neither is called here; controlled-side
+#   `evaluate_nomination` still ranks by nomination. `PeerPin` is unaffected.
+#
+# Not verified live: nothing above has been run against a real browser, ffmpeg
+# or OBS peer, or across a 0.23 edge talking to a 0.24 relay (0.24 enables no
+# new wire feature by default, so that should work). The evidence is source
+# reading, the suites in `tests/distribution.rs` (str0m at both ends) and
+# offline SDP probes.
+#
+# Still true on 0.24.1: the built-in H.264 entries are clamped to level 3.1,
+# and `match_h264_score` is byte-identical to 0.23.1, so the level-5.1 block in
+# `WebrtcSession::new` stays. KNOWN DEFECT, which predates this bump and is
+# unchanged by it: that block makes `accept_offer` panic ("Pt locked multiple
+# times: 102") on a recvonly or sendrecv offer whose H.264 PT matches both a
+# built-in entry and an extra. A browser WHEP offer is one. It reproduces on
+# 0.23.1 and 0.24.1. Tests miss it because their "browser" is another
+# `WebrtcSession` with the same extras. It is not fixed here because a fix
+# changes the answer SDP and needs its own interop run.
+#
+# KNOWN GAP, also predating this bump: unlike bilbycast-edge, this crate
+# carries no `[patch.crates-io]` and no vendored `is`, so it builds against
+# upstream's strict ICE parser (`stun.rs` is byte-identical in 0.11.1). Its
+# WHIP ingest therefore REJECTS Binding Requests with no PRIORITY attribute,
+# which is what ffmpeg 8.0.x (n8.0 to n8.0.3) sends. ffmpeg 8.1 and later send
+# PRIORITY (upstream 7fd967c2c1) and are accepted. Vendoring a permissive parser
+# here would also have to replace the unguarded `.expect("STUN request prio")`
+# in `is`'s `stun_server_handle_message`, which such a request would then
+# reach.
+version = "0.24.1"
 optional = true
 default-features = false
 features = ["openssl"]
