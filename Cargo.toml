@@ -34,7 +34,7 @@ rustls-pemfile = "2.2.0"
 rcgen = "0.14.10"
 
 # Async runtime
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.2", features = ["full"] }
 
 # Direct socket-option control for IPV6_V6ONLY on dual-stack QUIC + REST listeners.
 socket2 = "0.6.5"
@@ -92,7 +92,7 @@ futures-util = "0.3.34"
 chrono = { version = "0.4.45", features = ["serde"] }
 
 # Utilities
-uuid = { version = "1.26.1", features = ["v4", "serde"] }
+uuid = { version = "1.27.0", features = ["v4", "serde"] }
 anyhow = "1.0.104"
 bytes = "1.12.1"
 
