@@ -302,6 +302,7 @@ async fn mail_harness(base: &str, public_host: Option<&str>) -> String {
             click_through_base: None,
             click_through: true,
             authelia_host: None,
+            authelia_prefix: String::new(),
             brand: "Example".into(),
             link_lifetime: None,
             invite_subject: None,
@@ -422,7 +423,9 @@ async fn the_set_password_page_is_inert_until_somebody_presses_the_button() {
         assert_eq!(r.status(), 400, "{bad} was followed");
         assert_guarded(&r);
     }
-    assert_guarded(&press(&portal, forged_body(&link)).await);
+    let r = press(&portal, forged_body(&link)).await;
+    assert_eq!(r.status(), 303);
+    assert_guarded(&r);
 
     // A forged value that cannot be a header is a refusal or a clean
     // redirect, never a 500.

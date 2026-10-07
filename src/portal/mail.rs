@@ -188,6 +188,11 @@ pub struct MailConfig {
     /// has none to wrap.
     #[serde(skip)]
     pub authelia_host: Option<String>,
+    /// Not a config key either: the path Authelia is served under on that
+    /// host (`/auth`, or empty at its root), from `accounts.authelia_url` —
+    /// so startup can tell whether `/set-password` beside it is the portal's.
+    #[serde(skip)]
+    pub authelia_prefix: String,
 
     /// Who the emails say they come from, in their wording and in the default
     /// subjects.
@@ -1485,6 +1490,7 @@ mod tests {
             click_through_base: None,
             click_through: true,
             authelia_host: Some("watch.portal.example".into()),
+            authelia_prefix: "/auth".into(),
             brand: default_brand(),
             link_lifetime: None,
             invite_subject: None,

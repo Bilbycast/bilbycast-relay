@@ -119,6 +119,44 @@ pub fn email_link(cfg: &MailConfig, link: String) -> String {
 }
 
 fn through_the_page(cfg: &MailConfig, link: &str) -> Result<String, String> {
+    let host = cfg
+        .authelia_host
+        .as_deref()
+        .ok_or("no accounts block names the host Authelia's links are on")?;
+    let url = permitted(host, link).ok_or_else(|| refusal(host, link))?;
+    // The link's own prefix, not the configured one: it is where Authelia
+    // really is.
+    let prefix = url
+        .path()
+        .strip_suffix(AUTHELIA_RESET_PATH)
+        .unwrap_or_default();
+    let page = page_for(cfg, &url, prefix)?;
+    Ok(wrap(page.as_str(), link))
+}
+
+/// What the portal can tell at startup: `None` when it wraps no links at all
+/// (`click_through` off, or no `accounts` to ask for any), else the page's
+/// address or why links will go out as Authelia wrote them. [`email_link`]
+/// decides again on each send, with the link itself to go on.
+pub fn page_at_startup(cfg: &MailConfig) -> Option<Result<String, String>> {
+    if !cfg.click_through {
+        return None;
+    }
+    let host = cfg.authelia_host.as_deref()?;
+    let Ok(authelia) = Url::parse(&format!("https://{host}/")) else {
+        return Some(Err(format!("accounts.public_host `{host}` is not a host")));
+    };
+    Some(
+        page_for(cfg, &authelia, &cfg.authelia_prefix)
+            .map(|page| format!("{}{PATH}", page.as_str().trim_end_matches('/'))),
+    )
+}
+
+/// Where the page is served, given where Authelia's links are — or why it
+/// cannot be. Under a path prefix (`/auth`) the rest of Authelia's host is the
+/// portal's; at the root of the page's host, `/set-password` would be
+/// Authelia's.
+fn page_for(cfg: &MailConfig, authelia: &Url, prefix: &str) -> Result<Url, String> {
     let base = cfg.click_through_base();
     let page = origin(base).ok_or_else(|| {
         format!(
@@ -126,39 +164,39 @@ fn through_the_page(cfg: &MailConfig, link: &str) -> Result<String, String> {
              set mail.click_through_base"
         )
     })?;
-    let host = cfg
-        .authelia_host
-        .as_deref()
-        .ok_or("no accounts block names the host Authelia's links are on")?;
-    let url = permitted(host, link).ok_or_else(|| {
-        let named = Url::parse(link)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| "no host".into());
-        format!(
-            "the link names {named}, and the page follows links only to accounts.public_host {host}"
-        )
-    })?;
-    if served_by_authelia(&page, &url) {
+    if same_host(&page, authelia) && prefix.is_empty() {
         return Err(format!(
-            "{base}{PATH} would be Authelia's: it is served at the root of that host. Set \
-             mail.click_through_base (or sign_in_url) to the portal's own address"
+            "{base}{PATH} would be Authelia's, whose links are at the root of that host. Either \
+             sign_in_url (or mail.click_through_base) names Authelia's host — set it to the \
+             portal's own address — or Authelia's links are missing its path prefix: \
+             accounts.authelia_url must carry the path of Authelia's server.address"
         ));
     }
-    Ok(wrap(base, link))
+    Ok(page)
 }
 
-/// Would `{page}/set-password` reach Authelia rather than this portal? Only
-/// when they share a host and Authelia is served at its root — under a path
-/// prefix (`/auth`), the rest of the host is the portal's.
-fn served_by_authelia(page: &Url, link: &Url) -> bool {
-    let prefix = link
-        .path()
-        .strip_suffix(AUTHELIA_RESET_PATH)
-        .unwrap_or_default();
-    page.host_str() == link.host_str()
-        && page.port() == link.port()
-        && (prefix.is_empty() || PATH.starts_with(&format!("{prefix}/")))
+/// Why [`permitted`] refused a link Authelia mailed — never the link itself,
+/// which carries the token.
+fn refusal(host: &str, link: &str) -> String {
+    let want = Url::parse(&format!("https://{host}/")).ok();
+    match Url::parse(link) {
+        Ok(u) if want.as_ref().is_some_and(|w| same_host(&u, w)) => format!(
+            "the link is on {host} but is not Authelia's reset page as the portal expects it: \
+             https, …{AUTHELIA_RESET_PATH} with a token, no credentials or fragment, at most \
+             {MAX_LINK_LEN} bytes"
+        ),
+        Ok(u) => format!(
+            "the link names {}, and the page follows links only to accounts.public_host {host}",
+            u.host_str().unwrap_or("no host")
+        ),
+        Err(_) => "the link is not a URL".into(),
+    }
+}
+
+/// Host and port, compared as parsed: case, IDNA and a default port spelled
+/// out make no difference.
+fn same_host(a: &Url, b: &Url) -> bool {
+    a.host_str().is_some() && a.host_str() == b.host_str() && a.port() == b.port()
 }
 
 /// Can the page be served at `base`? An `https` address of a host alone: the
@@ -204,9 +242,7 @@ pub fn permitted(authelia_host: &str, url: &str) -> Option<Url> {
     let want = Url::parse(&format!("https://{authelia_host}/")).ok()?;
     let u = Url::parse(url).ok()?;
     let ok = u.scheme() == "https"
-        && u.host_str().is_some()
-        && u.host_str() == want.host_str()
-        && u.port() == want.port()
+        && same_host(&u, &want)
         && u.username().is_empty()
         && u.password().is_none()
         && u.fragment().is_none()
@@ -448,19 +484,82 @@ mod tests {
         assert!(wrap(BASE, link).starts_with("https://watch.example.com/set-password?u="));
     }
 
-    /// Authelia at the root of the host the page would be on owns
-    /// `/set-password` there too; under a path prefix it does not.
+    /// What startup can say, and that it agrees with what a send then does.
     #[test]
-    fn a_page_on_authelias_own_host_is_noticed() {
-        let at_root = Url::parse("https://auth.example.com/reset-password/step2?token=x").unwrap();
-        let under_auth = Url::parse(LINK).unwrap();
-        let portal = origin(BASE).unwrap();
-        let authelias = origin("https://auth.example.com").unwrap();
-        assert!(served_by_authelia(&authelias, &at_root));
-        assert!(!served_by_authelia(&portal, &at_root));
-        assert!(!served_by_authelia(&portal, &under_auth));
-        let elsewhere = origin("https://auth.example.com:8443").unwrap();
-        assert!(!served_by_authelia(&elsewhere, &at_root));
+    fn startup_says_what_the_sends_will_do() {
+        fn mail(sign_in: &str, host: Option<&str>, prefix: &str) -> MailConfig {
+            let mut m: MailConfig = serde_json::from_value(serde_json::json!({
+                "relay_host": "127.0.0.1",
+                "relay_username": "u",
+                "relay_password_file": "/dev/null",
+                "from": "Portal <noreply@example.com>",
+                "sign_in_url": sign_in,
+            }))
+            .unwrap();
+            m.authelia_host = host.map(str::to_string);
+            m.authelia_prefix = prefix.into();
+            m
+        }
+        let at = |link: &str, m: &MailConfig| {
+            email_link(m, link.into()).starts_with("https://watch.example.com/set-password?u=")
+        };
+
+        // Authelia under `/auth` on the portal's host.
+        let m = mail(BASE, Some(HOST), "/auth");
+        assert_eq!(
+            page_at_startup(&m),
+            Some(Ok("https://watch.example.com/set-password".into()))
+        );
+        assert!(at(LINK, &m));
+
+        // Authelia at the root of its own host.
+        let own = "https://auth.example.com/reset-password/step2?token=x";
+        let m = mail(BASE, Some("auth.example.com"), "");
+        assert!(matches!(page_at_startup(&m), Some(Ok(_))));
+        assert!(at(own, &m));
+
+        // ...and a sign-in address naming that host: `/set-password` there is
+        // Authelia's, so neither says the page is used.
+        let m = mail("https://auth.example.com", Some("auth.example.com"), "");
+        let why = page_at_startup(&m).unwrap().unwrap_err();
+        assert!(why.contains("would be Authelia's"), "{why}");
+        assert_eq!(email_link(&m, own.into()), own);
+
+        // Authelia's links missing the path it is served under: on the
+        // portal's host with no prefix, `/set-password` would be Authelia's.
+        let m = mail(BASE, Some(HOST), "");
+        assert!(matches!(page_at_startup(&m), Some(Err(_))));
+        assert!(!at(
+            "https://watch.example.com/reset-password/step2?token=x",
+            &m
+        ));
+
+        // A base the page cannot be served at.
+        let m = mail("https://watch.example.com/portal", Some(HOST), "/auth");
+        assert!(matches!(page_at_startup(&m), Some(Err(_))));
+        assert_eq!(email_link(&m, LINK.into()), LINK);
+
+        // Nothing to say: no `accounts`, or click-through off.
+        assert_eq!(page_at_startup(&mail(BASE, None, "")), None);
+        let mut m = mail(BASE, Some(HOST), "/auth");
+        m.click_through = false;
+        assert_eq!(page_at_startup(&m), None);
+    }
+
+    /// The warning names the check a link failed, and never the token.
+    #[test]
+    fn a_refusal_says_why_without_the_token() {
+        let foreign = refusal(
+            HOST,
+            "https://evil.test/auth/reset-password/step2?token=SECRET",
+        );
+        assert!(foreign.contains("names evil.test"), "{foreign}");
+        let long = format!("{LINK}{}", "A".repeat(MAX_LINK_LEN));
+        let ours = refusal(HOST, &long);
+        assert!(ours.contains("is on watch.example.com but"), "{ours}");
+        for why in [foreign, ours, refusal(HOST, "not a url")] {
+            assert!(!why.contains("SECRET") && !why.contains("eyJ"), "{why}");
+        }
     }
 
     #[test]

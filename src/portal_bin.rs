@@ -153,24 +153,20 @@ fn start_mail(mail: MailConfig, links: Arc<PendingLinks>) -> anyhow::Result<Join
     // page needs: an Authelia rule that lets it through. Without that rule a
     // link lands on the sign-in page, and the manager is still told "sent".
     // Without `accounts` the portal asks for no links, so there is nothing to
-    // say.
-    let base = mail.click_through_base();
-    if mail.click_through && mail.authelia_host.is_some() {
-        if portal::clickthrough::usable_base(base) {
-            tracing::info!(
-                page = %format!("{base}{}", portal::clickthrough::PATH),
-                "password links point at the set-password page: Authelia needs a `policy: \
-                 bypass` rule for `^/set-password([?].*)?$` ahead of the portal's own, or they \
-                 land on the sign-in page"
-            );
-        } else {
-            tracing::warn!(
-                base,
-                "password links go out as Authelia wrote them, where a mail scanner can spend \
-                 them: the set-password page needs the portal's https address, a host alone; \
-                 set mail.click_through_base"
-            );
-        }
+    // say. The same conditions decide each send, so this cannot promise a
+    // page the sends then do not use.
+    match portal::clickthrough::page_at_startup(&mail) {
+        None => {}
+        Some(Ok(page)) => tracing::info!(
+            page,
+            "password links point at the set-password page: Authelia needs a `policy: bypass` \
+             rule for `^/set-password([?].*)?$` ahead of the portal's own, or they land on the \
+             sign-in page"
+        ),
+        Some(Err(why)) => tracing::warn!(
+            reason = %why,
+            "password links go out as Authelia wrote them, where a mail scanner can spend them"
+        ),
     }
     let interceptor = portal::mail::Interceptor::new(mail, secret, links, Arc::new(relay));
     Ok(tokio::spawn(Arc::new(interceptor).serve(listener)))

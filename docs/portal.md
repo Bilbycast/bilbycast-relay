@@ -720,10 +720,15 @@ host — with a token and no credentials or fragment, and no longer than 2048
 characters. Anything else answers `400`; otherwise this would be an open
 redirect on your own domain. The same check runs before the email is written:
 a link the page would refuse, a `click_through_base` it cannot be served at,
-or one on the host where Authelia is served at the root — so that
+or one on the host where Authelia's links are at the root — so that
 `/set-password` there would be Authelia's — is emailed as Authelia wrote it,
 with a warning in the journal naming why, rather than as a link that cannot
-work.
+work. That last one has two causes: `sign_in_url` (or `click_through_base`)
+naming Authelia's host, or an `accounts.authelia_url` without the path
+Authelia is served under (see
+[`authelia_url` and its path](#authelia_url-and-its-path)). The startup line
+applies the same conditions, so it does not promise a page the sends will
+not use.
 
 `sign_in_url`, and so the default `click_through_base`, is the **portal's**
 address — where the feeds are listed — in either layout; with Authelia on its
@@ -755,7 +760,8 @@ access_control:
 
 Without the bypass the link lands on the sign-in page, which the person it was
 sent to cannot get past; they can still use "Reset password" there. With
-`accounts` and a usable base, the portal says what it needs at every start —
+`accounts` and a base the page can be served at (see above), the portal says
+what it needs at every start —
 ``password links point at the set-password page: Authelia needs a `policy:
 bypass` rule …`` — because it cannot see Authelia's rules for itself.
 
@@ -1377,4 +1383,4 @@ three hours for a link grant, which cannot renew.
 | `DELETE /api/clips` | Remove one clip on the viewer's behalf. The body names the session and the clip; the portal mints against the manager as the permission check and deletes on the relay from here, because the page's `connect-src 'self'` never lets the browser reach the origin itself. |
 | `GET /healthz` | Liveness. Deliberately needs no user — a health check that required one would be reporting on the proxy. |
 | `GET /set-password?u=…` | The page an emailed password link points at: a button and nothing else — no link, no script — so a mail scanner that opens it spends nothing. Needs no user, and needs Authelia's `bypass` rule for the path; see [the link is not sent for a scanner to open](#the-link-is-not-sent-for-a-scanner-to-open). `400` for a link the portal would not follow; `404` unless both `mail` and `accounts` are configured. |
-| `POST /set-password` | The button: `303` to Authelia's reset page, only when the link is that page on `accounts.public_host`; `400` otherwise. |
+| `POST /set-password` | The button: `303` to Authelia's reset page, only when the link is that page on `accounts.public_host`; `400` otherwise; `404` unless both `mail` and `accounts` are configured. |

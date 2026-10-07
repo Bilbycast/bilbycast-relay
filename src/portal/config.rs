@@ -186,6 +186,12 @@ impl PortalConfig {
             // names in the links the portal asks for — and the portal asks for
             // them with `X-Forwarded-Host: public_host`.
             m.authelia_host = self.accounts.as_ref().map(|a| a.public_host.clone());
+            m.authelia_prefix = self
+                .accounts
+                .as_ref()
+                .and_then(|a| reqwest::Url::parse(&a.authelia_url).ok())
+                .map(|u| u.path().trim_end_matches('/').to_string())
+                .unwrap_or_default();
         }
     }
 
@@ -622,10 +628,13 @@ mod tests {
             .unwrap(),
         );
         c.normalise();
-        assert_eq!(
-            c.mail.as_ref().unwrap().authelia_host.as_deref(),
-            Some("auth.example.com")
-        );
+        let m = c.mail.as_ref().unwrap();
+        assert_eq!(m.authelia_host.as_deref(), Some("auth.example.com"));
+        assert_eq!(m.authelia_prefix, "/auth", "authelia_url's default path");
+
+        c.accounts.as_mut().unwrap().authelia_url = "http://127.0.0.1:9091/".into();
+        c.normalise();
+        assert_eq!(c.mail.as_ref().unwrap().authelia_prefix, "", "at the root");
     }
 
     /// A logout URL that is not a URL would be rendered as a link the viewer
