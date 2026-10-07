@@ -13,11 +13,12 @@
 //! (The QUIC ES ingest in [`super::ingest`] is the future lower-overhead path,
 //! but WHIP-in reuses the proven edge encoder today.)
 //!
-//! str0m delivers **one depacketized NAL unit per `MediaData`** for H.264, so
-//! this module reassembles an access unit by grouping consecutive NALs that
-//! share a presentation timestamp (mirroring bilbycast-edge's WHIP-server
-//! input), and publishes one [`EsFrame`] per AU. Opus frames pass straight
-//! through.
+//! For H.264, str0m delivers **one depacketized frame per `MediaData`**,
+//! already Annex B. A sender that ends a frame before its access unit ends (one
+//! NAL per frame, say) delivers several with one timestamp, so this module
+//! reassembles an access unit by grouping consecutive frames that share a
+//! presentation timestamp (mirroring bilbycast-edge's WHIP-server input), and
+//! publishes one [`EsFrame`] per AU. Opus frames pass straight through.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::es::EsFrame;
+use super::es::{EsFrame, au_is_idr, h264_nalu_type};
 use super::hub::DistributionHub;
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 
@@ -67,8 +68,10 @@ pub async fn create_and_spawn_ingest(
     let loop_stream = stream_id.clone();
     let loop_sid = session_id.clone();
     tokio::spawn(async move {
-        ingest_loop(session, hub, loop_cancel.clone(), &loop_stream, &loop_sid).await;
-        loop_cancel.cancel();
+        // Cancel our own token however this task ends, a panic included, so
+        // the reaper in `whip_ingest_offer` always drops the session record.
+        let _cancel_on_exit = loop_cancel.clone().drop_guard();
+        ingest_loop(session, hub, loop_cancel, &loop_stream, &loop_sid).await;
     });
 
     Ok(WhipIngestHandle { session_id, answer_sdp, cancel })
@@ -87,18 +90,29 @@ impl AuAssembler {
         Self { stream_id, cur_pts: None, nalus: Vec::new(), keyframe: false }
     }
 
-    /// Push one depacketized NAL. If it opens a new access unit (PTS change),
+    /// Push one depacketized frame: Annex B, as str0m's H.264 depacketizer
+    /// emits it, or one bare NAL. If it opens a new access unit (PTS change),
     /// flush the previous AU first.
-    fn push(&mut self, hub: &DistributionHub, pts_90k: u64, nal: &[u8]) {
+    ///
+    /// Every frame used to get a start code prefixed and its keyframe flag
+    /// read from its first byte. That held only while video was negotiated as
+    /// VP8, whose depacketizer hands back the bytes the sender wrote, and the
+    /// sender wrote one bare NAL per frame, as this crate's own writer does.
+    /// Negotiated as H.264, it doubled str0m's own start code and read the
+    /// flag from that start code's zero, so no frame was ever a keyframe.
+    fn push(&mut self, hub: &DistributionHub, pts_90k: u64, frame: &[u8]) {
         if self.cur_pts.is_some() && self.cur_pts != Some(pts_90k) {
             self.flush(hub);
         }
         self.cur_pts = Some(pts_90k);
-        // Annex-B: 4-byte start code + NAL payload.
-        self.nalus.extend_from_slice(&[0, 0, 0, 1]);
-        self.nalus.extend_from_slice(nal);
-        if !nal.is_empty() && (nal[0] & 0x1f) == 5 {
-            self.keyframe = true;
+        if frame.starts_with(&[0, 0, 1]) || frame.starts_with(&[0, 0, 0, 1]) {
+            self.nalus.extend_from_slice(frame);
+            self.keyframe |= au_is_idr(frame);
+        } else {
+            // A bare NAL: 4-byte start code + NAL payload.
+            self.nalus.extend_from_slice(&[0, 0, 0, 1]);
+            self.nalus.extend_from_slice(frame);
+            self.keyframe |= !frame.is_empty() && h264_nalu_type(frame) == 5;
         }
     }
 
@@ -196,6 +210,33 @@ pub(crate) async fn republish_from_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What str0m's H.264 depacketizer hands over once video is negotiated as
+    /// H.264: one whole frame, Annex B. It reaches the hub as it came, with no
+    /// second start code, and its IDR flags the access unit a keyframe.
+    #[test]
+    fn an_annex_b_frame_goes_through_unchanged_and_flags_its_idr() {
+        let hub = DistributionHub::new();
+        let mut sub = hub.subscribe("s");
+        let mut asm = AuAssembler::new("s".to_string());
+
+        let idr: &[u8] = &[
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1f, //
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, //
+            0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00,
+        ];
+        let p: &[u8] = &[0, 0, 0, 1, 0x41, 0x9a, 0x21];
+        asm.push(&hub, 0, idr);
+        asm.push(&hub, 3600, p);
+        asm.flush(&hub);
+
+        let f1 = sub.rx.try_recv().unwrap();
+        assert!(f1.keyframe, "an IDR access unit is a keyframe");
+        assert_eq!(&f1.data[..], idr, "no doubled start code");
+        let f2 = sub.rx.try_recv().unwrap();
+        assert!(!f2.keyframe);
+        assert_eq!(&f2.data[..], p);
+    }
 
     #[test]
     fn au_assembler_groups_by_pts_and_flags_keyframe() {

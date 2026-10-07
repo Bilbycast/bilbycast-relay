@@ -6,9 +6,10 @@
 //! VENDORED from `bilbycast-edge::engine::webrtc::session`. Depends only on
 //! str0m + tokio + anyhow — zero edge-internal types — so it lifts cleanly.
 //! The relay uses it in the ICE-Lite **server** role only (per-viewer WHEP).
-//! Keep in sync with the edge; the SDP-normalise / `is`-ICE-priority /
-//! level-5.1-H.264-PT interop workarounds must not diverge across the two
-//! str0m deployments.
+//! Keep in sync with the edge; the SDP-normalise / `is`-ICE-priority
+//! interop workarounds and the codec set ([`H264_LEVEL_5_1`]) must not diverge
+//! across the two str0m deployments — the edge's WHIP output negotiates with
+//! this file's WHIP ingest.
 //!
 //! **KNOWN, DELIBERATE DIVERGENCE — do not "resync" it away.** This copy
 //! carries a security control the edge copy does not: [`PeerPin`], an ingress
@@ -37,10 +38,107 @@ use std::time::Instant;
 use anyhow::Result;
 use str0m::change::SdpOffer;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use str0m::net::Protocol;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
+
+/// The H.264 entries every session registers, as `(pt, rtx_pt,
+/// packetization_mode_1, profile_level_id)`: str0m 0.24.1's own seven
+/// built-in entries (`CodecConfig::enable_h264`) with the same payload type,
+/// RTX payload type, packetization mode and profile, and only the level byte
+/// raised from 3.1 (`0x1f`) to 5.1 (`0x33`). With Opus they are the whole
+/// codec set — see [`rtc_config`].
+///
+/// **Why level 5.1.** str0m answers with its own `profile-level-id` and never
+/// narrows or raises an H.264 level to the peer's (see the KNOWN LIMITATION
+/// note in str0m's `PayloadParams::update_param`). With the built-in 3.1, the
+/// answer to a 1080p or 4K publisher would declare that the relay receives
+/// nothing above level 3.1.
+///
+/// **Why exactly one entry per (packetization mode, profile).** This used to be
+/// str0m's whole default set *plus* four extra level-5.1 entries. Since str0m
+/// 0.22 (#1016) an H.264 level mismatch only lowers the match score, so an
+/// offered Baseline mode-1 PT matched both the built-in 3.1 entry and the
+/// extra 5.1 one. When the remote dictates the PTs — a browser's `recvonly`
+/// WHEP offer, or a `recvonly` answer to our `sendonly` offer — both entries
+/// lock that one PT and str0m panics, "Pt locked multiple times: 102". Every
+/// Chrome WHEP viewer hit it. With one entry per pair, an offered PT can match
+/// at most one local entry.
+///
+/// **Why only H.264 and Opus.** They are all this pipeline carries
+/// (`EsKind::{VideoH264, AudioOpus}`). Every other codec in str0m's default set
+/// is one the relay cannot depacketize on ingest or produce for a viewer, and
+/// [`WebrtcSession::get_pt`] takes the first negotiated entry, which in the
+/// default set is VP8 (PT 96): H.264 went out labelled as VP8.
+///
+/// **Why str0m's own numbers.** They are proven-valid RTX slots (an arbitrary
+/// free PT can break str0m's SDP generation), none collides with Opus's 111,
+/// and they are what bilbycast-edge registers too: the edge's WHIP output
+/// talks to this crate's WHIP ingest, so the two sets must stay identical.
+/// `codec_set_is_str0ms_h264_defaults_at_level_5_1_plus_opus` fails if a str0m
+/// bump moves the built-in entries.
+const H264_LEVEL_5_1: [(u8, u8, bool, u32); 7] = [
+    (127, 121, true, 0x42_00_33),  // Baseline, packetization-mode=1
+    (125, 107, false, 0x42_00_33), // Baseline, packetization-mode=0
+    (108, 109, true, 0x42_e0_33),  // Constrained Baseline, mode 1
+    (124, 120, false, 0x42_e0_33), // Constrained Baseline, mode 0
+    (123, 119, true, 0x4d_00_33),  // Main, mode 1
+    (35, 36, false, 0x4d_00_33),   // Main, mode 0
+    (114, 115, true, 0x64_00_33),  // High, mode 1
+];
+
+/// The str0m configuration every session is built from: Opus without RED, the
+/// [`H264_LEVEL_5_1`] entries, and no other codec.
+///
+/// str0m 0.24 also added a receive-reorder deadline (2 s video, 1 s audio) that
+/// holds every later frame behind an incomplete one until it expires. Without
+/// retransmission, one lost packet then stalls video about twice as long as
+/// 0.23 did. `None` restores 0.23's release by frame count, which is what this
+/// pipeline was tuned against.
+fn rtc_config(ice_lite: bool) -> RtcConfig {
+    let mut config = Rtc::builder()
+        .set_ice_lite(ice_lite)
+        .set_reordering_timeout_video(None)
+        .set_reordering_timeout_audio(None)
+        .clear_codecs()
+        .enable_opus(true, false);
+    let codecs = config.codec_config();
+    for (pt, rtx, packetization_mode_1, profile_level_id) in H264_LEVEL_5_1 {
+        codecs.add_h264(
+            Pt::new_with_value(pt),
+            Some(Pt::new_with_value(rtx)),
+            packetization_mode_1,
+            profile_level_id,
+        );
+    }
+    config
+}
+
+/// Run one str0m negotiation step, turning a panic inside it into an error.
+///
+/// str0m still asserts its way through some SDP it cannot reconcile — an offer
+/// whose one RTX PT repairs two H.264 PTs makes 0.24.1 panic "Pt locked
+/// multiple times" whatever codecs are registered — and the input is whatever
+/// a WHEP viewer, a WHIP publisher or a cascade upstream sent. Unchecked, the
+/// panic unwinds through the HTTP handler: the client gets a dropped
+/// connection, and before `ViewerSlot` existed the per-IP slot leaked with it.
+/// Contained here, it is an error for that one request.
+///
+/// `AssertUnwindSafe` is sound because nothing observes the `Rtc` afterwards:
+/// every caller discards the whole session when one of these steps returns
+/// `Err`, which is the contract documented on each.
+fn negotiate<T>(step: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("(non-string panic payload)");
+        tracing::warn!("WebRTC: str0m panicked during {step}: {msg}");
+        Err(anyhow::anyhow!("str0m panicked during {step}: {msg}"))
+    })
+}
 
 /// Events produced by the WebRTC session for the caller to handle.
 ///
@@ -260,69 +358,9 @@ impl WebrtcSession {
         let socket = UdpSocket::bind(config.bind_addr).await?;
         let local_addr = socket.local_addr()?;
 
-        // str0m 0.18 ships H.264 profiles all clamped to level 3.1 (0x1f).
-        // ffmpeg's WHIP muxer offers H.264 at higher levels (typically
-        // 4.0 / 0x28 for 1080p sources), and `match_h264_score` rejects
-        // any offered level higher than the local config's level. Result:
-        // ICE+DTLS complete, but the SDP answer drops all video PTs and
-        // the depayloader silently discards every RTP packet.
-        //
-        // Workaround: register additional H.264 entries with level 5.1
-        // (0x33) so the level check passes for any 1080p/4K source.
-        //
-        // Payload types here must avoid str0m 0.19's defaults AND generate
-        // valid SDP. str0m 0.19 assigns **Opus payload type 111** (see
-        // `PT_OPUS` in `format::codec_config`), and its default H.264 set uses
-        // the RTX slots 121/107/109/120/119/36/115. The original block reused
-        // **111 as the RTX slot for payload 110** — colliding with Opus. That
-        // panics str0m ("Pt locked multiple times: 111") the instant a session
-        // negotiates both this H.264 and Opus (a WHEP client offering audio,
-        // OR a server answering a default-codec offer). str0m is also fussy
-        // about *which* value an RTX PT may take (an arbitrary free PT such as
-        // 100/119 breaks SDP generation), so rather than hunt for another
-        // acceptable RTX PT we simply give payload 110 **no RTX** — the
-        // other three profiles keep their (proven-valid) RTX slots, and the
-        // default H.264 profiles carry RTX for the common case. This makes the
-        // workaround safe on BOTH the server (accept_offer) and client
-        // (create_offer, e.g. the cascade WHEP-client) roles.
-        //
-        // Whenever str0m bumps its built-in H.264 levels (or adds an
-        // ergonomic API to set them), retire this block.
-        // str0m 0.24 added a receive-reorder deadline (2 s video, 1 s audio) that
-        // holds every later frame behind an incomplete one until it expires.
-        // Without retransmission, one lost packet then stalls video about twice
-        // as long as 0.23 did. `None` restores 0.23's release by frame count,
-        // which is what this pipeline was tuned against.
-        let mut rtc_builder = Rtc::builder()
-            .set_ice_lite(config.ice_lite)
-            .set_reordering_timeout_video(None)
-            .set_reordering_timeout_audio(None);
-        let codec_config = rtc_builder.codec_config();
-        codec_config.add_h264(
-            Pt::new_with_value(110),
-            None,        // no RTX — 111 would collide with Opus (see above)
-            true,        // packetization-mode=1
-            0x42_00_33,  // Baseline profile, level 5.1
-        );
-        codec_config.add_h264(
-            Pt::new_with_value(112),
-            Some(Pt::new_with_value(113)),
-            true,
-            0x42_e0_33,  // Constrained Baseline, level 5.1
-        );
-        codec_config.add_h264(
-            Pt::new_with_value(116),
-            Some(Pt::new_with_value(117)),
-            true,
-            0x4d_00_33,  // Main profile, level 5.1
-        );
-        codec_config.add_h264(
-            Pt::new_with_value(118),
-            Some(Pt::new_with_value(122)),
-            true,
-            0x64_00_33,  // High profile, level 5.1
-        );
-        let mut rtc = rtc_builder.build(Instant::now());
+        // Opus + str0m's H.264 entries at level 5.1, nothing else. The reasons,
+        // and the panic the previous set caused, are on `H264_LEVEL_5_1`.
+        let mut rtc = rtc_config(config.ice_lite).build(Instant::now());
 
         // Build the host-candidate set the answer SDP will advertise.
         //
@@ -402,13 +440,17 @@ impl WebrtcSession {
     }
 
     /// Accept an SDP offer (server mode) and return the SDP answer string.
+    ///
+    /// On `Err` the session must be discarded: a panic inside str0m comes back
+    /// as an error (see [`negotiate`]), and the `Rtc` it unwound out of is in
+    /// no state to be driven further.
     pub fn accept_offer(&mut self, offer_sdp: &str) -> Result<String> {
-        // str0m 0.18's SDP parser hard-codes the session name field to a
-        // single dash (`s=-`) and rejects every other session name. ffmpeg
-        // and a number of other production WHIP publishers send a real
-        // session name (e.g. `s=FFmpegPublishSession`), which is RFC 4566
-        // legal but trips str0m. We normalise the offer here before parsing
-        // so the rest of the pipeline doesn't have to know about the quirk.
+        // str0m 0.18's SDP parser accepted only `s=-` as the session name,
+        // and ffmpeg and other WHIP publishers send a real one (e.g.
+        // `s=FFmpegPublishSession`, which RFC 8866 allows). str0m 0.24.1
+        // accepts any non-empty name, so that rewrite now matters only for an
+        // empty `s=`, which str0m still rejects. The BUNDLE rewrite is a
+        // separate workaround; see `normalise_sdp_offer_for_str0m`.
         let normalised = normalise_sdp_offer_for_str0m(offer_sdp);
 
         let offer = SdpOffer::from_sdp_string(&normalised)
@@ -416,8 +458,12 @@ impl WebrtcSession {
 
         tracing::info!("SDP offer (normalised):\n{}", normalised);
 
-        let answer = self.rtc.sdp_api().accept_offer(offer)
-            .map_err(|e| anyhow::anyhow!("SDP accept error: {}", e))?;
+        let answer = negotiate("accept_offer", || {
+            self.rtc
+                .sdp_api()
+                .accept_offer(offer)
+                .map_err(|e| anyhow::anyhow!("SDP accept error: {}", e))
+        })?;
 
         let answer_sdp = answer.to_sdp_string();
         tracing::info!("SDP answer:\n{}", answer_sdp);
@@ -451,12 +497,18 @@ impl WebrtcSession {
 
     /// Apply an SDP answer received from the remote peer (client mode).
     /// Requires the pending offer from `create_offer()`.
+    ///
+    /// On `Err` the session must be discarded, as for [`Self::accept_offer`].
     pub fn apply_answer(&mut self, answer_sdp: &str, pending: str0m::change::SdpPendingOffer) -> Result<()> {
         let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp)
             .map_err(|e| anyhow::anyhow!("SDP answer parse error: {}", e))?;
 
-        self.rtc.sdp_api().accept_answer(pending, answer)
-            .map_err(|e| anyhow::anyhow!("SDP answer accept error: {}", e))?;
+        negotiate("accept_answer", || {
+            self.rtc
+                .sdp_api()
+                .accept_answer(pending, answer)
+                .map_err(|e| anyhow::anyhow!("SDP answer accept error: {}", e))
+        })?;
 
         // Kickstart the ICE agent. After accept_answer the agent has
         // remote candidates and credentials, but str0m's first
@@ -528,7 +580,19 @@ impl WebrtcSession {
         }
     }
 
-    /// Get the first negotiated payload type for a given MID.
+    /// The payload type to write `mid`'s media on: the first entry of the local
+    /// codec set, in registration order, that the peer negotiated for that
+    /// track. The set is Opus and then [`H264_LEVEL_5_1`], so this is Opus on
+    /// an audio track and H.264 on a video track — the Baseline
+    /// packetization-mode=1 PT whenever the peer offered one, as Chrome does.
+    /// Mode 1 is what the FU-A packetizer needs; the table is ordered by
+    /// profile, so a peer offering Baseline only in mode 0 would get that PT
+    /// ahead of another profile's mode-1 one.
+    ///
+    /// Under str0m's default set the first entry was VP8, so between two
+    /// `WebrtcSession`s — the edge's WHIP output and this crate's ingest, or an
+    /// upstream WHEP viewer and a cascade pull — this returned PT 96 and H.264
+    /// went out labelled VP8.
     pub fn get_pt(&mut self, mid: Mid) -> Option<Pt> {
         let writer = self.rtc.writer(mid)?;
         writer.payload_params().next().map(|p| p.pt())
@@ -892,9 +956,10 @@ fn resolve_destination(
 /// Workarounds applied (all safe — affect only descriptive/grouping
 /// metadata, never ICE, DTLS, crypto, or codec semantics):
 ///
-/// 1. **Session name** (`s=`): str0m 0.18 hard-codes `s=-` and rejects
-///    any other value. ffmpeg sends `s=FFmpegPublishSession`. We rewrite
-///    to `s=-`.
+/// 1. **Session name** (`s=`): rewritten to `s=-`. str0m 0.18 accepted
+///    nothing else, and ffmpeg sends `s=FFmpegPublishSession`. str0m 0.24.1
+///    accepts any non-empty name (RFC 8866 §5.3), so this now only rescues
+///    an empty `s=`, which it still rejects.
 ///
 /// 2. **BUNDLE group** (`a=group:BUNDLE`): ffmpeg 8.x WHIP muxer emits
 ///    `a=group:BUNDLE 0 1` but only includes one m-section with
@@ -1474,5 +1539,98 @@ mod tests {
         assert!(pin.accept(sa("[2001:db8::10]:41111")));
         assert!(!pin.accept(sa("[2001:db8::999]:40000")));
         assert_eq!(pin.dropped, 1);
+    }
+
+    // ── The codec set ──────────────────────────────────────────────────
+
+    /// `H264_LEVEL_5_1` is str0m's own built-in H.264 set with only the level
+    /// raised, and Opus (without RED) is the only other codec. A str0m bump
+    /// that renumbers, reorders or adds to its built-in H.264 entries turns
+    /// this red: move the table with it, and bilbycast-edge's copy in the same
+    /// change.
+    #[test]
+    fn codec_set_is_str0ms_h264_defaults_at_level_5_1_plus_opus() {
+        use str0m::format::{Codec, PayloadParams};
+
+        // (pt, rtx pt, packetization mode, profile-level-id)
+        type Entry = (u8, Option<u8>, Option<u8>, u32);
+        fn h264(params: &[PayloadParams]) -> Vec<Entry> {
+            params
+                .iter()
+                .filter(|p| p.spec().codec == Codec::H264)
+                .map(|p| {
+                    let format = p.spec().format;
+                    (
+                        *p.pt(),
+                        p.resend().map(|rtx| *rtx),
+                        format.packetization_mode,
+                        format
+                            .profile_level_id
+                            .expect("H.264 entries carry a profile-level-id"),
+                    )
+                })
+                .collect()
+        }
+
+        let builtin = h264(Rtc::builder().codec_config().params());
+        let ours = rtc_config(true).codec_config().params().to_vec();
+        let registered = h264(&ours);
+
+        assert_eq!(
+            registered.len(),
+            builtin.len(),
+            "{registered:x?} vs {builtin:x?}"
+        );
+        for (o, b) in registered.iter().zip(&builtin) {
+            assert_eq!(
+                (o.0, o.1, o.2),
+                (b.0, b.1, b.2),
+                "PT, RTX PT and packetization mode"
+            );
+            assert_eq!(o.3 >> 8, b.3 >> 8, "profile of PT {}", o.0);
+            assert_eq!(
+                b.3 & 0xff,
+                0x1f,
+                "str0m's built-in PT {} is no longer level 3.1",
+                b.0
+            );
+            assert_eq!(o.3 & 0xff, 0x33, "PT {} is not level 5.1", o.0);
+        }
+
+        let others: Vec<(Codec, u8)> = ours
+            .iter()
+            .filter(|p| p.spec().codec != Codec::H264)
+            .map(|p| (p.spec().codec, *p.pt()))
+            .collect();
+        assert_eq!(
+            others,
+            vec![(Codec::Opus, 111)],
+            "anything besides H.264 and Opus"
+        );
+        assert!(ours.iter().all(|p| p.red().is_none()), "RED is off");
+    }
+
+    /// A panic inside a negotiation step comes back as an error carrying the
+    /// panic message — both payload shapes `panic!` produces — and a step that
+    /// does not panic passes its own result through untouched.
+    #[test]
+    fn negotiate_turns_a_panic_into_an_error() {
+        let pt = 102;
+        let err = negotiate::<()>("accept_offer", || panic!("Pt locked multiple times: {pt}"))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "str0m panicked during accept_offer: Pt locked multiple times: 102"
+        );
+        let err = negotiate::<()>("accept_answer", || panic!("a static message")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "str0m panicked during accept_answer: a static message"
+        );
+
+        assert_eq!(negotiate("accept_offer", || Ok(7)).unwrap(), 7);
+        let err = negotiate::<()>("accept_offer", || Err(anyhow::anyhow!("SDP accept error")))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "SDP accept error");
     }
 }

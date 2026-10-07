@@ -1246,9 +1246,14 @@ does for tunnels). Automatic geo/latency-based viewer assignment is a follow-up
 (it needs real multi-region relays + latency data to tune).
 
 *(Historical note: the cascade WHEP-client offering audio previously tripped a
-str0m PT-collision — the `add_h264` workaround reused PT 111, which is Opus's
-default. Fixed in `webrtc/session.rs` by dropping the RTX slot on that one
-H.264 profile; the workaround is now safe on both the server and client roles.)*
+str0m PT-collision — an `add_h264` workaround reused PT 111, which is Opus's
+default. That workaround, four level-5.1 H.264 entries added on top of str0m's
+default codec set, is gone too: on str0m 0.22 and later it made every Chrome
+WHEP offer panic str0m ("Pt locked multiple times: 102"), and the default set
+it sat on had the send loop label H.264 as VP8. Every WebRTC session — WHEP,
+WHIP ingest and the cascade pull — now registers Opus plus str0m's own H.264
+entries at level 5.1 and nothing else; see `H264_LEVEL_5_1` in
+`webrtc/session.rs`.)*
 
 ### Late-join & keyframes
 

@@ -269,11 +269,12 @@ async fn ingest_rejects_missing_token_when_required() {
 }
 
 /// PT-111 regression: a client (ice_lite=false) building an offer WITH audio
-/// must not panic. Before the fix, the vendored session applied the level-5.1
-/// H.264 workaround unconditionally, reusing PT 111 as an RTX slot that
-/// collides with Opus (also PT 111) — str0m panicked "Pt locked multiple
-/// times: 111". The workaround is now server-role-only. This unblocks the
-/// cascade WHEP-client (which pulls video+audio from an upstream relay).
+/// must not panic. An earlier level-5.1 H.264 workaround reused PT 111 — Opus's
+/// PT — as an RTX slot, and str0m panicked "Pt locked multiple times: 111".
+/// That workaround is gone: the codec set is now Opus plus str0m's own H.264
+/// entries at level 5.1 (`H264_LEVEL_5_1` in `webrtc/session.rs`), whose RTX
+/// slots never collide with 111. This keeps the cascade WHEP-client (which
+/// pulls video+audio from an upstream relay) covered.
 #[tokio::test]
 async fn client_offer_with_audio_does_not_panic() {
     use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
@@ -1554,4 +1555,596 @@ async fn shared_marks_work_over_http_and_need_a_viewer_token() {
         "the object route was disturbed by the marks routes"
     );
     assert_eq!(body, "x");
+}
+
+// ── Codec negotiation against real peers' SDP ──────────────────────────────
+//
+// Every WebRTC test above negotiates a `WebrtcSession` against another
+// `WebrtcSession`. Both ends register the same codec set, so each offered PT
+// matches exactly one local entry by construction — and the suite stayed green
+// while every Chrome WHEP viewer panicked str0m ("Pt locked multiple times:
+// 102") and the WHEP send loop labelled H.264 as VP8. These drive the session
+// with SDP that real peers produce.
+
+/// HeadlessChrome 124.0.6367.78's WHEP offer (`recvonly` video + audio,
+/// default codec preferences), as POSTed to the relay in the 2026-10-07 str0m
+/// 0.24.1 interop run and logged by `accept_offer`. That log line is taken
+/// after `normalise_sdp_offer_for_str0m`, which leaves this offer unchanged:
+/// its `s=` is already `-` and both BUNDLE mids exist.
+const CHROME_WHEP_OFFER: &str = include_str!("fixtures/webrtc/chrome124-whep-recvonly-offer.sdp");
+
+/// A Chrome publisher's offer (`sendonly` audio + video, plus the data channel
+/// that page also opened), captured 2022-08-18 and shipped by str0m 0.24.1 as
+/// `docs/chrome-sdp.json`: the shape a browser WHIP client POSTs to
+/// `/whip/{stream}`.
+const CHROME_SENDONLY_OFFER: &str = include_str!("fixtures/webrtc/chrome-sendonly-offer.sdp");
+
+/// ffmpeg 8.1's WHIP offer for a libx264 High@4.0 + Opus source, rendered from
+/// the format string in `generate_sdp_offer` (`libavformat/whip.c`, n8.1): a
+/// real session name, `setup:passive`, Opus on 111 and one H.264 PT (106) with
+/// its RTX (105). Not a capture — ffmpeg is not installed here — but every
+/// line is that function's.
+const FFMPEG_WHIP_OFFER: &str = include_str!("fixtures/webrtc/ffmpeg81-whip-offer.sdp");
+
+/// The codec facts the negotiation tests need from one `m=` section.
+#[derive(Debug, Default)]
+struct MSection {
+    pts: Vec<u8>,
+    /// PT -> encoding name as written (`H264`, `rtx`, `opus`, `VP8`, ...).
+    codec: std::collections::HashMap<u8, String>,
+    /// PT -> the `a=fmtp` value.
+    fmtp: std::collections::HashMap<u8, String>,
+    direction: Option<String>,
+    mid: Option<String>,
+}
+
+/// The first `m=<kind>` section of `sdp`.
+fn m_section(sdp: &str, kind: &str) -> Option<MSection> {
+    let mut found: Option<MSection> = None;
+    for line in sdp.lines().map(str::trim_end) {
+        if let Some(rest) = line.strip_prefix("m=") {
+            if found.is_some() {
+                break;
+            }
+            if rest.split(' ').next() == Some(kind) {
+                found = Some(MSection {
+                    pts: rest
+                        .split(' ')
+                        .skip(3)
+                        .filter_map(|p| p.parse().ok())
+                        .collect(),
+                    ..Default::default()
+                });
+            }
+            continue;
+        }
+        let Some(m) = found.as_mut() else { continue };
+        let pt_and_value = |rest: &str| {
+            let (pt, value) = rest.split_once(' ')?;
+            Some((pt.parse::<u8>().ok()?, value.to_string()))
+        };
+        if let Some((pt, value)) = line.strip_prefix("a=rtpmap:").and_then(pt_and_value) {
+            m.codec
+                .insert(pt, value.split('/').next().unwrap_or_default().to_string());
+        } else if let Some((pt, value)) = line.strip_prefix("a=fmtp:").and_then(pt_and_value) {
+            m.fmtp.insert(pt, value);
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            m.mid = Some(mid.to_string());
+        } else if matches!(
+            line,
+            "a=sendonly" | "a=recvonly" | "a=sendrecv" | "a=inactive"
+        ) {
+            m.direction = Some(line[2..].to_string());
+        }
+    }
+    found
+}
+
+/// One `key=value` out of an `a=fmtp` value.
+fn fmtp_param<'a>(fmtp: &'a str, key: &str) -> Option<&'a str> {
+    fmtp.split(';')
+        .find_map(|kv| kv.trim().strip_prefix(key)?.strip_prefix('='))
+}
+
+/// The answer carries H.264 (with its RTX) and Opus and nothing else, and only
+/// on PTs the offer gave those codecs to — never a PT the offer did not list,
+/// never another codec's — with the offer's packetization mode and profile.
+/// The level is the one thing allowed to differ: str0m answers with its own.
+fn assert_h264_and_opus_on_offered_pts(offer: &str, answer: &str) {
+    for name in ["VP8", "VP9", "AV1", "H265"] {
+        assert!(
+            !answer.contains(&format!(" {name}/")),
+            "the answer offers {name}, which the relay can neither send nor depacketize:\n{answer}"
+        );
+    }
+    let offered = m_section(offer, "video").expect("offer has video");
+    let answered = m_section(answer, "video").expect("answer has video");
+    assert!(!answered.pts.is_empty(), "video was rejected:\n{answer}");
+    for pt in &answered.pts {
+        assert!(
+            offered.pts.contains(pt),
+            "answer video PT {pt} is not in the offer's m-line {:?}:\n{answer}",
+            offered.pts
+        );
+        let codec = answered.codec.get(pt).map(String::as_str);
+        assert_eq!(
+            codec,
+            offered.codec.get(pt).map(String::as_str),
+            "PT {pt} was relabelled"
+        );
+        match codec {
+            Some("H264") => {
+                let (o, a) = (&offered.fmtp[pt], &answered.fmtp[pt]);
+                assert_eq!(
+                    fmtp_param(a, "packetization-mode"),
+                    fmtp_param(o, "packetization-mode"),
+                    "PT {pt}: packetization mode changed"
+                );
+                let profile = |f: &str| {
+                    fmtp_param(f, "profile-level-id").map(|p| p[..4].to_ascii_lowercase())
+                };
+                assert_eq!(profile(a), profile(o), "PT {pt}: profile changed");
+            }
+            Some("rtx") => assert_eq!(
+                fmtp_param(&answered.fmtp[pt], "apt"),
+                fmtp_param(&offered.fmtp[pt], "apt"),
+                "RTX PT {pt} repairs a different PT than offered"
+            ),
+            other => panic!("answer video PT {pt} carries {other:?}, not H.264 or its RTX"),
+        }
+    }
+    let offered = m_section(offer, "audio").expect("offer has audio");
+    let answered = m_section(answer, "audio").expect("answer has audio");
+    assert!(!answered.pts.is_empty(), "audio was rejected:\n{answer}");
+    for pt in &answered.pts {
+        assert!(
+            offered.pts.contains(pt),
+            "answer audio PT {pt} is not in the offer"
+        );
+        assert_eq!(
+            answered.codec.get(pt).map(String::as_str),
+            Some("opus"),
+            "audio PT {pt}"
+        );
+        assert_eq!(
+            offered.codec.get(pt).map(String::as_str),
+            Some("opus"),
+            "audio PT {pt}"
+        );
+    }
+}
+
+/// A relay-side (ICE-Lite) session, exactly as WHEP and WHIP ingest build one.
+async fn ice_lite_session() -> bilbycast_relay::distribution::webrtc::session::WebrtcSession {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+    WebrtcSession::new(&SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: true,
+    })
+    .await
+    .expect("bind")
+}
+
+/// The `(video, audio)` PTs `s` writes on — `get_pt`, as `whep::viewer_loop`
+/// calls it — for the tracks `sdp` (the offer or the answer: the mids are the
+/// same) describes. `viewer_loop` learns those mids from str0m's `MediaAdded`
+/// events, which str0m holds back until DTLS completes; the writer and its
+/// negotiated PTs exist as soon as the SDP exchange does.
+fn send_pts(
+    s: &mut bilbycast_relay::distribution::webrtc::session::WebrtcSession,
+    sdp: &str,
+) -> (u8, u8) {
+    let mid = |kind: &str| {
+        let mid = m_section(sdp, kind)
+            .and_then(|m| m.mid)
+            .unwrap_or_else(|| panic!("no {kind} mid"));
+        str0m::media::Mid::from(mid.as_str())
+    };
+    (
+        *s.get_pt(mid("video")).expect("a video PT was negotiated"),
+        *s.get_pt(mid("audio")).expect("an audio PT was negotiated"),
+    )
+}
+
+/// A real Chrome WHEP offer: answered without a panic, H.264 and Opus only,
+/// and the send loop writes video on one of Chrome's H.264 PTs — the
+/// packetization-mode=1 one, because the packetizer emits FU-A — and audio on
+/// Chrome's Opus PT.
+///
+/// Before the codec set was rebuilt this panicked str0m in `accept_offer`:
+/// Chrome's PT 102 (Baseline, mode 1, level 3.1) matched both str0m's
+/// built-in Baseline entry and the extra level-5.1 Baseline entry, and since
+/// str0m 0.22 a level mismatch only lowers the match score, so both locked 102.
+#[tokio::test]
+async fn a_real_chrome_whep_offer_negotiates_h264_and_opus() {
+    let mut s = ice_lite_session().await;
+    let answer = s
+        .accept_offer(CHROME_WHEP_OFFER)
+        .expect("Chrome's WHEP offer must be answered");
+    assert_h264_and_opus_on_offered_pts(CHROME_WHEP_OFFER, &answer);
+
+    let (video_pt, audio_pt) = send_pts(&mut s, &answer);
+    let offered = m_section(CHROME_WHEP_OFFER, "video").unwrap();
+    assert_eq!(
+        offered.codec.get(&video_pt).map(String::as_str),
+        Some("H264"),
+        "video is written on PT {video_pt}, which Chrome did not offer as H.264"
+    );
+    assert_eq!(
+        fmtp_param(&offered.fmtp[&video_pt], "packetization-mode"),
+        Some("1"),
+        "video is written on a packetization-mode=0 PT, which cannot carry FU-A"
+    );
+    assert_eq!(
+        video_pt, 102,
+        "Chrome's first packetization-mode=1 H.264 PT"
+    );
+    assert_eq!(audio_pt, 111, "Chrome's Opus PT");
+}
+
+/// A real Chrome publisher's (`sendonly`) offer, as a browser WHIP client POSTs
+/// it: answered with H.264 and Opus only, on Chrome's own PTs.
+///
+/// Before, the answer listed VP8, VP9 and AV1 (str0m's default set, which the
+/// relay can neither depacketize nor republish) plus H.264 PTs Chrome never
+/// offered (the level-5.1 extras, remapped onto their own numbers).
+#[tokio::test]
+async fn a_real_chrome_publisher_offer_is_answered_with_h264_and_opus_only() {
+    let mut s = ice_lite_session().await;
+    let answer = s
+        .accept_offer(CHROME_SENDONLY_OFFER)
+        .expect("Chrome's publisher offer must be answered");
+    assert_h264_and_opus_on_offered_pts(CHROME_SENDONLY_OFFER, &answer);
+    assert_eq!(
+        m_section(&answer, "video").unwrap().direction.as_deref(),
+        Some("recvonly")
+    );
+}
+
+/// ffmpeg's WHIP muxer sends on the PTs it offered whatever the answer says,
+/// so the answer must keep them: 106 (+ RTX 105) for H.264, 111 for Opus, at
+/// every level ffmpeg offers.
+///
+/// Before, a level-5.1 (4K) offer was answered on PT 118 — the extra High entry
+/// outscored the built-in one and, the relay being the controlling side for a
+/// `sendonly` offer, answered with its own number — so the relay listened on
+/// 118 for a stream arriving on 106.
+#[tokio::test]
+async fn ffmpeg_whip_offers_are_answered_on_ffmpegs_own_pts() {
+    for profile_level_id in ["640028", "640033", "42e01f"] {
+        let offer = FFMPEG_WHIP_OFFER.replace(
+            "profile-level-id=640028",
+            &format!("profile-level-id={profile_level_id}"),
+        );
+        let mut s = ice_lite_session().await;
+        let answer = s
+            .accept_offer(&offer)
+            .unwrap_or_else(|e| panic!("{profile_level_id}: {e:#}"));
+        assert_h264_and_opus_on_offered_pts(&offer, &answer);
+        assert_eq!(
+            m_section(&answer, "video").unwrap().pts,
+            vec![106, 105],
+            "{profile_level_id}:\n{answer}"
+        );
+        assert_eq!(
+            m_section(&answer, "audio").unwrap().pts,
+            vec![111],
+            "{profile_level_id}"
+        );
+    }
+}
+
+/// Between two `WebrtcSession`s — a WHEP viewer of this relay and a cascade
+/// pull, or the edge's WHIP output and this relay's ingest — the sender writes
+/// video on an H.264 PT and audio on Opus.
+///
+/// Before, both ends registered str0m's whole default set, whose first entry
+/// is VP8, and `get_pt` takes the first negotiated entry: video went out on
+/// PT 96, labelled VP8, and the far end depacketized H.264 as VP8.
+#[tokio::test]
+async fn between_two_sessions_video_is_written_as_h264() {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+
+    let client = || async {
+        WebrtcSession::new(&SessionConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_ip: Some("127.0.0.1".parse().unwrap()),
+            ice_lite: false,
+        })
+        .await
+        .unwrap()
+    };
+
+    // The relay sends: a `recvonly` client offer (a cascade pull) to WHEP.
+    let mut puller = client().await;
+    let (offer, _pending) = puller.create_offer(true, true, false).unwrap();
+    let mut relay = ice_lite_session().await;
+    let answer = relay.accept_offer(&offer).unwrap();
+    let (video_pt, audio_pt) = send_pts(&mut relay, &answer);
+    let offered = m_section(&offer, "video").unwrap();
+    assert_eq!(
+        offered.codec.get(&video_pt).map(String::as_str),
+        Some("H264"),
+        "WHEP video PT {video_pt}"
+    );
+    assert_eq!(audio_pt, 111);
+    assert_h264_and_opus_on_offered_pts(&offer, &answer);
+
+    // The client sends: a `sendonly` offer (a WHIP publisher) to the ingest.
+    let mut publisher = client().await;
+    let (offer, pending) = publisher.create_offer(true, true, true).unwrap();
+    let mut ingest = ice_lite_session().await;
+    let answer = ingest.accept_offer(&offer).unwrap();
+    publisher.apply_answer(&answer, pending).unwrap();
+    let (video_pt, audio_pt) = send_pts(&mut publisher, &answer);
+    let answered = m_section(&answer, "video").unwrap();
+    assert_eq!(
+        answered.codec.get(&video_pt).map(String::as_str),
+        Some("H264"),
+        "WHIP video PT {video_pt}"
+    );
+    assert_eq!(audio_pt, 111);
+    assert_h264_and_opus_on_offered_pts(&offer, &answer);
+}
+
+/// An answer to one of our offers that keeps a single H.264 PT, as a WHIP or
+/// WHEP server that picks one codec writes it. `direction` is the answerer's.
+fn single_pt_answer(
+    offer: &str,
+    direction: &str,
+    pt: u8,
+    rtx: u8,
+    profile_level_id: &str,
+) -> String {
+    const FP: &str = "5B:7E:0A:26:41:91:C4:7F:33:D8:12:6E:A0:5C:B9:E4:08:71:2D:9F:C6:3A:55:EB:10:84:7D:F2:69:0C:A3:1E";
+    let video = m_section(offer, "video")
+        .expect("offer has video")
+        .mid
+        .expect("video mid");
+    let audio = m_section(offer, "audio")
+        .expect("offer has audio")
+        .mid
+        .expect("audio mid");
+    let common = |mid: &str| {
+        format!(
+            "c=IN IP4 0.0.0.0\r\na=ice-ufrag:srvu\r\na=ice-pwd:serverpasswordserverpw\r\n\
+             a=fingerprint:sha-256 {FP}\r\na=setup:passive\r\na=mid:{mid}\r\na={direction}\r\n\
+             a=rtcp-mux\r\n"
+        )
+    };
+    format!(
+        "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE {video} {audio}\r\n\
+         a=ice-lite\r\n\
+         m=video 9 UDP/TLS/RTP/SAVPF {pt} {rtx}\r\n{}\
+         a=rtpmap:{pt} H264/90000\r\n\
+         a=fmtp:{pt} level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}\r\n\
+         a=rtpmap:{rtx} rtx/90000\r\na=fmtp:{rtx} apt={pt}\r\n\
+         a=candidate:1 1 udp 2130706431 127.0.0.1 9 typ host\r\n\
+         m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n{}\
+         a=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\n",
+        common(&video),
+        common(&audio),
+    )
+}
+
+/// Single-PT answers, in both client roles: a `sendonly` offer (a WHIP client —
+/// what the edge's WHIP output does, and what the tests above stand in for)
+/// answered `recvonly`, and a `recvonly` offer (the cascade's WHEP pull)
+/// answered `sendonly`. The answerer's level differs from ours, as a real
+/// server's does.
+///
+/// Before, the `sendonly` case panicked str0m in `accept_answer`: the answer
+/// dictates the PT, and the built-in and level-5.1 entries for that profile
+/// both matched it.
+#[tokio::test]
+async fn single_pt_answers_negotiate_in_both_client_roles() {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+
+    for (pt, rtx, profile_level_id) in [
+        (127, 121, "42001f"),
+        (108, 109, "42e01f"),
+        (114, 115, "640028"),
+    ] {
+        for (send_only, answerer) in [(true, "recvonly"), (false, "sendonly")] {
+            let case = format!("PT {pt} ({profile_level_id}), answer {answerer}");
+            let mut s = WebrtcSession::new(&SessionConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                public_ip: Some("127.0.0.1".parse().unwrap()),
+                ice_lite: false,
+            })
+            .await
+            .unwrap();
+            let (offer, pending) = s.create_offer(true, true, send_only).unwrap();
+            let answer = single_pt_answer(&offer, answerer, pt, rtx, profile_level_id);
+            s.apply_answer(&answer, pending)
+                .unwrap_or_else(|e| panic!("{case}: {e:#}"));
+            if send_only {
+                assert_eq!(
+                    send_pts(&mut s, &answer),
+                    (pt, 111),
+                    "{case}: written on the answered PTs"
+                );
+            }
+        }
+    }
+}
+
+/// An offer whose one RTX PT repairs two H.264 PTs. str0m 0.24.1 locks that RTX
+/// PT once per primary and panics ("Pt locked multiple times: 103") whatever
+/// codecs are registered, because both of these primaries — Baseline in
+/// packetization mode 1 and in mode 0 — are in every H.264 set str0m ships.
+/// So it stands for any negotiation panic still left in str0m.
+fn offer_with_an_rtx_pt_repairing_two_pts(direction: &str) -> String {
+    const FP: &str = "5B:7E:0A:26:41:91:C4:7F:33:D8:12:6E:A0:5C:B9:E4:08:71:2D:9F:C6:3A:55:EB:10:84:7D:F2:69:0C:A3:1E";
+    format!(
+        "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\na=msid-semantic: WMS\r\n\
+         m=video 9 UDP/TLS/RTP/SAVPF 102 104 103\r\nc=IN IP4 0.0.0.0\r\n\
+         a=ice-ufrag:hstl\r\na=ice-pwd:hostilepasswordhostile\r\na=fingerprint:sha-256 {FP}\r\n\
+         a=setup:actpass\r\na=mid:0\r\na={direction}\r\na=rtcp-mux\r\n\
+         a=rtpmap:102 H264/90000\r\n\
+         a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n\
+         a=rtpmap:104 H264/90000\r\n\
+         a=fmtp:104 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\r\n\
+         a=rtpmap:103 rtx/90000\r\na=fmtp:103 apt=102\r\na=fmtp:103 apt=104\r\n"
+    )
+}
+
+/// A panic inside str0m's negotiation is an error for that one session, not a
+/// crash: `accept_offer` (WHEP and WHIP ingest) and `apply_answer` (the
+/// cascade pull) both return `Err`.
+#[tokio::test]
+async fn a_str0m_panic_during_negotiation_is_an_error() {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+
+    let mut s = ice_lite_session().await;
+    let err = s
+        .accept_offer(&offer_with_an_rtx_pt_repairing_two_pts("recvonly"))
+        .expect_err("str0m cannot negotiate this offer");
+    assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+
+    // The same SDP shape as an answer to a WHIP client's offer, on two PTs
+    // that offer carries (Baseline in mode 1 and mode 0, one RTX for both).
+    let mut c = WebrtcSession::new(&SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: false,
+    })
+    .await
+    .unwrap();
+    let (offer, pending) = c.create_offer(true, false, true).unwrap();
+    let mid = m_section(&offer, "video").unwrap().mid.unwrap();
+    let answer = offer_with_an_rtx_pt_repairing_two_pts("recvonly")
+        .replace(
+            "a=group:BUNDLE 0",
+            &format!("a=group:BUNDLE {mid}\r\na=ice-lite"),
+        )
+        .replace("a=mid:0", &format!("a=mid:{mid}"))
+        .replace("a=setup:actpass", "a=setup:passive")
+        .replace(" 102 104 103\r\n", " 127 125 121\r\n")
+        .replace(":102 ", ":127 ")
+        .replace(":104 ", ":125 ")
+        .replace(":103 ", ":121 ")
+        .replace("apt=102", "apt=127")
+        .replace("apt=104", "apt=125");
+    let err = c
+        .apply_answer(&answer, pending)
+        .expect_err("str0m cannot accept this answer");
+    assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+}
+
+/// The per-IP viewer cap, through the real router: offers that fail — here,
+/// by panicking str0m — give their slot back, so no number of them shuts an IP
+/// out, and a real viewer's slot comes back when it is deleted.
+///
+/// Before, the slot was released by hand in the handler's `Err` arm only. A
+/// panic unwound straight past it (and dropped the connection with no
+/// response), so each one leaked a slot for the life of the process; with the
+/// default cap of 256, 256 Chrome WHEP attempts locked an IP out for good. The
+/// WHIP ingest route had the same crash with nothing to leak.
+#[tokio::test]
+async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::distribution::origin::OriginStore;
+    use bilbycast_relay::distribution::{DistributionState, build_router};
+
+    const CAP: u32 = 2;
+    let cancel = CancellationToken::new();
+    let (events, _rx) = event_channel();
+    let cfg = DistributionConfig {
+        require_viewer_token: false,
+        require_ingest_token: false,
+        max_viewers_per_ip: CAP,
+        ..Default::default()
+    };
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, Some(lo)), vec![]);
+    let state = DistributionState::new(
+        Arc::new(DistributionHub::new()),
+        Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap()),
+        cfg,
+        control,
+        cancel.clone(),
+        events,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+
+    /// `(status, Location, body)`; status 0 when the connection closed without
+    /// a response, which is what a panicking handler leaves.
+    async fn send(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String, String) {
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/sdp\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let location = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("location")
+                    .then(|| v.trim().to_string())
+            })
+            .unwrap_or_default();
+        (status, location, body.to_string())
+    }
+    let held = |st: &DistributionState| {
+        st.viewers_by_ip
+            .get(&lo)
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    };
+
+    let hostile = offer_with_an_rtx_pt_repairing_two_pts("recvonly");
+    for attempt in 1..=3 * CAP {
+        let (status, _, body) = send(addr, "POST", "/whep/show", &hostile).await;
+        assert_eq!(
+            held(&state),
+            0,
+            "WHEP attempt {attempt} kept its per-IP slot"
+        );
+        assert_eq!(status, 400, "WHEP attempt {attempt}: {body}");
+    }
+    let (status, _, body) = send(addr, "POST", "/whip/show", &hostile).await;
+    assert_eq!(status, 400, "WHIP ingest: {body}");
+
+    // A real viewer still gets in after all that, holds one slot while it
+    // lives, and gives it back when deleted.
+    let (status, location, answer) = send(addr, "POST", "/whep/show", CHROME_WHEP_OFFER).await;
+    assert_eq!(status, 201, "a real Chrome viewer: {answer}");
+    assert_h264_and_opus_on_offered_pts(CHROME_WHEP_OFFER, &answer);
+    assert_eq!(held(&state), 1, "a live viewer holds its slot");
+    let (status, _, _) = send(addr, "DELETE", &location, "").await;
+    assert_eq!(status, 200, "DELETE {location}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while held(&state) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a deleted viewer gave its slot back");
+
+    cancel.cancel();
 }

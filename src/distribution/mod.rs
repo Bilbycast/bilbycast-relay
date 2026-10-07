@@ -73,6 +73,53 @@ pub struct ViewerSession {
     pub ip: IpAddr,
 }
 
+/// One reserved slot of an IP's concurrent-viewer cap
+/// ([`DistributionState::viewers_by_ip`]), given back when dropped.
+///
+/// Dropping is the only release, which makes the release unconditional: an
+/// error return, a panic unwinding through `whep_offer`, and the handler future
+/// being dropped mid-await (a client hanging up can do that) all give it back. A
+/// viewer that gets going takes ownership — `whep_offer` moves the slot into
+/// the session's reaper — and holds it until the session's cancel token fires.
+///
+/// The slot used to be released by hand in the `Err` arm only. A str0m panic
+/// during negotiation (every Chrome WHEP offer caused one, until the codec set
+/// was fixed) unwound straight past it and leaked the slot for the life of the
+/// process: `max_viewers_per_ip` such attempts (256 by default) locked that IP
+/// out of WHEP for good.
+struct ViewerSlot {
+    st: Arc<DistributionState>,
+    ip: IpAddr,
+}
+
+impl ViewerSlot {
+    /// Reserve a slot for `ip`, or `None` when it already holds `cap`. The
+    /// check and the increment happen under the map entry's shard lock, so
+    /// two concurrent offers cannot both take the last slot.
+    fn reserve(st: &Arc<DistributionState>, ip: IpAddr, cap: u32) -> Option<Self> {
+        let count = st
+            .viewers_by_ip
+            .entry(ip)
+            .or_insert_with(|| AtomicU32::new(0));
+        if count.load(Ordering::Relaxed) >= cap {
+            return None;
+        }
+        count.fetch_add(1, Ordering::Relaxed);
+        Some(Self {
+            st: Arc::clone(st),
+            ip,
+        })
+    }
+}
+
+impl Drop for ViewerSlot {
+    fn drop(&mut self) {
+        if let Some(count) = self.st.viewers_by_ip.get(&self.ip) {
+            count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl DistributionState {
     /// Construct subsystem state with empty session/ingest registries. Shared
     /// by `run_distribution` and integration tests. `control` carries the
@@ -413,22 +460,19 @@ async fn whep_offer(
         return (StatusCode::BAD_REQUEST, "empty SDP offer").into_response();
     }
 
-    // Per-IP concurrent-viewer cap (public-endpoint DoS control).
+    // Per-IP concurrent-viewer cap (public-endpoint DoS control). The slot is
+    // given back whenever `slot` drops, unless the reaper below has taken it.
     let ip = peer.ip();
     let cap = st.config.max_viewers_per_ip;
-    {
-        let entry = st.viewers_by_ip.entry(ip).or_insert_with(|| AtomicU32::new(0));
-        if entry.load(Ordering::Relaxed) >= cap {
-            st.events.emit_with_details(
-                crate::manager::events::EventSeverity::Warning,
-                crate::manager::events::category::DISTRIBUTION,
-                format!("per-IP viewer cap ({cap}) reached from {ip}"),
-                serde_json::json!({ "ip": ip.to_string(), "cap": cap }),
-            );
-            return (StatusCode::TOO_MANY_REQUESTS, "per-IP viewer cap reached").into_response();
-        }
-        entry.fetch_add(1, Ordering::Relaxed);
-    }
+    let Some(slot) = ViewerSlot::reserve(&st, ip, cap) else {
+        st.events.emit_with_details(
+            crate::manager::events::EventSeverity::Warning,
+            crate::manager::events::category::DISTRIBUTION,
+            format!("per-IP viewer cap ({cap}) reached from {ip}"),
+            serde_json::json!({ "ip": ip.to_string(), "cap": cap }),
+        );
+        return (StatusCode::TOO_MANY_REQUESTS, "per-IP viewer cap reached").into_response();
+    };
 
     match whep::create_and_spawn_viewer(
         st.hub.clone(),
@@ -445,17 +489,16 @@ async fn whep_offer(
                 handle.session_id.clone(),
                 ViewerSession { cancel: handle.cancel.clone(), ip },
             );
-            // Reaper: when this viewer's token fires (natural end OR DELETE),
-            // drop the session record and release the per-IP slot.
+            // Reaper: when this viewer's token fires (natural end, DELETE, or
+            // the viewer task dying), drop the session record and release the
+            // per-IP slot, which the reaper owns from here on.
             let reap = Arc::clone(&st);
             let sid = handle.session_id.clone();
             let watch = handle.cancel.clone();
             tokio::spawn(async move {
                 watch.cancelled().await;
                 reap.sessions.remove(&sid);
-                if let Some(c) = reap.viewers_by_ip.get(&ip) {
-                    c.fetch_sub(1, Ordering::Relaxed);
-                }
+                drop(slot);
             });
 
             let location = format!("/whep/{stream_id}/{}", handle.session_id);
@@ -470,10 +513,7 @@ async fn whep_offer(
                 .into_response()
         }
         Err(e) => {
-            // Setup failed — release the slot we reserved.
-            if let Some(c) = st.viewers_by_ip.get(&ip) {
-                c.fetch_sub(1, Ordering::Relaxed);
-            }
+            // Setup failed — `slot` drops on return and gives the slot back.
             tracing::warn!("WHEP setup failed for stream '{stream_id}': {e:#}");
             (StatusCode::BAD_REQUEST, format!("WHEP setup failed: {e}")).into_response()
         }
@@ -3267,5 +3307,74 @@ mod tests {
         assert!(token_from_query(Some("token=")).is_none());
         // Must not match a different key that merely ends in "token".
         assert!(token_from_query(Some("ingest_token=abc")).is_none());
+    }
+
+    /// `ViewerSlot` holds the per-IP cap and gives each slot back exactly once,
+    /// however it is dropped — including by a panic unwinding past it, which
+    /// is the case the old hand-written release in the `Err` arm missed. The
+    /// wiring (that `whep_offer` reserves through it) is asserted over HTTP in
+    /// `tests/distribution.rs` (`failed_offers_never_exhaust_the_per_ip_viewer_cap`).
+    #[test]
+    fn a_viewer_slot_is_given_back_exactly_once_however_it_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = DistributionConfig::default();
+        let control = DistributionControl::new(
+            crate::distribution_control::RuntimeDistConfig::from_config(&cfg, None),
+            vec![],
+        );
+        let origin = OriginStore::new(origin::OriginConfig {
+            root: tmp.path().join("origin"),
+            retention: std::time::Duration::from_secs(3600),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            min_free_bytes: 0,
+            idle_grace: std::time::Duration::from_secs(60),
+        })
+        .unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let st = DistributionState::new(
+            Arc::new(DistributionHub::new()),
+            Arc::new(origin),
+            cfg,
+            control,
+            CancellationToken::new(),
+            events,
+        );
+        let ip: IpAddr = "198.51.100.7".parse().unwrap();
+        let held = |ip: IpAddr| {
+            st.viewers_by_ip
+                .get(&ip)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+
+        let first = ViewerSlot::reserve(&st, ip, 2).expect("first slot");
+        let second = ViewerSlot::reserve(&st, ip, 2).expect("second slot");
+        assert!(ViewerSlot::reserve(&st, ip, 2).is_none(), "the cap is 2");
+        let other: IpAddr = "198.51.100.8".parse().unwrap();
+        let elsewhere = ViewerSlot::reserve(&st, other, 2).expect("another IP's cap is its own");
+        assert_eq!((held(ip), held(other)), (2, 1));
+
+        drop(first);
+        assert_eq!(held(ip), 1, "a plain drop gives the slot back");
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _slot = second;
+            panic!("negotiation failed after the slot was reserved");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(held(ip), 0, "a panic unwinding past the slot gives it back");
+        assert!(
+            ViewerSlot::reserve(&st, ip, 2).is_some(),
+            "and the IP can watch again"
+        );
+        assert_eq!(
+            held(ip),
+            0,
+            "a slot reserved and dropped at once leaves nothing held"
+        );
+
+        drop(elsewhere);
+        assert_eq!(held(other), 0);
     }
 }
