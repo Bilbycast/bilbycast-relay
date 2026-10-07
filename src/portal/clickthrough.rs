@@ -101,50 +101,90 @@ pub fn wrap(base: &str, authelia_link: &str) -> String {
 /// person on to `link` — and Authelia's own otherwise.
 ///
 /// Checked here rather than trusted, because an email pointing at a page that
-/// answers `400` is worse than the problem this module exists for: a scanner
+/// cannot work is worse than the problem this module exists for: a scanner
 /// spends only *some* links, and that would spend every one. So a link this
-/// page would refuse — Authelia naming a host other than
-/// `accounts.public_host` — or a base this page cannot be reached at goes out
-/// as Authelia wrote it, with a warning naming the reason.
+/// page would refuse, a base it cannot be served at, or a base that is
+/// Authelia's own goes out as Authelia wrote it, with a warning naming why.
 pub fn email_link(cfg: &MailConfig, link: String) -> String {
     if !cfg.click_through {
         return link;
     }
-    let base = cfg.click_through_base();
-    if !usable_base(base) {
-        tracing::warn!(
-            base,
-            "emailing Authelia's own link: the set-password page is not reachable at an https \
-             address; set mail.click_through_base"
-        );
-        return link;
-    }
-    match cfg.authelia_host.as_deref() {
-        Some(host) if permitted(host, &link).is_some() => wrap(base, &link),
-        host => {
-            tracing::warn!(
-                expected_host = host.unwrap_or("(no accounts block)"),
-                "emailing Authelia's own link: it is not one the set-password page would follow \
-                 — its host should be accounts.public_host"
-            );
+    match through_the_page(cfg, &link) {
+        Ok(wrapped) => wrapped,
+        Err(why) => {
+            tracing::warn!(reason = %why, "emailing Authelia's own link, not the set-password page");
             link
         }
     }
 }
 
-/// Can the page be served at `base`? An absolute `https` URL with a host and
-/// nothing a path cannot be appended to: the address carries a one-time
-/// credential, so not in clear.
+fn through_the_page(cfg: &MailConfig, link: &str) -> Result<String, String> {
+    let base = cfg.click_through_base();
+    let page = origin(base).ok_or_else(|| {
+        format!(
+            "`{base}` is not an https address of a host alone for the page to be served at; \
+             set mail.click_through_base"
+        )
+    })?;
+    let host = cfg
+        .authelia_host
+        .as_deref()
+        .ok_or("no accounts block names the host Authelia's links are on")?;
+    let url = permitted(host, link).ok_or_else(|| {
+        let named = Url::parse(link)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "no host".into());
+        format!(
+            "the link names {named}, and the page follows links only to accounts.public_host {host}"
+        )
+    })?;
+    if served_by_authelia(&page, &url) {
+        return Err(format!(
+            "{base}{PATH} would be Authelia's: it is served at the root of that host. Set \
+             mail.click_through_base (or sign_in_url) to the portal's own address"
+        ));
+    }
+    Ok(wrap(base, link))
+}
+
+/// Would `{page}/set-password` reach Authelia rather than this portal? Only
+/// when they share a host and Authelia is served at its root — under a path
+/// prefix (`/auth`), the rest of the host is the portal's.
+fn served_by_authelia(page: &Url, link: &Url) -> bool {
+    let prefix = link
+        .path()
+        .strip_suffix(AUTHELIA_RESET_PATH)
+        .unwrap_or_default();
+    page.host_str() == link.host_str()
+        && page.port() == link.port()
+        && (prefix.is_empty() || PATH.starts_with(&format!("{prefix}/")))
+}
+
+/// Can the page be served at `base`? An `https` address of a host alone: the
+/// page's form posts to `/set-password` at the root, and Authelia's bypass rule
+/// names that path — and the address carries a one-time credential, so not
+/// in clear.
 pub fn usable_base(base: &str) -> bool {
-    Url::parse(base).is_ok_and(|u| {
+    origin(base).is_some()
+}
+
+fn origin(base: &str) -> Option<Url> {
+    Url::parse(base).ok().filter(|u| {
         u.scheme() == "https"
             && u.host_str().is_some_and(|h| !h.is_empty())
             && u.username().is_empty()
             && u.password().is_none()
+            && u.path() == "/"
             && u.query().is_none()
             && u.fragment().is_none()
     })
 }
+
+/// The monorepo's cap on a URL. Authelia's reset links are a few hundred
+/// bytes; anything this long was not minted by it, and would otherwise be
+/// echoed back whole in a page or a `Location`.
+const MAX_LINK_LEN: usize = 2048;
 
 /// Is this a URL this portal is willing to send somebody to?
 ///
@@ -156,6 +196,9 @@ pub fn usable_base(base: &str) -> bool {
 /// the parsed URL is what the redirect names: there is no second reading of
 /// the string for the two to disagree about.
 pub fn permitted(authelia_host: &str, url: &str) -> Option<Url> {
+    if url.len() > MAX_LINK_LEN {
+        return None;
+    }
     // Parsed through a URL so both sides are compared normalised: case, IDNA
     // and a default port spelled out in the config.
     let want = Url::parse(&format!("https://{authelia_host}/")).ok()?;
@@ -383,6 +426,8 @@ mod tests {
             "//watch.example.com/auth/reset-password/step2?token=x",
             "javascript:alert(1)//watch.example.com/reset-password/step2?token=x",
             "",
+            // Longer than any link Authelia mints.
+            &format!("{LINK}{}", "A".repeat(MAX_LINK_LEN)),
         ] {
             assert!(
                 permitted(HOST, bad).is_none(),
@@ -401,6 +446,21 @@ mod tests {
         assert!(permitted(HOST, link).is_none());
         assert!(permitted("auth.example.com", LINK).is_none());
         assert!(wrap(BASE, link).starts_with("https://watch.example.com/set-password?u="));
+    }
+
+    /// Authelia at the root of the host the page would be on owns
+    /// `/set-password` there too; under a path prefix it does not.
+    #[test]
+    fn a_page_on_authelias_own_host_is_noticed() {
+        let at_root = Url::parse("https://auth.example.com/reset-password/step2?token=x").unwrap();
+        let under_auth = Url::parse(LINK).unwrap();
+        let portal = origin(BASE).unwrap();
+        let authelias = origin("https://auth.example.com").unwrap();
+        assert!(served_by_authelia(&authelias, &at_root));
+        assert!(!served_by_authelia(&portal, &at_root));
+        assert!(!served_by_authelia(&portal, &under_auth));
+        let elsewhere = origin("https://auth.example.com:8443").unwrap();
+        assert!(!served_by_authelia(&elsewhere, &at_root));
     }
 
     #[test]
@@ -458,7 +518,8 @@ mod tests {
     fn the_page_is_served_only_at_an_https_address() {
         for ok in [
             "https://watch.example.com",
-            "https://watch.example.com/portal",
+            "https://watch.example.com/",
+            "https://watch.example.com:8443",
         ] {
             assert!(usable_base(ok), "{ok} refused");
         }
@@ -470,6 +531,10 @@ mod tests {
             "https://",
             "watch.example.com",
             "http://watch.example.com",
+            // The form posts to `/set-password` at the root, and the bypass
+            // rule names that path: a prefix would serve a page that cannot
+            // work.
+            "https://watch.example.com/portal",
             "https://u:p@watch.example.com",
             "https://watch.example.com/?from=email",
             "https://watch.example.com/#top",

@@ -168,8 +168,9 @@ pub struct MailConfig {
     /// Where this portal answers, for the page an emailed link points at —
     /// e.g. `https://watch.example.com`. Defaults to
     /// [`sign_in_url`](Self::sign_in_url), which is the portal's address in
-    /// every deployment that has one. Must be `https`: the address carries a
-    /// one-time credential.
+    /// every deployment that has one. An `https` address of a host alone: the
+    /// page is served at its root, and the address carries a one-time
+    /// credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub click_through_base: Option<String>,
     /// Email the address of the portal's own set-password page rather than
@@ -333,9 +334,9 @@ impl MailConfig {
             && !super::clickthrough::usable_base(base)
         {
             return Err(format!(
-                "mail.click_through_base `{base}` must be an https:// URL with a host and no \
-                 credentials, query or fragment: the set-password page is served under it, and \
-                 its address carries a one-time password link"
+                "mail.click_through_base `{base}` must be the portal's https:// address, a host \
+                 alone — no path, credentials, query or fragment: the set-password page is served \
+                 at its root, and its address carries a one-time password link"
             ));
         }
         one_line("mail.brand", &self.brand, 64)?;
@@ -1908,13 +1909,23 @@ mod tests {
             .unwrap()
             .replace("watch.portal.example/auth", "auth.portal.example")
             .into_bytes();
-        let body = invitation_with(&c, msg).await;
+        let body = invitation_with(&c, msg.clone()).await;
         assert!(
             body.contains(
                 "https://watch.portal.example/set-password?u=https%3A%2F%2Fauth.portal.example%2Freset-password%2Fstep2%3Ftoken%3D"
             ),
             "{body}"
         );
+
+        // A sign-in address naming Authelia's host would put the page where
+        // Authelia answers instead — so Authelia's link goes out as it is.
+        c.sign_in_url = "https://auth.portal.example".into();
+        let body = invitation_with(&c, msg).await;
+        assert!(
+            body.contains("https://auth.portal.example/reset-password/step2?token="),
+            "{body}"
+        );
+        assert!(!body.contains("/set-password?u="), "{body}");
     }
 
     /// An email pointing at a page that answers `400` would spend every link,
@@ -1929,8 +1940,11 @@ mod tests {
                 as fn(&mut MailConfig),
             // No `accounts`, so no host to hold the link to.
             |c| c.authelia_host = None,
-            // A sign-in address the page cannot be served at.
+            // Sign-in addresses the page cannot be served at: in clear, or
+            // under a path, where neither its form nor Authelia's bypass rule
+            // would find it.
             |c| c.sign_in_url = "http://watch.portal.example".into(),
+            |c| c.sign_in_url = "https://watch.portal.example/portal".into(),
         ] {
             let mut c = cfg();
             break_it(&mut c);
@@ -1972,6 +1986,7 @@ mod tests {
         for bad in [
             "https://",
             "http://portal.other.example",
+            "https://portal.other.example/portal",
             "portal.other.example",
             "https://portal.other.example/?from=email",
         ] {

@@ -273,8 +273,9 @@ fn forged_body(url: &str) -> String {
 }
 
 /// A portal that sends password links, for the click-through page below.
-/// `public_host` is the host Authelia names in them.
-async fn mail_harness(base: &str, public_host: &str) -> String {
+/// `public_host` is the host Authelia names in them; `None` is a portal with
+/// `mail` but no `accounts`, which asks for no links.
+async fn mail_harness(base: &str, public_host: Option<&str>) -> String {
     let mut cfg = PortalConfig {
         listen_addr: "127.0.0.1:0".into(),
         manager_url: "http://127.0.0.1:1".into(),
@@ -282,10 +283,10 @@ async fn mail_harness(base: &str, public_host: &str) -> String {
         username_header: "remote-user".into(),
         trusted_proxies: ["127.0.0.1".parse().unwrap()].into_iter().collect(),
         player_origins: Vec::new(),
-        accounts: Some(portal::accounts::AccountSyncConfig {
+        accounts: public_host.map(|h| portal::accounts::AccountSyncConfig {
             users_file: "/etc/authelia/users.yml".into(),
             authelia_url: "http://127.0.0.1:9091/auth".into(),
-            public_host: public_host.into(),
+            public_host: h.into(),
             managed_group: "bilbycast-portal".into(),
             interval_secs: 15,
         }),
@@ -331,24 +332,42 @@ async fn press_the_button(portal: &str, emailed: &str) -> (String, reqwest::Resp
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+    assert_guarded(&r);
+    let page = r.text().await.unwrap();
+    let r = press(portal, form_body_from(&page)).await;
+    (page, r)
+}
+
+/// `POST /set-password` with `body`, stopping at the redirect.
+async fn press(portal: &str, body: String) -> reqwest::Response {
+    client_no_redirect()
+        .post(format!("{portal}/set-password"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// What every answer from `/set-password` carries: its address can hold a
+/// one-time credential, so nothing may cache it, frame it or pass it on.
+fn assert_guarded(r: &reqwest::Response) {
     for (name, want) in [
+        (
+            "content-security-policy",
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+        ),
         ("cache-control", "no-store"),
         ("referrer-policy", "no-referrer"),
         ("x-frame-options", "DENY"),
     ] {
-        assert_eq!(r.headers()[name], want, "the page went out without {name}");
+        assert_eq!(
+            r.headers().get(name).map(|v| v.to_str().unwrap()),
+            Some(want),
+            "a {} went out without {name}",
+            r.status()
+        );
     }
-    let csp = r.headers()["content-security-policy"].to_str().unwrap();
-    assert!(csp.contains("default-src 'none'"), "{csp}");
-    let page = r.text().await.unwrap();
-    let r = client_no_redirect()
-        .post(format!("{portal}/set-password"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form_body_from(&page))
-        .send()
-        .await
-        .unwrap();
-    (page, r)
 }
 
 /// The page an emailed password link points at.
@@ -363,7 +382,7 @@ async fn press_the_button(portal: &str, emailed: &str) -> (String, reqwest::Resp
 async fn the_set_password_page_is_inert_until_somebody_presses_the_button() {
     let base = "https://watch.portal.example";
     let link = format!("{base}/auth/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc.def");
-    let portal = mail_harness(base, "watch.portal.example").await;
+    let portal = mail_harness(base, Some("watch.portal.example")).await;
 
     // GET: a page, and nothing a crawler can act on. POST, as the browser
     // sends it: only now does the browser go on to Authelia.
@@ -396,27 +415,18 @@ async fn the_set_password_page_is_inert_until_somebody_presses_the_button() {
             .await
             .unwrap();
         assert_eq!(r.status(), 400, "{bad} was offered a button");
+        assert_guarded(&r);
         assert!(!r.text().await.unwrap().contains("<form"));
 
-        let r = client_no_redirect()
-            .post(format!("{portal}/set-password"))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(forged_body(bad))
-            .send()
-            .await
-            .unwrap();
+        let r = press(&portal, forged_body(bad)).await;
         assert_eq!(r.status(), 400, "{bad} was followed");
+        assert_guarded(&r);
     }
+    assert_guarded(&press(&portal, forged_body(&link)).await);
 
     // A forged value that cannot be a header is a refusal or a clean
     // redirect, never a 500.
-    let r = client_no_redirect()
-        .post(format!("{portal}/set-password"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(forged_body(&format!("{link}\r\nSet-Cookie: x=1")))
-        .send()
-        .await
-        .unwrap();
+    let r = press(&portal, forged_body(&format!("{link}\r\nSet-Cookie: x=1"))).await;
     assert!(matches!(r.status().as_u16(), 303 | 400), "{}", r.status());
     assert!(r.headers().get("set-cookie").is_none());
 }
@@ -427,10 +437,29 @@ async fn the_set_password_page_is_inert_until_somebody_presses_the_button() {
 async fn the_button_reaches_authelia_on_its_own_host() {
     let base = "https://watch.portal.example";
     let link = "https://auth.portal.example/reset-password/step2?token=eyJhbGciOiJIUzI1NiJ9.abc";
-    let portal = mail_harness(base, "auth.portal.example").await;
+    let portal = mail_harness(base, Some("auth.portal.example")).await;
     let (_, r) = press_the_button(&portal, &portal::clickthrough::wrap(base, link)).await;
     assert_eq!(r.status(), 303);
     assert_eq!(r.headers()["location"], link);
+}
+
+/// Without `accounts` the portal asks for no links, so there is no page to
+/// show and nothing to follow.
+#[tokio::test]
+async fn a_portal_that_asks_for_no_links_has_no_set_password_page() {
+    let base = "https://watch.portal.example";
+    let link = format!("{base}/auth/reset-password/step2?token=abc");
+    let portal = mail_harness(base, None).await;
+    let r = client()
+        .get(portal::clickthrough::wrap(&portal, &link))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    assert_guarded(&r);
+    let r = press(&portal, forged_body(&link)).await;
+    assert_eq!(r.status(), 404);
+    assert_guarded(&r);
 }
 
 #[tokio::test]

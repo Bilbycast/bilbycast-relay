@@ -558,8 +558,9 @@ if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
         refresh_portal_unit "$(find staging -maxdepth 4 -name "${PORTAL_UNIT_NAME}.service" -type f | head -1)"
         # A `mail` block that does not name `click_through` gets it on, and
         # the page it emails needs an Authelia rule this script cannot add.
+        # Without `accounts` the portal asks for no links, so wraps none.
         # Report, never block — see the distribution notice above.
-        if jq -e '.mail and (.mail | has("click_through") | not)' \
+        if jq -e '.mail and .accounts and (.mail | has("click_through") | not)' \
             /etc/bilbycast/portal.json > /dev/null 2>&1; then
             echo
             echo "  This portal rewrites Authelia's mail, and password links now point"

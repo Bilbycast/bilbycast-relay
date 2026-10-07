@@ -439,8 +439,10 @@ https on `accounts.public_host` (copied into `MailConfig::authelia_host` by
 `PortalConfig::normalise`; `permitted` parses with `Url` and the redirect names
 the parsed URL). `email_link` runs the same check before the email is written
 and falls back to Authelia's own link rather than emailing one the page would
-refuse. Needs an Authelia `bypass` rule for `^/set-password([?].*)?$`, which
-the portal cannot see — it says so at startup and `upgrade-relay.sh` reminds. The listener requires `AUTH PLAIN`/`LOGIN` with
+refuse — or one whose base is not an https host alone, or is the host where
+Authelia is served at the root. Needs an Authelia `bypass` rule for
+`^/set-password([?].*)?$`, which the portal cannot see — it says so at startup
+and `upgrade-relay.sh` reminds. The listener requires `AUTH PLAIN`/`LOGIN` with
 the secret in the **required** `listen_password_file` (≥ 32 chars; Authelia
 gets the same file as
 `AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE`), refuses any envelope sender but
