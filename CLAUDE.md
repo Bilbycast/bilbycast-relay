@@ -231,10 +231,16 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   access units + Opus frames, and feeds the hub. A **QUIC ES ingest** (ALPN
   `bilbycast-distribution`, `:4486`) is the future lower-overhead path.
 - **Hub** (`src/distribution/hub.rs`): one `tokio::broadcast` fan-out per stream
-  + a lock-free (`arc-swap`) keyframe cache for instant late-join.
+  + a lock-free (`arc-swap`) keyframe cache for instant late-join, and the
+  stream's latest SPS / PPS, put back ahead of every IDR that arrives without
+  its own (`es::restore_param_sets`) so a viewer can start on any IDR.
 - **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
-  packetize (RFC 6184) → SRTP → browser. Vendored str0m session + H.264
-  packetizer under `src/distribution/webrtc/` (kept in sync with bilbycast-edge).
+  each H.264 access unit goes to str0m's writer **once, whole, as Annex B** and
+  str0m packetizes it (RFC 6184) → SRTP → browser. There is no relay-side
+  packetizer: the vendored one was fed to str0m packet by packet, which
+  packetized every packet again, and no browser decoded a frame (removed, as the
+  edge removed its own in e927368). Vendored str0m session under
+  `src/distribution/webrtc/` (kept in sync with bilbycast-edge).
 - **Cascade** (`src/distribution/cascade.rs`): scale past one relay's viewer
   ceiling — a downstream relay is a **WHEP client** of an upstream relay
   (`create_offer` → POST `/whep/{stream}` → ICE/DTLS/SRTP → republish to local

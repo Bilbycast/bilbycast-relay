@@ -7,7 +7,9 @@
 //! frame; the WHEP side calls [`DistributionHub::subscribe`] once per viewer.
 //! Each stream owns a `tokio::broadcast` channel (drop-on-lag, never blocks
 //! ingest) plus a lock-free [`ArcSwapOption`] holding the most recent
-//! keyframe access unit so late joiners decode immediately.
+//! keyframe access unit so late joiners decode immediately, and the latest
+//! SPS / PPS the stream carried, which go back ahead of every IDR that
+//! arrives without its own (see [`restore_param_sets`]).
 //!
 //! This is the deliberately-stateful heart of the viewer-distribution
 //! subsystem — isolated behind the `viewer-distribution` feature so the
@@ -16,11 +18,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
-use super::es::{EsFrame, EsKind, au_is_idr};
+use super::es::{EsFrame, EsKind, H264ParamSets, restore_param_sets};
 
 /// Per-viewer broadcast depth. A viewer that falls this far behind is lagged
 /// (drop-on-`Lagged`) — the relay never applies backpressure to ingest.
@@ -29,7 +31,8 @@ const VIEWER_CHANNEL_CAPACITY: usize = 1024;
 /// The most recent keyframe, cached for instant late-join.
 #[derive(Clone)]
 pub struct CachedKeyframe {
-    /// The IDR access unit (carries the edge's in-band SPS/PPS).
+    /// The IDR access unit, behind the stream's SPS / PPS — its own, or the
+    /// ones [`DistributionHub::publish`] put back.
     pub frame: EsFrame,
 }
 
@@ -38,6 +41,9 @@ pub struct StreamState {
     stream_id: String,
     tx: broadcast::Sender<Arc<EsFrame>>,
     keyframe: ArcSwapOption<CachedKeyframe>,
+    /// The latest SPS / PPS the stream carried in-band. Written only by the
+    /// ingest publishing this stream, read on each video frame it publishes.
+    param_sets: ArcSwap<H264ParamSets>,
     /// True once at least one audio frame has been published — WHEP viewers
     /// use this to decide whether to negotiate an audio m-line.
     has_audio: std::sync::atomic::AtomicBool,
@@ -59,6 +65,7 @@ impl StreamState {
             stream_id,
             tx,
             keyframe: ArcSwapOption::empty(),
+            param_sets: ArcSwap::from_pointee(H264ParamSets::default()),
             has_audio: std::sync::atomic::AtomicBool::new(false),
             viewers: AtomicU64::new(0),
             frames_in: AtomicU64::new(0),
@@ -167,7 +174,13 @@ impl DistributionHub {
 
     /// Publish one elementary frame to a stream. Never blocks: if no viewers
     /// are attached the frame is dropped after refreshing the keyframe cache.
-    pub fn publish(&self, stream_id: &str, frame: EsFrame) {
+    ///
+    /// An IDR access unit that does not carry its own SPS / PPS goes out (and
+    /// into the keyframe cache) behind the stream's latest ones, so every
+    /// viewer — a late joiner primed from the cache included — can start
+    /// decoding on any IDR. Every ingest path publishes through here, so this
+    /// is done once per frame rather than once per viewer.
+    pub fn publish(&self, stream_id: &str, mut frame: EsFrame) {
         let state = self.ensure(stream_id);
 
         state.frames_in.fetch_add(1, Ordering::Relaxed);
@@ -177,13 +190,22 @@ impl DistributionHub {
             state.has_audio.store(true, Ordering::Relaxed);
         }
 
-        // Refresh the keyframe cache on an IDR access unit. `keyframe` is set
-        // by the ingest; fall back to scanning the AU so a mis-flagged frame
-        // still primes the cache.
-        if frame.kind == EsKind::VideoH264 && (frame.keyframe || au_is_idr(&frame.data)) {
-            state
-                .keyframe
-                .store(Some(Arc::new(CachedKeyframe { frame: frame.clone() })));
+        if frame.kind == EsKind::VideoH264 {
+            let restored = restore_param_sets(&frame.data, &state.param_sets.load());
+            if let Some(sets) = restored.param_sets {
+                state.param_sets.store(Arc::new(sets));
+            }
+            if let Some(au) = restored.au {
+                frame.data = au.into();
+            }
+            // Refresh the keyframe cache on an IDR access unit. `keyframe` is
+            // set by the ingest; the scan above catches a mis-flagged frame
+            // so it still primes the cache.
+            if frame.keyframe || restored.idr {
+                state
+                    .keyframe
+                    .store(Some(Arc::new(CachedKeyframe { frame: frame.clone() })));
+            }
         }
 
         // Drop-on-no-receiver / drop-on-lag: ignore the error.
@@ -303,6 +325,44 @@ mod tests {
         assert_eq!(hub.get("s1").unwrap().viewer_count(), 1);
         drop(sub);
         assert_eq!(hub.get("s1").unwrap().viewer_count(), 0);
+    }
+
+    /// An IDR that arrives without its own SPS / PPS goes out — live and from
+    /// the keyframe cache — behind the stream's latest ones, so a viewer that
+    /// joins after the IDR that carried them can decode. Before the hub put
+    /// them back, a stream whose sender sent its parameter sets once left
+    /// every later viewer with undecodable slices.
+    #[tokio::test]
+    async fn an_idr_without_parameter_sets_goes_out_behind_the_streams_own() {
+        let hub = DistributionHub::new();
+        let bare_idr = Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x99, 0x77]);
+        let p = Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a]);
+
+        // Nothing to put back before the stream has carried any.
+        hub.publish("s1", EsFrame::video(0, bare_idr.clone(), true));
+        assert_eq!(hub.get("s1").unwrap().keyframe().unwrap().frame.data, bare_idr);
+
+        hub.publish("s1", EsFrame::video(3000, idr_au(), true));
+        let mut sub = hub.subscribe("s1");
+        hub.publish("s1", EsFrame::video(6000, p.clone(), false));
+        hub.publish("s1", EsFrame::video(9000, bare_idr, true));
+
+        let expected: &[u8] = &[
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1f, //
+            0, 0, 0, 1, 0x68, 0xce, //
+            0, 0, 0, 1, 0x65, 0x99, 0x77, //
+        ];
+        assert_eq!(sub.rx.recv().await.unwrap().data, p, "a P frame goes out as it came");
+        let idr = sub.rx.recv().await.unwrap();
+        assert_eq!(&idr.data[..], expected, "the live IDR carries the parameter sets");
+        assert!(idr.keyframe);
+        let cached = hub.get("s1").unwrap().keyframe().unwrap();
+        assert_eq!(&cached.frame.data[..], expected, "so does the late joiner's");
+        // Bytes in counts what the ingest sent, not what the hub added.
+        assert_eq!(
+            hub.snapshot()[0].bytes_in,
+            (7 + idr_au().len() + p.len() + 7) as u64
+        );
     }
 
     #[test]
