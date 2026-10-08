@@ -2839,14 +2839,19 @@ async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back
 }
 
 /// A viewer whose ICE consent checks pause past the point where `is` reports
-/// it disconnected — 17 s, against `is`'s 15 s — and then resume, as after a
-/// Wi-Fi or cellular hiccup, a suspended laptop or a backgrounded mobile
-/// browser, is kept: ICE comes back on its next nomination, the viewer holds
-/// its slot throughout and it receives what is published after it returns.
+/// it disconnected — 17 s, against `is`'s 15 s — and then resume, as a
+/// suspended laptop or a backgrounded mobile browser does, is kept: ICE comes
+/// back on its next nomination, the viewer holds its slot throughout, and it
+/// receives what is published after it returns — still, once it has been back
+/// for longer than `ICE_DISCONNECT_GRACE`.
 ///
 /// Before, a session ended on the first ICE `Disconnected`, so this viewer was
 /// reaped at about 15 s although str0m and the viewer would both have resumed
-/// — and the `/watch` player does not reconnect, so it stayed black.
+/// — and the `/watch` player does not reconnect, so it stayed black. The last
+/// check is what proves the return reaches the code that cancels the grace
+/// (`Connected` / `Completed` in `handle_event`): without it a returning
+/// viewer is reaped `ICE_DISCONNECT_GRACE` after its disconnect, 10 to 13 s
+/// after it came back here, and the checks before that pass all the same.
 #[tokio::test]
 async fn a_viewer_whose_ice_pauses_and_comes_back_is_kept() {
     use bilbycast_relay::distribution::webrtc::session::{ICE_DISCONNECT_GRACE, SessionEvent};
@@ -2914,6 +2919,41 @@ async fn a_viewer_whose_ice_pauses_and_comes_back_is_kept() {
         (held(&state), state.sessions.len()),
         (1, 1),
         "and it still holds its slot"
+    );
+
+    // Keep watching for longer than the grace: a disconnect its return did
+    // not cancel would end the session within it.
+    let drive = ICE_DISCONNECT_GRACE + Duration::from_secs(5);
+    let stop = CancellationToken::new();
+    let stop_at = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(drive).await;
+        stop_at.cancel();
+    });
+    let (mut frames, mut last_frame) = (0u64, None);
+    loop {
+        match viewer.poll_event(&stop).await {
+            SessionEvent::MediaData { mid, .. } if Some(mid) == video => {
+                frames += 1;
+                last_frame = Some(std::time::Instant::now());
+            }
+            SessionEvent::Disconnected if stop.is_cancelled() => break,
+            SessionEvent::Disconnected => {
+                panic!("the viewer's own session ended after {frames} frames")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        last_frame.is_some_and(|at| at.elapsed() < Duration::from_secs(2)),
+        "{drive:?} after it came back, the viewer must still be receiving: {frames} frames, \
+         the last {:?} ago",
+        last_frame.map(|at| at.elapsed())
+    );
+    assert_eq!(
+        (held(&state), state.sessions.len()),
+        (1, 1),
+        "{drive:?} after it came back, the viewer must still hold its slot"
     );
 
     cancel.cancel();

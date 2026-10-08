@@ -241,10 +241,12 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   `MAX_PARAM_SET_BYTES` (1024) is never cached and retires the cached one, and
   nothing is inserted past `MAX_PARAM_SETS_ON_THE_WIRE` (1115 = str0m's 1120-byte
   payload MTU less the STAP-A framing; a larger STAP-A is silently dropped).
-  WHIP-in / cascade access units are capped at `es::MAX_FRAME_BYTES` (4 MiB,
-  the QUIC ingest's frame cap) plus 64 KiB of headroom for what an upstream
-  relay adds to a unit at that cap (`whip_ingest::MAX_RTP_AU_BYTES`), and
-  dropped whole past it.
+  WHIP-in access units are capped at `es::MAX_FRAME_BYTES` (4 MiB, the QUIC
+  ingest's frame cap) and a cascade pull's at that plus 64 KiB of headroom
+  (`whip_ingest::MAX_RTP_AU_BYTES`) for what the relays above add to a unit
+  their origin took — the re-inserted SPS / PPS and 4-byte start codes, each
+  at most once along a chain — so what an origin takes reaches every tier;
+  a unit past its cap is dropped whole.
 - **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
   each H.264 access unit goes to str0m's writer **once, whole, as Annex B** and
   str0m packetizes it (RFC 6184) → SRTP → browser. There is no relay-side

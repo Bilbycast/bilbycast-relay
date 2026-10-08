@@ -162,27 +162,44 @@ ends on whichever comes first:
   sent the stream, and held its slot, for as long as the stream lived.
 
   The grace is there because the ICE-Lite side recovers: a viewer whose
-  checks paused — a Wi-Fi or cellular hiccup, a suspended laptop, a
-  backgrounded mobile browser — is nominated again by its next check, and a
-  browser itself gives up only after RFC 7675's 30 s. Ending the session on
-  the first disconnect closed such a viewer, which the `/watch` player does
-  not reconnect. str0m keeps sending to the viewer's last address meanwhile,
-  so a viewer that really left is sent about 30 s of the stream.
+  checks paused is nominated again by its next check. That keeps a viewer
+  whose browser was suspended or backgrounded — a laptop lid, a mobile tab, a
+  frozen process — and one whose network comes back before the browser's own
+  ICE fails (measured with Chrome 124: a 20 s freeze and a 14 s network loss
+  both came back). Chrome fails a connection after about 15 s of unanswered
+  checks, not RFC 7675's 30 s, and then stops checking for good — neither
+  side restarts ICE, and the `/watch` player does not reconnect — so a longer
+  network outage loses the viewer whatever the relay does. Ending the
+  session on the first disconnect lost the ones that would have come back.
+  str0m keeps sending to the viewer's last address meanwhile, so a viewer
+  that really left is sent about 30 s of the stream.
 - **30 s without connecting** (`SETUP_DEADLINE`) — an offer whose sender never
   completes ICE and DTLS, such as one with no `a=candidate` lines from a peer
   that never sends STUN, which ICE-Lite would otherwise wait on for ever. WHIP
   ingest sessions and cascade pulls have the same deadline.
 
-A WHIP ingest session and a cascade pull end the same ways — on a `DELETE`,
-the peer closing the connection, or `SETUP_DEADLINE` — except that they end
-on ICE's first disconnect, with no grace. Before, a publisher or upstream that
-closed the connection without a `DELETE` ended nothing: str0m goes inert after
-a close_notify, so the ingest stayed registered for good and the cascade pull
-never retried.
+A WHIP ingest session ends the same ways — on a `DELETE`, the publisher
+closing the connection, or `SETUP_DEADLINE` — except that it ends on ICE's
+first disconnect, with no grace.
+
+A cascade pull has no `DELETE`: it is a WHEP client this relay runs. It ends
+when its entry in `distribution.cascade_sources` is removed or changed (a
+changed one starts again at once), when the relay stops, when the upstream
+closes the connection, on ICE's first disconnect, or at `SETUP_DEADLINE`. On
+the last three, and when its offer fails (an unreachable upstream, say), it
+tries again 3 s later. It sends the upstream no `DELETE` either, so the
+upstream relay reaps the pull's session the way it reaps any viewer that
+leaves without one.
+
+Before, a publisher or upstream that closed the connection without a
+`DELETE` ended nothing: str0m goes inert after a close_notify, so the ingest
+stayed registered for good and the cascade pull never retried.
 
 The relay logs each viewer's end with its reason (`WHEP viewer '…' closed
 (stream '…'): deleted by the client`, `ICE disconnected`, `DTLS closed`,
-`stream closed`, …), and a `DELETE` with the client's address as it arrives.
+`stream closed`, …), and each `DELETE` as it arrives, with the address it
+came from and the viewer's (`WHEP viewer '…' deleted by 203.0.113.9:51234
+(viewer 198.51.100.7)`) — anyone holding a session's id can delete it.
 
 ### Media source pin
 
@@ -1650,10 +1667,11 @@ as ignored at startup.
   `DELETE` — on a live stream and on a stalled one — are reaped once ICE has
   given up on them for the ICE grace, and give their per-IP slot back
   (`a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back`,
-  about 30 s); a viewer whose ICE pauses for 17 s and resumes is kept and
-  receives what is published after it returns
-  (`a_viewer_whose_ice_pauses_and_comes_back_is_kept`); a viewer and a WHIP
-  publisher that close their connection without a `DELETE` end at once
+  about 30 s); a viewer whose ICE pauses for 17 s and resumes is kept, and is
+  still receiving what is published once it has been back for longer than
+  the grace (`a_viewer_whose_ice_pauses_and_comes_back_is_kept`, about 37 s);
+  a viewer and a WHIP publisher that close their connection without a
+  `DELETE` end at once
   (`a_peer_that_closes_without_a_delete_ends_at_once`); a WHEP viewer and a
   WHIP publisher that never connect are closed at the 30 s setup deadline
   (`an_offer_that_never_connects_is_closed_at_the_setup_deadline`, 30 s).

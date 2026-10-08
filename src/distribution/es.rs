@@ -17,8 +17,9 @@ use bytes::Bytes;
 /// The largest elementary frame the distribution plane takes from any ingest
 /// (a generous 4 MiB — a 4K IDR access unit is well under this): a frame on
 /// the QUIC ES ingest ([`super::ingest`]), and an access unit a WHIP
-/// publisher or cascade upstream builds out of RTP (`whip_ingest`'s
-/// assembler).
+/// publisher builds out of RTP (`whip_ingest`'s assembler). A cascade pull
+/// takes this plus headroom for what the relays above it add
+/// (`whip_ingest::MAX_RTP_AU_BYTES`).
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 /// Which elementary stream an [`EsFrame`] carries.

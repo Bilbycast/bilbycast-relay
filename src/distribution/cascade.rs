@@ -33,7 +33,7 @@ use crate::distribution_control::DistributionControl;
 use super::hub::DistributionHub;
 use super::webrtc::session::{SessionConfig, WebrtcSession};
 use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
-use super::whip_ingest::republish_from_session;
+use super::whip_ingest::{MAX_RTP_AU_BYTES, republish_from_session};
 
 /// Supervise the set of cascade pulls, reconciling running WHEP-client tasks
 /// against the (manager-updatable) source list on every change. Keyed by
@@ -173,7 +173,7 @@ async fn cascade_attempt(
     tracing::info!("cascade '{}': connected to upstream", source.local_stream);
     hub.register(&source.local_stream);
 
-    republish_from_session(client, hub, &source.local_stream, cancel).await;
+    republish_from_session(client, hub, &source.local_stream, cancel, MAX_RTP_AU_BYTES).await;
 
     hub.remove(&source.local_stream);
     Ok(())

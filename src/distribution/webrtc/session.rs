@@ -27,10 +27,23 @@
 //! Porting `PeerPin` across is the fix; until then, a sync in either direction
 //! must carry this control forward, never delete it.
 //!
-//! The disconnect latch ([`WebrtcSession::is_disconnected`], with
-//! [`ICE_DISCONNECT_GRACE`] and [`SessionEnd`]) is relay-only too: the WHEP
-//! send loop reaps a departed viewer by it. Carry it forward in a sync as
-//! well, and the handling of `Event::Closed` with it.
+//! Both copies now give an ICE-Lite session a grace before ICE `Disconnected`
+//! ends it
+//! ([`ICE_DISCONNECT_GRACE`], [`WebrtcSession::is_disconnected`]) and end one
+//! on `Event::Closed`, but they were built separately and differ, so a sync
+//! must merge the two rather than copy either over the other. Relay-only:
+//! [`SessionEnd`] and [`WebrtcSession::end`] — why a session ended, which
+//! each WHEP viewer's last log line names; a public [`WebrtcSession::close`]
+//! (only tests call it; the edge's is `cfg(test)`); a grace that only a
+//! nomination (`Connected` / `Completed`) cancels, where the edge's is
+//! cancelled by any other ICE state; and a `poll_event` that wakes when a
+//! grace runs out and returns on any end. The edge's copy, for its part, also
+//! ends a session on a socket or str0m error seen while draining
+//! (`drain_outputs`, `drive_udp_io`), where this one latches such an error
+//! only in `poll_event`; gives the grace only to ICE-Lite sessions (its WHIP
+//! output, a full ICE agent, ends at its first `Disconnected`); and puts
+//! nothing on the wire while ICE is down (`ice_down`), where this one keeps
+//! sending through the grace.
 //!
 //! Manages the lifecycle of a single WebRTC PeerConnection: ICE, DTLS,
 //! SRTP, and media I/O. Integrates str0m's sans-I/O model with tokio
@@ -211,11 +224,14 @@ fn send_pt<'a>(kind: MediaKind, params: impl Iterator<Item = &'a PayloadParams>)
 /// Binding Request (`RECENT_BINDING_REQUEST`), but that agent comes back: the
 /// peer's next request re-creates the pair it pruned and, carrying
 /// USE-CANDIDATE as a controlling agent's checks on its nominated pair do,
-/// nominates it, and ICE is `Completed` again. A viewer whose checks paused —
-/// a Wi-Fi or cellular hiccup, a suspended laptop, a backgrounded mobile
-/// browser — resumes. A browser gives up only when it has heard nothing for
-/// RFC 7675's 30 s, so 15 s of grace on top of `is`'s 15 s ends the relay's
-/// side no sooner than the browser would end its own.
+/// nominates it, and ICE is `Completed` again. So the grace keeps a viewer
+/// whose browser stopped checking and then resumed — a suspended laptop, a
+/// backgrounded mobile tab, a frozen process — and one whose network came
+/// back before the browser's own ICE failed (measured with Chrome 124: a
+/// 20 s freeze and a 14 s network loss both came back). That second window
+/// is short: Chrome fails a connection after about 15 s of unanswered checks,
+/// not RFC 7675's 30 s, and then stops checking for good (nothing here
+/// restarts ICE), so a longer outage loses the viewer whatever the relay does.
 ///
 /// The grace is not free: str0m keeps sending to the last nominated address
 /// until the session ends, so a viewer that really left is sent about 30 s of

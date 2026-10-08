@@ -609,18 +609,21 @@ async fn whep_offer(
 /// `DELETE /whep/{stream_id}/{session_id}` — tear down exactly this viewer.
 async fn whep_delete(
     State(st): State<Arc<DistributionState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((_stream_id, session_id)): Path<(String, String)>,
 ) -> Response {
     // Cancel the session; the reaper spawned at offer time removes the record
-    // and releases the per-IP slot. Logged here, where the client is known:
-    // the viewer's own last line says only "deleted by the client", the same
-    // for a tab's `pagehide` as for any other DELETE. The path's stream id is
-    // not logged — it is whatever the client wrote, and need not be the
+    // and releases the per-IP slot. Logged here, where the request is: the
+    // viewer's own last line says only "deleted by the client", the same for
+    // a tab's `pagehide` as for any other DELETE. Both addresses are logged —
+    // the one this DELETE came from, and the one the viewer's offer came from
+    // — since anyone holding the session id can send it. The path's stream id
+    // is not logged — it is whatever the client wrote, and need not be the
     // viewer's stream, which that last line names.
     match st.sessions.get(&session_id) {
         Some(s) => {
             tracing::info!(
-                "WHEP viewer '{session_id}' deleted by the client ({})",
+                "WHEP viewer '{session_id}' deleted by {peer} (viewer {})",
                 s.ip
             );
             s.cancel.cancel();
@@ -3405,21 +3408,15 @@ mod tests {
         assert!(token_from_query(Some("ingest_token=abc")).is_none());
     }
 
-    /// `ViewerSlot` holds the per-IP cap and gives each slot back exactly once,
-    /// however it is dropped — including by a panic unwinding past it, which
-    /// is the case the old hand-written release in the `Err` arm missed. The
-    /// wiring (that `whep_offer` reserves through it) is asserted over HTTP in
-    /// `tests/distribution.rs` (`failed_offers_never_exhaust_the_per_ip_viewer_cap`).
-    #[test]
-    fn a_viewer_slot_is_given_back_exactly_once_however_it_is_dropped() {
-        let tmp = tempfile::tempdir().unwrap();
+    /// A `DistributionState` with default config, its origin under `dir`.
+    fn test_state(dir: &std::path::Path) -> Arc<DistributionState> {
         let cfg = DistributionConfig::default();
         let control = DistributionControl::new(
             crate::distribution_control::RuntimeDistConfig::from_config(&cfg, None),
             vec![],
         );
         let origin = OriginStore::new(origin::OriginConfig {
-            root: tmp.path().join("origin"),
+            root: dir.join("origin"),
             retention: std::time::Duration::from_secs(3600),
             max_bytes_per_stream: 1 << 30,
             min_segments: 8,
@@ -3428,14 +3425,79 @@ mod tests {
         })
         .unwrap();
         let (events, _rx) = crate::manager::events::event_channel();
-        let st = DistributionState::new(
+        DistributionState::new(
             Arc::new(DistributionHub::new()),
             Arc::new(origin),
             cfg,
             control,
             CancellationToken::new(),
             events,
+        )
+    }
+
+    /// A WHEP `DELETE` is logged with the address it came from and the
+    /// viewer's. Anyone holding the session id can send one, and the line
+    /// used to name only the address the viewer's offer came from, as though
+    /// the DELETE had come from there too.
+    #[tokio::test]
+    async fn a_whep_delete_is_logged_with_its_own_address_and_the_viewers() {
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let st = test_state(tmp.path());
+        let cancel = CancellationToken::new();
+        st.sessions.insert(
+            "v1".to_string(),
+            ViewerSession {
+                cancel: cancel.clone(),
+                ip: "198.51.100.7".parse().unwrap(),
+            },
         );
+
+        let log = Captured::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let resp = whep_delete(
+            State(st.clone()),
+            ConnectInfo("203.0.113.9:4321".parse().unwrap()),
+            Path(("show".to_string(), "v1".to_string())),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(cancel.is_cancelled(), "the viewer was told to end");
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("WHEP viewer 'v1' deleted by 203.0.113.9:4321 (viewer 198.51.100.7)"),
+            "{text}"
+        );
+    }
+
+    /// `ViewerSlot` holds the per-IP cap and gives each slot back exactly once,
+    /// however it is dropped — including by a panic unwinding past it, which
+    /// is the case the old hand-written release in the `Err` arm missed. The
+    /// wiring (that `whep_offer` reserves through it) is asserted over HTTP in
+    /// `tests/distribution.rs` (`failed_offers_never_exhaust_the_per_ip_viewer_cap`).
+    #[test]
+    fn a_viewer_slot_is_given_back_exactly_once_however_it_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = test_state(tmp.path());
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         let held = |ip: IpAddr| {
             st.viewers_by_ip

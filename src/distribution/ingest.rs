@@ -49,8 +49,9 @@ const KIND_AUDIO: u8 = 2;
 const KIND_EOS: u8 = 0xFF;
 const FLAG_KEYFRAME: u8 = 0x01;
 
-// The frame cap, `MAX_FRAME_BYTES`, lives in `es.rs`: WHIP ingest and the
-// cascade pull build access units under the same one.
+// The frame cap, `MAX_FRAME_BYTES`, lives in `es.rs`: WHIP ingest builds
+// access units under the same one, and the cascade pull under it plus
+// headroom (`whip_ingest::MAX_RTP_AU_BYTES`).
 const MAX_HELLO_BYTES: usize = 64 * 1024;
 
 /// Ingest stream opener sent by the edge.
