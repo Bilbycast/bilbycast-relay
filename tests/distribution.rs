@@ -2748,9 +2748,9 @@ async fn eventually(within: Duration, done: impl Fn() -> bool) -> bool {
 }
 
 /// A viewer that leaves without a DELETE — a closed tab, a lost network —
-/// is reaped once ICE gives up on it, and gives its per-IP slot back: one
-/// watching a live stream, and one watching a stream that has stalled (one
-/// keyframe, then nothing).
+/// is reaped once ICE has given up on it for `ICE_DISCONNECT_GRACE`, and gives
+/// its per-IP slot back: one watching a live stream, and one watching a stream
+/// that has stalled (one keyframe, then nothing).
 ///
 /// Before, neither was reaped while its stream lived. str0m reports ICE
 /// giving up from the timeout the send loop runs after each write, and that
@@ -2760,6 +2760,8 @@ async fn eventually(within: Duration, done: impl Fn() -> bool) -> bool {
 /// address locked it out of WHEP after `max_viewers_per_ip` of them.
 #[tokio::test]
 async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back() {
+    use bilbycast_relay::distribution::webrtc::session::ICE_DISCONNECT_GRACE;
+
     let cancel = CancellationToken::new();
     let (state, addr, _events) = serve_distribution(8, &cancel).await;
 
@@ -2800,19 +2802,30 @@ async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back
     let left = std::time::Instant::now();
 
     // `is` gives a silent peer 15 s from its last Binding Request
-    // (`RECENT_BINDING_REQUEST`); measured here at about 15 s. The bound
-    // leaves room for a loaded runner. Both sessions connected (each viewer
-    // received media), so the setup deadline is not what ends them.
-    let reaped = eventually(Duration::from_secs(40), || {
+    // (`RECENT_BINDING_REQUEST`) before it reports ICE disconnected, and the
+    // session then has `ICE_DISCONNECT_GRACE` to come back: about 30 s in
+    // all. The bound leaves room for a loaded runner. Both sessions connected
+    // (each viewer received media), so the setup deadline is not what ends
+    // them.
+    let reaped = eventually(Duration::from_secs(35) + ICE_DISCONNECT_GRACE, || {
         held(&state) == 0 && state.sessions.is_empty()
     })
     .await;
+    let after = left.elapsed();
     assert!(
         reaped,
-        "after {:?}: {} slots held, {} sessions",
-        left.elapsed(),
+        "after {after:?}: {} slots held, {} sessions",
         held(&state),
         state.sessions.len()
+    );
+    // A viewer checks at least every 3 s (`is`'s `max_rto`), so `is` cannot
+    // report it disconnected sooner than about 10 s after it left; the grace
+    // comes on top. Reaped sooner, it was reaped on the disconnect itself
+    // (measured at 15.1 s that way), which a viewer that comes back would be
+    // too.
+    assert!(
+        after >= ICE_DISCONNECT_GRACE + Duration::from_secs(5),
+        "reaped after {after:?}: without the ICE grace"
     );
     for stream in ["live", "stalled"] {
         assert_eq!(
@@ -2821,6 +2834,174 @@ async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back
             "the '{stream}' viewer's subscription went with it"
         );
     }
+
+    cancel.cancel();
+}
+
+/// A viewer whose ICE consent checks pause past the point where `is` reports
+/// it disconnected — 17 s, against `is`'s 15 s — and then resume, as after a
+/// Wi-Fi or cellular hiccup, a suspended laptop or a backgrounded mobile
+/// browser, is kept: ICE comes back on its next nomination, the viewer holds
+/// its slot throughout and it receives what is published after it returns.
+///
+/// Before, a session ended on the first ICE `Disconnected`, so this viewer was
+/// reaped at about 15 s although str0m and the viewer would both have resumed
+/// — and the `/watch` player does not reconnect, so it stayed black.
+#[tokio::test]
+async fn a_viewer_whose_ice_pauses_and_comes_back_is_kept() {
+    use bilbycast_relay::distribution::webrtc::session::{ICE_DISCONNECT_GRACE, SessionEvent};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Past `is`'s 15 s, well inside the grace that follows it.
+    const PAUSE: Duration = Duration::from_secs(17);
+    const { assert!(PAUSE.as_secs() < 15 + ICE_DISCONNECT_GRACE.as_secs() - 5) };
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    let next = Arc::new(AtomicU64::new(0));
+    let hub = state.hub.clone();
+    let (pub_cancel, pub_next) = (cancel.clone(), next.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    let k = pub_next.fetch_add(1, Ordering::Relaxed);
+                    let pts = k * FRAME_90K;
+                    hub.publish(
+                        "blip",
+                        EsFrame::video(pts, decodable_frame(k).into(), k.is_multiple_of(GOP)),
+                    );
+                    hub.publish("blip", EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55])));
+                }
+            }
+        }
+    });
+
+    let mut viewer = watch(addr, "blip").await;
+    // The viewer goes quiet: not driven, it neither checks nor reads.
+    tokio::time::sleep(PAUSE).await;
+    assert_eq!(
+        (held(&state), state.sessions.len()),
+        (1, 1),
+        "the viewer was reaped during a {PAUSE:?} pause"
+    );
+
+    let resumed_at = next.load(Ordering::Relaxed) * FRAME_90K;
+    let video = viewer.video_mid;
+    let viewer_cancel = CancellationToken::new();
+    let back = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match viewer.poll_event(&viewer_cancel).await {
+                SessionEvent::MediaData { mid, rtp_time, .. }
+                    if Some(mid) == video && rtp_time.numer() >= resumed_at =>
+                {
+                    return true;
+                }
+                SessionEvent::Disconnected => return false,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(back, Ok(true)),
+        "the viewer must receive what was published after it came back, got {back:?}"
+    );
+    assert_eq!(
+        (held(&state), state.sessions.len()),
+        (1, 1),
+        "and it still holds its slot"
+    );
+
+    cancel.cancel();
+}
+
+/// A WHEP viewer or a WHIP publisher that closes its connection without a
+/// DELETE — `RTCPeerConnection.close()`, or a str0m peer's `Rtc::close`, each
+/// of which sends a DTLS close_notify — ends at once: the viewer gives its slot
+/// back; the publisher's ingest record goes and its stream is unregistered.
+///
+/// Before, `Event::Closed` was dropped, and str0m goes inert after it, with
+/// no timeout or ICE event to follow. The ingest loop parked in `poll_event`
+/// for good — its record, socket and task kept and the stream registered —
+/// one per publisher that came and went (WHIP has no per-IP cap); the cascade
+/// pull, which shares that loop, never retried. The viewer half passed
+/// already, by the send loop's closed-`Rtc` check; it is here so that a clean
+/// close never waits out the ICE grace.
+#[tokio::test]
+async fn a_peer_that_closes_without_a_delete_ends_at_once() {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+    use bilbycast_relay::distribution::webrtc::{Setup, await_connected};
+    use bilbycast_relay::distribution::whep;
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    // A publisher on `/whip/pub`, through the router.
+    let mut publisher = WebrtcSession::new(&SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: false,
+    })
+    .await
+    .unwrap();
+    let (offer, pending) = publisher.create_offer(true, false, true).unwrap();
+    let (status, _, answer) = http(addr, "POST", "/whip/pub", &offer).await;
+    assert_eq!(status, 201, "WHIP: {answer}");
+    publisher.apply_answer(&answer, pending).unwrap();
+    let publisher_cancel = CancellationToken::new();
+    assert_eq!(
+        await_connected(&mut publisher, &publisher_cancel, Duration::from_secs(10)).await,
+        Setup::Connected
+    );
+    publisher.drain_pending_events();
+    for k in 0..GOP {
+        whep::write_video_au(&mut publisher, k * FRAME_90K, &decodable_frame(k)).await;
+        let _ = publisher.drive_udp_io().await;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    assert!(
+        eventually(Duration::from_secs(5), || {
+            state.hub.get("pub").is_some_and(|s| s.frames_in() > 0)
+        })
+        .await,
+        "the publisher's stream is live"
+    );
+    assert_eq!(state.ingests.len(), 1);
+
+    // A viewer of it, primed from the cached keyframe.
+    let mut viewer = watch(addr, "pub").await;
+    assert_eq!(held(&state), 1);
+
+    viewer.close();
+    viewer.drain_outputs().await;
+    let closed = std::time::Instant::now();
+    assert!(
+        eventually(Duration::from_secs(5), || held(&state) == 0
+            && state.sessions.is_empty())
+        .await,
+        "after {:?}: {} slots held, {} viewer sessions",
+        closed.elapsed(),
+        held(&state),
+        state.sessions.len()
+    );
+
+    publisher.close();
+    publisher.drain_outputs().await;
+    let closed = std::time::Instant::now();
+    assert!(
+        eventually(Duration::from_secs(5), || {
+            state.ingests.is_empty() && state.hub.get("pub").is_none()
+        })
+        .await,
+        "after {:?}: {} ingests, stream registered: {}",
+        closed.elapsed(),
+        state.ingests.len(),
+        state.hub.get("pub").is_some()
+    );
 
     cancel.cancel();
 }

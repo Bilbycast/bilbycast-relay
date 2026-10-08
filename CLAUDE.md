@@ -242,7 +242,9 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   nothing is inserted past `MAX_PARAM_SETS_ON_THE_WIRE` (1115 = str0m's 1120-byte
   payload MTU less the STAP-A framing; a larger STAP-A is silently dropped).
   WHIP-in / cascade access units are capped at `es::MAX_FRAME_BYTES` (4 MiB,
-  shared with the QUIC ingest) and dropped whole past it.
+  the QUIC ingest's frame cap) plus 64 KiB of headroom for what an upstream
+  relay adds to a unit at that cap (`whip_ingest::MAX_RTP_AU_BYTES`), and
+  dropped whole past it.
 - **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
   each H.264 access unit goes to str0m's writer **once, whole, as Annex B** and
   str0m packetizes it (RFC 6184) → SRTP → browser. There is no relay-side
@@ -251,10 +253,15 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   edge removed its own in e927368). Vendored str0m session under
   `src/distribution/webrtc/` (kept in sync with bilbycast-edge). A session ends
   on `DELETE` (the `/watch` player sends a `keepalive` fetch on `pagehide`), on
-  ICE giving up on a viewer that left without one (`is_disconnected` latch,
-  checked after every write and drive; the send loop drives an idle session
-  every second), or at `webrtc::SETUP_DEADLINE` (30 s) if it never connects —
-  WHIP ingest and the cascade pull have the same deadline.
+  the peer closing the connection (DTLS close_notify, `Event::Closed`), on ICE
+  staying disconnected for `session::ICE_DISCONNECT_GRACE` (15 s, on top of
+  `is`'s 15 s — about 30 s from a viewer's last check; an ICE-Lite agent comes
+  back on the peer's next nomination, so the first disconnect is not the end)
+  — `is_disconnected`, checked after every write and drive; the send loop
+  drives an idle session every second — or at `webrtc::SETUP_DEADLINE` (30 s)
+  if it never connects. WHIP ingest and the cascade pull have the same
+  deadline, end on a close the same way, and end on ICE's first disconnect.
+  Each viewer's last log line names why it ended.
 - **Cascade** (`src/distribution/cascade.rs`): scale past one relay's viewer
   ceiling — a downstream relay is a **WHEP client** of an upstream relay
   (`create_offer` → POST `/whep/{stream}` → ICE/DTLS/SRTP → republish to local

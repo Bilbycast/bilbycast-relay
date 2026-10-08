@@ -40,6 +40,19 @@ use super::hub::DistributionHub;
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
 
+/// The largest access unit this module builds out of RTP: the frame cap of
+/// the QUIC ingest, [`MAX_FRAME_BYTES`], plus 64 KiB of headroom.
+///
+/// The headroom is for what an upstream relay adds to a unit it took at that
+/// cap before a cascade pull here receives it: its hub can put the stream's
+/// SPS and PPS back ahead of an IDR (at most
+/// [`MAX_PARAM_SETS_ON_THE_WIRE`](super::es::MAX_PARAM_SETS_ON_THE_WIRE) +
+/// 8 bytes), and str0m's depacketizer puts a 4-byte start code ahead of every
+/// NAL, one byte more than a 3-byte one. With no headroom such a unit was
+/// accepted at the origin and dropped whole at every tier below it. The cap
+/// bounds memory; it sets no policy, so the headroom costs nothing.
+const MAX_RTP_AU_BYTES: usize = MAX_FRAME_BYTES + 64 * 1024;
+
 /// The oversized-access-unit warning is logged at most once per this interval
 /// per session, with a count of the units dropped since. A publisher whose
 /// timestamp is stuck trips the cap every 4 MiB it sends.
@@ -98,7 +111,7 @@ struct AuAssembler {
     cur_pts: Option<u64>,
     nalus: Vec<u8>,
     keyframe: bool,
-    /// The unit at `cur_pts` went past [`MAX_FRAME_BYTES`] and was dropped;
+    /// The unit at `cur_pts` went past [`MAX_RTP_AU_BYTES`] and was dropped;
     /// the rest of it is discarded until the timestamp moves on.
     oversized: bool,
     /// Oversized units dropped since the last warning, and when that was.
@@ -124,11 +137,11 @@ impl AuAssembler {
     /// first. A payload-less frame (an RTP padding probe) is no part of any
     /// access unit and touches nothing.
     ///
-    /// An access unit is capped at [`MAX_FRAME_BYTES`], the QUIC ingest's
-    /// frame cap. Nothing is published until the timestamp changes, so a
-    /// publisher — or cascade upstream — whose timestamp stuck used to grow
-    /// this buffer at its send rate until the relay ran out of memory, while
-    /// its viewers got nothing. A unit that would pass the cap is dropped
+    /// An access unit is capped at [`MAX_RTP_AU_BYTES`], the QUIC ingest's
+    /// frame cap plus headroom. Nothing is published until the timestamp
+    /// changes, so a publisher — or cascade upstream — whose timestamp stuck
+    /// used to grow this buffer at its send rate until the relay ran out of
+    /// memory, while its viewers got nothing. A unit that would pass the cap is dropped
     /// whole, and the rest of it with it: publishing its tail would hand
     /// viewers a fragment.
     fn push(&mut self, hub: &DistributionHub, pts_90k: u64, data: &[u8]) {
@@ -148,7 +161,7 @@ impl AuAssembler {
         // str0m's own. No NAL header byte is zero, so a leading zero is
         // a start code's.
         let framing: &[u8] = if data[0] != 0 { &[0, 0, 0, 1] } else { &[] };
-        if self.nalus.len() + framing.len() + data.len() > MAX_FRAME_BYTES {
+        if self.nalus.len() + framing.len() + data.len() > MAX_RTP_AU_BYTES {
             self.drop_oversized(pts_90k);
             return;
         }
@@ -174,7 +187,7 @@ impl AuAssembler {
     }
 
     /// Drop the unit being built at `pts_90k` — it would pass
-    /// [`MAX_FRAME_BYTES`] — and give its buffer back. Warns at most once per
+    /// [`MAX_RTP_AU_BYTES`] — and give its buffer back. Warns at most once per
     /// [`OVERSIZE_WARN_INTERVAL`].
     fn drop_oversized(&mut self, pts_90k: u64) {
         self.nalus = Vec::new();
@@ -188,7 +201,7 @@ impl AuAssembler {
         {
             tracing::warn!(
                 "WebRTC ingest for stream '{}': access unit at pts {pts_90k} passed \
-                 {MAX_FRAME_BYTES} bytes on one RTP timestamp; dropped ({} since the last warning)",
+                 {MAX_RTP_AU_BYTES} bytes on one RTP timestamp; dropped ({} since the last warning)",
                 self.stream_id,
                 self.dropped_since_warn,
             );
@@ -336,7 +349,7 @@ mod tests {
     }
 
     /// A publisher whose RTP timestamp sticks — here 100 kB frames, all at
-    /// one pts — cannot grow the unit being built past `MAX_FRAME_BYTES`. The
+    /// one pts — cannot grow the unit being built past `MAX_RTP_AU_BYTES`. The
     /// oversized unit is dropped whole, its tail included, and the next
     /// timestamp starts afresh. Before, every frame was appended until the
     /// timestamp moved: 40 MB on one timestamp grew the relay by 40 MB, and
@@ -348,10 +361,10 @@ mod tests {
         let mut asm = AuAssembler::new("s".to_string());
 
         let slice = vec![0x41u8; 100_000];
-        for _ in 0..(MAX_FRAME_BYTES / slice.len() + 20) {
+        for _ in 0..(MAX_RTP_AU_BYTES / slice.len() + 20) {
             asm.push(&hub, 3000, &slice);
             assert!(
-                asm.nalus.len() <= MAX_FRAME_BYTES,
+                asm.nalus.len() <= MAX_RTP_AU_BYTES,
                 "buffered {} bytes on one timestamp",
                 asm.nalus.len()
             );
@@ -369,11 +382,65 @@ mod tests {
 
         // A unit of exactly the limit is not oversized.
         let mut whole = vec![0x65u8];
-        whole.resize(MAX_FRAME_BYTES - 4, 0x11);
+        whole.resize(MAX_RTP_AU_BYTES - 4, 0x11);
         asm.push(&hub, 9000, &whole);
         asm.flush(&hub);
         let f = sub.rx.try_recv().expect("a unit at the limit goes out");
-        assert_eq!(f.data.len(), MAX_FRAME_BYTES);
+        assert_eq!(f.data.len(), MAX_RTP_AU_BYTES);
+    }
+
+    /// A unit at the QUIC ingest's frame cap, as an upstream relay publishes
+    /// it, passes a cascade tier's assembler. The upstream hub put the
+    /// stream's SPS and PPS back ahead of it — the most it inserts — and in
+    /// rebuilding the unit put every NAL behind a 4-byte start code where the
+    /// source used 3-byte ones; str0m's depacketizer hands it over that way.
+    ///
+    /// Capped at `MAX_FRAME_BYTES` itself, the assembler dropped it whole.
+    #[test]
+    fn a_unit_an_upstream_relay_publishes_at_the_frame_cap_passes_a_cascade_tier() {
+        use crate::distribution::es::{MAX_PARAM_SET_BYTES, MAX_PARAM_SETS_ON_THE_WIRE};
+
+        let upstream = DistributionHub::new();
+        let mut published = upstream.subscribe("s");
+        // The stream's parameter sets, as large as the upstream re-inserts.
+        let sps_len = MAX_PARAM_SET_BYTES;
+        let pps_len = MAX_PARAM_SETS_ON_THE_WIRE - sps_len;
+        let mut first = vec![0, 0, 0, 1, 0x67];
+        first.resize(4 + sps_len, 0x42);
+        first.extend_from_slice(&[0, 0, 0, 1, 0x68]);
+        first.resize(first.len() + pps_len - 1, 0xce);
+        first.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        upstream.publish("s", EsFrame::video(0, first.into(), true));
+        let _ = published.rx.try_recv().unwrap();
+
+        // An IDR without its own sets, exactly at the QUIC ingest's cap: 512
+        // slices, each behind a 3-byte start code.
+        let slices = 512;
+        let mut idr = Vec::with_capacity(MAX_FRAME_BYTES);
+        for _ in 0..slices {
+            idr.extend_from_slice(&[0, 0, 1, 0x65]);
+            idr.resize(idr.len() + MAX_FRAME_BYTES / slices - 4, 0x11);
+        }
+        assert_eq!(idr.len(), MAX_FRAME_BYTES);
+        upstream.publish("s", EsFrame::video(3000, idr.into(), true));
+        let au = published.rx.try_recv().unwrap();
+        assert_eq!(
+            au.data.len(),
+            MAX_FRAME_BYTES + slices + MAX_PARAM_SETS_ON_THE_WIRE + 8,
+            "the sets went back in, and every start code grew a byte"
+        );
+
+        let downstream = DistributionHub::new();
+        let mut sub = downstream.subscribe("s");
+        let mut asm = AuAssembler::new("s".to_string());
+        asm.push(&downstream, 3000, &au.data);
+        asm.flush(&downstream);
+        let f = sub
+            .rx
+            .try_recv()
+            .expect("the unit goes out at the cascade tier");
+        assert_eq!(f.data, au.data);
+        assert!(f.keyframe);
     }
 
     /// A sender that marks every NAL a frame of its own (bare NALs, one

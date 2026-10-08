@@ -612,9 +612,17 @@ async fn whep_delete(
     Path((_stream_id, session_id)): Path<(String, String)>,
 ) -> Response {
     // Cancel the session; the reaper spawned at offer time removes the record
-    // and releases the per-IP slot.
+    // and releases the per-IP slot. Logged here, where the client is known:
+    // the viewer's own last line says only "deleted by the client", the same
+    // for a tab's `pagehide` as for any other DELETE. The path's stream id is
+    // not logged — it is whatever the client wrote, and need not be the
+    // viewer's stream, which that last line names.
     match st.sessions.get(&session_id) {
         Some(s) => {
+            tracing::info!(
+                "WHEP viewer '{session_id}' deleted by the client ({})",
+                s.ip
+            );
             s.cancel.cancel();
             StatusCode::OK.into_response()
         }

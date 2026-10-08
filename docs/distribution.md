@@ -150,16 +150,39 @@ ends on whichever comes first:
 - **`DELETE` of its resource.** The `/watch` player sends one on `pagehide`, as
   a `keepalive` fetch (it used a beacon, which can only `POST`, and every tab
   close got a `405`).
-- **ICE giving up on it** — a closed tab, a lost network. str0m's ICE agent
-  allows a silent viewer about 15 s from its last binding request; the send
-  loop drives the session at least once a second even when its stream has
-  stalled, so this fires either way. Before, the event was dropped and a
-  viewer that left without a `DELETE` was sent the stream, and held its slot,
-  for as long as the stream lived.
+- **The peer closing the connection** — `RTCPeerConnection.close()` sends a
+  DTLS close_notify, and the session ends on it at once. (Closing a Chrome tab
+  sends none: measured live, that tab was reaped by ICE.)
+- **ICE staying disconnected** — a crashed tab, a lost network. str0m's
+  ICE agent reports a silent viewer disconnected about 15 s after its last
+  binding request, and the session then has `ICE_DISCONNECT_GRACE` (15 s) to
+  come back: so about 30 s in all. The send loop drives the session at least
+  once a second even when its stream has stalled, so this fires either way.
+  Before, the event was dropped and a viewer that left without a `DELETE` was
+  sent the stream, and held its slot, for as long as the stream lived.
+
+  The grace is there because the ICE-Lite side recovers: a viewer whose
+  checks paused — a Wi-Fi or cellular hiccup, a suspended laptop, a
+  backgrounded mobile browser — is nominated again by its next check, and a
+  browser itself gives up only after RFC 7675's 30 s. Ending the session on
+  the first disconnect closed such a viewer, which the `/watch` player does
+  not reconnect. str0m keeps sending to the viewer's last address meanwhile,
+  so a viewer that really left is sent about 30 s of the stream.
 - **30 s without connecting** (`SETUP_DEADLINE`) — an offer whose sender never
   completes ICE and DTLS, such as one with no `a=candidate` lines from a peer
   that never sends STUN, which ICE-Lite would otherwise wait on for ever. WHIP
   ingest sessions and cascade pulls have the same deadline.
+
+A WHIP ingest session and a cascade pull end the same ways — on a `DELETE`,
+the peer closing the connection, or `SETUP_DEADLINE` — except that they end
+on ICE's first disconnect, with no grace. Before, a publisher or upstream that
+closed the connection without a `DELETE` ended nothing: str0m goes inert after
+a close_notify, so the ingest stayed registered for good and the cascade pull
+never retried.
+
+The relay logs each viewer's end with its reason (`WHEP viewer '…' closed
+(stream '…'): deleted by the client`, `ICE disconnected`, `DTLS closed`,
+`stream closed`, …), and a `DELETE` with the client's address as it arrives.
 
 ### Media source pin
 
@@ -1624,11 +1647,15 @@ as ignored at startup.
   against str0m's real packetizer: SPS + PPS at 1115 bytes arrive, a byte
   over do not (`parameter_sets_past_the_stap_a_budget_never_reach_a_viewer`).
 - **Session ends, through the real router**: viewers that leave without a
-  `DELETE` — on a live stream and on a stalled one — are reaped once ICE gives
-  up and give their per-IP slot back
+  `DELETE` — on a live stream and on a stalled one — are reaped once ICE has
+  given up on them for the ICE grace, and give their per-IP slot back
   (`a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back`,
-  about 15 s); a WHEP viewer and a WHIP publisher that never connect are closed
-  at the 30 s setup deadline
+  about 30 s); a viewer whose ICE pauses for 17 s and resumes is kept and
+  receives what is published after it returns
+  (`a_viewer_whose_ice_pauses_and_comes_back_is_kept`); a viewer and a WHIP
+  publisher that close their connection without a `DELETE` end at once
+  (`a_peer_that_closes_without_a_delete_ends_at_once`); a WHEP viewer and a
+  WHIP publisher that never connect are closed at the 30 s setup deadline
   (`an_offer_that_never_connects_is_closed_at_the_setup_deadline`, 30 s).
 - **Negotiation panics**: an offer str0m panics on fails that request with a
   `400` and raises one rate-limited `webrtc_negotiation_panic` event

@@ -27,9 +27,10 @@
 //! Porting `PeerPin` across is the fix; until then, a sync in either direction
 //! must carry this control forward, never delete it.
 //!
-//! The disconnect latch ([`WebrtcSession::is_disconnected`]) is relay-only
-//! too: the WHEP send loop reaps a departed viewer by it. Carry it forward in
-//! a sync as well.
+//! The disconnect latch ([`WebrtcSession::is_disconnected`], with
+//! [`ICE_DISCONNECT_GRACE`] and [`SessionEnd`]) is relay-only too: the WHEP
+//! send loop reaps a departed viewer by it. Carry it forward in a sync as
+//! well, and the handling of `Event::Closed` with it.
 //!
 //! Manages the lifecycle of a single WebRTC PeerConnection: ICE, DTLS,
 //! SRTP, and media I/O. Integrates str0m's sans-I/O model with tokio
@@ -37,7 +38,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use str0m::change::SdpOffer;
@@ -203,6 +204,51 @@ fn send_pt<'a>(kind: MediaKind, params: impl Iterator<Item = &'a PayloadParams>)
     mode_0
 }
 
+/// How long ICE may stay disconnected before the session is over
+/// ([`WebrtcSession::is_disconnected`]).
+///
+/// `is` reports an ICE-Lite agent `Disconnected` 15 s after the peer's last
+/// Binding Request (`RECENT_BINDING_REQUEST`), but that agent comes back: the
+/// peer's next request re-creates the pair it pruned and, carrying
+/// USE-CANDIDATE as a controlling agent's checks on its nominated pair do,
+/// nominates it, and ICE is `Completed` again. A viewer whose checks paused —
+/// a Wi-Fi or cellular hiccup, a suspended laptop, a backgrounded mobile
+/// browser — resumes. A browser gives up only when it has heard nothing for
+/// RFC 7675's 30 s, so 15 s of grace on top of `is`'s 15 s ends the relay's
+/// side no sooner than the browser would end its own.
+///
+/// The grace is not free: str0m keeps sending to the last nominated address
+/// until the session ends, so a viewer that really left is sent about 30 s of
+/// its stream rather than 15.
+pub const ICE_DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
+/// Why a session is over. See [`WebrtcSession::end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// ICE stayed disconnected for [`ICE_DISCONNECT_GRACE`]: the peer stopped
+    /// answering — a closed tab, a lost network.
+    IceDisconnected,
+    /// The connection was closed: the peer sent a DTLS close_notify
+    /// (`RTCPeerConnection.close()`, a str0m peer's `Rtc::close`) or its SCTP
+    /// association went, or this side closed the `Rtc`.
+    Closed,
+    /// The UDP socket failed.
+    SocketError,
+    /// str0m returned an error.
+    Str0mError,
+}
+
+impl std::fmt::Display for SessionEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SessionEnd::IceDisconnected => "ICE disconnected",
+            SessionEnd::Closed => "DTLS closed",
+            SessionEnd::SocketError => "UDP socket error",
+            SessionEnd::Str0mError => "str0m error",
+        })
+    }
+}
+
 /// Events produced by the WebRTC session for the caller to handle.
 ///
 /// Some fields are retained for future use (audio support, timing, diagnostics)
@@ -231,7 +277,14 @@ pub enum SessionEvent {
     MediaAdded { mid: Mid, kind: MediaKind },
     /// Incoming keyframe request from the remote peer.
     KeyframeRequest { mid: Mid },
-    /// Session has been disconnected or failed.
+    /// The session ended — see [`SessionEnd`] — or `poll_event`'s cancel
+    /// fired. Also reported the moment ICE goes `Disconnected`, which an
+    /// ICE-Lite session can come back from: [`poll_event`]'s callers (setup,
+    /// WHIP ingest, the cascade pull) end on it at once, as they always have,
+    /// while the WHEP send loop reads [`WebrtcSession::is_disconnected`],
+    /// which gives ICE [`ICE_DISCONNECT_GRACE`] to return.
+    ///
+    /// [`poll_event`]: WebrtcSession::poll_event
     Disconnected,
 }
 
@@ -412,9 +465,12 @@ pub struct WebrtcSession {
     pub audio_mid: Option<Mid>,
     /// Anti-reflection ingress filter. See [`PeerPin`].
     pin: PeerPin,
-    /// Latched when str0m reports the session disconnected, on whichever path
-    /// drained the event. See [`Self::is_disconnected`].
-    disconnected: bool,
+    /// Latched by the first fatal end — a closed connection, a socket or
+    /// str0m error — on whichever path drained it. See [`Self::end`].
+    ended: Option<SessionEnd>,
+    /// When ICE last went `Disconnected`, until it is `Connected` or
+    /// `Completed` again. See [`ICE_DISCONNECT_GRACE`].
+    ice_disconnected_since: Option<Instant>,
     buf: Vec<u8>,
 }
 
@@ -477,7 +533,8 @@ impl WebrtcSession {
             video_mid: None,
             audio_mid: None,
             pin: PeerPin::default(),
-            disconnected: false,
+            ended: None,
+            ice_disconnected_since: None,
             buf: vec![0u8; 2048],
         })
     }
@@ -638,10 +695,10 @@ impl WebrtcSession {
     /// `Input::Timeout` so the write is packetized eagerly. Cheap when there's
     /// nothing pending (one no-op timeout + one no-op poll).
     ///
-    /// Events drained here are not returned, but a disconnect among them is
-    /// latched (see [`Self::is_disconnected`]): str0m reports ICE giving up
-    /// from inside the very `handle_timeout` this runs, so for a viewer that
-    /// left without a DELETE this is where it usually surfaces.
+    /// Events drained here are not returned, but what they say about the
+    /// session's end is kept (see [`Self::is_disconnected`]): str0m reports
+    /// ICE giving up from inside the very `handle_timeout` this runs, so for a
+    /// viewer that left without a DELETE this is where it usually surfaces.
     pub async fn drain_outputs(&mut self) {
         // Feed a current-time timeout so str0m runs `do_payload` and turns
         // the just-written sample into RTP packets ready for `poll_output`.
@@ -701,18 +758,57 @@ impl WebrtcSession {
         self.rtc.is_alive()
     }
 
-    /// The session is over: str0m reported it disconnected (ICE gave up, or
-    /// the socket or str0m failed) on any path that drained its events, or the
-    /// `Rtc` is closed.
+    /// The session is over ([`Self::end`] says why).
     ///
     /// Callers that drive the session with [`Self::drain_outputs`] and
     /// [`Self::drive_udp_io`] — the WHEP send loop — must check this after
-    /// each call. `drain_outputs` returns no event at all and `drive_udp_io`
-    /// only the first of a batch, so a `Disconnected` used to be dropped
-    /// there: a viewer that left without a DELETE was sent the stream, and
-    /// held its per-IP slot, for as long as the stream lived.
+    /// each call, and drive the session even when they have nothing to send,
+    /// so that an ICE grace lapses. `drain_outputs` returns no event at all and
+    /// `drive_udp_io` only the first of a batch, so a disconnect used to be
+    /// dropped there: a viewer that left without a DELETE was sent the stream,
+    /// and held its per-IP slot, for as long as the stream lived.
     pub fn is_disconnected(&self) -> bool {
-        self.disconnected || !self.rtc.is_alive()
+        self.end().is_some()
+    }
+
+    /// Why the session is over, or `None` while it is not.
+    ///
+    /// - A fatal end is final from the moment any drain sees it: the peer
+    ///   closed the connection (`Event::Closed`, which str0m follows by going
+    ///   inert — no timeout and no ICE event ever comes after it), the socket
+    ///   failed, or str0m did. A closed `Rtc` counts too, however it closed.
+    /// - ICE going `Disconnected` is not, on its own: an ICE-Lite agent comes
+    ///   back on the peer's next nomination. It ends the session only once it
+    ///   has lasted [`ICE_DISCONNECT_GRACE`]. Before, the first `Disconnected`
+    ///   ended it, so a viewer whose consent checks paused for 15 s was closed
+    ///   although str0m and the browser would both have resumed, and the
+    ///   `/watch` player, which does not reconnect, stayed black.
+    pub fn end(&self) -> Option<SessionEnd> {
+        if let Some(end) = self.ended {
+            return Some(end);
+        }
+        if !self.rtc.is_alive() {
+            return Some(SessionEnd::Closed);
+        }
+        self.ice_disconnected_since
+            .filter(|since| since.elapsed() >= ICE_DISCONNECT_GRACE)
+            .map(|_| SessionEnd::IceDisconnected)
+    }
+
+    /// Keep the first fatal end; see [`Self::end`].
+    fn latch(&mut self, end: SessionEnd) {
+        self.ended.get_or_insert(end);
+    }
+
+    /// Close the connection from this side: str0m sends an RTCP BYE and a
+    /// DTLS close_notify on the next drain ([`Self::drain_outputs`],
+    /// [`Self::drive_udp_io`]), and the peer's session ends on it
+    /// ([`SessionEnd::Closed`]). This session is over at once.
+    pub fn close(&mut self) {
+        // `start_close` fails only on an SCTP or DTLS error, and then the
+        // `Rtc` is unusable anyway: the session is over either way.
+        let _ = self.rtc.close();
+        self.latch(SessionEnd::Closed);
     }
 
     /// Drive the session event loop. Blocks until a meaningful event occurs.
@@ -734,8 +830,21 @@ impl WebrtcSession {
                     continue;
                 }
                 Ok(Output::Timeout(deadline)) => {
-                    // Wait for input
-                    let sleep_dur = deadline.saturating_duration_since(Instant::now());
+                    // Everything is drained. A session that is over has
+                    // nothing to wait for — least of all a closed `Rtc`, which
+                    // is inert: its deadline is years away and no input wakes
+                    // it, so a `Closed` this loop did not see itself (one a
+                    // drain took) used to park it for good.
+                    if self.is_disconnected() {
+                        return SessionEvent::Disconnected;
+                    }
+                    // Wait for input — and for an ICE grace to lapse, so that
+                    // it is noticed when it does.
+                    let wake = match self.ice_disconnected_since {
+                        Some(since) => deadline.min(since + ICE_DISCONNECT_GRACE),
+                        None => deadline,
+                    };
+                    let sleep_dur = wake.saturating_duration_since(Instant::now());
                     tracing::trace!("poll_event: Timeout, sleeping {:?}", sleep_dur);
                     tokio::select! {
                         _ = cancel.cancelled() => {
@@ -755,7 +864,7 @@ impl WebrtcSession {
                                 }
                                 Err(e) => {
                                     tracing::error!("UDP recv error: {}", e);
-                                    self.disconnected = true;
+                                    self.latch(SessionEnd::SocketError);
                                     return SessionEvent::Disconnected;
                                 }
                             }
@@ -764,7 +873,7 @@ impl WebrtcSession {
                 }
                 Err(e) => {
                     tracing::error!("str0m error: {}", e);
-                    self.disconnected = true;
+                    self.latch(SessionEnd::Str0mError);
                     return SessionEvent::Disconnected;
                 }
             }
@@ -843,7 +952,7 @@ impl WebrtcSession {
     /// Non-blocking: receive any pending UDP packets and feed them to
     /// str0m, then drain all pending transmits. Returns the first
     /// meaningful session event (if any) discovered while processing; a
-    /// disconnect behind it is not returned but is latched, so check
+    /// disconnect behind it is not returned but is kept, so check
     /// [`Self::is_disconnected`] rather than the return value.
     ///
     /// Designed for the WHIP client output and WHEP viewer send loops,
@@ -900,16 +1009,39 @@ impl WebrtcSession {
             }
             Event::IceConnectionStateChange(state) => {
                 tracing::debug!("ICE state: {:?}", state);
+                // Kept here, the one place every drain path goes through, so
+                // it holds whether or not the caller sees the event (see
+                // `end`). A disconnect starts the grace; only a nomination —
+                // `Connected` or `Completed` — ends it. `Checking` does not:
+                // a pair re-created without one is no recovery, so the clock
+                // runs on.
                 match state {
                     IceConnectionState::Disconnected => {
-                        // Latched here, the one place every drain path goes
-                        // through, so it holds whether or not the caller sees
-                        // the event (see `is_disconnected`).
-                        self.disconnected = true;
+                        self.ice_disconnected_since.get_or_insert_with(Instant::now);
                         Some(SessionEvent::Disconnected)
+                    }
+                    IceConnectionState::Connected | IceConnectionState::Completed => {
+                        if let Some(since) = self.ice_disconnected_since.take() {
+                            tracing::info!(
+                                "WebRTC: ICE back ({state:?}) after {:.1?} disconnected",
+                                since.elapsed()
+                            );
+                        }
+                        Some(SessionEvent::IceStateChange(state))
                     }
                     _ => Some(SessionEvent::IceStateChange(state)),
                 }
+            }
+            Event::Closed => {
+                // The peer's DTLS close_notify (or its SCTP association
+                // going). str0m drains its own close output and then goes
+                // inert: nothing — no ICE event, no timeout — follows. It
+                // used to fall through to `_ => None`, so a WHIP ingest or a
+                // cascade pull whose peer closed without a DELETE parked in
+                // `poll_event` for good, its stream still registered.
+                tracing::debug!("WebRTC: the peer closed the connection");
+                self.latch(SessionEnd::Closed);
+                Some(SessionEvent::Disconnected)
             }
             Event::MediaAdded(added) => {
                 let kind = {
@@ -1871,27 +2003,140 @@ mod tests {
 
     // ── The disconnect latch ──────────────────────────────────────────
 
-    /// A disconnect str0m reports while a caller is not looking at events —
-    /// in `drain_outputs`, or behind another event in `drive_udp_io` — is
-    /// latched, and a closed `Rtc` counts too. Before, both drains dropped
-    /// it, and the WHEP send loop kept a departed viewer forever.
+    /// What the drains do with every event: hand it to `handle_event` and
+    /// drop the result.
+    fn ice(s: &mut WebrtcSession, state: IceConnectionState) {
+        let _ = s.handle_event(Event::IceConnectionStateChange(state));
+    }
+
+    /// Backdate the start of an ICE disconnect by `ago`.
+    fn disconnected_for(s: &mut WebrtcSession, ago: Duration) {
+        s.ice_disconnected_since = Some(Instant::now().checked_sub(ago).unwrap());
+    }
+
+    /// An ICE disconnect str0m reports while a caller is not looking at
+    /// events — in `drain_outputs`, or behind another event in `drive_udp_io`
+    /// — is kept, and ends the session once it has lasted
+    /// `ICE_DISCONNECT_GRACE`; a nomination in the meantime (`Connected` or
+    /// `Completed`) cancels it, and a re-created pair without one (`Checking`)
+    /// does not restart the clock.
+    ///
+    /// Before, the first `Disconnected` ended the session, though an ICE-Lite
+    /// agent comes back from it on the peer's next nomination: the "brief"
+    /// half of this test failed on it.
     #[tokio::test]
-    async fn a_disconnect_nobody_returned_is_still_latched() {
+    async fn an_ice_disconnect_ends_the_session_only_once_it_has_lasted_the_grace() {
         let mut s = test_session().await;
-        assert!(!s.is_disconnected());
-        // What the drains do with every event: hand it to `handle_event` and
-        // drop the result.
-        let _ = s.handle_event(Event::IceConnectionStateChange(
-            IceConnectionState::Checking,
-        ));
-        assert!(!s.is_disconnected(), "not every state change is the end");
-        let _ = s.handle_event(Event::IceConnectionStateChange(
-            IceConnectionState::Disconnected,
-        ));
+        assert_eq!(s.end(), None);
+        ice(&mut s, IceConnectionState::Checking);
+        assert_eq!(s.end(), None, "not every state change is the end");
+
+        // A brief disconnect is not the end, and a nomination cancels it.
+        ice(&mut s, IceConnectionState::Disconnected);
+        assert_eq!(s.end(), None, "a fresh disconnect may yet come back");
+        ice(&mut s, IceConnectionState::Completed);
+        assert_eq!(s.ice_disconnected_since, None, "Completed cancels it");
+        disconnected_for(&mut s, Duration::ZERO);
+        ice(&mut s, IceConnectionState::Connected);
+        assert_eq!(s.ice_disconnected_since, None, "Connected cancels it too");
+
+        // One that lasts the grace is.
+        ice(&mut s, IceConnectionState::Disconnected);
+        disconnected_for(&mut s, ICE_DISCONNECT_GRACE - Duration::from_secs(1));
+        assert_eq!(s.end(), None);
+        disconnected_for(&mut s, ICE_DISCONNECT_GRACE);
+        assert_eq!(s.end(), Some(SessionEnd::IceDisconnected));
         assert!(s.is_disconnected());
+
+        // A later `Disconnected` keeps the first one's start, and `Checking`
+        // in between neither cancels nor restarts it.
+        ice(&mut s, IceConnectionState::Checking);
+        ice(&mut s, IceConnectionState::Disconnected);
+        assert_eq!(s.end(), Some(SessionEnd::IceDisconnected));
+    }
+
+    /// A fatal end is final from the first drain that sees it: the peer
+    /// closing the connection (`Event::Closed`, which used to be dropped), a
+    /// closed `Rtc`, or a local `close`.
+    #[tokio::test]
+    async fn a_closed_connection_ends_the_session_at_once() {
+        let mut s = test_session().await;
+        assert!(matches!(
+            s.handle_event(Event::Closed),
+            Some(SessionEvent::Disconnected)
+        ));
+        assert_eq!(s.end(), Some(SessionEnd::Closed));
+        ice(&mut s, IceConnectionState::Completed);
+        assert_eq!(s.end(), Some(SessionEnd::Closed), "and nothing revives it");
 
         let mut s = test_session().await;
         s.rtc.disconnect();
-        assert!(s.is_disconnected(), "a closed Rtc is over");
+        assert_eq!(s.end(), Some(SessionEnd::Closed), "a closed Rtc is over");
+
+        let mut s = test_session().await;
+        s.close();
+        assert_eq!(s.end(), Some(SessionEnd::Closed));
+    }
+
+    /// Two connected sessions; `close` on one sends its DTLS close_notify, and
+    /// the other's `poll_event` returns `Disconnected` on it within a few
+    /// seconds, its end `Closed`.
+    ///
+    /// Before, `Event::Closed` was dropped and str0m then went inert, so
+    /// `poll_event` slept on a deadline years away: a WHIP ingest or cascade
+    /// pull whose peer closed without a DELETE never ended.
+    #[tokio::test]
+    async fn poll_event_ends_when_the_peer_closes_the_connection() {
+        let session = |ice_lite| async move {
+            WebrtcSession::new(&SessionConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                public_ip: Some("127.0.0.1".parse().unwrap()),
+                ice_lite,
+            })
+            .await
+            .unwrap()
+        };
+        let mut client = session(false).await;
+        let mut server = session(true).await;
+        let (offer, pending) = client.create_offer(true, false, true).unwrap();
+        let answer = server.accept_offer(&offer).unwrap();
+        client.apply_answer(&answer, pending).unwrap();
+        async fn connected(s: &mut WebrtcSession, cancel: &CancellationToken) -> bool {
+            loop {
+                match s.poll_event(cancel).await {
+                    SessionEvent::Connected => return true,
+                    SessionEvent::Disconnected => return false,
+                    _ => {}
+                }
+            }
+        }
+        let cancel = CancellationToken::new();
+        let both = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                connected(&mut client, &cancel),
+                connected(&mut server, &cancel)
+            )
+        })
+        .await
+        .expect("the two sessions connect");
+        assert_eq!(both, (true, true));
+
+        client.close();
+        client.drain_outputs().await;
+        assert!(client.is_disconnected());
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SessionEvent::Disconnected = server.poll_event(&cancel).await {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "poll_event did not end after the peer closed"
+        );
+        assert_eq!(server.end(), Some(SessionEnd::Closed));
     }
 }
