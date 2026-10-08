@@ -156,7 +156,11 @@ the lean forwarder pass `--variant default` at install, or set
 
 Point the edge's existing WebRTC (WHIP) output at `http(s)://<relay>/whip/<stream>`,
 then share `http(s)://<relay>/watch/<stream>`. Front the HTTP listener (`:4485`)
-with a TLS-terminating proxy for the browser secure context.
+with a TLS-terminating proxy for the browser secure context. **Upgrade the edges
+first**: every edge released through v0.113.0 panics in its WHIP output against
+this relay and stops publishing, and in a cascade the upstream relay goes before
+the ones that pull from it — see the upgrade order in
+[`docs/distribution.md`](docs/distribution.md#upgrade-order-edges-first-then-relays-upstream-first).
 
 `http(s)://<relay>/dvr/<stream>` is the scrub-back player (live, frame jog,
 shuttle), and the optional `bilbycast-portal` binary is the sign-in front door

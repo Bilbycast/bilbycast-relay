@@ -187,9 +187,25 @@ arc-swap = "1.9.2"
 # set, because its WHIP output negotiates with this crate's WHIP ingest. Tested
 # in `tests/distribution.rs` against a captured Chrome 124 WHEP offer, a
 # captured Chrome publisher offer, an ffmpeg 8.1-shaped WHIP offer and
-# single-PT answers; not yet re-run live against a browser. A negotiation
-# panic str0m still has (an offer whose one RTX PT repairs two H.264 PTs) is
-# caught in `webrtc::session::negotiate` and fails that one request.
+# single-PT answers, and run live at 18cd89a against HeadlessChrome 124 (edge
+# WHIP -> relay -> Chrome WHEP, and Chrome WHIP -> relay -> Chrome WHEP). A
+# negotiation panic str0m still has (an offer whose one RTX PT repairs two
+# H.264 PTs) is caught in `webrtc::session::isolate_negotiation` and fails that
+# one request.
+#
+# UPGRADE ORDER — this set and the old one do not interoperate both ways.
+# Every earlier build (bilbycast-edge releases through v0.113.0 and edge trees
+# before 5f71c4c; relay releases through v0.15.0) holds two entries for some
+# (profile, mode) pairs, and str0m panics in it whenever this set's SDP
+# dictates the PT for one of them: no answer shape avoids it, because one PT
+# matches both old entries. An old edge's WHIP output panics applying this
+# relay's answer ("Pt locked multiple times: 110") and its output task dies
+# without retrying; an old upstream relay panics on a new downstream's cascade
+# offer (": 127") and leaks a per-IP viewer slot on each 3 s retry. A new edge
+# publishing to an old relay, and an old downstream pulling from a new
+# upstream, both work. So upgrade WHIP-publishing edges first, then relays from
+# the upstream end of each cascade. Operator copy: `docs/distribution.md`,
+# "Upgrade order".
 #
 # KNOWN GAP, also predating this bump: unlike bilbycast-edge, this crate
 # carries no `[patch.crates-io]` and no vendored `is`, so it builds against

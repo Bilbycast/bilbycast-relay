@@ -28,8 +28,9 @@ pub mod whep;
 pub mod whip_ingest;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::{ConnectInfo, Path, RawQuery, State};
@@ -47,6 +48,12 @@ use crate::manager::events::EventSender;
 
 use self::hub::DistributionHub;
 use self::origin::OriginStore;
+use self::webrtc::session::NegotiationPanic;
+
+/// At most one `webrtc_negotiation_panic` event per this interval. The WHEP
+/// and WHIP endpoints are public, so whoever can send an offer str0m panics on
+/// can send a thousand, and the manager's event queue is 1024 deep.
+const NEGOTIATION_PANIC_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Shared state for the distribution subsystem's HTTP surface.
 pub struct DistributionState {
@@ -65,6 +72,83 @@ pub struct DistributionState {
     /// Concurrent viewer count per source IP (public-endpoint DoS cap).
     pub viewers_by_ip: DashMap<IpAddr, AtomicU32>,
     pub events: EventSender,
+    /// Rate limit on the `webrtc_negotiation_panic` event.
+    negotiation_panics: EventGate,
+}
+
+/// A rate limit for one event: the first occurrence is reported, then at most
+/// one per `interval`, and each report carries the number held back since the
+/// one before it, so a flood is visible without being forwarded.
+struct EventGate {
+    epoch: Instant,
+    interval: Duration,
+    /// When the next report may go, in ms since `epoch`.
+    next_ms: AtomicU64,
+    held_back: AtomicU64,
+}
+
+impl EventGate {
+    fn new(interval: Duration) -> Self {
+        Self {
+            epoch: Instant::now(),
+            interval,
+            next_ms: AtomicU64::new(0),
+            held_back: AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(held back since the last report)` when an occurrence at `now`
+    /// is to be reported, else `None` (and it is counted as held back).
+    fn admit(&self, now: Instant) -> Option<u64> {
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        let next = self.next_ms.load(Ordering::Relaxed);
+        let due = now_ms + self.interval.as_millis() as u64;
+        if now_ms >= next
+            && self
+                .next_ms
+                .compare_exchange(next, due, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            return Some(self.held_back.swap(0, Ordering::Relaxed));
+        }
+        self.held_back.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// Raise the Warning event for a negotiation that str0m panicked in — rate
+/// limited by [`NEGOTIATION_PANIC_EVENT_INTERVAL`] — naming the `peer` (e.g.
+/// `"WHEP viewer"`). Any other setup error is the peer's own (a malformed
+/// SDP) and stays a log line. A relay is headless: without this, a str0m
+/// panic a public offer triggered left one `warn!` line and nothing the
+/// manager could show. bilbycast-edge raises the same `error_code`.
+fn report_negotiation_panic(
+    st: &DistributionState,
+    err: &anyhow::Error,
+    peer: &str,
+    stream_id: &str,
+    ip: IpAddr,
+) {
+    let Some(panic) = err.downcast_ref::<NegotiationPanic>() else {
+        return;
+    };
+    let Some(held_back) = st.negotiation_panics.admit(Instant::now()) else {
+        return;
+    };
+    st.events.emit_with_details(
+        crate::manager::events::EventSeverity::Warning,
+        crate::manager::events::category::DISTRIBUTION,
+        format!("WebRTC negotiation with {peer} failed: {panic}"),
+        serde_json::json!({
+            "error_code": "webrtc_negotiation_panic",
+            "peer": peer,
+            "stream": stream_id,
+            "step": panic.step,
+            "panic": panic.message,
+            "ip": ip.to_string(),
+            "suppressed": held_back,
+        }),
+    );
 }
 
 /// A live viewer session tracked for teardown + per-IP accounting.
@@ -143,6 +227,7 @@ impl DistributionState {
             ingests: DashMap::new(),
             viewers_by_ip: DashMap::new(),
             events,
+            negotiation_panics: EventGate::new(NEGOTIATION_PANIC_EVENT_INTERVAL),
         })
     }
 
@@ -515,6 +600,7 @@ async fn whep_offer(
         Err(e) => {
             // Setup failed — `slot` drops on return and gives the slot back.
             tracing::warn!("WHEP setup failed for stream '{stream_id}': {e:#}");
+            report_negotiation_panic(&st, &e, "WHEP viewer", &stream_id, ip);
             (StatusCode::BAD_REQUEST, format!("WHEP setup failed: {e}")).into_response()
         }
     }
@@ -523,12 +609,23 @@ async fn whep_offer(
 /// `DELETE /whep/{stream_id}/{session_id}` — tear down exactly this viewer.
 async fn whep_delete(
     State(st): State<Arc<DistributionState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((_stream_id, session_id)): Path<(String, String)>,
 ) -> Response {
     // Cancel the session; the reaper spawned at offer time removes the record
-    // and releases the per-IP slot.
+    // and releases the per-IP slot. Logged here, where the request is: the
+    // viewer's own last line says only "deleted by the client", the same for
+    // a tab's `pagehide` as for any other DELETE. Both addresses are logged —
+    // the one this DELETE came from, and the one the viewer's offer came from
+    // — since anyone holding the session id can send it. The path's stream id
+    // is not logged — it is whatever the client wrote, and need not be the
+    // viewer's stream, which that last line names.
     match st.sessions.get(&session_id) {
         Some(s) => {
+            tracing::info!(
+                "WHEP viewer '{session_id}' deleted by {peer} (viewer {})",
+                s.ip
+            );
             s.cancel.cancel();
             StatusCode::OK.into_response()
         }
@@ -540,6 +637,7 @@ async fn whep_delete(
 async fn whip_ingest_offer(
     State(st): State<Arc<DistributionState>>,
     Path(stream_id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -602,6 +700,7 @@ async fn whip_ingest_offer(
         }
         Err(e) => {
             tracing::warn!("WHIP ingest setup failed for stream '{stream_id}': {e:#}");
+            report_negotiation_panic(&st, &e, "WHIP publisher", &stream_id, peer.ip());
             (StatusCode::BAD_REQUEST, format!("WHIP ingest setup failed: {e}")).into_response()
         }
     }
@@ -3309,21 +3408,15 @@ mod tests {
         assert!(token_from_query(Some("ingest_token=abc")).is_none());
     }
 
-    /// `ViewerSlot` holds the per-IP cap and gives each slot back exactly once,
-    /// however it is dropped — including by a panic unwinding past it, which
-    /// is the case the old hand-written release in the `Err` arm missed. The
-    /// wiring (that `whep_offer` reserves through it) is asserted over HTTP in
-    /// `tests/distribution.rs` (`failed_offers_never_exhaust_the_per_ip_viewer_cap`).
-    #[test]
-    fn a_viewer_slot_is_given_back_exactly_once_however_it_is_dropped() {
-        let tmp = tempfile::tempdir().unwrap();
+    /// A `DistributionState` with default config, its origin under `dir`.
+    fn test_state(dir: &std::path::Path) -> Arc<DistributionState> {
         let cfg = DistributionConfig::default();
         let control = DistributionControl::new(
             crate::distribution_control::RuntimeDistConfig::from_config(&cfg, None),
             vec![],
         );
         let origin = OriginStore::new(origin::OriginConfig {
-            root: tmp.path().join("origin"),
+            root: dir.join("origin"),
             retention: std::time::Duration::from_secs(3600),
             max_bytes_per_stream: 1 << 30,
             min_segments: 8,
@@ -3332,14 +3425,79 @@ mod tests {
         })
         .unwrap();
         let (events, _rx) = crate::manager::events::event_channel();
-        let st = DistributionState::new(
+        DistributionState::new(
             Arc::new(DistributionHub::new()),
             Arc::new(origin),
             cfg,
             control,
             CancellationToken::new(),
             events,
+        )
+    }
+
+    /// A WHEP `DELETE` is logged with the address it came from and the
+    /// viewer's. Anyone holding the session id can send one, and the line
+    /// used to name only the address the viewer's offer came from, as though
+    /// the DELETE had come from there too.
+    #[tokio::test]
+    async fn a_whep_delete_is_logged_with_its_own_address_and_the_viewers() {
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let st = test_state(tmp.path());
+        let cancel = CancellationToken::new();
+        st.sessions.insert(
+            "v1".to_string(),
+            ViewerSession {
+                cancel: cancel.clone(),
+                ip: "198.51.100.7".parse().unwrap(),
+            },
         );
+
+        let log = Captured::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let resp = whep_delete(
+            State(st.clone()),
+            ConnectInfo("203.0.113.9:4321".parse().unwrap()),
+            Path(("show".to_string(), "v1".to_string())),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(cancel.is_cancelled(), "the viewer was told to end");
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("WHEP viewer 'v1' deleted by 203.0.113.9:4321 (viewer 198.51.100.7)"),
+            "{text}"
+        );
+    }
+
+    /// `ViewerSlot` holds the per-IP cap and gives each slot back exactly once,
+    /// however it is dropped — including by a panic unwinding past it, which
+    /// is the case the old hand-written release in the `Err` arm missed. The
+    /// wiring (that `whep_offer` reserves through it) is asserted over HTTP in
+    /// `tests/distribution.rs` (`failed_offers_never_exhaust_the_per_ip_viewer_cap`).
+    #[test]
+    fn a_viewer_slot_is_given_back_exactly_once_however_it_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = test_state(tmp.path());
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         let held = |ip: IpAddr| {
             st.viewers_by_ip
@@ -3376,5 +3534,52 @@ mod tests {
 
         drop(elsewhere);
         assert_eq!(held(other), 0);
+    }
+
+    /// The negotiation-panic event gate reports the first occurrence, then at
+    /// most one per interval, each report counting the ones held back since
+    /// the last.
+    #[test]
+    fn the_event_gate_reports_one_per_interval_and_counts_the_rest() {
+        let gate = EventGate::new(Duration::from_secs(10));
+        let t0 = gate.epoch;
+        assert_eq!(gate.admit(t0), Some(0), "the first is reported");
+        assert_eq!(gate.admit(t0 + Duration::from_secs(1)), None);
+        assert_eq!(gate.admit(t0 + Duration::from_secs(9)), None);
+        assert_eq!(
+            gate.admit(t0 + Duration::from_secs(10)),
+            Some(2),
+            "the next, a full interval on, says how many were held back"
+        );
+        assert_eq!(gate.admit(t0 + Duration::from_secs(11)), None);
+        assert_eq!(gate.admit(t0 + Duration::from_secs(60)), Some(1));
+        assert_eq!(gate.admit(t0 + Duration::from_secs(70)), Some(0));
+    }
+
+    /// The `/watch` player tears its WHEP session down on its way out with a
+    /// `DELETE`, the only method its resource answers. It used
+    /// `navigator.sendBeacon`, which can only POST: every tab close got a 405,
+    /// and the session — its socket, its per-IP slot and the media sent to
+    /// it — outlived the viewer.
+    #[test]
+    fn the_watch_player_deletes_its_session_on_the_way_out() {
+        let html = include_str!("player.html");
+        assert!(
+            !html.contains("sendBeacon"),
+            "a beacon is a POST, and the resource takes DELETE"
+        );
+        let teardown = html
+            .split("addEventListener(\"pagehide\"")
+            .nth(1)
+            .expect("the player tears down on pagehide")
+            .split(");\n")
+            .next()
+            .unwrap();
+        assert!(
+            teardown.contains("fetch(resourceUrl")
+                && teardown.contains("method: \"DELETE\"")
+                && teardown.contains("keepalive: true"),
+            "the teardown is a keepalive DELETE of the session resource: {teardown}"
+        );
     }
 }

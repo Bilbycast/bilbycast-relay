@@ -14,6 +14,14 @@
 
 use bytes::Bytes;
 
+/// The largest elementary frame the distribution plane takes from any ingest
+/// (a generous 4 MiB — a 4K IDR access unit is well under this): a frame on
+/// the QUIC ES ingest ([`super::ingest`]), and an access unit a WHIP
+/// publisher builds out of RTP (`whip_ingest`'s assembler). A cascade pull
+/// takes this plus headroom for what the relays above it add
+/// (`whip_ingest::MAX_RTP_AU_BYTES`).
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 /// Which elementary stream an [`EsFrame`] carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EsKind {
@@ -160,12 +168,38 @@ pub fn au_is_idr(au: &[u8]) -> bool {
 }
 
 /// The latest SPS and PPS an H.264 stream carried in-band (NAL units, start
-/// codes removed).
+/// codes removed). One of each: the last ones seen, whatever their ids.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct H264ParamSets {
     pub sps: Option<Bytes>,
     pub pps: Option<Bytes>,
 }
+
+/// The largest SPS or PPS the parameter-set cache keeps. A real one is tens
+/// of bytes — a few hundred with VUI and scaling lists.
+///
+/// The cache used to keep a set of any size and copy it ahead of every later
+/// IDR that lacked one, so a publisher could send one megabyte-sized "SPS"
+/// and then seven-byte IDRs, and every one went out — to the broadcast ring,
+/// the keyframe cache and each viewer's packetizer — a megabyte long
+/// (measured: 210 bytes of ingest published as 31 MB).
+pub const MAX_PARAM_SET_BYTES: usize = 1024;
+
+/// The payload size str0m 0.24.1's H.264 packetizer is given: its default
+/// 1150-byte datagram target (`str0m::DATAGRAM_MTU_TARGET`) less the 16-byte
+/// SRTP tag, rounded down to the 16-byte SRTP block — 1120 (`do_payload` in
+/// str0m's `media/mod.rs`). The relay sets no MTU of its own.
+const STR0M_PAYLOAD_MTU: usize = {
+    let rtp = str0m::DATAGRAM_MTU_TARGET - 16;
+    rtp - rtp % 16
+};
+
+/// The most SPS + PPS bytes that reach a viewer. str0m's packetizer sends an
+/// access unit's SPS and PPS as one STAP-A ahead of its first slice — a header
+/// byte, then each set behind a two-byte length — and silently sends neither
+/// when that packet would exceed [`STR0M_PAYLOAD_MTU`] (`H264Packetizer::emit`
+/// in str0m's `packet/h264.rs`). 1115 bytes.
+pub const MAX_PARAM_SETS_ON_THE_WIRE: usize = STR0M_PAYLOAD_MTU - 5;
 
 /// What [`restore_param_sets`] made of one access unit.
 #[derive(Debug)]
@@ -181,13 +215,30 @@ pub struct RestoredAu {
 }
 
 /// Put a stream's SPS and PPS back ahead of an IDR that does not carry its
-/// own, so a decoder can start on any IDR.
+/// own, so a decoder can start on any IDR of a stream that uses one SPS and
+/// one PPS — the common case.
 ///
 /// A sender need not repeat its parameter sets with every IDR (only libwebrtc
 /// does so reliably; an encoder with global headers sends them once). A WHEP
 /// viewer that joined after the IDR that carried them — primed with the
 /// cached keyframe, or waiting for the next live one — then has slices it
 /// cannot decode, and a browser asks for a keyframe (PLI) forever.
+///
+/// **One of each.** The cache holds the last SPS and the last PPS the stream
+/// carried, whatever their ids. A stream that uses several — separate
+/// CABAC / CAVLC or field PPSs, from some broadcast and hardware encoders —
+/// gets only the last of each back, so a late joiner cannot decode slices
+/// that reference the others until an IDR brings its own. Keying the cache by
+/// id would gain a WHEP viewer little: str0m's packetizer puts at most one SPS
+/// and one PPS — the last of each it has seen — ahead of a slice
+/// (`H264Packetizer::emit`), so extra sets in one unit are lost on the wire
+/// anyway.
+///
+/// **Bounded.** A set past [`MAX_PARAM_SET_BYTES`] is never cached — it clears
+/// the cached one instead, so a stale set is not put back ahead of an IDR the
+/// new one describes — and nothing is inserted when the SPS and PPS the unit
+/// would then carry exceed [`MAX_PARAM_SETS_ON_THE_WIRE`], since str0m would
+/// send neither. So an insertion adds at most that many bytes to an IDR.
 ///
 /// `cached` is the stream's cache *before* this unit. The unit's own
 /// parameter sets always win and refresh the cache (returned, so the caller
@@ -207,23 +258,38 @@ pub fn restore_param_sets(au: &[u8], cached: &H264ParamSets) -> RestoredAu {
         }
     }
 
-    // Copied, not sliced out of the unit: a slice would keep the whole IDR
-    // buffer alive for as long as the cache holds it.
-    let fresh = |own: Option<&[u8]>, cached: &Option<Bytes>| {
-        own.filter(|n| cached.as_deref() != Some(*n))
-            .map(Bytes::copy_from_slice)
+    // What the unit's own set does to the cached one: `None` leaves it,
+    // `Some(set)` replaces it. Copied, not sliced out of the unit: a slice
+    // would keep the whole IDR buffer alive for as long as the cache holds it.
+    let update = |own: Option<&[u8]>, cached: &Option<Bytes>| -> Option<Option<Bytes>> {
+        let own = own?;
+        if own.len() > MAX_PARAM_SET_BYTES {
+            return cached.is_some().then_some(None);
+        }
+        (cached.as_deref() != Some(own)).then(|| Some(Bytes::copy_from_slice(own)))
     };
-    let new_sps = fresh(own_sps, &cached.sps);
-    let new_pps = fresh(own_pps, &cached.pps);
+    let new_sps = update(own_sps, &cached.sps);
+    let new_pps = update(own_pps, &cached.pps);
     let param_sets = (new_sps.is_some() || new_pps.is_some()).then(|| H264ParamSets {
-        sps: new_sps.or_else(|| cached.sps.clone()),
-        pps: new_pps.or_else(|| cached.pps.clone()),
+        sps: new_sps.unwrap_or_else(|| cached.sps.clone()),
+        pps: new_pps.unwrap_or_else(|| cached.pps.clone()),
     });
 
     let insert_sps = cached.sps.as_deref().filter(|_| idr && own_sps.is_none());
     let insert_pps = cached.pps.as_deref().filter(|_| idr && own_pps.is_none());
     if insert_sps.is_none() && insert_pps.is_none() {
         return RestoredAu { au: None, idr, param_sets };
+    }
+    let on_the_wire =
+        |own: Option<&[u8]>, inserted: Option<&[u8]>| own.or(inserted).map_or(0, <[u8]>::len);
+    if on_the_wire(own_sps, insert_sps) + on_the_wire(own_pps, insert_pps)
+        > MAX_PARAM_SETS_ON_THE_WIRE
+    {
+        return RestoredAu {
+            au: None,
+            idr,
+            param_sets,
+        };
     }
 
     // `idr` holds, so there is a non-AUD NAL for `first_body` to find.
@@ -396,6 +462,105 @@ mod tests {
         let (au, idr) = restore(&[0x65, 0x11, 0x22], &mut cache);
         assert!(idr);
         assert_eq!(au, unit(&[7, 8, 5]));
+    }
+
+    /// An oversized "SPS" is never cached, and never copied ahead of the IDRs
+    /// after it. Before, the cache kept any size: a 1 MiB type-7 NAL and then
+    /// thirty seven-byte bare IDRs published 31 MB.
+    #[test]
+    fn an_oversized_parameter_set_is_never_put_back() {
+        let mut cache = H264ParamSets::default();
+        let mut huge = vec![0x67];
+        huge.resize(1 << 20, 0x11);
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&huge);
+        au.extend_from_slice(&unit(&[8, 5]));
+        restore(&au, &mut cache);
+        assert_eq!(cache.sps, None, "a 1 MiB SPS is not cached");
+
+        let mut published = 0;
+        for _ in 0..30 {
+            let (au, idr) = restore(&unit(&[5]), &mut cache);
+            assert!(idr);
+            published += au.len();
+        }
+        assert!(
+            published <= 30 * (unit(&[5]).len() + MAX_PARAM_SETS_ON_THE_WIRE + 8),
+            "30 bare IDRs published {published} bytes"
+        );
+
+        // The largest set the cache keeps goes back in as before.
+        let mut cache = H264ParamSets::default();
+        let mut sps = vec![0x67];
+        sps.resize(MAX_PARAM_SET_BYTES, 0x11);
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&sps);
+        au.extend_from_slice(&unit(&[8, 5]));
+        restore(&au, &mut cache);
+        assert_eq!(cache.sps.as_deref(), Some(&sps[..]));
+        let (au, _) = restore(&unit(&[5]), &mut cache);
+        assert_eq!(nal_types(&au), vec![7, 8, 5]);
+    }
+
+    /// A set the cache will not keep still retires the one it replaces: the
+    /// stream has moved on, and the old SPS would describe the next IDR
+    /// wrongly.
+    #[test]
+    fn an_uncacheable_set_retires_the_cached_one() {
+        let mut cache = H264ParamSets::default();
+        restore(&unit(&[7, 8, 5]), &mut cache);
+        assert!(cache.sps.is_some());
+        let mut huge = vec![0, 0, 0, 1, 0x67];
+        huge.resize(4 + MAX_PARAM_SET_BYTES + 1, 0x11);
+        restore(&huge, &mut cache);
+        assert_eq!(cache.sps, None, "the stale SPS is gone");
+        assert!(cache.pps.is_some(), "the PPS stands");
+        let (au, _) = restore(&unit(&[5]), &mut cache);
+        assert!(!nal_types(&au).contains(&7), "no stale SPS goes back in");
+    }
+
+    /// Nothing is inserted when the SPS and PPS a unit would then carry are
+    /// more than str0m's packetizer sends: one byte over its STAP-A budget,
+    /// the unit goes out as it came; at the budget, the sets go in.
+    #[test]
+    fn nothing_is_inserted_past_the_stap_a_budget() {
+        assert_eq!(
+            STR0M_PAYLOAD_MTU, 1120,
+            "str0m's payload MTU moved: re-derive the budget"
+        );
+        assert_eq!(MAX_PARAM_SETS_ON_THE_WIRE, 1115);
+
+        let sized = |header: u8, len: usize| {
+            let mut n = vec![header];
+            n.resize(len, 0x11);
+            n
+        };
+        for (sps_len, inserted) in [(MAX_PARAM_SET_BYTES, true), (MAX_PARAM_SET_BYTES, false)] {
+            let pps_len = MAX_PARAM_SETS_ON_THE_WIRE - sps_len + usize::from(!inserted);
+            let mut cache = H264ParamSets {
+                sps: Some(sized(0x67, sps_len).into()),
+                pps: Some(sized(0x68, pps_len).into()),
+            };
+            let (au, _) = restore(&unit(&[5]), &mut cache);
+            let types = nal_types(&au);
+            if inserted {
+                assert_eq!(types, vec![7, 8, 5], "{sps_len} + {pps_len} bytes fit");
+            } else {
+                assert_eq!(types, vec![5], "{sps_len} + {pps_len} bytes do not");
+            }
+        }
+
+        // The unit's own SPS counts too: a cached PPS that would push it past
+        // the budget stays out.
+        let mut cache = H264ParamSets {
+            sps: None,
+            pps: Some(sized(0x68, MAX_PARAM_SET_BYTES).into()),
+        };
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&sized(0x67, 200));
+        au.extend_from_slice(&unit(&[5]));
+        let (out, _) = restore(&au, &mut cache);
+        assert_eq!(out, au, "{} + {MAX_PARAM_SET_BYTES} bytes do not fit", 200);
     }
 
     #[test]

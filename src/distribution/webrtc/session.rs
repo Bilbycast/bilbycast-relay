@@ -27,16 +27,35 @@
 //! Porting `PeerPin` across is the fix; until then, a sync in either direction
 //! must carry this control forward, never delete it.
 //!
+//! Both copies now give an ICE-Lite session a grace before ICE `Disconnected`
+//! ends it
+//! ([`ICE_DISCONNECT_GRACE`], [`WebrtcSession::is_disconnected`]) and end one
+//! on `Event::Closed`, but they were built separately and differ, so a sync
+//! must merge the two rather than copy either over the other. Relay-only:
+//! [`SessionEnd`] and [`WebrtcSession::end`] — why a session ended, which
+//! each WHEP viewer's last log line names; a public [`WebrtcSession::close`]
+//! (only tests call it; the edge's is `cfg(test)`); a grace that only a
+//! nomination (`Connected` / `Completed`) cancels, where the edge's is
+//! cancelled by any other ICE state; and a `poll_event` that wakes when a
+//! grace runs out and returns on any end. The edge's copy, for its part, also
+//! ends a session on a socket or str0m error seen while draining
+//! (`drain_outputs`, `drive_udp_io`), where this one latches such an error
+//! only in `poll_event`; gives the grace only to ICE-Lite sessions (its WHIP
+//! output, a full ICE agent, ends at its first `Disconnected`); and puts
+//! nothing on the wire while ICE is down (`ice_down`), where this one keeps
+//! sending through the grace.
+//!
 //! Manages the lifecycle of a single WebRTC PeerConnection: ICE, DTLS,
 //! SRTP, and media I/O. Integrates str0m's sans-I/O model with tokio
 //! by driving the UDP socket and str0m poll loop in a select! loop.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use str0m::change::SdpOffer;
+use str0m::format::{Codec, PayloadParams};
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use str0m::net::Protocol;
@@ -69,8 +88,8 @@ use tokio_util::sync::CancellationToken;
 /// **Why only H.264 and Opus.** They are all this pipeline carries
 /// (`EsKind::{VideoH264, AudioOpus}`). Every other codec in str0m's default set
 /// is one the relay cannot depacketize on ingest or produce for a viewer, and
-/// [`WebrtcSession::get_pt`] takes the first negotiated entry, which in the
-/// default set is VP8 (PT 96): H.264 went out labelled as VP8.
+/// [`WebrtcSession::get_pt`] used to take the first negotiated entry, which in
+/// the default set is VP8 (PT 96): H.264 went out labelled as VP8.
 ///
 /// **Why str0m's own numbers.** They are proven-valid RTX slots (an arbitrary
 /// free PT can break str0m's SDP generation), none collides with Opus's 111,
@@ -115,7 +134,29 @@ fn rtc_config(ice_lite: bool) -> RtcConfig {
     config
 }
 
-/// Run one str0m negotiation step, turning a panic inside it into an error.
+/// A panic str0m raised while negotiating with one peer, caught so that it
+/// fails that peer alone (see [`isolate_negotiation`]). Same shape as
+/// bilbycast-edge's; the HTTP handlers in `distribution/mod.rs` turn it into
+/// the `webrtc_negotiation_panic` Warning event.
+#[derive(Debug)]
+pub struct NegotiationPanic {
+    /// The step that panicked: `"session setup"`, `"SDP offer"`, `"SDP offer
+    /// creation"` or `"SDP answer"`.
+    pub step: &'static str,
+    /// The panic message.
+    pub message: String,
+}
+
+impl std::fmt::Display for NegotiationPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "str0m panicked during {}: {}", self.step, self.message)
+    }
+}
+
+impl std::error::Error for NegotiationPanic {}
+
+/// Run one synchronous str0m negotiation step, turning a panic inside it into
+/// a [`NegotiationPanic`] error.
 ///
 /// str0m still asserts its way through some SDP it cannot reconcile — an offer
 /// whose one RTX PT repairs two H.264 PTs makes 0.24.1 panic "Pt locked
@@ -123,21 +164,105 @@ fn rtc_config(ice_lite: bool) -> RtcConfig {
 /// a WHEP viewer, a WHIP publisher or a cascade upstream sent. Unchecked, the
 /// panic unwinds through the HTTP handler: the client gets a dropped
 /// connection, and before `ViewerSlot` existed the per-IP slot leaked with it.
-/// Contained here, it is an error for that one request.
+/// Contained here, it is an error for that one request. Each step wraps
+/// everything str0m does with the peer's SDP — parsing it and writing ours
+/// included — as bilbycast-edge's `isolate_negotiation` does.
 ///
 /// `AssertUnwindSafe` is sound because nothing observes the `Rtc` afterwards:
 /// every caller discards the whole session when one of these steps returns
 /// `Err`, which is the contract documented on each.
-fn negotiate<T>(step: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
-        let msg = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("(non-string panic payload)");
-        tracing::warn!("WebRTC: str0m panicked during {step}: {msg}");
-        Err(anyhow::anyhow!("str0m panicked during {step}: {msg}"))
-    })
+fn isolate_negotiation<T>(step: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "(no message)".to_string());
+            let panic = NegotiationPanic { step, message };
+            tracing::warn!("WebRTC: {panic}; failing this peer only");
+            Err(panic.into())
+        }
+    }
+}
+
+/// The payload type a track is written on, from the payload params its
+/// m-line negotiated: H.264 on video, Opus on audio, `None` when the peer
+/// accepted neither. Ported from bilbycast-edge's `send_pt`; keep the two
+/// identical.
+///
+/// `Writer::payload_params` lists every negotiated param in codec-config
+/// order, and its first entry used to be taken — whatever its packetization
+/// mode. On video, packetization-mode 1 is preferred: str0m packetizes into
+/// STAP-A / FU-A, which a mode-0 PT forbids, so a mode-0 PT is taken only
+/// when the peer accepted no other. [`H264_LEVEL_5_1`] is ordered by profile,
+/// so a peer offering Baseline only in mode 0 and another profile in mode 1
+/// used to get its mode-0 PT.
+fn send_pt<'a>(kind: MediaKind, params: impl Iterator<Item = &'a PayloadParams>) -> Option<Pt> {
+    let mut mode_0 = None;
+    for p in params {
+        let spec = p.spec();
+        match kind {
+            MediaKind::Audio if spec.codec == Codec::Opus => return Some(p.pt()),
+            MediaKind::Video if spec.codec == Codec::H264 => {
+                if spec.format.packetization_mode == Some(1) {
+                    return Some(p.pt());
+                }
+                mode_0.get_or_insert(p.pt());
+            }
+            _ => {}
+        }
+    }
+    mode_0
+}
+
+/// How long ICE may stay disconnected before the session is over
+/// ([`WebrtcSession::is_disconnected`]).
+///
+/// `is` reports an ICE-Lite agent `Disconnected` 15 s after the peer's last
+/// Binding Request (`RECENT_BINDING_REQUEST`), but that agent comes back: the
+/// peer's next request re-creates the pair it pruned and, carrying
+/// USE-CANDIDATE as a controlling agent's checks on its nominated pair do,
+/// nominates it, and ICE is `Completed` again. So the grace keeps a viewer
+/// whose browser stopped checking and then resumed — a suspended laptop, a
+/// backgrounded mobile tab, a frozen process — and one whose network came
+/// back before the browser's own ICE failed (measured with Chrome 124: a
+/// 20 s freeze and a 14 s network loss both came back). That second window
+/// is short: Chrome fails a connection after about 15 s of unanswered checks,
+/// not RFC 7675's 30 s, and then stops checking for good (nothing here
+/// restarts ICE), so a longer outage loses the viewer whatever the relay does.
+///
+/// The grace is not free: str0m keeps sending to the last nominated address
+/// until the session ends, so a viewer that really left is sent about 30 s of
+/// its stream rather than 15.
+pub const ICE_DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
+/// Why a session is over. See [`WebrtcSession::end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// ICE stayed disconnected for [`ICE_DISCONNECT_GRACE`]: the peer stopped
+    /// answering — a closed tab, a lost network.
+    IceDisconnected,
+    /// The connection was closed: the peer sent a DTLS close_notify
+    /// (`RTCPeerConnection.close()`, a str0m peer's `Rtc::close`) or its SCTP
+    /// association went, or this side closed the `Rtc`.
+    Closed,
+    /// The UDP socket failed.
+    SocketError,
+    /// str0m returned an error.
+    Str0mError,
+}
+
+impl std::fmt::Display for SessionEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SessionEnd::IceDisconnected => "ICE disconnected",
+            SessionEnd::Closed => "DTLS closed",
+            SessionEnd::SocketError => "UDP socket error",
+            SessionEnd::Str0mError => "str0m error",
+        })
+    }
 }
 
 /// Events produced by the WebRTC session for the caller to handle.
@@ -168,7 +293,14 @@ pub enum SessionEvent {
     MediaAdded { mid: Mid, kind: MediaKind },
     /// Incoming keyframe request from the remote peer.
     KeyframeRequest { mid: Mid },
-    /// Session has been disconnected or failed.
+    /// The session ended — see [`SessionEnd`] — or `poll_event`'s cancel
+    /// fired. Also reported the moment ICE goes `Disconnected`, which an
+    /// ICE-Lite session can come back from: [`poll_event`]'s callers (setup,
+    /// WHIP ingest, the cascade pull) end on it at once, as they always have,
+    /// while the WHEP send loop reads [`WebrtcSession::is_disconnected`],
+    /// which gives ICE [`ICE_DISCONNECT_GRACE`] to return.
+    ///
+    /// [`poll_event`]: WebrtcSession::poll_event
     Disconnected,
 }
 
@@ -349,6 +481,12 @@ pub struct WebrtcSession {
     pub audio_mid: Option<Mid>,
     /// Anti-reflection ingress filter. See [`PeerPin`].
     pin: PeerPin,
+    /// Latched by the first fatal end — a closed connection, a socket or
+    /// str0m error — on whichever path drained it. See [`Self::end`].
+    ended: Option<SessionEnd>,
+    /// When ICE last went `Disconnected`, until it is `Connected` or
+    /// `Completed` again. See [`ICE_DISCONNECT_GRACE`].
+    ice_disconnected_since: Option<Instant>,
     buf: Vec<u8>,
 }
 
@@ -357,10 +495,6 @@ impl WebrtcSession {
     pub async fn new(config: &SessionConfig) -> Result<Self> {
         let socket = UdpSocket::bind(config.bind_addr).await?;
         let local_addr = socket.local_addr()?;
-
-        // Opus + str0m's H.264 entries at level 5.1, nothing else. The reasons,
-        // and the panic the previous set caused, are on `H264_LEVEL_5_1`.
-        let mut rtc = rtc_config(config.ice_lite).build(Instant::now());
 
         // Build the host-candidate set the answer SDP will advertise.
         //
@@ -393,13 +527,19 @@ impl WebrtcSession {
             route_discovered_lan_ip,
         );
 
-        for ip in &candidate_ips {
-            let cand_addr = SocketAddr::new(*ip, port);
-            let cand = Candidate::host(cand_addr, Protocol::Udp)
-                .map_err(|e| anyhow::anyhow!("ICE candidate error: {}", e))?;
-            rtc.add_local_candidate(cand);
-            tracing::debug!("WebRTC: added local ICE host candidate {cand_addr}");
-        }
+        // Opus + str0m's H.264 entries at level 5.1, nothing else. The reasons,
+        // and the panic the previous set caused, are on `H264_LEVEL_5_1`.
+        let rtc = isolate_negotiation("session setup", || {
+            let mut rtc = rtc_config(config.ice_lite).build(Instant::now());
+            for ip in &candidate_ips {
+                let cand_addr = SocketAddr::new(*ip, port);
+                let cand = Candidate::host(cand_addr, Protocol::Udp)
+                    .map_err(|e| anyhow::anyhow!("ICE candidate error: {}", e))?;
+                rtc.add_local_candidate(cand);
+                tracing::debug!("WebRTC: added local ICE host candidate {cand_addr}");
+            }
+            Ok(rtc)
+        })?;
 
         Ok(Self {
             rtc,
@@ -409,6 +549,8 @@ impl WebrtcSession {
             video_mid: None,
             audio_mid: None,
             pin: PeerPin::default(),
+            ended: None,
+            ice_disconnected_since: None,
             buf: vec![0u8; 2048],
         })
     }
@@ -442,8 +584,8 @@ impl WebrtcSession {
     /// Accept an SDP offer (server mode) and return the SDP answer string.
     ///
     /// On `Err` the session must be discarded: a panic inside str0m comes back
-    /// as an error (see [`negotiate`]), and the `Rtc` it unwound out of is in
-    /// no state to be driven further.
+    /// as a [`NegotiationPanic`] error (see [`isolate_negotiation`]), and the
+    /// `Rtc` it unwound out of is in no state to be driven further.
     pub fn accept_offer(&mut self, offer_sdp: &str) -> Result<String> {
         // str0m 0.18's SDP parser accepted only `s=-` as the session name,
         // and ffmpeg and other WHIP publishers send a real one (e.g.
@@ -453,19 +595,19 @@ impl WebrtcSession {
         // separate workaround; see `normalise_sdp_offer_for_str0m`.
         let normalised = normalise_sdp_offer_for_str0m(offer_sdp);
 
-        let offer = SdpOffer::from_sdp_string(&normalised)
-            .map_err(|e| anyhow::anyhow!("SDP parse error: {}", e))?;
+        let answer_sdp = isolate_negotiation("SDP offer", || {
+            let offer = SdpOffer::from_sdp_string(&normalised)
+                .map_err(|e| anyhow::anyhow!("SDP parse error: {}", e))?;
 
-        tracing::info!("SDP offer (normalised):\n{}", normalised);
+            tracing::info!("SDP offer (normalised):\n{}", normalised);
 
-        let answer = negotiate("accept_offer", || {
-            self.rtc
+            let answer = self
+                .rtc
                 .sdp_api()
                 .accept_offer(offer)
-                .map_err(|e| anyhow::anyhow!("SDP accept error: {}", e))
+                .map_err(|e| anyhow::anyhow!("SDP accept error: {}", e))?;
+            Ok(answer.to_sdp_string())
         })?;
-
-        let answer_sdp = answer.to_sdp_string();
         tracing::info!("SDP answer:\n{}", answer_sdp);
 
         // MIDs will be discovered via MediaAdded events
@@ -474,23 +616,29 @@ impl WebrtcSession {
 
     /// Create an SDP offer (client mode). Returns the SDP offer string.
     /// The pending offer must be kept and passed to `apply_answer()`.
+    ///
+    /// A panic inside str0m comes back as a [`NegotiationPanic`] error.
     pub fn create_offer(&mut self, video: bool, audio: bool, send_only: bool) -> Result<(String, str0m::change::SdpPendingOffer)> {
-        let mut api = self.rtc.sdp_api();
         let direction = if send_only { Direction::SendOnly } else { Direction::RecvOnly };
 
-        if video {
-            let mid = api.add_media(MediaKind::Video, direction, None, None, None);
-            self.video_mid = Some(mid);
-        }
-        if audio {
-            let mid = api.add_media(MediaKind::Audio, direction, None, None, None);
-            self.audio_mid = Some(mid);
-        }
+        let (offer_sdp, pending) = isolate_negotiation("SDP offer creation", || {
+            let mut api = self.rtc.sdp_api();
 
-        let (offer, pending) = api.apply()
-            .ok_or_else(|| anyhow::anyhow!("No SDP changes to apply"))?;
+            if video {
+                let mid = api.add_media(MediaKind::Video, direction, None, None, None);
+                self.video_mid = Some(mid);
+            }
+            if audio {
+                let mid = api.add_media(MediaKind::Audio, direction, None, None, None);
+                self.audio_mid = Some(mid);
+            }
 
-        let offer_sdp = offer.to_sdp_string();
+            let (offer, pending) = api
+                .apply()
+                .ok_or_else(|| anyhow::anyhow!("No SDP changes to apply"))?;
+            Ok((offer.to_sdp_string(), pending))
+        })?;
+
         tracing::info!("SDP offer (created):\n{}", offer_sdp);
         Ok((offer_sdp, pending))
     }
@@ -500,28 +648,28 @@ impl WebrtcSession {
     ///
     /// On `Err` the session must be discarded, as for [`Self::accept_offer`].
     pub fn apply_answer(&mut self, answer_sdp: &str, pending: str0m::change::SdpPendingOffer) -> Result<()> {
-        let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp)
-            .map_err(|e| anyhow::anyhow!("SDP answer parse error: {}", e))?;
+        isolate_negotiation("SDP answer", || {
+            let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp)
+                .map_err(|e| anyhow::anyhow!("SDP answer parse error: {}", e))?;
 
-        negotiate("accept_answer", || {
             self.rtc
                 .sdp_api()
                 .accept_answer(pending, answer)
-                .map_err(|e| anyhow::anyhow!("SDP answer accept error: {}", e))
-        })?;
+                .map_err(|e| anyhow::anyhow!("SDP answer accept error: {}", e))?;
 
-        // Kickstart the ICE agent. After accept_answer the agent has
-        // remote candidates and credentials, but str0m's first
-        // `poll_output()` may return a `Timeout` with a deadline ~100
-        // years in the future ("nothing to do") because the sans-IO
-        // state machine hasn't been told to advance time. Without this
-        // call, our `poll_event` loop on the sender side sleeps until
-        // doomsday and ICE never starts. One zero-cost time injection
-        // wakes the agent and the next `poll_output` produces the first
-        // STUN binding request immediately.
-        let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
+            // Kickstart the ICE agent. After accept_answer the agent has
+            // remote candidates and credentials, but str0m's first
+            // `poll_output()` may return a `Timeout` with a deadline ~100
+            // years in the future ("nothing to do") because the sans-IO
+            // state machine hasn't been told to advance time. Without this
+            // call, our `poll_event` loop on the sender side sleeps until
+            // doomsday and ICE never starts. One zero-cost time injection
+            // wakes the agent and the next `poll_output` produces the first
+            // STUN binding request immediately.
+            let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Get the local socket address.
@@ -553,15 +701,20 @@ impl WebrtcSession {
     }
 
     /// Drain str0m's pending output queue, sending any queued UDP transmits
-    /// to the wire. This MUST be called between consecutive `write_media`
-    /// calls — str0m queues writes in `to_payload` (cap 512 since str0m
-    /// 0.24; 100 before) and only drains them via `handle_timeout`, which is
-    /// reached from a `Output::Timeout` poll cycle. Without this drain, the
-    /// inner H.264 fragmentation loop overflows the queue at the cap and every
-    /// subsequent `write_media` returns `Err("Consecutive calls to write()
-    /// without poll_output() in between")`. We feed an `Input::Timeout`
-    /// so the per-write payload queue is processed eagerly. Cheap when
-    /// there's nothing pending (one no-op timeout + one no-op poll).
+    /// to the wire.
+    ///
+    /// str0m holds up to 512 pending writes per track (`MAX_PENDING_PAYLOADS`
+    /// in its `media/mod.rs`; 100 before 0.24) and packetizes them only from
+    /// `handle_timeout`; past the cap `write_media` returns
+    /// `WriteWithoutPoll`. Draining after each write sends an access unit's
+    /// packets at once and keeps that queue at one entry. We feed an
+    /// `Input::Timeout` so the write is packetized eagerly. Cheap when there's
+    /// nothing pending (one no-op timeout + one no-op poll).
+    ///
+    /// Events drained here are not returned, but what they say about the
+    /// session's end is kept (see [`Self::is_disconnected`]): str0m reports
+    /// ICE giving up from inside the very `handle_timeout` this runs, so for a
+    /// viewer that left without a DELETE this is where it usually surfaces.
     pub async fn drain_outputs(&mut self) {
         // Feed a current-time timeout so str0m runs `do_payload` and turns
         // the just-written sample into RTP packets ready for `poll_output`.
@@ -580,22 +733,19 @@ impl WebrtcSession {
         }
     }
 
-    /// The payload type to write `mid`'s media on: the first entry of the local
-    /// codec set, in registration order, that the peer negotiated for that
-    /// track. The set is Opus and then [`H264_LEVEL_5_1`], so this is Opus on
-    /// an audio track and H.264 on a video track — the Baseline
-    /// packetization-mode=1 PT whenever the peer offered one, as Chrome does.
-    /// Mode 1 is what the FU-A packetizer needs; the table is ordered by
-    /// profile, so a peer offering Baseline only in mode 0 would get that PT
-    /// ahead of another profile's mode-1 one.
+    /// The negotiated payload type to write `mid`'s media on: H.264 on a
+    /// video m-line — a packetization-mode=1 PT whenever the peer accepted
+    /// one — and Opus on an audio one (see [`send_pt`]). `None` when the peer
+    /// accepted neither, rather than another codec's PT.
     ///
-    /// Under str0m's default set the first entry was VP8, so between two
-    /// `WebrtcSession`s — the edge's WHIP output and this crate's ingest, or an
-    /// upstream WHEP viewer and a cascade pull — this returned PT 96 and H.264
-    /// went out labelled VP8.
+    /// Under str0m's default set the first negotiated entry was taken, and it
+    /// was VP8, so between two `WebrtcSession`s — the edge's WHIP output and
+    /// this crate's ingest, or an upstream WHEP viewer and a cascade pull —
+    /// this returned PT 96 and H.264 went out labelled VP8.
     pub fn get_pt(&mut self, mid: Mid) -> Option<Pt> {
+        let kind = self.rtc.media(mid)?.kind();
         let writer = self.rtc.writer(mid)?;
-        writer.payload_params().next().map(|p| p.pt())
+        send_pt(kind, writer.payload_params())
     }
 
     /// Drain all pending str0m events without blocking, populating
@@ -624,6 +774,59 @@ impl WebrtcSession {
         self.rtc.is_alive()
     }
 
+    /// The session is over ([`Self::end`] says why).
+    ///
+    /// Callers that drive the session with [`Self::drain_outputs`] and
+    /// [`Self::drive_udp_io`] — the WHEP send loop — must check this after
+    /// each call, and drive the session even when they have nothing to send,
+    /// so that an ICE grace lapses. `drain_outputs` returns no event at all and
+    /// `drive_udp_io` only the first of a batch, so a disconnect used to be
+    /// dropped there: a viewer that left without a DELETE was sent the stream,
+    /// and held its per-IP slot, for as long as the stream lived.
+    pub fn is_disconnected(&self) -> bool {
+        self.end().is_some()
+    }
+
+    /// Why the session is over, or `None` while it is not.
+    ///
+    /// - A fatal end is final from the moment any drain sees it: the peer
+    ///   closed the connection (`Event::Closed`, which str0m follows by going
+    ///   inert — no timeout and no ICE event ever comes after it), the socket
+    ///   failed, or str0m did. A closed `Rtc` counts too, however it closed.
+    /// - ICE going `Disconnected` is not, on its own: an ICE-Lite agent comes
+    ///   back on the peer's next nomination. It ends the session only once it
+    ///   has lasted [`ICE_DISCONNECT_GRACE`]. Before, the first `Disconnected`
+    ///   ended it, so a viewer whose consent checks paused for 15 s was closed
+    ///   although str0m and the browser would both have resumed, and the
+    ///   `/watch` player, which does not reconnect, stayed black.
+    pub fn end(&self) -> Option<SessionEnd> {
+        if let Some(end) = self.ended {
+            return Some(end);
+        }
+        if !self.rtc.is_alive() {
+            return Some(SessionEnd::Closed);
+        }
+        self.ice_disconnected_since
+            .filter(|since| since.elapsed() >= ICE_DISCONNECT_GRACE)
+            .map(|_| SessionEnd::IceDisconnected)
+    }
+
+    /// Keep the first fatal end; see [`Self::end`].
+    fn latch(&mut self, end: SessionEnd) {
+        self.ended.get_or_insert(end);
+    }
+
+    /// Close the connection from this side: str0m sends an RTCP BYE and a
+    /// DTLS close_notify on the next drain ([`Self::drain_outputs`],
+    /// [`Self::drive_udp_io`]), and the peer's session ends on it
+    /// ([`SessionEnd::Closed`]). This session is over at once.
+    pub fn close(&mut self) {
+        // `start_close` fails only on an SCTP or DTLS error, and then the
+        // `Rtc` is unusable anyway: the session is over either way.
+        let _ = self.rtc.close();
+        self.latch(SessionEnd::Closed);
+    }
+
     /// Drive the session event loop. Blocks until a meaningful event occurs.
     pub async fn poll_event(&mut self, cancel: &CancellationToken) -> SessionEvent {
         loop {
@@ -643,8 +846,21 @@ impl WebrtcSession {
                     continue;
                 }
                 Ok(Output::Timeout(deadline)) => {
-                    // Wait for input
-                    let sleep_dur = deadline.saturating_duration_since(Instant::now());
+                    // Everything is drained. A session that is over has
+                    // nothing to wait for — least of all a closed `Rtc`, which
+                    // is inert: its deadline is years away and no input wakes
+                    // it, so a `Closed` this loop did not see itself (one a
+                    // drain took) used to park it for good.
+                    if self.is_disconnected() {
+                        return SessionEvent::Disconnected;
+                    }
+                    // Wait for input — and for an ICE grace to lapse, so that
+                    // it is noticed when it does.
+                    let wake = match self.ice_disconnected_since {
+                        Some(since) => deadline.min(since + ICE_DISCONNECT_GRACE),
+                        None => deadline,
+                    };
+                    let sleep_dur = wake.saturating_duration_since(Instant::now());
                     tracing::trace!("poll_event: Timeout, sleeping {:?}", sleep_dur);
                     tokio::select! {
                         _ = cancel.cancelled() => {
@@ -664,6 +880,7 @@ impl WebrtcSession {
                                 }
                                 Err(e) => {
                                     tracing::error!("UDP recv error: {}", e);
+                                    self.latch(SessionEnd::SocketError);
                                     return SessionEvent::Disconnected;
                                 }
                             }
@@ -672,6 +889,7 @@ impl WebrtcSession {
                 }
                 Err(e) => {
                     tracing::error!("str0m error: {}", e);
+                    self.latch(SessionEnd::Str0mError);
                     return SessionEvent::Disconnected;
                 }
             }
@@ -749,7 +967,9 @@ impl WebrtcSession {
 
     /// Non-blocking: receive any pending UDP packets and feed them to
     /// str0m, then drain all pending transmits. Returns the first
-    /// meaningful session event (if any) discovered while processing.
+    /// meaningful session event (if any) discovered while processing; a
+    /// disconnect behind it is not returned but is kept, so check
+    /// [`Self::is_disconnected`] rather than the return value.
     ///
     /// Designed for the WHIP client output and WHEP viewer send loops,
     /// which need to keep str0m alive (RTCP, STUN keepalives) while
@@ -805,10 +1025,39 @@ impl WebrtcSession {
             }
             Event::IceConnectionStateChange(state) => {
                 tracing::debug!("ICE state: {:?}", state);
+                // Kept here, the one place every drain path goes through, so
+                // it holds whether or not the caller sees the event (see
+                // `end`). A disconnect starts the grace; only a nomination —
+                // `Connected` or `Completed` — ends it. `Checking` does not:
+                // a pair re-created without one is no recovery, so the clock
+                // runs on.
                 match state {
-                    IceConnectionState::Disconnected => Some(SessionEvent::Disconnected),
+                    IceConnectionState::Disconnected => {
+                        self.ice_disconnected_since.get_or_insert_with(Instant::now);
+                        Some(SessionEvent::Disconnected)
+                    }
+                    IceConnectionState::Connected | IceConnectionState::Completed => {
+                        if let Some(since) = self.ice_disconnected_since.take() {
+                            tracing::info!(
+                                "WebRTC: ICE back ({state:?}) after {:.1?} disconnected",
+                                since.elapsed()
+                            );
+                        }
+                        Some(SessionEvent::IceStateChange(state))
+                    }
                     _ => Some(SessionEvent::IceStateChange(state)),
                 }
+            }
+            Event::Closed => {
+                // The peer's DTLS close_notify (or its SCTP association
+                // going). str0m drains its own close output and then goes
+                // inert: nothing — no ICE event, no timeout — follows. It
+                // used to fall through to `_ => None`, so a WHIP ingest or a
+                // cascade pull whose peer closed without a DELETE parked in
+                // `poll_event` for good, its stream still registered.
+                tracing::debug!("WebRTC: the peer closed the connection");
+                self.latch(SessionEnd::Closed);
+                Some(SessionEvent::Disconnected)
             }
             Event::MediaAdded(added) => {
                 let kind = {
@@ -1610,27 +1859,300 @@ mod tests {
         assert!(ours.iter().all(|p| p.red().is_none()), "RED is off");
     }
 
-    /// A panic inside a negotiation step comes back as an error carrying the
-    /// panic message — both payload shapes `panic!` produces — and a step that
-    /// does not panic passes its own result through untouched.
+    /// A panic inside a negotiation step comes back as a typed
+    /// [`NegotiationPanic`] carrying the step and the panic message — both
+    /// payload shapes `panic!` produces — and a step that does not panic
+    /// passes its own result through untouched, an error included.
     #[test]
-    fn negotiate_turns_a_panic_into_an_error() {
+    fn isolate_negotiation_turns_a_panic_into_a_typed_error() {
         let pt = 102;
-        let err = negotiate::<()>("accept_offer", || panic!("Pt locked multiple times: {pt}"))
-            .unwrap_err();
+        let err =
+            isolate_negotiation::<()>("SDP offer", || panic!("Pt locked multiple times: {pt}"))
+                .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "str0m panicked during accept_offer: Pt locked multiple times: 102"
+            "str0m panicked during SDP offer: Pt locked multiple times: 102"
         );
-        let err = negotiate::<()>("accept_answer", || panic!("a static message")).unwrap_err();
+        let panic = err.downcast_ref::<NegotiationPanic>().expect("typed");
+        assert_eq!(
+            (panic.step, panic.message.as_str()),
+            ("SDP offer", "Pt locked multiple times: 102")
+        );
+        let err =
+            isolate_negotiation::<()>("SDP answer", || panic!("a static message")).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "str0m panicked during accept_answer: a static message"
+            "str0m panicked during SDP answer: a static message"
         );
 
-        assert_eq!(negotiate("accept_offer", || Ok(7)).unwrap(), 7);
-        let err = negotiate::<()>("accept_offer", || Err(anyhow::anyhow!("SDP accept error")))
-            .unwrap_err();
+        assert_eq!(isolate_negotiation("SDP offer", || Ok(7)).unwrap(), 7);
+        let err =
+            isolate_negotiation::<()>("SDP offer", || Err(anyhow::anyhow!("SDP accept error")))
+                .unwrap_err();
         assert_eq!(err.to_string(), "SDP accept error");
+        assert!(
+            err.downcast_ref::<NegotiationPanic>().is_none(),
+            "not a panic"
+        );
+    }
+
+    /// An offer that str0m cannot negotiate fails as a [`NegotiationPanic`]
+    /// of the step it reached, and one that does not even parse fails as a
+    /// plain error — the parse now runs inside the isolated step too.
+    #[tokio::test]
+    async fn accept_offer_reports_which_step_panicked() {
+        // Baseline in packetization mode 1 and 0, one RTX PT repairing both:
+        // str0m 0.24.1 locks that RTX PT twice and panics.
+        let hostile = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n\
+             m=video 9 UDP/TLS/RTP/SAVPF 102 104 103\r\nc=IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:hstl\r\na=ice-pwd:hostilepasswordhostile\r\n\
+             a=fingerprint:sha-256 5B:7E:0A:26:41:91:C4:7F:33:D8:12:6E:A0:5C:B9:E4:08:71:2D:9F:C6:3A:55:EB:10:84:7D:F2:69:0C:A3:1E\r\n\
+             a=setup:actpass\r\na=mid:0\r\na=recvonly\r\na=rtcp-mux\r\n\
+             a=rtpmap:102 H264/90000\r\n\
+             a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n\
+             a=rtpmap:104 H264/90000\r\n\
+             a=fmtp:104 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\r\n\
+             a=rtpmap:103 rtx/90000\r\na=fmtp:103 apt=102\r\na=fmtp:103 apt=104\r\n";
+        let err = test_session().await.accept_offer(hostile).unwrap_err();
+        let panic = err
+            .downcast_ref::<NegotiationPanic>()
+            .expect("a str0m panic");
+        assert_eq!(panic.step, "SDP offer");
+        assert!(
+            panic.message.contains("Pt locked multiple times"),
+            "{panic}"
+        );
+
+        let err = test_session()
+            .await
+            .accept_offer("v=0\r\nnot an offer\r\n")
+            .unwrap_err();
+        assert!(err.downcast_ref::<NegotiationPanic>().is_none(), "{err}");
+    }
+
+    // ── The send payload type ─────────────────────────────────────────
+
+    /// Negotiated params, in codec-config order, for the m-line that offered
+    /// `offered` as `(pt, codec name, fmtp)` — what `Writer::payload_params`
+    /// hands `send_pt`.
+    fn negotiated(kind: MediaKind, offered: &[(u8, &str, &str)]) -> Vec<PayloadParams> {
+        let (m, clock) = match kind {
+            MediaKind::Video => ("video", "90000"),
+            MediaKind::Audio => ("audio", "48000/2"),
+        };
+        let mut sdp = format!(
+            "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n\
+             m={m} 9 UDP/TLS/RTP/SAVPF {}\r\nc=IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:pptu\r\na=ice-pwd:payloadtypepasswordpw\r\n\
+             a=fingerprint:sha-256 5B:7E:0A:26:41:91:C4:7F:33:D8:12:6E:A0:5C:B9:E4:08:71:2D:9F:C6:3A:55:EB:10:84:7D:F2:69:0C:A3:1E\r\n\
+             a=setup:actpass\r\na=mid:0\r\na=recvonly\r\na=rtcp-mux\r\n",
+            offered
+                .iter()
+                .map(|o| o.0.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (pt, codec, fmtp) in offered {
+            sdp.push_str(&format!("a=rtpmap:{pt} {codec}/{clock}\r\n"));
+            if !fmtp.is_empty() {
+                sdp.push_str(&format!("a=fmtp:{pt} {fmtp}\r\n"));
+            }
+        }
+        let mut rtc = rtc_config(true).build(Instant::now());
+        rtc.sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&sdp).unwrap())
+            .unwrap();
+        let mid = Mid::from("0");
+        rtc.writer(mid).unwrap().payload_params().cloned().collect()
+    }
+
+    /// Video goes out on an H.264 packetization-mode=1 PT whenever the peer
+    /// accepted one, even when a mode-0 PT comes first in codec-config order;
+    /// a peer that accepted only mode 0 still gets video, on that PT. Audio
+    /// goes out on Opus.
+    ///
+    /// Before, the first negotiated entry was taken. This offer — Baseline in
+    /// mode 0 (PT 104), Constrained Baseline in mode 1 (PT 106) — lists
+    /// Baseline first in [`H264_LEVEL_5_1`], so video went out on 104 and
+    /// str0m sent STAP-A and FU-A on a PT that forbids them. bilbycast-edge's
+    /// `send_pt` returns 106 here.
+    #[test]
+    fn video_is_written_on_a_packetization_mode_1_pt_when_the_peer_took_one() {
+        const MODE_0: &str =
+            "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f";
+        const MODE_1: &str =
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+        let params = negotiated(
+            MediaKind::Video,
+            &[(104, "H264", MODE_0), (106, "H264", MODE_1)],
+        );
+        assert_eq!(
+            params.iter().map(|p| *p.pt()).collect::<Vec<_>>(),
+            vec![104, 106],
+            "mode 0 first in codec-config order"
+        );
+        assert_eq!(
+            send_pt(MediaKind::Video, params.iter()),
+            Some(Pt::new_with_value(106))
+        );
+
+        let params = negotiated(MediaKind::Video, &[(104, "H264", MODE_0)]);
+        assert_eq!(
+            send_pt(MediaKind::Video, params.iter()),
+            Some(Pt::new_with_value(104))
+        );
+
+        let params = negotiated(
+            MediaKind::Audio,
+            &[(111, "opus", "minptime=10;useinbandfec=1")],
+        );
+        assert_eq!(
+            send_pt(MediaKind::Audio, params.iter()),
+            Some(Pt::new_with_value(111))
+        );
+        assert_eq!(
+            send_pt(MediaKind::Video, params.iter()),
+            None,
+            "no H.264 on an audio line"
+        );
+    }
+
+    // ── The disconnect latch ──────────────────────────────────────────
+
+    /// What the drains do with every event: hand it to `handle_event` and
+    /// drop the result.
+    fn ice(s: &mut WebrtcSession, state: IceConnectionState) {
+        let _ = s.handle_event(Event::IceConnectionStateChange(state));
+    }
+
+    /// Backdate the start of an ICE disconnect by `ago`.
+    fn disconnected_for(s: &mut WebrtcSession, ago: Duration) {
+        s.ice_disconnected_since = Some(Instant::now().checked_sub(ago).unwrap());
+    }
+
+    /// An ICE disconnect str0m reports while a caller is not looking at
+    /// events — in `drain_outputs`, or behind another event in `drive_udp_io`
+    /// — is kept, and ends the session once it has lasted
+    /// `ICE_DISCONNECT_GRACE`; a nomination in the meantime (`Connected` or
+    /// `Completed`) cancels it, and a re-created pair without one (`Checking`)
+    /// does not restart the clock.
+    ///
+    /// Before, the first `Disconnected` ended the session, though an ICE-Lite
+    /// agent comes back from it on the peer's next nomination: the "brief"
+    /// half of this test failed on it.
+    #[tokio::test]
+    async fn an_ice_disconnect_ends_the_session_only_once_it_has_lasted_the_grace() {
+        let mut s = test_session().await;
+        assert_eq!(s.end(), None);
+        ice(&mut s, IceConnectionState::Checking);
+        assert_eq!(s.end(), None, "not every state change is the end");
+
+        // A brief disconnect is not the end, and a nomination cancels it.
+        ice(&mut s, IceConnectionState::Disconnected);
+        assert_eq!(s.end(), None, "a fresh disconnect may yet come back");
+        ice(&mut s, IceConnectionState::Completed);
+        assert_eq!(s.ice_disconnected_since, None, "Completed cancels it");
+        disconnected_for(&mut s, Duration::ZERO);
+        ice(&mut s, IceConnectionState::Connected);
+        assert_eq!(s.ice_disconnected_since, None, "Connected cancels it too");
+
+        // One that lasts the grace is.
+        ice(&mut s, IceConnectionState::Disconnected);
+        disconnected_for(&mut s, ICE_DISCONNECT_GRACE - Duration::from_secs(1));
+        assert_eq!(s.end(), None);
+        disconnected_for(&mut s, ICE_DISCONNECT_GRACE);
+        assert_eq!(s.end(), Some(SessionEnd::IceDisconnected));
+        assert!(s.is_disconnected());
+
+        // A later `Disconnected` keeps the first one's start, and `Checking`
+        // in between neither cancels nor restarts it.
+        ice(&mut s, IceConnectionState::Checking);
+        ice(&mut s, IceConnectionState::Disconnected);
+        assert_eq!(s.end(), Some(SessionEnd::IceDisconnected));
+    }
+
+    /// A fatal end is final from the first drain that sees it: the peer
+    /// closing the connection (`Event::Closed`, which used to be dropped), a
+    /// closed `Rtc`, or a local `close`.
+    #[tokio::test]
+    async fn a_closed_connection_ends_the_session_at_once() {
+        let mut s = test_session().await;
+        assert!(matches!(
+            s.handle_event(Event::Closed),
+            Some(SessionEvent::Disconnected)
+        ));
+        assert_eq!(s.end(), Some(SessionEnd::Closed));
+        ice(&mut s, IceConnectionState::Completed);
+        assert_eq!(s.end(), Some(SessionEnd::Closed), "and nothing revives it");
+
+        let mut s = test_session().await;
+        s.rtc.disconnect();
+        assert_eq!(s.end(), Some(SessionEnd::Closed), "a closed Rtc is over");
+
+        let mut s = test_session().await;
+        s.close();
+        assert_eq!(s.end(), Some(SessionEnd::Closed));
+    }
+
+    /// Two connected sessions; `close` on one sends its DTLS close_notify, and
+    /// the other's `poll_event` returns `Disconnected` on it within a few
+    /// seconds, its end `Closed`.
+    ///
+    /// Before, `Event::Closed` was dropped and str0m then went inert, so
+    /// `poll_event` slept on a deadline years away: a WHIP ingest or cascade
+    /// pull whose peer closed without a DELETE never ended.
+    #[tokio::test]
+    async fn poll_event_ends_when_the_peer_closes_the_connection() {
+        let session = |ice_lite| async move {
+            WebrtcSession::new(&SessionConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                public_ip: Some("127.0.0.1".parse().unwrap()),
+                ice_lite,
+            })
+            .await
+            .unwrap()
+        };
+        let mut client = session(false).await;
+        let mut server = session(true).await;
+        let (offer, pending) = client.create_offer(true, false, true).unwrap();
+        let answer = server.accept_offer(&offer).unwrap();
+        client.apply_answer(&answer, pending).unwrap();
+        async fn connected(s: &mut WebrtcSession, cancel: &CancellationToken) -> bool {
+            loop {
+                match s.poll_event(cancel).await {
+                    SessionEvent::Connected => return true,
+                    SessionEvent::Disconnected => return false,
+                    _ => {}
+                }
+            }
+        }
+        let cancel = CancellationToken::new();
+        let both = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                connected(&mut client, &cancel),
+                connected(&mut server, &cancel)
+            )
+        })
+        .await
+        .expect("the two sessions connect");
+        assert_eq!(both, (true, true));
+
+        client.close();
+        client.drain_outputs().await;
+        assert!(client.is_disconnected());
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SessionEvent::Disconnected = server.poll_event(&cancel).await {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "poll_event did not end after the peer closed"
+        );
+        assert_eq!(server.end(), Some(SessionEnd::Closed));
     }
 }

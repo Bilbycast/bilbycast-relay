@@ -709,6 +709,110 @@ fn nal_types(au: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// `es::MAX_PARAM_SETS_ON_THE_WIRE` is str0m's real limit: an IDR whose SPS
+/// and PPS add up to it reaches the viewer behind both, and one a byte over
+/// it reaches the viewer bare — str0m's packetizer drops the STAP-A. The hub
+/// does not insert parameter sets past that budget, because they would never
+/// arrive; this pins the budget against the packetizer rather than against
+/// a reading of its source.
+#[tokio::test]
+async fn parameter_sets_past_the_stap_a_budget_never_reach_a_viewer() {
+    use bilbycast_relay::distribution::es::{MAX_PARAM_SET_BYTES, MAX_PARAM_SETS_ON_THE_WIRE};
+    use bilbycast_relay::distribution::webrtc::session::{
+        SessionConfig, SessionEvent, WebrtcSession,
+    };
+    use bilbycast_relay::distribution::whep;
+
+    let hub = Arc::new(DistributionHub::new());
+    let cancel = CancellationToken::new();
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    // Even frames: SPS + PPS exactly at the budget. Odd: one byte over. Each
+    // carries its own, so the hub inserts nothing and str0m gets them as sent.
+    let frame = |k: u64| -> Vec<u8> {
+        let pps_len = MAX_PARAM_SETS_ON_THE_WIRE - MAX_PARAM_SET_BYTES + (k % 2) as usize;
+        annex_b(&[
+            &nal_body(0x67, MAX_PARAM_SET_BYTES - 1, k),
+            &nal_body(0x68, pps_len - 1, k),
+            &test_idr_slice(),
+        ])
+    };
+    let client_cfg = SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some(lo),
+        ice_lite: false,
+    };
+    let mut client = WebrtcSession::new(&client_cfg).await.unwrap();
+    let (offer_sdp, pending) = client.create_offer(true, false, false).unwrap();
+    let (whep_events, _whep_rx) = bilbycast_relay::manager::events::event_channel();
+    let handle = whep::create_and_spawn_viewer(
+        hub.clone(),
+        "budget".to_string(),
+        &h264_only(&offer_sdp),
+        Some(lo),
+        cancel.clone(),
+        whep_events,
+    )
+    .await
+    .expect("WHEP setup");
+    client.apply_answer(&handle.answer_sdp, pending).unwrap();
+
+    let pub_hub = hub.clone();
+    let pub_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut k = 0;
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    pub_hub.publish("budget", EsFrame::video(k * FRAME_90K, frame(k).into(), true));
+                    k += 1;
+                }
+            }
+        }
+    });
+
+    let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
+    let client_cancel = CancellationToken::new();
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        while frames.len() < 6 {
+            match client.poll_event(&client_cancel).await {
+                SessionEvent::MediaData { data, rtp_time, .. } => {
+                    frames.push((rtp_time.numer() / FRAME_90K, data.to_vec()));
+                }
+                SessionEvent::Disconnected => return false,
+                _ => {}
+            }
+        }
+        true
+    })
+    .await;
+    cancel.cancel();
+    assert!(
+        matches!(done, Ok(true)),
+        "got {} frames: {done:?}",
+        frames.len()
+    );
+
+    for (k, data) in &frames {
+        if k % 2 == 0 {
+            assert_eq!(
+                data,
+                &frame(*k),
+                "frame {k}: SPS + PPS at the budget arrive"
+            );
+        } else {
+            assert_eq!(
+                nal_types(data),
+                vec![5],
+                "frame {k}: SPS + PPS a byte past the budget are dropped by str0m"
+            );
+        }
+    }
+    assert!(frames.iter().any(|(k, _)| k % 2 == 0) && frames.iter().any(|(k, _)| k % 2 == 1));
+}
+
 /// WHIP ingest over str0m's H.264 packetizer: str0m hands the relay one whole
 /// Annex-B frame per `MediaData`, and the access unit must reach the hub as
 /// it came — no doubled start code — with every IDR flagged a keyframe. The
@@ -1925,6 +2029,13 @@ async fn shared_marks_work_over_http_and_need_a_viewer_token() {
 /// its `s=` is already `-` and both BUNDLE mids exist.
 const CHROME_WHEP_OFFER: &str = include_str!("fixtures/webrtc/chrome124-whep-recvonly-offer.sdp");
 
+/// A HeadlessChrome 124 WHEP offer narrowed by `setCodecPreferences` to its
+/// packetization-mode=0 H.264 entries (PTs 104, 108, 39, 43), from the same
+/// interop run — bilbycast-edge's `testdata/chrome124-whep-recvonly-pm0.sdp`,
+/// byte for byte.
+const CHROME_WHEP_MODE_0_OFFER: &str =
+    include_str!("fixtures/webrtc/chrome124-whep-recvonly-pm0.sdp");
+
 /// A Chrome publisher's offer (`sendonly` audio + video, plus the data channel
 /// that page also opened), captured 2022-08-18 and shipped by str0m 0.24.1 as
 /// `docs/chrome-sdp.json`: the shape a browser WHIP client POSTs to
@@ -2133,6 +2244,65 @@ async fn a_real_chrome_whep_offer_negotiates_h264_and_opus() {
         "Chrome's first packetization-mode=1 H.264 PT"
     );
     assert_eq!(audio_pt, 111, "Chrome's Opus PT");
+}
+
+/// `sdp` with its video section narrowed to the payload types in `keep` — what
+/// `setCodecPreferences` does to a browser's offer.
+fn keep_video_pts(sdp: &str, keep: &[u8]) -> String {
+    let kept = |pt: &str| pt.parse::<u8>().is_ok_and(|pt| keep.contains(&pt));
+    let mut out = String::new();
+    let mut in_video = false;
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            in_video = line.starts_with("m=video");
+            if in_video {
+                let mut parts = line.split(' ');
+                let head: Vec<&str> = parts.by_ref().take(3).collect();
+                let fmts: Vec<&str> = parts.filter(|pt| kept(pt)).collect();
+                out.push_str(&format!("{} {}\r\n", head.join(" "), fmts.join(" ")));
+                continue;
+            }
+        }
+        let pt = ["a=rtpmap:", "a=fmtp:", "a=rtcp-fb:"]
+            .iter()
+            .find_map(|attr| line.strip_prefix(attr)?.split_whitespace().next());
+        if in_video && pt.is_some_and(|pt| !kept(pt)) {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// A viewer that accepts Baseline only in packetization mode 0 (PT 104) and
+/// Constrained Baseline in mode 1 (PT 106) is sent video on 106: str0m
+/// packetizes into STAP-A and FU-A, which mode 0 forbids. One that accepts
+/// only mode 0 still gets video, on its mode-0 PT.
+///
+/// Before, `get_pt` took the first negotiated H.264 entry in codec-config
+/// order, Baseline before Constrained Baseline, and wrote on 104.
+/// bilbycast-edge's `send_pt` already picked 106.
+#[tokio::test]
+async fn video_goes_out_on_a_packetization_mode_1_pt_whenever_the_viewer_took_one() {
+    let offer = keep_video_pts(CHROME_WHEP_OFFER, &[104, 105, 106, 107]);
+    let mut s = ice_lite_session().await;
+    let answer = s.accept_offer(&offer).expect("answered");
+    assert_eq!(
+        m_section(&answer, "video").unwrap().pts,
+        vec![104, 105, 106, 107]
+    );
+    let (video_pt, audio_pt) = send_pts(&mut s, &answer);
+    assert_eq!(
+        (video_pt, audio_pt),
+        (106, 111),
+        "Constrained Baseline in mode 1, and Opus"
+    );
+
+    let mut s = ice_lite_session().await;
+    let answer = s.accept_offer(CHROME_WHEP_MODE_0_OFFER).expect("answered");
+    let (video_pt, _) = send_pts(&mut s, &answer);
+    assert_eq!(video_pt, 104, "only mode 0 was offered: its first PT");
 }
 
 /// A real Chrome publisher's (`sendonly`) offer, as a browser WHIP client POSTs
@@ -2385,30 +2555,25 @@ async fn a_str0m_panic_during_negotiation_is_an_error() {
     assert!(format!("{err:#}").contains("panicked"), "{err:#}");
 }
 
-/// The per-IP viewer cap, through the real router: offers that fail — here,
-/// by panicking str0m — give their slot back, so no number of them shuts an IP
-/// out, and a real viewer's slot comes back when it is deleted.
-///
-/// Before, the slot was released by hand in the handler's `Err` arm only. A
-/// panic unwound straight past it (and dropped the connection with no
-/// response), so each one leaked a slot for the life of the process; with the
-/// default cap of 256, 256 Chrome WHEP attempts locked an IP out for good. The
-/// WHIP ingest route had the same crash with nothing to leak.
-#[tokio::test]
-async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    use bilbycast_relay::distribution::origin::OriginStore;
+/// A distribution node on loopback, served as `run_distribution` serves it —
+/// with connect info, so the per-IP cap sees the client's address — with
+/// `max_viewers_per_ip` = `cap`, both token gates off and `127.0.0.1` as its
+/// public IP. Returns the state, the address and the node's event queue.
+async fn serve_distribution(
+    cap: u32,
+    cancel: &CancellationToken,
+) -> (
+    Arc<bilbycast_relay::distribution::DistributionState>,
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<bilbycast_relay::manager::events::Event>,
+) {
     use bilbycast_relay::distribution::{DistributionState, build_router};
 
-    const CAP: u32 = 2;
-    let cancel = CancellationToken::new();
-    let (events, _rx) = event_channel();
+    let (events, rx) = event_channel();
     let cfg = DistributionConfig {
         require_viewer_token: false,
         require_ingest_token: false,
-        max_viewers_per_ip: CAP,
+        max_viewers_per_ip: cap,
         ..Default::default()
     };
     let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
@@ -2427,51 +2592,79 @@ async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await;
     });
+    (state, addr, rx)
+}
 
-    /// `(status, Location, body)`; status 0 when the connection closed without
-    /// a response, which is what a panicking handler leaves.
-    async fn send(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String, String) {
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/sdp\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        s.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf).await;
-        let text = String::from_utf8_lossy(&buf).into_owned();
-        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-        let status = head
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
-        let location = head
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("location")
-                    .then(|| v.trim().to_string())
-            })
-            .unwrap_or_default();
-        (status, location, body.to_string())
-    }
-    let held = |st: &DistributionState| {
-        st.viewers_by_ip
-            .get(&lo)
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0)
-    };
+/// One HTTP/1.1 request to `addr`. `(status, Location, body)`; status 0 when
+/// the connection closed without a response, which is what a panicking
+/// handler leaves.
+async fn http(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (u16, String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/sdp\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let location = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("location")
+                .then(|| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    (status, location, body.to_string())
+}
+
+/// The per-IP viewer slots `127.0.0.1` holds.
+fn held(st: &bilbycast_relay::distribution::DistributionState) -> u32 {
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    st.viewers_by_ip
+        .get(&lo)
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// The per-IP viewer cap, through the real router: offers that fail — here,
+/// by panicking str0m — give their slot back, so no number of them shuts an IP
+/// out, and a real viewer's slot comes back when it is deleted.
+///
+/// Before, the slot was released by hand in the handler's `Err` arm only. A
+/// panic unwound straight past it (and dropped the connection with no
+/// response), so each one leaked a slot for the life of the process; with the
+/// default cap of 256, 256 Chrome WHEP attempts locked an IP out for good. The
+/// WHIP ingest route had the same crash with nothing to leak.
+#[tokio::test]
+async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
+    const CAP: u32 = 2;
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(CAP, &cancel).await;
 
     let hostile = offer_with_an_rtx_pt_repairing_two_pts("recvonly");
     for attempt in 1..=3 * CAP {
-        let (status, _, body) = send(addr, "POST", "/whep/show", &hostile).await;
+        let (status, _, body) = http(addr, "POST", "/whep/show", &hostile).await;
         assert_eq!(
             held(&state),
             0,
@@ -2479,16 +2672,16 @@ async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
         );
         assert_eq!(status, 400, "WHEP attempt {attempt}: {body}");
     }
-    let (status, _, body) = send(addr, "POST", "/whip/show", &hostile).await;
+    let (status, _, body) = http(addr, "POST", "/whip/show", &hostile).await;
     assert_eq!(status, 400, "WHIP ingest: {body}");
 
     // A real viewer still gets in after all that, holds one slot while it
     // lives, and gives it back when deleted.
-    let (status, location, answer) = send(addr, "POST", "/whep/show", CHROME_WHEP_OFFER).await;
+    let (status, location, answer) = http(addr, "POST", "/whep/show", CHROME_WHEP_OFFER).await;
     assert_eq!(status, 201, "a real Chrome viewer: {answer}");
     assert_h264_and_opus_on_offered_pts(CHROME_WHEP_OFFER, &answer);
     assert_eq!(held(&state), 1, "a live viewer holds its slot");
-    let (status, _, _) = send(addr, "DELETE", &location, "").await;
+    let (status, _, _) = http(addr, "DELETE", &location, "").await;
     assert_eq!(status, 200, "DELETE {location}");
     tokio::time::timeout(Duration::from_secs(5), async {
         while held(&state) != 0 {
@@ -2497,6 +2690,488 @@ async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
     })
     .await
     .expect("a deleted viewer gave its slot back");
+
+    cancel.cancel();
+}
+
+/// A str0m session in the client role, as a browser stands in for it here:
+/// it offers `recvonly` video and audio to `/whep/{stream}` and drives itself
+/// until it has decoded media, which the relay sends only once its own side
+/// has connected. Returns the session, still answering ICE while it is
+/// polled; dropping it is a viewer that left without a DELETE.
+async fn watch(
+    addr: std::net::SocketAddr,
+    stream: &str,
+) -> bilbycast_relay::distribution::webrtc::session::WebrtcSession {
+    use bilbycast_relay::distribution::webrtc::session::{
+        SessionConfig, SessionEvent, WebrtcSession,
+    };
+
+    let mut client = WebrtcSession::new(&SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: false,
+    })
+    .await
+    .unwrap();
+    let (offer, pending) = client.create_offer(true, true, false).unwrap();
+    let (status, _, answer) = http(addr, "POST", &format!("/whep/{stream}"), &offer).await;
+    assert_eq!(status, 201, "WHEP {stream}: {answer}");
+    client.apply_answer(&answer, pending).unwrap();
+    let cancel = CancellationToken::new();
+    let got_media = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match client.poll_event(&cancel).await {
+                SessionEvent::MediaData { .. } => return true,
+                SessionEvent::Disconnected => return false,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(got_media, Ok(true)),
+        "viewer of '{stream}' must receive media, got {got_media:?}"
+    );
+    client
+}
+
+/// Wait up to `within` for `done` to hold, polling.
+async fn eventually(within: Duration, done: impl Fn() -> bool) -> bool {
+    tokio::time::timeout(within, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// A viewer that leaves without a DELETE — a closed tab, a lost network —
+/// is reaped once ICE has given up on it for `ICE_DISCONNECT_GRACE`, and gives
+/// its per-IP slot back: one watching a live stream, and one watching a stream
+/// that has stalled (one keyframe, then nothing).
+///
+/// Before, neither was reaped while its stream lived. str0m reports ICE
+/// giving up from the timeout the send loop runs after each write, and that
+/// drain threw the event away; the stalled viewer's session was not driven at
+/// all once frames stopped. Both held their slot — and the live one kept
+/// being sent the stream — until the relay shut down: reloads from one NAT
+/// address locked it out of WHEP after `max_viewers_per_ip` of them.
+#[tokio::test]
+async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back() {
+    use bilbycast_relay::distribution::webrtc::session::ICE_DISCONNECT_GRACE;
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    let hub = state.hub.clone();
+    let pub_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        let mut k: u64 = 0;
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    let pts = k * FRAME_90K;
+                    hub.publish(
+                        "live",
+                        EsFrame::video(pts, decodable_frame(k).into(), k.is_multiple_of(GOP)),
+                    );
+                    hub.publish("live", EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55])));
+                    k += 1;
+                }
+            }
+        }
+    });
+    // The stalled stream: one keyframe — which primes the viewer, proving its
+    // session connected — and then nothing.
+    state.hub.publish(
+        "stalled",
+        EsFrame::video(0, decodable_frame(0).into(), true),
+    );
+
+    let live = watch(addr, "live").await;
+    let stalled = watch(addr, "stalled").await;
+    assert_eq!(held(&state), 2, "two live viewers hold two slots");
+    assert_eq!(state.sessions.len(), 2);
+
+    drop(live);
+    drop(stalled);
+    let left = std::time::Instant::now();
+
+    // `is` gives a silent peer 15 s from its last Binding Request
+    // (`RECENT_BINDING_REQUEST`) before it reports ICE disconnected, and the
+    // session then has `ICE_DISCONNECT_GRACE` to come back: about 30 s in
+    // all. The bound leaves room for a loaded runner. Both sessions connected
+    // (each viewer received media), so the setup deadline is not what ends
+    // them.
+    let reaped = eventually(Duration::from_secs(35) + ICE_DISCONNECT_GRACE, || {
+        held(&state) == 0 && state.sessions.is_empty()
+    })
+    .await;
+    let after = left.elapsed();
+    assert!(
+        reaped,
+        "after {after:?}: {} slots held, {} sessions",
+        held(&state),
+        state.sessions.len()
+    );
+    // A viewer checks at least every 3 s (`is`'s `max_rto`), so `is` cannot
+    // report it disconnected sooner than about 10 s after it left; the grace
+    // comes on top. Reaped sooner, it was reaped on the disconnect itself
+    // (measured at 15.1 s that way), which a viewer that comes back would be
+    // too.
+    assert!(
+        after >= ICE_DISCONNECT_GRACE + Duration::from_secs(5),
+        "reaped after {after:?}: without the ICE grace"
+    );
+    for stream in ["live", "stalled"] {
+        assert_eq!(
+            state.hub.get(stream).unwrap().viewer_count(),
+            0,
+            "the '{stream}' viewer's subscription went with it"
+        );
+    }
+
+    cancel.cancel();
+}
+
+/// A viewer whose ICE consent checks pause past the point where `is` reports
+/// it disconnected — 17 s, against `is`'s 15 s — and then resume, as a
+/// suspended laptop or a backgrounded mobile browser does, is kept: ICE comes
+/// back on its next nomination, the viewer holds its slot throughout, and it
+/// receives what is published after it returns — still, once it has been back
+/// for longer than `ICE_DISCONNECT_GRACE`.
+///
+/// Before, a session ended on the first ICE `Disconnected`, so this viewer was
+/// reaped at about 15 s although str0m and the viewer would both have resumed
+/// — and the `/watch` player does not reconnect, so it stayed black. The last
+/// check is what proves the return reaches the code that cancels the grace
+/// (`Connected` / `Completed` in `handle_event`): without it a returning
+/// viewer is reaped `ICE_DISCONNECT_GRACE` after its disconnect, 10 to 13 s
+/// after it came back here, and the checks before that pass all the same.
+#[tokio::test]
+async fn a_viewer_whose_ice_pauses_and_comes_back_is_kept() {
+    use bilbycast_relay::distribution::webrtc::session::{ICE_DISCONNECT_GRACE, SessionEvent};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Past `is`'s 15 s, well inside the grace that follows it.
+    const PAUSE: Duration = Duration::from_secs(17);
+    const { assert!(PAUSE.as_secs() < 15 + ICE_DISCONNECT_GRACE.as_secs() - 5) };
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    let next = Arc::new(AtomicU64::new(0));
+    let hub = state.hub.clone();
+    let (pub_cancel, pub_next) = (cancel.clone(), next.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    let k = pub_next.fetch_add(1, Ordering::Relaxed);
+                    let pts = k * FRAME_90K;
+                    hub.publish(
+                        "blip",
+                        EsFrame::video(pts, decodable_frame(k).into(), k.is_multiple_of(GOP)),
+                    );
+                    hub.publish("blip", EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55])));
+                }
+            }
+        }
+    });
+
+    let mut viewer = watch(addr, "blip").await;
+    // The viewer goes quiet: not driven, it neither checks nor reads.
+    tokio::time::sleep(PAUSE).await;
+    assert_eq!(
+        (held(&state), state.sessions.len()),
+        (1, 1),
+        "the viewer was reaped during a {PAUSE:?} pause"
+    );
+
+    let resumed_at = next.load(Ordering::Relaxed) * FRAME_90K;
+    let video = viewer.video_mid;
+    let viewer_cancel = CancellationToken::new();
+    let back = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match viewer.poll_event(&viewer_cancel).await {
+                SessionEvent::MediaData { mid, rtp_time, .. }
+                    if Some(mid) == video && rtp_time.numer() >= resumed_at =>
+                {
+                    return true;
+                }
+                SessionEvent::Disconnected => return false,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(back, Ok(true)),
+        "the viewer must receive what was published after it came back, got {back:?}"
+    );
+    assert_eq!(
+        (held(&state), state.sessions.len()),
+        (1, 1),
+        "and it still holds its slot"
+    );
+
+    // Keep watching for longer than the grace: a disconnect its return did
+    // not cancel would end the session within it.
+    let drive = ICE_DISCONNECT_GRACE + Duration::from_secs(5);
+    let stop = CancellationToken::new();
+    let stop_at = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(drive).await;
+        stop_at.cancel();
+    });
+    let (mut frames, mut last_frame) = (0u64, None);
+    loop {
+        match viewer.poll_event(&stop).await {
+            SessionEvent::MediaData { mid, .. } if Some(mid) == video => {
+                frames += 1;
+                last_frame = Some(std::time::Instant::now());
+            }
+            SessionEvent::Disconnected if stop.is_cancelled() => break,
+            SessionEvent::Disconnected => {
+                panic!("the viewer's own session ended after {frames} frames")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        last_frame.is_some_and(|at| at.elapsed() < Duration::from_secs(2)),
+        "{drive:?} after it came back, the viewer must still be receiving: {frames} frames, \
+         the last {:?} ago",
+        last_frame.map(|at| at.elapsed())
+    );
+    assert_eq!(
+        (held(&state), state.sessions.len()),
+        (1, 1),
+        "{drive:?} after it came back, the viewer must still hold its slot"
+    );
+
+    cancel.cancel();
+}
+
+/// A WHEP viewer or a WHIP publisher that closes its connection without a
+/// DELETE — `RTCPeerConnection.close()`, or a str0m peer's `Rtc::close`, each
+/// of which sends a DTLS close_notify — ends at once: the viewer gives its slot
+/// back; the publisher's ingest record goes and its stream is unregistered.
+///
+/// Before, `Event::Closed` was dropped, and str0m goes inert after it, with
+/// no timeout or ICE event to follow. The ingest loop parked in `poll_event`
+/// for good — its record, socket and task kept and the stream registered —
+/// one per publisher that came and went (WHIP has no per-IP cap); the cascade
+/// pull, which shares that loop, never retried. The viewer half passed
+/// already, by the send loop's closed-`Rtc` check; it is here so that a clean
+/// close never waits out the ICE grace.
+#[tokio::test]
+async fn a_peer_that_closes_without_a_delete_ends_at_once() {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+    use bilbycast_relay::distribution::webrtc::{Setup, await_connected};
+    use bilbycast_relay::distribution::whep;
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    // A publisher on `/whip/pub`, through the router.
+    let mut publisher = WebrtcSession::new(&SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: false,
+    })
+    .await
+    .unwrap();
+    let (offer, pending) = publisher.create_offer(true, false, true).unwrap();
+    let (status, _, answer) = http(addr, "POST", "/whip/pub", &offer).await;
+    assert_eq!(status, 201, "WHIP: {answer}");
+    publisher.apply_answer(&answer, pending).unwrap();
+    let publisher_cancel = CancellationToken::new();
+    assert_eq!(
+        await_connected(&mut publisher, &publisher_cancel, Duration::from_secs(10)).await,
+        Setup::Connected
+    );
+    publisher.drain_pending_events();
+    for k in 0..GOP {
+        whep::write_video_au(&mut publisher, k * FRAME_90K, &decodable_frame(k)).await;
+        let _ = publisher.drive_udp_io().await;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    assert!(
+        eventually(Duration::from_secs(5), || {
+            state.hub.get("pub").is_some_and(|s| s.frames_in() > 0)
+        })
+        .await,
+        "the publisher's stream is live"
+    );
+    assert_eq!(state.ingests.len(), 1);
+
+    // A viewer of it, primed from the cached keyframe.
+    let mut viewer = watch(addr, "pub").await;
+    assert_eq!(held(&state), 1);
+
+    viewer.close();
+    viewer.drain_outputs().await;
+    let closed = std::time::Instant::now();
+    assert!(
+        eventually(Duration::from_secs(5), || held(&state) == 0
+            && state.sessions.is_empty())
+        .await,
+        "after {:?}: {} slots held, {} viewer sessions",
+        closed.elapsed(),
+        held(&state),
+        state.sessions.len()
+    );
+
+    publisher.close();
+    publisher.drain_outputs().await;
+    let closed = std::time::Instant::now();
+    assert!(
+        eventually(Duration::from_secs(5), || {
+            state.ingests.is_empty() && state.hub.get("pub").is_none()
+        })
+        .await,
+        "after {:?}: {} ingests, stream registered: {}",
+        closed.elapsed(),
+        state.ingests.len(),
+        state.hub.get("pub").is_some()
+    );
+
+    cancel.cancel();
+}
+
+/// A WHEP viewer or WHIP publisher whose offer is answered but never
+/// connects — here an offer without `a=candidate` lines from a peer that
+/// never sends STUN — is closed at `SETUP_DEADLINE`: its session ends, the
+/// viewer's per-IP slot comes back and the ingest record goes.
+///
+/// Before, both waited for `Connected` for ever: an ICE-Lite agent with no
+/// remote candidate stays in Checking (`is` counts "no candidates yet" as
+/// still possible), so each such offer pinned a session, a UDP socket, a task
+/// and — for a viewer — a per-IP slot until a DELETE that need never come.
+#[tokio::test]
+async fn an_offer_that_never_connects_is_closed_at_the_setup_deadline() {
+    use bilbycast_relay::distribution::webrtc::SETUP_DEADLINE;
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    let no_candidates = |sdp: String| -> String {
+        sdp.split_inclusive('\n')
+            .filter(|l| !l.starts_with("a=candidate"))
+            .collect()
+    };
+    let client = || async {
+        WebrtcSession::new(&SessionConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_ip: Some("127.0.0.1".parse().unwrap()),
+            ice_lite: false,
+        })
+        .await
+        .unwrap()
+    };
+    // Kept, undriven, for the whole test: neither says a word.
+    let mut viewer = client().await;
+    let (offer, _viewer_pending) = viewer.create_offer(true, true, false).unwrap();
+    let (status, _, body) = http(addr, "POST", "/whep/quiet", &no_candidates(offer)).await;
+    assert_eq!(status, 201, "WHEP: {body}");
+    let mut publisher = client().await;
+    let (offer, _publisher_pending) = publisher.create_offer(true, true, true).unwrap();
+    let (status, _, body) = http(addr, "POST", "/whip/quiet-in", &no_candidates(offer)).await;
+    assert_eq!(status, 201, "WHIP: {body}");
+    let posted = std::time::Instant::now();
+    assert_eq!(
+        (held(&state), state.sessions.len(), state.ingests.len()),
+        (1, 1, 1)
+    );
+
+    let closed = eventually(SETUP_DEADLINE + Duration::from_secs(10), || {
+        held(&state) == 0 && state.sessions.is_empty() && state.ingests.is_empty()
+    })
+    .await;
+    assert!(
+        closed,
+        "after {:?}: {} slots held, {} viewer sessions, {} ingests",
+        posted.elapsed(),
+        held(&state),
+        state.sessions.len(),
+        state.ingests.len()
+    );
+    assert!(
+        posted.elapsed() >= SETUP_DEADLINE - Duration::from_secs(1),
+        "closed after {:?}, before the deadline: something else ended them",
+        posted.elapsed()
+    );
+
+    drop((viewer, publisher));
+    cancel.cancel();
+}
+
+/// A str0m panic during negotiation on the public WHEP or WHIP endpoint
+/// raises one Warning event naming the peer, the step, the panic and the
+/// client's address — rate limited, so a flood of hostile offers raises one —
+/// and a merely malformed offer raises none.
+///
+/// Before, the panic was caught and the request failed with a 400, but the
+/// only trace was a `warn!` line on a headless relay; bilbycast-edge raises
+/// `webrtc_negotiation_panic` for the same panic.
+#[tokio::test]
+async fn a_str0m_panic_in_negotiation_raises_one_rate_limited_warning() {
+    use bilbycast_relay::manager::events::EventSeverity;
+
+    let cancel = CancellationToken::new();
+    let (_state, addr, mut events) = serve_distribution(8, &cancel).await;
+
+    let (status, _, body) = http(addr, "POST", "/whep/show", "v=0\r\nnot an offer\r\n").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        events.try_recv().is_err(),
+        "a malformed offer raised an event"
+    );
+
+    let hostile = offer_with_an_rtx_pt_repairing_two_pts("recvonly");
+    for _ in 0..3 {
+        let (status, _, body) = http(addr, "POST", "/whep/show", &hostile).await;
+        assert_eq!(status, 400, "{body}");
+    }
+    let (status, _, body) = http(addr, "POST", "/whip/show", &hostile).await;
+    assert_eq!(status, 400, "{body}");
+
+    let ev = events.try_recv().expect("one Warning event");
+    assert_eq!(ev.severity, EventSeverity::Warning);
+    assert_eq!(ev.category, "distribution");
+    assert!(
+        ev.message.starts_with(
+            "WebRTC negotiation with WHEP viewer failed: str0m panicked during SDP offer"
+        ),
+        "{}",
+        ev.message
+    );
+    let details = ev.details.expect("details");
+    assert_eq!(details["error_code"], "webrtc_negotiation_panic");
+    assert_eq!(details["peer"], "WHEP viewer");
+    assert_eq!(details["stream"], "show");
+    assert_eq!(details["step"], "SDP offer");
+    assert!(
+        details["panic"]
+            .as_str()
+            .unwrap()
+            .contains("Pt locked multiple times"),
+        "{details}"
+    );
+    assert_eq!(details["ip"], "127.0.0.1");
+    assert_eq!(details["suppressed"], 0);
+    assert!(
+        events.try_recv().is_err(),
+        "the other three inside the interval are held back"
+    );
 
     cancel.cancel();
 }

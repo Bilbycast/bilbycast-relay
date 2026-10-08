@@ -31,8 +31,9 @@ use crate::config::CascadeSource;
 use crate::distribution_control::DistributionControl;
 
 use super::hub::DistributionHub;
-use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
-use super::whip_ingest::republish_from_session;
+use super::webrtc::session::{SessionConfig, WebrtcSession};
+use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
+use super::whip_ingest::{MAX_RTP_AU_BYTES, republish_from_session};
 
 /// Supervise the set of cascade pulls, reconciling running WHEP-client tasks
 /// against the (manager-updatable) source list on every change. Keyed by
@@ -115,7 +116,7 @@ pub async fn run_cascade(
         if cancel.is_cancelled() {
             break;
         }
-        match cascade_attempt(&hub, &source, public_ip, &cancel).await {
+        match cascade_attempt(&hub, &source, public_ip, &cancel, SETUP_DEADLINE).await {
             Ok(()) => tracing::info!(
                 "cascade '{}': upstream closed; will reconnect",
                 source.local_stream
@@ -131,11 +132,15 @@ pub async fn run_cascade(
     tracing::info!("cascade '{}' stopped", source.local_stream);
 }
 
+/// One pull: offer, exchange, connect within `setup_deadline`, republish until
+/// the upstream goes. `Err` for anything that failed before media flowed,
+/// `Ok` once a connected pull ends (or ICE gives up during setup).
 async fn cascade_attempt(
     hub: &DistributionHub,
     source: &CascadeSource,
     public_ip: Option<IpAddr>,
     cancel: &CancellationToken,
+    setup_deadline: Duration,
 ) -> Result<()> {
     let bind_addr = match public_ip {
         Some(ip) => SocketAddr::new(ip, 0),
@@ -158,18 +163,17 @@ async fn cascade_attempt(
         .apply_answer(&answer, pending)
         .context("apply upstream WHEP answer")?;
 
-    // Drive ICE + DTLS to Connected.
-    loop {
-        match client.poll_event(cancel).await {
-            SessionEvent::Connected => break,
-            SessionEvent::Disconnected => return Ok(()),
-            _ => {}
-        }
+    // Drive ICE + DTLS to Connected. Bounded: an answer with no candidate
+    // leaves ICE checking for ever, and the pull would never retry.
+    match await_connected(&mut client, cancel, setup_deadline).await {
+        Setup::Connected => {}
+        Setup::Disconnected => return Ok(()),
+        Setup::TimedOut => bail!("upstream did not complete ICE + DTLS within {setup_deadline:?}"),
     }
     tracing::info!("cascade '{}': connected to upstream", source.local_stream);
     hub.register(&source.local_stream);
 
-    republish_from_session(client, hub, &source.local_stream, cancel).await;
+    republish_from_session(client, hub, &source.local_stream, cancel, MAX_RTP_AU_BYTES).await;
 
     hub.remove(&source.local_stream);
     Ok(())
@@ -242,6 +246,87 @@ pub(crate) async fn whep_post(url: &str, token: Option<&str>, offer: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upstream that answers but never connects — here, an answer with no
+    /// candidate, which leaves ICE checking for ever — ends the attempt at
+    /// the setup deadline, so the pull retries. Unbounded, the attempt never
+    /// returned, and the pull never retried.
+    #[tokio::test]
+    async fn an_upstream_that_never_connects_ends_the_attempt_at_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            // The whole request: headers, then the Content-Length body.
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let offer = loop {
+                let n = conn.read(&mut chunk).await.unwrap();
+                req.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap();
+                    if body.len() >= len {
+                        break body[..len].to_string();
+                    }
+                }
+            };
+            let mut upstream = WebrtcSession::new(&SessionConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                public_ip: Some("127.0.0.1".parse().unwrap()),
+                ice_lite: true,
+            })
+            .await
+            .unwrap();
+            let answer: String = upstream
+                .accept_offer(&offer)
+                .unwrap()
+                .split_inclusive('\n')
+                .filter(|l| !l.starts_with("a=candidate"))
+                .collect();
+            let resp = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/sdp\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            conn.write_all(resp.as_bytes()).await.unwrap();
+            // `Connection: close`: the client reads to the end.
+            drop(conn);
+            // Keep the upstream's session alive, silent, past the deadline.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(upstream);
+        });
+
+        let hub = DistributionHub::new();
+        let source = CascadeSource {
+            upstream_whep_url: format!("http://{addr}/whep/up"),
+            local_stream: "down".to_string(),
+            token: None,
+        };
+        let cancel = CancellationToken::new();
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            cascade_attempt(
+                &hub,
+                &source,
+                Some("127.0.0.1".parse().unwrap()),
+                &cancel,
+                Duration::from_millis(500),
+            ),
+        )
+        .await
+        .expect("the attempt must end at its setup deadline");
+        let err = attempt.expect_err("a pull that never connected is a failed attempt");
+        assert!(
+            format!("{err:#}").contains("did not complete ICE"),
+            "{err:#}"
+        );
+        assert!(hub.get("down").is_none(), "nothing was registered");
+    }
 
     #[test]
     fn whep_post_rejects_non_http() {

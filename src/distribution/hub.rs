@@ -8,8 +8,9 @@
 //! Each stream owns a `tokio::broadcast` channel (drop-on-lag, never blocks
 //! ingest) plus a lock-free [`ArcSwapOption`] holding the most recent
 //! keyframe access unit so late joiners decode immediately, and the latest
-//! SPS / PPS the stream carried, which go back ahead of every IDR that
-//! arrives without its own (see [`restore_param_sets`]).
+//! SPS / PPS the stream carried — one of each, size-capped — which go back
+//! ahead of every IDR that arrives without its own (see
+//! [`restore_param_sets`] for the limits).
 //!
 //! This is the deliberately-stateful heart of the viewer-distribution
 //! subsystem — isolated behind the `viewer-distribution` feature so the
@@ -178,8 +179,10 @@ impl DistributionHub {
     /// An IDR access unit that does not carry its own SPS / PPS goes out (and
     /// into the keyframe cache) behind the stream's latest ones, so every
     /// viewer — a late joiner primed from the cache included — can start
-    /// decoding on any IDR. Every ingest path publishes through here, so this
-    /// is done once per frame rather than once per viewer.
+    /// decoding on any IDR of a stream that uses one SPS and one PPS (the
+    /// limits are on [`restore_param_sets`]). Every ingest path publishes
+    /// through here, so this is done once per frame rather than once per
+    /// viewer.
     pub fn publish(&self, stream_id: &str, mut frame: EsFrame) {
         let state = self.ensure(stream_id);
 

@@ -56,10 +56,13 @@ they are not either/or.
  bilbycast-edge  ── CMAF PUT (fMP4 + m3u8/mpd) ──────────┘      (1–5 s, cache-scale)
 ```
 
-- **WHIP ingest** (zero new edge code): point the edge's existing WHIP-client
+- **WHIP ingest** (no new edge media path): point the edge's WHIP-client
   output at `https://{relay}/whip/{stream}`. The relay terminates DTLS/SRTP,
   depacketizes to elementary frames, and fans out to WHEP viewers. This reuses
-  the edge's proven, quality-gated encoder — nothing new to verify on the edge.
+  the edge's quality-gated encoder, but it needs an edge whose WHIP output
+  negotiates with this relay's codec set: **every released edge through
+  v0.113.0 panics against it and stops publishing** — upgrade the edges first,
+  see [Upgrade order](#upgrade-order-edges-first-then-relays-upstream-first).
 - **QUIC ES ingest** (optional, lower overhead): a future edge output can ship
   already-encoded H.264+Opus elementary frames over a dedicated QUIC endpoint
   (`ALPN bilbycast-distribution`, default `:4486`). Wire format in
@@ -67,6 +70,46 @@ they are not either/or.
 - **Keyframe cache**: the relay caches the last IDR access unit per stream, so a
   late-joining viewer decodes immediately instead of waiting for the source's
   next IDR.
+
+### Upgrade order: edges first, then relays upstream first
+
+This relay registers one H.264 entry per (profile, packetization mode) —
+str0m's own seven at level 5.1, plus Opus (`H264_LEVEL_5_1` in
+`src/distribution/webrtc/session.rs`). Every earlier build registered str0m's
+default codecs plus four level-5.1 H.264 extras: **every bilbycast-edge release
+through v0.113.0, any edge build before commit 5f71c4c, and every relay release
+through v0.15.0**. Such a peer holds two entries for some (profile, mode) pairs,
+and when the other side's SDP dictates the payload type for one of them str0m
+matches it to both, locks it twice and panics ("Pt locked multiple times").
+No answer this relay could write avoids it: one PT for that pair matches both
+of the old peer's entries, because a level mismatch only lowers str0m's match
+score.
+
+What that does in a mixed fleet:
+
+- **An old edge's WHIP output against this relay** panics applying the answer
+  ("Pt locked multiple times: 110"). Released edges have no panic isolation on
+  that path, so the output task dies and does not retry: nothing reaches the
+  relay until the flow is restarted, and the restarted output panics again.
+  On the relay the ingest session ends during setup, and WHEP viewers of the
+  stream get nothing.
+- **A new edge publishing to an old relay works** (tested), so upgrading the
+  edges first costs nothing.
+- **In a cascade, a new downstream relay's pull panics an old upstream relay**
+  ("Pt locked multiple times: 127"). The old relay has no panic isolation and
+  released the per-IP viewer slot by hand on the error path only, so each
+  failed pull leaks one; the downstream retries every 3 s, so by that
+  arithmetic its address is locked out of the upstream's WHEP after
+  `max_viewers_per_ip` attempts (256 by default — about 13 minutes) until the
+  upstream restarts. An old downstream pulling from a new upstream works.
+
+So roll out in this order:
+
+1. **Every edge that publishes WHIP to a relay**, to a build containing edge
+   commit 5f71c4c (the first release after v0.113.0).
+2. **Relays, from the upstream end of each cascade**: the origin relay first,
+   then each tier below it. A relay that only takes WHIP from edges and feeds
+   no cascade can go any time after step 1.
 
 ## Endpoints (browser-facing HTTP listener, default `:4485`)
 
@@ -98,6 +141,65 @@ context, so front it with a TLS-terminating reverse proxy / load balancer (the
 `behind_proxy` pattern) presenting a CA cert on `public_base_url`'s hostname. The
 DTLS/SRTP media path is independently encrypted regardless. Native in-relay TLS
 is a planned follow-up.
+
+### How a viewer session ends
+
+A WHEP session — and the per-IP slot it holds against `max_viewers_per_ip` —
+ends on whichever comes first:
+
+- **`DELETE` of its resource.** The `/watch` player sends one on `pagehide`, as
+  a `keepalive` fetch (it used a beacon, which can only `POST`, and every tab
+  close got a `405`).
+- **The peer closing the connection** — `RTCPeerConnection.close()` sends a
+  DTLS close_notify, and the session ends on it at once. (Closing a Chrome tab
+  sends none: measured live, that tab was reaped by ICE.)
+- **ICE staying disconnected** — a crashed tab, a lost network. str0m's
+  ICE agent reports a silent viewer disconnected about 15 s after its last
+  binding request, and the session then has `ICE_DISCONNECT_GRACE` (15 s) to
+  come back: so about 30 s in all. The send loop drives the session at least
+  once a second even when its stream has stalled, so this fires either way.
+  Before, the event was dropped and a viewer that left without a `DELETE` was
+  sent the stream, and held its slot, for as long as the stream lived.
+
+  The grace is there because the ICE-Lite side recovers: a viewer whose
+  checks paused is nominated again by its next check. That keeps a viewer
+  whose browser was suspended or backgrounded — a laptop lid, a mobile tab, a
+  frozen process — and one whose network comes back before the browser's own
+  ICE fails (measured with Chrome 124: a 20 s freeze and a 14 s network loss
+  both came back). Chrome fails a connection after about 15 s of unanswered
+  checks, not RFC 7675's 30 s, and then stops checking for good — neither
+  side restarts ICE, and the `/watch` player does not reconnect — so a longer
+  network outage loses the viewer whatever the relay does. Ending the
+  session on the first disconnect lost the ones that would have come back.
+  str0m keeps sending to the viewer's last address meanwhile, so a viewer
+  that really left is sent about 30 s of the stream.
+- **30 s without connecting** (`SETUP_DEADLINE`) — an offer whose sender never
+  completes ICE and DTLS, such as one with no `a=candidate` lines from a peer
+  that never sends STUN, which ICE-Lite would otherwise wait on for ever. WHIP
+  ingest sessions and cascade pulls have the same deadline.
+
+A WHIP ingest session ends the same ways — on a `DELETE`, the publisher
+closing the connection, or `SETUP_DEADLINE` — except that it ends on ICE's
+first disconnect, with no grace.
+
+A cascade pull has no `DELETE`: it is a WHEP client this relay runs. It ends
+when its entry in `distribution.cascade_sources` is removed or changed (a
+changed one starts again at once), when the relay stops, when the upstream
+closes the connection, on ICE's first disconnect, or at `SETUP_DEADLINE`. On
+the last three, and when its offer fails (an unreachable upstream, say), it
+tries again 3 s later. It sends the upstream no `DELETE` either, so the
+upstream relay reaps the pull's session the way it reaps any viewer that
+leaves without one.
+
+Before, a publisher or upstream that closed the connection without a
+`DELETE` ended nothing: str0m goes inert after a close_notify, so the ingest
+stayed registered for good and the cascade pull never retried.
+
+The relay logs each viewer's end with its reason (`WHEP viewer '…' closed
+(stream '…'): deleted by the client`, `ICE disconnected`, `DTLS closed`,
+`stream closed`, …), and each `DELETE` as it arrives, with the address it
+came from and the viewer's (`WHEP viewer '…' deleted by 203.0.113.9:51234
+(viewer 198.51.100.7)`) — anyone holding a session's id can delete it.
 
 ### Media source pin
 
@@ -1238,6 +1340,14 @@ nearby viewers. **Implemented** (`src/distribution/cascade.rs`):
   ```
 
   Relay-to-relay signalling uses plain `http://` on a trusted network in v1.
+- **Upgrade the upstream end first.** A relay of this version pulling from a
+  relay released through v0.15.0 panics the upstream on every attempt and,
+  retrying every 3 s, leaks one of the upstream's per-IP viewer slots each
+  time, until its address is locked out of that upstream. Pulling the other
+  way round works. Upgrade the origin relay, then each tier below it — see
+  [Upgrade order](#upgrade-order-edges-first-then-relays-upstream-first).
+- A pull whose upstream answers but never completes ICE and DTLS is abandoned
+  after 30 s (`SETUP_DEADLINE`) and retried, like any other failed attempt.
 
 **Nearest-relay assignment** (which regional relay a given viewer connects to)
 is manager orchestration — today the operator points viewers at the nearest
@@ -1264,18 +1374,41 @@ SPS and PPS and puts them back ahead of every IDR that arrives without its own
 (a sender need not repeat them, and an encoder with global headers sends them
 once), live and in the cache alike — otherwise a viewer that joined after the
 IDR that carried them has slices it cannot decode, and a browser asks for a
-keyframe forever. An optional enhancement forwards a viewer
+keyframe forever. Its limits (`es::restore_param_sets`):
+
+- **One SPS and one PPS** — the last of each the stream carried, whatever their
+  ids. A stream that uses several (separate CABAC / CAVLC or field PPSs, from
+  some broadcast and hardware encoders) gets only the last back, so a late
+  joiner cannot decode slices that reference the others until an IDR carries
+  its own. str0m's packetizer puts at most one SPS and one PPS ahead of a
+  slice in any case, so extra sets in one unit are lost on the wire anyway.
+- **Bounded.** A set over 1024 bytes (`MAX_PARAM_SET_BYTES`; a real one is tens
+  of bytes, a few hundred at most) is never cached, and retires the cached one
+  so a stale set is not put back. Nothing is inserted when the SPS and PPS the
+  IDR would then carry exceed 1115 bytes (`MAX_PARAM_SETS_ON_THE_WIRE`): str0m
+  sends them as one STAP-A within its 1120-byte payload MTU and silently drops
+  a larger one, so they would never arrive. An insertion therefore adds at
+  most 1115 bytes to an IDR, where an unbounded cache once turned one
+  megabyte-sized "SPS" and a run of seven-byte IDRs into megabytes per frame.
+
+An optional enhancement forwards a viewer
 PLI to the WHIP-ingest source (the edge encoder) over an RTCP feedback channel
 to force an on-demand IDR; it is not required given the cache and is a follow-up.
 
 ### Broadcast quality gates
 
-The relay's fan-out is **passthrough** — it depacketizes and re-packetizes the
-same H.264 + Opus elementary streams with **no transcode, no PCR regeneration,
-no A/V remux**. The broadcast quality gates (wallclock rate, decode round-trip,
-A/V drift, PCR_AC) therefore apply to the **edge's** WHIP-client output (which
-does the AAC→Opus / HEVC→H.264 transcode and is already gated on ship), not to
-the relay. No new gate runs are required for the relay's passthrough SFU.
+The relay's fan-out depacketizes and re-packetizes the same H.264 + Opus
+elementary streams with **no transcode, no PCR regeneration, no A/V remux** —
+and no change to any timestamp or coded picture. It is not byte-for-byte
+passthrough, though: the hub puts a stream's last SPS and PPS back ahead of an
+IDR that arrives without them (`es::restore_param_sets`, see
+[Late-join & keyframes](#late-join--keyframes)), which rewrites those access
+units. The broadcast quality gates (wallclock rate, decode round-trip, A/V
+drift, PCR_AC) therefore apply to the **edge's** WHIP-client output (which does
+the AAC→Opus / HEVC→H.264 transcode and is already gated on ship), not to the
+relay; what the insertion can affect is only which IDR a mid-stream viewer
+starts decoding on, which `tests/distribution.rs` checks with str0m at both
+ends.
 
 ## Configuration — manager-managed
 
@@ -1527,6 +1660,24 @@ as ignored at startup.
   (`whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on`);
   WHIP-in publishes each frame unchanged and flags every IDR a keyframe
   (`whip_ingest_publishes_whole_h264_access_units_and_flags_every_idr`).
+  The STAP-A budget the hub's parameter-set insertion respects is pinned
+  against str0m's real packetizer: SPS + PPS at 1115 bytes arrive, a byte
+  over do not (`parameter_sets_past_the_stap_a_budget_never_reach_a_viewer`).
+- **Session ends, through the real router**: viewers that leave without a
+  `DELETE` — on a live stream and on a stalled one — are reaped once ICE has
+  given up on them for the ICE grace, and give their per-IP slot back
+  (`a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back`,
+  about 30 s); a viewer whose ICE pauses for 17 s and resumes is kept, and is
+  still receiving what is published once it has been back for longer than
+  the grace (`a_viewer_whose_ice_pauses_and_comes_back_is_kept`, about 37 s);
+  a viewer and a WHIP publisher that close their connection without a
+  `DELETE` end at once
+  (`a_peer_that_closes_without_a_delete_ends_at_once`); a WHEP viewer and a
+  WHIP publisher that never connect are closed at the 30 s setup deadline
+  (`an_offer_that_never_connects_is_closed_at_the_setup_deadline`, 30 s).
+- **Negotiation panics**: an offer str0m panics on fails that request with a
+  `400` and raises one rate-limited `webrtc_negotiation_panic` event
+  (`a_str0m_panic_in_negotiation_raises_one_rate_limited_warning`).
 - **Cascade**: an upstream relay serving WHEP + a downstream relay pulling it
   (real HTTP signalling + real ICE/DTLS/SRTP) and republishing to its own hub
   (`cascade_pulls_upstream_whep_and_republishes`).
