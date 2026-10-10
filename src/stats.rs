@@ -106,6 +106,9 @@ pub struct RelayStats {
     /// because it is a list; published on the same slow telemetry tick, read
     /// by the health builder — never on a media path.
     pub distribution_origin_streams: arc_swap::ArcSwap<Vec<OriginStreamUsage>>,
+    /// What each viewer's player last reported about its playback. Published
+    /// on the same slow tick as the per-stream list, for the same reason.
+    pub distribution_viewer_metrics: arc_swap::ArcSwap<Vec<ViewerMetricReport>>,
     /// Viewer sessions that had a datagram refused by the WebRTC ingress
     /// source pin (`webrtc::session::PeerPin`). One per session, not per
     /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
@@ -130,6 +133,70 @@ pub struct OriginStreamUsage {
     pub policy_overridden: bool,
 }
 
+/// What one viewer's player reported about its own playback, as the relay
+/// carries it to the manager on the health tick.
+///
+/// Plain data, no feature-gated types, so a plain forwarder build compiles the
+/// health builder unchanged. The fields are the player's own measurements —
+/// the relay checks the credential and bounds the numbers, nothing more. See
+/// `distribution::origin::metrics` for the surface that collects them.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ViewerMetricReport {
+    /// The origin stream the player is reporting against.
+    pub stream: String,
+    /// The player's own id for this page load. Opaque; the manager joins it
+    /// to a portal login through the beat, which carries the same id.
+    pub client: String,
+    /// Seconds since the relay received this report.
+    pub age_secs: u64,
+    /// Where the report came from, for the operator's "From" column.
+    pub ip: String,
+    /// `full`, `balanced` or `low`.
+    pub quality: String,
+    /// Whether the page dropped itself to Low after repeated stalls.
+    pub auto_low: bool,
+    /// `live`, `scrub`, `jog` or `shuttle`.
+    pub mode: String,
+    /// Whether the picture was running when the report was taken.
+    pub playing: bool,
+    /// Seconds of hold-back behind the live edge the player is aiming for.
+    pub holdback_s: f32,
+    /// Seconds of media buffered ahead of the playhead.
+    pub ahead_s: f32,
+    /// Seconds between the playhead and the end of the seekable range.
+    pub behind_live_s: f32,
+    /// hls.js's bandwidth estimate, kbit/s. 0 when it has none yet.
+    pub bw_kbps: u32,
+    /// Stall episodes since the page loaded, and in the last five minutes.
+    pub stalls: u32,
+    pub stalls_5m: u32,
+    /// Rebuffer holds (picture paused to refill) likewise, and the total time
+    /// held, milliseconds.
+    pub holds: u32,
+    pub holds_5m: u32,
+    pub hold_ms: u32,
+    /// Reconnect attempts after hls.js called an error fatal.
+    pub reconnects: u32,
+    pub reconnects_5m: u32,
+    /// Frames the browser decoded and dropped, from `getVideoPlaybackQuality`.
+    pub decoded: u32,
+    pub dropped: u32,
+    /// The last main-rendition segment: time to first byte, total load time,
+    /// size.
+    pub seg_ttfb_ms: u32,
+    pub seg_load_ms: u32,
+    pub seg_kb: u32,
+    /// Seconds since the page loaded.
+    pub up_s: u32,
+    /// The browser's own reading of its link (`navigator.connection`), when it
+    /// offers one: effective type, downlink Mbit/s, round trip ms.
+    pub net_type: String,
+    pub net_down_mbps: f32,
+    pub net_rtt_ms: u32,
+    /// The browser, truncated — enough to tell a tablet from a desktop.
+    pub ua: String,
+}
+
 /// Snapshot of the distribution subsystem telemetry.
 #[derive(Debug, Clone, Serialize)]
 pub struct DistributionStatsSnapshot {
@@ -141,6 +208,8 @@ pub struct DistributionStatsSnapshot {
     pub offpath_sessions: u64,
     /// Per-stream breakdown of `origin_bytes`.
     pub origin_streams: Vec<OriginStreamUsage>,
+    /// What each viewer's player last reported, freshest first.
+    pub viewer_metrics: Vec<ViewerMetricReport>,
 }
 
 /// Current wall-clock epoch in milliseconds (saturating to 0 before 1970).
@@ -186,6 +255,7 @@ impl RelayStats {
             distribution_bytes_out: AtomicU64::new(0),
             distribution_origin_bytes: AtomicU64::new(0),
             distribution_origin_streams: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            distribution_viewer_metrics: arc_swap::ArcSwap::from_pointee(Vec::new()),
             distribution_offpath_sessions: AtomicU64::new(0),
         }
     }
@@ -210,6 +280,13 @@ impl RelayStats {
         self.distribution_offpath_sessions.store(offpath_sessions, Ordering::Relaxed);
     }
 
+    /// Publish what the viewers' players last reported (called by the
+    /// subsystem on its telemetry tick).
+    pub fn set_viewer_metrics(&self, reports: Vec<ViewerMetricReport>) {
+        self.distribution_viewer_metrics
+            .store(std::sync::Arc::new(reports));
+    }
+
     /// Snapshot the distribution telemetry. Returns `None` when the subsystem
     /// is not running (so the field is omitted from health/REST payloads).
     pub fn distribution_snapshot(&self) -> Option<DistributionStatsSnapshot> {
@@ -224,6 +301,7 @@ impl RelayStats {
             origin_bytes: self.distribution_origin_bytes.load(Ordering::Relaxed),
             offpath_sessions: self.distribution_offpath_sessions.load(Ordering::Relaxed),
             origin_streams: self.distribution_origin_streams.load().as_ref().clone(),
+            viewer_metrics: self.distribution_viewer_metrics.load().as_ref().clone(),
         })
     }
 

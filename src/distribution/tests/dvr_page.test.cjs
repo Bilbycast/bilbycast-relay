@@ -316,6 +316,8 @@ function fakeRelay(opts = {}) {
   relay.fetch = async (url, init = {}) => {
     const method = init.method || "GET";
     const headers = init.headers || {};
+    // Playback reports are another surface; the marks tests count marks calls.
+    if (/^\/origin\/bigshow\/metrics(\?|$)/.test(url)) return json(200, { next_report_secs: 20 });
     relay.calls.push(method + " " + url);
     relay.auth.push(headers.Authorization || null);
     const [path, query = ""] = url.split("?");
@@ -351,8 +353,11 @@ function olderRelay() {
   const relay = { calls: [] };
   relay.fetch = async (url, init = {}) => {
     const method = init.method || "GET";
-    relay.calls.push(method + " " + url);
     const path = url.split("?")[0];
+    // A playback report to a relay without the route is a 404 the page
+    // ignores; these tests count marks calls.
+    if (path === "/origin/bigshow/metrics") return { status: 404, ok: false, headers: { get: () => null }, text: async () => "" };
+    relay.calls.push(method + " " + url);
     const status = /^\/origin\/bigshow\/marks$/.test(path) ? (method === "GET" ? 400 : 405) : 404;
     return {
       status,
@@ -1535,4 +1540,72 @@ test("a stall on an empty buffer is left to hls.js, a stall past the edge is nud
   assert.ok(w.document.body.dataset.holdback, "the page publishes its hold-back for inspection");
   assert.ok(Number(w.document.body.dataset.holdback) > 8, "after repeated stalls live sits further behind the edge than the 8 s default: " + w.document.body.dataset.holdback);
   if (hls) assert.equal(hls.config.liveSyncDuration, Number(w.document.body.dataset.holdback));
+});
+
+// Playback metrics, 2026-10-10: what the debug panel shows goes to the relay
+// too, so an operator can see how the picture is going for the people
+// watching. Reported under an id the portal beat also carries.
+test("a page with a token reports its playback to the relay under a client id, and counts its stalls", async (t) => {
+  const posts = [];
+  const fetch = async (url, init = {}) => {
+    if (/\/metrics$/.test(url.split("?")[0])) {
+      posts.push({ url, headers: init.headers || {}, body: JSON.parse(init.body) });
+      return { ok: true, status: 200, json: async () => ({ next_report_secs: 20 }) };
+    }
+    return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), text: async () => "" };
+  };
+  const w = loadPage({ token: TOKEN, fetch });
+  t.after(() => closePage(w));
+  // The interval is twenty seconds; coming back to the foreground reports at
+  // once, which is how a test asks for one without waiting.
+  const report = async () => {
+    w.document.dispatchEvent(new w.Event("visibilitychange"));
+    await new Promise((r) => setTimeout(r, 10));
+  };
+  await report();
+  assert.equal(posts.length, 1, "one report");
+  assert.equal(posts[0].url, "/origin/bigshow/metrics");
+  assert.equal(posts[0].headers.Authorization, "Bearer " + TOKEN, "the viewer token rides as a header, as every other request's does");
+  const first = posts[0].body;
+  assert.match(first.client, /^[0-9a-f]{16}$/, "a per-load id: " + first.client);
+  assert.equal(first.quality, "full");
+  assert.equal(first.mode, "live");
+  assert.equal(first.stalls, 0);
+  assert.equal(first.auto_low, false);
+  assert.equal(typeof first.ahead_s, "number");
+  assert.equal(typeof first.up_s, "number");
+  assert.ok(first.ua.length <= 120);
+
+  for (let i = 0; i < 2; i++) {
+    for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+  }
+  await report();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].body.client, first.client, "the same id for the life of the page");
+  assert.equal(posts[1].body.stalls, 2);
+  assert.equal(posts[1].body.stalls_5m, 2);
+  assert.equal(posts[1].body.holdback_s, Number(w.document.body.dataset.holdback), "the hold-back the second stall moved");
+});
+
+test("a page without a token sends no report, and neither does a page whose access has expired", async (t) => {
+  const calls = [];
+  const fetch = async (url, init = {}) => {
+    calls.push((init.method || "GET") + " " + url);
+    return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), text: async () => "" };
+  };
+  const w = loadPage({ fetch });
+  t.after(() => closePage(w));
+  w.document.dispatchEvent(new w.Event("visibilitychange"));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(!calls.some((c) => /metrics/.test(c)), "nothing to report under: " + calls.join(", "));
+
+  const expired = loadPage({ token: TOKEN, fetch });
+  t.after(() => closePage(expired));
+  calls.length = 0;
+  for (const cb of expired.hlsHandlers.hlsError || []) {
+    cb("hlsError", { type: "networkError", details: "manifestLoadError", fatal: true, response: { code: 401 } });
+  }
+  expired.document.dispatchEvent(new expired.Event("visibilitychange"));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(!calls.some((c) => /metrics/.test(c)), "an expired tab has nothing to say: " + calls.join(", "));
 });

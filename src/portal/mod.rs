@@ -696,6 +696,13 @@ pub struct WatchQuery {
     /// the one caller that cannot do without it — see `beat`.
     #[serde(default)]
     pub held: Option<String>,
+    /// On a beat, the id the player reports its playback metrics under at the
+    /// relay (`POST /origin/{stream}/metrics`). Minted by the page per load;
+    /// carried here so the manager can put a login's name beside the numbers
+    /// the relay holds anonymously. Opaque, grants nothing, optional: an older
+    /// player beats without one and is simply listed without metrics.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 /// The address to record for a viewer.
@@ -931,6 +938,12 @@ async fn beat(
     // runs per viewer per minute with no rate limit, and junk that can be
     // refused for free here is otherwise paid for with a manager round trip
     // and a Postgres comparison.
+    // The client id is held to the relay's own rule for it, so the manager
+    // never stores one the relay would not have accepted a report under.
+    let client = q
+        .client
+        .as_deref()
+        .filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
     if held.len() > 64
         || crate::distribution_control::sanitize_stream_id(&q.stream).as_deref()
             != Some(q.stream.as_str())
@@ -960,6 +973,7 @@ async fn beat(
             "username": username,
             "stream_id": q.stream,
             "holder": held,
+            "client": client,
         }))
         .send()
         .await;

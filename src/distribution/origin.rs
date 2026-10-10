@@ -45,6 +45,7 @@ use tokio::sync::Mutex;
 use super::{token, DistributionState};
 
 mod marks;
+pub mod metrics;
 
 /// How the origin store is sized. Bundled so the knobs travel together — they
 /// interact, and reading one without the others is misleading.
@@ -2479,6 +2480,7 @@ pub fn routes() -> Router<Arc<DistributionState>> {
         .merge(clip_media)
         .merge(clip_control)
         .merge(marks::routes())
+        .merge(metrics::routes())
 }
 
 /// `PUT /origin/{stream}/{file}` — accept an edge CMAF/HLS upload.

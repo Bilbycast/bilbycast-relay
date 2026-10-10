@@ -1042,6 +1042,7 @@
     if (now - lastStallAt > 60000) stallCount = 0;
     lastStallAt = now;
     stallCount++;
+    metricsEvent(stallTimes);
     logDiag("STALL #" + stallCount + " ahead=" + bufferedAhead(main).toFixed(1) + " t=" + main.currentTime.toFixed(1));
     if (stallCount >= 2 && liveHoldBack < HOLDBACK_MAX) {
       liveHoldBack = Math.min(HOLDBACK_MAX, liveHoldBack + segmentSeconds());
@@ -1082,6 +1083,7 @@
     var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
     reconnectAttempts++;
     reconnectingLabel = label;
+    metricsEvent(reconnectTimes);
     logDiag("RECONNECT attempt " + reconnectAttempts + " in " + delay + "ms");
     fail("Connection lost — reconnecting" + (reconnectAttempts > 1 ? " (attempt " + reconnectAttempts + ")" : "") + "…");
     reconnectTimer = setTimeout(function () {
@@ -1185,6 +1187,7 @@
     if (bufferedAhead(main) >= rebufferTarget) return;
     holdingForBuffer = true;
     holdStartedAt = Date.now();
+    metricsEvent(holdTimes);
     logDiag("HOLD ahead=" + bufferedAhead(main).toFixed(1) + " goal=" + rebufferTarget);
     try { main.pause(); } catch (e) {}
     showBuffering();
@@ -1203,6 +1206,7 @@
     if (holdTimer !== null) { clearInterval(holdTimer); holdTimer = null; }
     if (!holdingForBuffer) return;
     holdingForBuffer = false;
+    holdTotalMs += Date.now() - holdStartedAt;
     logDiag("RELEASE after " + ((Date.now() - holdStartedAt) / 1000).toFixed(1) + "s ahead=" + bufferedAhead(main).toFixed(1) + (play ? "" : " (viewer)"));
     fail("");
     if (play && mode === "live") main.play().catch(function () {});
@@ -1238,9 +1242,122 @@
     var was = null;
     try { was = window.localStorage.getItem(AUTOLOW_KEY); window.localStorage.removeItem(AUTOLOW_KEY); } catch (e) {}
     if (was !== "1") return;
+    autoLowApplied = true;
     fail("Switched to Low: this link could not keep up with Full. Change it in Settings.");
     setTimeout(function () { if (errEl.textContent.indexOf("Switched to Low") === 0) fail(""); }, 10000);
   }
+
+  // ── playback metrics, reported to the relay ───────────────────────────────
+  // What the debug panel shows, sent to the relay every twenty seconds
+  // (`POST /origin/{stream}/metrics`) so an operator can see how the picture
+  // is going for the people watching without asking them. The relay carries
+  // the latest report per client to the manager on its health tick; the
+  // manager puts a login's name beside it by the same client id, which the
+  // portal beat also carries. A viewer on a one-off link never beats, so
+  // their report stays anonymous — a row with a buffer reading, no name.
+  //
+  // The id is minted per page load, and is neither the token (two devices
+  // sharing a login can hold byte-identical tokens) nor the holder (which is
+  // never presented to the relay by design).
+  var CLIENT = (function () {
+    try {
+      var b = new Uint8Array(8);
+      window.crypto.getRandomValues(b);
+      var out = "";
+      for (var i = 0; i < b.length; i++) out += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+      return out;
+    } catch (e) {
+      return Math.random().toString(16).slice(2, 10) + Math.random().toString(16).slice(2, 10);
+    }
+  })();
+  var METRICS_MS = 20000, metricsTimer = null, metricsT0 = Date.now();
+  var stallTimes = [], holdTimes = [], reconnectTimes = [], holdTotalMs = 0;
+  var lastSegment = { ttfb: 0, total: 0, kb: 0 };
+  var autoLowApplied = false;
+  var METRICS_WINDOW_MS = 5 * 60 * 1000;
+  /// One event of a kind, kept for the five-minute count; the lifetime total
+  /// is the list's own counter so trimming the window loses nothing.
+  function metricsEvent(list) {
+    var now = Date.now();
+    list.push(now);
+    list.total = (list.total || 0) + 1;
+    while (list.length && now - list[0] > METRICS_WINDOW_MS) list.shift();
+  }
+  function recentCount(list) {
+    var now = Date.now();
+    while (list.length && now - list[0] > METRICS_WINDOW_MS) list.shift();
+    return list.length;
+  }
+  function metricsSample() {
+    var q = main.getVideoPlaybackQuality ? main.getVideoPlaybackQuality() : null;
+    var r = range(main);
+    var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    return {
+      client: CLIENT,
+      quality: quality,
+      auto_low: autoLowApplied,
+      mode: mode,
+      playing: mode === "live" && !main.paused && !holdingForBuffer,
+      holdback_s: liveHoldBack,
+      ahead_s: Math.round(bufferedAhead(main) * 10) / 10,
+      behind_live_s: r ? Math.max(0, Math.round((r.end - main.currentTime) * 10) / 10) : 0,
+      bw_kbps: mainHls && mainHls.bandwidthEstimate > 0 ? Math.round(mainHls.bandwidthEstimate / 1000) : 0,
+      stalls: stallTimes.total || 0,
+      stalls_5m: recentCount(stallTimes),
+      holds: holdTimes.total || 0,
+      holds_5m: recentCount(holdTimes),
+      hold_ms: holdTotalMs + (holdingForBuffer ? Date.now() - holdStartedAt : 0),
+      reconnects: reconnectTimes.total || 0,
+      reconnects_5m: recentCount(reconnectTimes),
+      decoded: q ? q.totalVideoFrames : 0,
+      dropped: q ? q.droppedVideoFrames : 0,
+      seg_ttfb_ms: lastSegment.ttfb,
+      seg_load_ms: lastSegment.total,
+      seg_kb: lastSegment.kb,
+      up_s: Math.round((Date.now() - metricsT0) / 1000),
+      net_type: c && c.effectiveType ? String(c.effectiveType) : "",
+      net_down_mbps: c && typeof c.downlink === "number" ? c.downlink : 0,
+      net_rtt_ms: c && typeof c.rtt === "number" ? c.rtt : 0,
+      ua: String(navigator.userAgent || "").slice(0, 120)
+    };
+  }
+  /// Only a credentialed, live-access, visible page reports: the relay
+  /// refuses a report without a token, an expired tab has nothing to say,
+  /// and a background tab's numbers describe nothing anyone is watching.
+  function mayReport() {
+    return !!(TOKEN && !accessExpired && !document.hidden);
+  }
+  function reportMetrics() {
+    if (!mayReport()) return;
+    var headers = { "Content-Type": "application/json" };
+    if (TOKEN_IN_HEADER && TOKEN) headers.Authorization = "Bearer " + TOKEN;
+    var sample = metricsSample();
+    fetch(url(STREAM, "metrics"), { method: "POST", headers: headers, cache: "no-store", body: JSON.stringify(sample) })
+      .then(function (r) { return r.ok ? r.json().catch(function () { return null; }) : null; })
+      .then(function (body) {
+        // The cadence is the relay's to set, as the beat's is the manager's;
+        // never faster than every ten seconds whatever it says.
+        if (body && body.next_report_secs > 0) {
+          var ms = Math.min(Math.max(10000, body.next_report_secs * 1000), 0x7fffffff);
+          if (ms !== METRICS_MS) { METRICS_MS = ms; stopReporting(); startReporting(); }
+        }
+      })
+      .catch(function () { /* a lost report costs a number on an operator's screen, not a picture */ });
+  }
+  function startReporting() {
+    if (metricsTimer !== null || !TOKEN) return;
+    metricsTimer = setInterval(reportMetrics, METRICS_MS);
+    // The first report waits a full interval: a page that has loaded nothing
+    // yet has only zeros to send.
+  }
+  function stopReporting() {
+    if (metricsTimer !== null) { clearInterval(metricsTimer); metricsTimer = null; }
+  }
+  // Coming back to the foreground reports now, so a viewer who was just told
+  // "it looks fine here" shows up on the operator's screen at once.
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && metricsTimer !== null) reportMetrics();
+  });
 
   // Hysteresis for the LIVE badge.
   //
@@ -1988,6 +2105,11 @@
         if (video !== main || !d || !d.frag) return;
         var st = (d.frag.stats && d.frag.stats.loading) || {};
         var kb = d.stats && d.stats.loaded ? Math.round(d.stats.loaded / 1024) : (d.frag.stats && d.frag.stats.loaded ? Math.round(d.frag.stats.loaded / 1024) : "?");
+        lastSegment = {
+          ttfb: st.first && st.start ? Math.round(st.first - st.start) : 0,
+          total: st.end && st.start ? Math.round(st.end - st.start) : 0,
+          kb: typeof kb === "number" ? kb : 0
+        };
         logDiag("got  sn=" + d.frag.sn + " " + kb + "KB ttfb=" + (st.first && st.start ? Math.round(st.first - st.start) : "?") + "ms total=" + (st.end && st.start ? Math.round(st.end - st.start) : "?") + "ms");
       });
       hls.on(Hls.Events.LEVEL_LOADED, function (_e, d) {
@@ -4651,6 +4773,11 @@
           var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
           return c ? (c.effectiveType || "?") + " " + (c.downlink !== undefined ? c.downlink + "Mbps" : "") + " rtt=" + (c.rtt !== undefined ? c.rtt + "ms" : "?") : "n/a";
         })(),
+      "client=" + CLIENT + "  reports every " + (METRICS_MS / 1000) + "s" +
+        "  stalls=" + (stallTimes.total || 0) + "/" + recentCount(stallTimes) + " (5m)" +
+        "  holds=" + (holdTimes.total || 0) + " " + Math.round(holdTotalMs / 1000) + "s" +
+        "  reconnects=" + (reconnectTimes.total || 0) +
+        "  lastSeg=" + lastSegment.kb + "KB ttfb=" + lastSegment.ttfb + "ms total=" + lastSegment.total + "ms",
       "transport log (newest last):",
       diag.slice(-18).join("\n"),
       // The preview has three independent ways to be silently absent: no
@@ -5507,7 +5634,8 @@
   function beatNow() {
     if (!mayBeat() || document.hidden) return;
     var url = PORTAL_URL.replace(/\/+$/, "") + "/api/beat?stream=" +
-              encodeURIComponent(STREAM) + "&held=" + encodeURIComponent(HOLDER);
+              encodeURIComponent(STREAM) + "&held=" + encodeURIComponent(HOLDER) +
+              "&client=" + encodeURIComponent(CLIENT);
     // POST, because it writes. No body and no custom header, so it stays a
     // "simple" request and costs no preflight — the beat must not turn one
     // round trip into two, every minute, per viewer.
@@ -5575,6 +5703,7 @@
   }
   scheduleRenewal();
   startBeating();
+  startReporting();
   syncQualityBadge();   // setMode returns early at startup, so seed it here
   loadMarks();
   renderMarks();
