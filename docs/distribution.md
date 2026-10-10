@@ -134,6 +134,7 @@ So roll out in this order:
 | `POST` | `/origin/{stream}/marks` | Add a mark `{at, name?, colour?, exported?}` — `at` in wall-clock ms; the same instant twice is one mark; `404` while the relay holds no directory for the stream (viewer token, always) |
 | `PATCH` | `/origin/{stream}/marks/{id}` | Rename, recolour or flag exported (viewer token, always) |
 | `DELETE` | `/origin/{stream}/marks/{id}` | Remove a mark; removing one already gone succeeds (viewer token, always) |
+| `POST` | `/origin/{stream}/metrics` | A player's report on its own playback (`{client, quality, mode, playing, ahead_s, bw_kbps, stalls_5m, …}`, ≤ 8 KiB); the freshest report per `client` is kept for 90 s and listed under `distribution.viewer_metrics` in the relay's health (at most 200, freshest first); replies `{next_report_secs}` (viewer token, always) |
 | `GET` | `/distribution/health` | Liveness |
 
 **The signaling + origin listener is plain HTTP.** Browsers require a secure

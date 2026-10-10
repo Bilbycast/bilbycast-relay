@@ -23,11 +23,10 @@
 //! buffer reading, where before there was nothing.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -175,12 +174,11 @@ impl ViewerReport {
     /// clamped, an unknown word becomes the fallback, text is cut. The client
     /// id is the one field that can refuse, and [`ViewerMetrics::record`]
     /// checks it.
-    pub fn sanitize(self, stream: &str, ip: IpAddr) -> ViewerMetricReport {
+    pub fn sanitize(self, stream: &str) -> ViewerMetricReport {
         ViewerMetricReport {
             stream: stream.to_string(),
             client: self.client,
             age_secs: 0,
-            ip: ip.to_string(),
             quality: bounded_word(&self.quality, 16, &["full", "balanced", "low"], "unknown"),
             auto_low: self.auto_low,
             mode: bounded_word(&self.mode, 16, &["live", "scrub", "jog", "shuttle"], "unknown"),
@@ -227,19 +225,13 @@ impl ViewerMetrics {
     }
 
     /// Keep this report, replacing the client's previous one.
-    pub fn record(
-        &self,
-        stream: &str,
-        ip: IpAddr,
-        report: ViewerReport,
-    ) -> Result<(), MetricRefusal> {
-        self.record_at(stream, ip, report, Instant::now())
+    pub fn record(&self, stream: &str, report: ViewerReport) -> Result<(), MetricRefusal> {
+        self.record_at(stream, report, Instant::now())
     }
 
     fn record_at(
         &self,
         stream: &str,
-        ip: IpAddr,
         report: ViewerReport,
         now: Instant,
     ) -> Result<(), MetricRefusal> {
@@ -257,7 +249,7 @@ impl ViewerMetrics {
         if !clients.contains_key(&report.client) && clients.len() >= MAX_CLIENTS_PER_STREAM {
             return Err(MetricRefusal::TooManyClients);
         }
-        let report = report.sanitize(stream, ip);
+        let report = report.sanitize(stream);
         clients.insert(
             report.client.clone(),
             Entry {
@@ -321,11 +313,11 @@ pub(super) fn routes() -> Router<Arc<DistributionState>> {
 /// `POST /origin/{stream}/metrics` — a player's report on its own playback.
 ///
 /// The viewer token only, as for marks: the edge has no business here. The
-/// reply carries the cadence, so it is the relay's to change.
+/// reply carries the cadence, so it is the relay's to change. The peer
+/// address is not read: see `ViewerMetricReport::age_secs`.
 async fn metrics_post(
     State(st): State<Arc<DistributionState>>,
     Path(stream): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
     axum::Json(report): axum::Json<ViewerReport>,
@@ -337,7 +329,7 @@ async fn metrics_post(
         return resp;
     }
     let no_store = [(header::CACHE_CONTROL, "no-store")];
-    match st.viewer_metrics.record(&stream, peer.ip(), report) {
+    match st.viewer_metrics.record(&stream, report) {
         Ok(()) => (
             StatusCode::OK,
             no_store,
@@ -363,10 +355,6 @@ async fn metrics_post(
 mod tests {
     use super::*;
 
-    fn ip() -> IpAddr {
-        "203.0.113.9".parse().unwrap()
-    }
-
     fn report(client: &str) -> ViewerReport {
         ViewerReport {
             client: client.into(),
@@ -385,11 +373,11 @@ mod tests {
     fn the_freshest_report_per_client_is_what_is_published_with_its_age() {
         let m = ViewerMetrics::default();
         let t0 = Instant::now();
-        m.record_at("show", ip(), report("a"), t0).unwrap();
-        m.record_at("show", ip(), report("b"), t0 + Duration::from_secs(5)).unwrap();
+        m.record_at("show", report("a"), t0).unwrap();
+        m.record_at("show", report("b"), t0 + Duration::from_secs(5)).unwrap();
         let mut again = report("a");
         again.stalls = 3.0;
-        m.record_at("show", ip(), again, t0 + Duration::from_secs(20)).unwrap();
+        m.record_at("show", again, t0 + Duration::from_secs(20)).unwrap();
 
         let snap = m.snapshot_at(t0 + Duration::from_secs(30));
         assert_eq!(snap.len(), 2);
@@ -399,7 +387,6 @@ mod tests {
         assert_eq!(snap[1].client, "b");
         assert_eq!(snap[1].age_secs, 25);
         assert_eq!(snap[0].stream, "show");
-        assert_eq!(snap[0].ip, "203.0.113.9");
         assert_eq!(snap[0].ahead_s, 4.3, "rounded to a tenth");
     }
 
@@ -407,7 +394,7 @@ mod tests {
     fn a_report_older_than_the_ttl_is_gone_from_the_snapshot_and_the_count() {
         let m = ViewerMetrics::default();
         let t0 = Instant::now();
-        m.record_at("show", ip(), report("a"), t0).unwrap();
+        m.record_at("show", report("a"), t0).unwrap();
         assert_eq!(m.snapshot_at(t0 + REPORT_TTL - Duration::from_secs(1)).len(), 1);
         assert_eq!(m.snapshot_at(t0 + REPORT_TTL).len(), 0);
         assert_eq!(m.inner.lock().unwrap().len(), 0, "an empty stream is dropped too");
@@ -427,7 +414,7 @@ mod tests {
             ua: "x".repeat(500),
             ..Default::default()
         }
-        .sanitize("show", ip());
+        .sanitize("show");
         assert_eq!(r.quality, "unknown");
         assert_eq!(r.mode, "live");
         assert_eq!(r.stalls, 0);
@@ -442,20 +429,20 @@ mod tests {
     fn a_bad_client_id_is_refused_and_the_caps_hold() {
         let m = ViewerMetrics::default();
         for bad in ["", "a b", "x".repeat(65).as_str(), "é"] {
-            assert_eq!(m.record("show", ip(), report(bad)), Err(MetricRefusal::BadClient), "{bad:?}");
+            assert_eq!(m.record("show", report(bad)), Err(MetricRefusal::BadClient), "{bad:?}");
         }
         for i in 0..MAX_CLIENTS_PER_STREAM {
-            m.record("show", ip(), report(&format!("c{i}"))).unwrap();
+            m.record("show", report(&format!("c{i}"))).unwrap();
         }
-        assert_eq!(m.record("show", ip(), report("one-more")), Err(MetricRefusal::TooManyClients));
+        assert_eq!(m.record("show", report("one-more")), Err(MetricRefusal::TooManyClients));
         // A client already held may still report.
-        m.record("show", ip(), report("c0")).unwrap();
+        m.record("show", report("c0")).unwrap();
         assert_eq!(m.reporting("show"), MAX_CLIENTS_PER_STREAM);
 
         for i in 1..MAX_STREAMS {
-            m.record(&format!("s{i}"), ip(), report("c")).unwrap();
+            m.record(&format!("s{i}"), report("c")).unwrap();
         }
-        assert_eq!(m.record("another", ip(), report("c")), Err(MetricRefusal::TooManyStreams));
+        assert_eq!(m.record("another", report("c")), Err(MetricRefusal::TooManyStreams));
     }
 
     #[test]
@@ -463,7 +450,7 @@ mod tests {
         let m = ViewerMetrics::default();
         let t0 = Instant::now();
         for i in 0..(MAX_REPORTED + 50) {
-            m.record_at(&format!("s{}", i % 8), ip(), report(&format!("c{i}")), t0 + Duration::from_millis(i as u64)).unwrap();
+            m.record_at(&format!("s{}", i % 8), report(&format!("c{i}")), t0 + Duration::from_millis(i as u64)).unwrap();
         }
         let snap = m.snapshot_at(t0 + Duration::from_secs(1));
         assert_eq!(snap.len(), MAX_REPORTED);

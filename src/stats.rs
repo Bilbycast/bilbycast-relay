@@ -148,9 +148,13 @@ pub struct ViewerMetricReport {
     /// to a portal login through the beat, which carries the same id.
     pub client: String,
     /// Seconds since the relay received this report.
+    ///
+    /// No address, deliberately. The relay sits behind a TLS terminator, so
+    /// the peer it sees is loopback for every viewer; and this list lands in
+    /// the manager's node health, which anyone with View on the relay can
+    /// read — an address here would walk past the Admin-only gate the
+    /// manager keeps on a viewer's address.
     pub age_secs: u64,
-    /// Where the report came from, for the operator's "From" column.
-    pub ip: String,
     /// `full`, `balanced` or `low`.
     pub quality: String,
     /// Whether the page dropped itself to Low after repeated stalls.
