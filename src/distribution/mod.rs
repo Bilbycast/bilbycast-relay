@@ -332,6 +332,14 @@ pub async fn run_distribution(
                         }
                         let update = rx.borrow_and_update().clone();
                         origin.apply_policy_update(&update);
+                        // The manager has named what each stream keeps (an
+                        // empty list included): segments adopted at startup
+                        // are trimmed to that from here, not before. A push
+                        // carrying only the node default says nothing about
+                        // any session's window, and does not end the hold.
+                        if update.per_stream.is_some() {
+                            origin.manager_policy_received();
+                        }
                         let d = origin.default_policy();
                         tracing::info!(
                             retention_secs = d.retention.as_secs(),
@@ -1912,8 +1920,11 @@ mod tests {
             f.contains(r#"if (quality === "full")"#),
             "the badge shows even when nothing is reduced: {f}"
         );
+        // "LOW", or "LOW · FULL OK" when the link looks able to carry Full
+        // again — either way a reduced moving picture says so, and a
+        // full-resolution still says HD.
         assert!(
-            f.contains(r#"hd ? "HD" : "LOW""#),
+            f.contains(r#"hd ? "HD" : ("#) && f.contains(r#": "LOW")"#),
             "the badge does not distinguish a full-resolution still: {f}"
         );
         assert!(

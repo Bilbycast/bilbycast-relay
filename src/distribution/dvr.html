@@ -117,8 +117,11 @@
     font-size: 11px; font-weight: 700; letter-spacing: .09em;
     background: rgba(20,26,32,.8); color: var(--dim); backdrop-filter: blur(6px);
   }
-  body[data-q="1"] #qbadge { display: block; }
+  body[data-q="1"] #qbadge { display: block; cursor: pointer; pointer-events: auto; }
   #qbadge.hd { background: var(--accent); color: #04241c; }
+  /* The connection looks able to carry Full again: the badge says so, in the
+     accent, and a tap takes the viewer back. */
+  #qbadge.offer { background: var(--accent); color: #04241c; }
   #status {
     display: none; position: absolute; left: 68px; top: 16px; z-index: 6;
     font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--dim);
@@ -542,7 +545,7 @@
   <div id="scrimTop" aria-hidden="true"></div>
 
   <div id="badge">live</div>
-  <div id="qbadge" aria-hidden="true"></div>
+  <div id="qbadge" role="button" tabindex="0"></div>
   <button id="zoomBadge" type="button" title="Reset zoom (0)">1.0&times;</button>
   <div id="status">—</div>
   <pre id="debug"></pre>
@@ -691,6 +694,7 @@
        the frame you are looking at is sharp without paying for sharpness while
        it moves. Shuttle and scrub work in all three, because the
        low-resolution rendition is all-intra. Takes effect on reload.</p>
+    <p class="note" id="autoLowNote" hidden></p>
     <fieldset class="clips">
       <legend>Live delay</legend>
       <label class="opt num">
@@ -1058,7 +1062,7 @@
 
   // Reconnecting after hls.js gave up: attempts, each further apart, until a
   // segment lands or the page closes.
-  var reconnectTimer = null, reconnectAttempts = 0, reconnectingLabel = null;
+  var reconnectTimer = null, reconnectAttempts = 0, reconnectingLabel = null, lastReconnectAt = 0;
   var RECONNECT_FIRST_MS = 1000, RECONNECT_MAX_MS = 15000;
 
   // A rolling log of what the transport saw — segment timings, stalls, holds,
@@ -1148,6 +1152,7 @@
     var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
     reconnectAttempts++;
     reconnectingLabel = label;
+    lastReconnectAt = Date.now();
     metricsEvent(reconnectTimes);
     noteEvent({ kind: "reconnect", ahead: bufferedAhead(main) });
     logDiag("RECONNECT attempt " + reconnectAttempts + " in " + delay + "ms");
@@ -1364,7 +1369,7 @@
     if (main.playbackRate === CATCHUP_RATE) main.playbackRate = (rate > 0 && rate <= 1) ? rate : 1;
     logDiag("CATCHUP stop: " + (behindLive() - liveHoldBack).toFixed(1) + "s from the live point");
   }
-  setInterval(tendLatency, 1000);
+  setInterval(function () { tendLatency(); tendReturnOffer(); }, 1000);
   // Where the browser does fire it, this is simply sooner than the next poll.
   main.addEventListener("progress", checkHold);
 
@@ -1409,7 +1414,82 @@
   function starvedByPauses() {
     return recentCount(holdTimes, STARVED_WINDOW_MS) >= STARVED_HOLDS && slowLink();
   }
+  //
+  // **And a way back.** The first cut announced the switch once and forgot
+  // it: the reloaded page was simply "on Low", the notice pointed at Settings
+  // and vanished after ten seconds, and a viewer whose connection recovered —
+  // a tablet walking back into coverage — stayed on a 360p picture for the
+  // rest of the event unless they went looking. So the drop is remembered for
+  // as long as it stands, and three things follow from that:
+  //   * the LOW badge is a control: a tap opens Settings at the choice;
+  //   * when the link has carried Low with room to spare for long enough,
+  //     the badge reads "LOW · FULL OK" and a tap returns to Full;
+  //   * Settings says the choice was the player's, not the viewer's.
+  // The return is offered, never taken: a reload in the middle of a passage
+  // is the viewer's to choose, and a player that flips itself between the
+  // two every few minutes on a marginal link is worse than either.
+  //
+  // The marker carries how many times this has happened: "1" / "1:N" asks the
+  // reloaded page to say so, "auto:N" is Low standing by the player's choice,
+  // "tried:N" is back on Full after N drops. Each failed return doubles how
+  // long the link must behave before Full is offered again.
   var AUTOLOW_KEY = "bilbycast.dvr.autolow." + STREAM;
+  function autoLowRead() {
+    var raw = null;
+    try { raw = window.localStorage.getItem(AUTOLOW_KEY); } catch (e) {}
+    var m = /^(1|auto|tried)(?::(\d+))?$/.exec(raw || "");
+    if (!m) return { state: "", n: 0 };
+    return { state: m[1], n: Math.min(8, Math.max(1, parseInt(m[2] || "1", 10))) };
+  }
+  function autoLowWrite(state, n) {
+    try {
+      if (!state) window.localStorage.removeItem(AUTOLOW_KEY);
+      else window.localStorage.setItem(AUTOLOW_KEY, state === "1" && n <= 1 ? "1" : state + ":" + n);
+    } catch (e) {}
+  }
+  var autoLowTimes = 0;          // how many automatic drops this viewer has had
+  var returnOffered = false;
+  var FULL_OK_RATIO = 0.2;       // Low fetched this fast leaves room for a rendition three times its size
+  var FULL_OK_SEGMENTS = 20;     // forty seconds of them, nine in ten under the line
+  var FULL_OK_QUIET_MS = 120000; // and this long without trouble, doubled per failed return
+  var returnRatios = [];
+  function returnQuietMs() {
+    return Math.min(30 * 60000, FULL_OK_QUIET_MS * Math.pow(2, Math.max(0, autoLowTimes - 1)));
+  }
+  /// Does the link look able to carry Full? Judged on how fast Low arrives:
+  /// Full is about three times the size, so Low in a fifth of real time is
+  /// Full in well under it.
+  function linkCouldCarryFull() {
+    if (returnRatios.length < FULL_OK_SEGMENTS) return false;
+    var sorted = returnRatios.slice().sort(function (a, b) { return a - b; });
+    return sorted[Math.floor(sorted.length * 0.9)] <= FULL_OK_RATIO;
+  }
+  function tendReturnOffer() {
+    if (!autoLowApplied || quality !== "low" || downgrading) return;
+    var now = Date.now();
+    var quietFor = now - Math.max(lastStallAt, lastHoldAt, metricsT0, lastReconnectAt);
+    var ok = hasPlayed && mode === "live" && !holdingForBuffer && reconnectTimer === null &&
+             quietFor >= returnQuietMs() && linkCouldCarryFull();
+    // Withdrawn the moment the link stops looking able; offered again only
+    // after the full quiet period, so the badge does not flicker.
+    if (ok !== returnOffered) {
+      returnOffered = ok;
+      document.body.dataset.fulloffer = ok ? "1" : "0";
+      logDiag(ok ? "FULL offered: Low is arriving fast enough to carry it" : "FULL offer withdrawn");
+      syncQualityBadge();
+    }
+  }
+  /// Back to Full at the viewer's request. Remembers that it was a return,
+  /// so a second drop waits longer before offering a third try.
+  function returnToFull() {
+    try {
+      window.localStorage.setItem(QUALITY_KEY, "full");
+      window.localStorage.removeItem(LOWRES_KEY);
+    } catch (e) { return; }
+    autoLowWrite("tried", Math.max(1, autoLowTimes));
+    fail("Switching back to Full…");
+    setTimeout(function () { try { location.reload(); } catch (e) {} }, 600);
+  }
   var downgrading = false;
   function maybeDowngrade() {
     if (downgrading || quality !== "full") return false;
@@ -1418,7 +1498,9 @@
     try {
       window.localStorage.setItem(QUALITY_KEY, "low");
       window.localStorage.removeItem(LOWRES_KEY);
-      window.localStorage.setItem(AUTOLOW_KEY, "1");
+      // One more than however many times it has happened before a return.
+      var before = autoLowRead();
+      window.localStorage.setItem(AUTOLOW_KEY, before.state === "tried" ? "1:" + (before.n + 1) : "1");
     } catch (e) { return false; }
     downgrading = true;
     noteEvent({ kind: "downgrade", ahead: bufferedAhead(main) });
@@ -1433,11 +1515,23 @@
     return true;
   }
   function announceAutoLow() {
-    var was = null;
-    try { was = window.localStorage.getItem(AUTOLOW_KEY); window.localStorage.removeItem(AUTOLOW_KEY); } catch (e) {}
-    if (was !== "1") return;
+    var was = autoLowRead();
+    autoLowTimes = was.n;
+    // Only while it still stands. A viewer who has since chosen something
+    // else in Settings made a choice of their own, and the marker goes.
+    if ((was.state === "1" || was.state === "auto") && quality !== "low") { autoLowWrite("", 0); autoLowTimes = 0; return; }
+    if (was.state !== "1" && was.state !== "auto") return;
     autoLowApplied = true;
-    fail("Switched to Low: this link could not keep up with Full. Change it in Settings.");
+    var note = document.getElementById("autoLowNote");
+    if (note) {
+      note.hidden = false;
+      note.textContent = "Low was chosen by the player: this connection could not keep up with Full. " +
+        "Pick Full above to go back. When the connection looks able, the LOW badge on the picture " +
+        "reads FULL OK and a tap on it returns to Full.";
+    }
+    if (was.state !== "1") return;       // already said, on an earlier load
+    autoLowWrite("auto", was.n);
+    fail("Switched to Low: this connection could not keep up with Full. Tap LOW to change it.");
     setTimeout(function () { if (errEl.textContent.indexOf("Switched to Low") === 0) fail(""); }, 10000);
   }
 
@@ -2332,6 +2426,8 @@
           if (st.end && st.start) {
             segLoadRatios.push((st.end - st.start) / (d.frag.duration * 1000));
             if (segLoadRatios.length > 3) segLoadRatios.shift();
+            returnRatios.push((st.end - st.start) / (d.frag.duration * 1000));
+            if (returnRatios.length > FULL_OK_SEGMENTS) returnRatios.shift();
           }
         }
         logDiag("got  sn=" + d.frag.sn + " " + kb + "KB ttfb=" + (st.first && st.start ? Math.round(st.first - st.start) : "?") + "ms total=" + (st.end && st.start ? Math.round(st.end - st.start) : "?") + "ms");
@@ -4378,12 +4474,27 @@
     if (quality === "full") { document.body.dataset.q = "0"; return; }
     document.body.dataset.q = "1";
     var hd = stillShowing;
-    qbadge.textContent = hd ? "HD" : "LOW";
+    var offer = !hd && returnOffered;
+    qbadge.textContent = hd ? "HD" : (offer ? "LOW \u00B7 FULL OK" : "LOW");
     qbadge.title = hd
       ? "Stopped, so this frame is at full resolution"
-      : "Moving picture is the low-resolution rendition";
-    qbadge.className = hd ? "hd" : "";
+      : offer
+        ? "This connection looks able to carry Full again. Tap to switch back."
+        : "Moving picture is the low-resolution rendition. Tap to change it.";
+    qbadge.className = hd ? "hd" : (offer ? "offer" : "");
   }
+  /// The badge is the way back: straight to Full when it is on offer,
+  /// otherwise to the choice in Settings.
+  function qbadgePressed() {
+    if (returnOffered && quality === "low") { returnToFull(); return; }
+    openSettings();
+    var first = document.querySelector('input[name="q"]');
+    if (first && first.scrollIntoView) { try { first.scrollIntoView({ block: "center" }); } catch (e) {} }
+  }
+  qbadge.addEventListener("click", qbadgePressed);
+  qbadge.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); qbadgePressed(); }
+  });
 
   function toggleDrawer() {
     if (document.body.dataset.drawer === "1") closeDrawer(); else openDrawer();
@@ -4725,7 +4836,11 @@
     var opts = {};
     if (TOKEN_IN_HEADER && TOKEN) opts.headers = { Authorization: "Bearer " + TOKEN };
     fetch(url(STREAM, uri), opts)
-      .then(function (r) { return r.ok ? r.blob() : null; })
+      .then(function (r) {
+        if (r.ok) { sheetMisses = 0; sheetMissRounds = 0; return r.blob(); }
+        noteSheetMiss();
+        return null;
+      })
       .then(function (b) {
         if (!b || sheetUrls[uri] !== entry) return;
         entry.url = URL.createObjectURL(b);
@@ -4766,6 +4881,27 @@
   /// Gap between prefetches. Slow on purpose: there is no deadline, and the
   /// media stream has one.
   var PREFETCH_GAP_MS = 350;
+  /// Sheets the index names and the relay does not have.
+  ///
+  /// The index is the edge's and the sheets are the relay's, and the two can
+  /// disagree for hours: a relay that lost its window (a restart, before
+  /// 2026-10-10's fix; a retention change; a full disk) goes on being told
+  /// about sheets it no longer holds until they age out of the edge's list.
+  /// The prefetcher then walked every one of them — a tablet on a 5 Mbit/s
+  /// link asked for 388 missing sheets in three minutes, three a second,
+  /// while its picture was failing to start. Three misses in a row now stop
+  /// the sweep for a minute, doubling to ten; one sheet that arrives resets
+  /// it. A drag still asks for exactly the sheet under the thumb.
+  var SHEET_MISS_LIMIT = 3, SHEET_MISS_PAUSE_MS = 60000, SHEET_MISS_PAUSE_MAX_MS = 600000;
+  var sheetMisses = 0, sheetMissRounds = 0, prefetchPausedUntil = 0;
+  function noteSheetMiss() {
+    sheetMisses++;
+    if (sheetMisses < SHEET_MISS_LIMIT) return;
+    sheetMisses = 0;
+    prefetchPausedUntil = Date.now() + Math.min(SHEET_MISS_PAUSE_MAX_MS, SHEET_MISS_PAUSE_MS * Math.pow(2, sheetMissRounds));
+    sheetMissRounds++;
+    logDiag("thumbnail sheets missing on the relay; prefetch paused " + Math.round((prefetchPausedUntil - Date.now()) / 1000) + "s");
+  }
   /// How long after playback starts before any of this begins.
   var PREFETCH_START_DELAY_MS = 8000;
   var prefetchTimer = null, prefetchStarted = false;
@@ -4802,7 +4938,7 @@
     // pair loops forever, re-downloading the window at `PREFETCH_GAP_MS` and
     // churning blob URLs for as long as the tab is open. Eviction is left to
     // the operator's own fetches, which at least have a deadline behind them.
-    if (!scrubbing && sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES) {
+    if (!scrubbing && Date.now() >= prefetchPausedUntil && sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES) {
       var uri = nextSheetToPrefetch();
       if (uri) sheetUrl(uri);   // the fetch, the cache and the trim are shared
     }
@@ -5003,6 +5139,7 @@
         "  ahead=" + bufferedAhead(main).toFixed(1) + "s  catchingUp=" + catchingUp +
         (delayIsViewers ? " (off: the delay is the viewer's own; Live clears it)" : "") +
         "  holding=" + holdingForBuffer + "  stalls=" + stallCount +
+        (autoLowApplied ? "  autoLow x" + autoLowTimes + " fullOffered=" + returnOffered + " (needs " + Math.round(returnQuietMs() / 1000) + "s quiet, 9 in 10 of " + returnRatios.length + "/" + FULL_OK_SEGMENTS + " fetches under " + FULL_OK_RATIO + ")" : "") +
         "  slowLink=" + slowLink() + (segLoadRatios.length ? " (fetch/play " + segLoadRatios.map(function (x) { return x.toFixed(2); }).join(" ") + ")" : "") +
         "  bwEstimate=" + (mainHls && mainHls.bandwidthEstimate ? Math.round(mainHls.bandwidthEstimate / 1000) + "kbps" : "n/a"),
       "client=" + CLIENT + "  reports every " + (METRICS_MS / 1000) + "s" +
@@ -5386,6 +5523,11 @@
         window.localStorage.setItem(QUALITY_KEY, r.value);
         window.localStorage.removeItem(LOWRES_KEY);   // the boolean it replaced
       } catch (err) { /* nothing to do: the setting simply will not stick */ }
+      // The player's own drop to Low no longer stands. Going back to Full
+      // from it is remembered as a return (so a second drop is slower to
+      // offer a third try); anything else is simply the viewer's choice.
+      if (autoLowApplied && r.value === "full") autoLowWrite("tried", Math.max(1, autoLowTimes));
+      else autoLowWrite("", 0);
     // Reload rather than re-attach. Swapping the stream under a running
     // player means tearing down hls.js, re-seeking and re-deriving the clock
     // mid-session; a reload does all of that correctly and keeps the token

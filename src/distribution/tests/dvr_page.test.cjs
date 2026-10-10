@@ -1410,7 +1410,8 @@ test("three stalls in a minute on Full switch the page to Low and say so after t
   const again = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "low", "bilbycast.dvr.autolow.bigshow": "1" } });
   t.after(() => closePage(again));
   assert.match(again.document.getElementById("err").textContent, /Switched to Low/);
-  assert.equal(again.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), null);
+  // Said once; remembered for as long as it stands, so there is a way back.
+  assert.equal(again.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "auto:1");
   // Already on Low: stalls do not try to go lower.
   for (let i = 0; i < 4; i++) for (const cb of again.hlsHandlers.hlsError || []) cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
   assert.equal(again.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low");
@@ -1917,4 +1918,158 @@ test("on Low already, or when the pauses were seeks, nothing is switched", (t) =
     full.pause();
   }
   assert.equal(full.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null, "the wait after a seek is not a rebuffer pause");
+});
+
+// "Once the viewer is dropped to Low there is no way for them to return to
+// Full" — AJ, 2026-10-10. There was, three taps deep in Settings behind a
+// notice that vanished after ten seconds, and nothing ever suggested it.
+function onAutoLow(t, extra = {}) {
+  const w = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "low", "bilbycast.dvr.autolow.bigshow": "1", ...(extra.storage || {}) } });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  Object.defineProperty(main, "buffered", { get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + 8 }), configurable: true });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  const segments = (n, ms) => {
+    for (let i = 0; i < n; i++) for (const cb of w.hlsHandlers.hlsFragLoaded || []) {
+      cb("hlsFragLoaded", { frag: { sn: 500 + i, duration: 2, stats: { loaded: 6e5, loading: { start: 1000, first: 1050, end: 1000 + ms } } }, stats: { loaded: 6e5 } });
+    }
+  };
+  // The quiet period is minutes; move the page's clock rather than wait.
+  const RealNow = w.Date.now.bind(w.Date);
+  let skew = 0;
+  w.Date.now = () => RealNow() + skew;
+  const later = (secs) => { skew = secs * 1000; };
+  const tick = () => new Promise((r) => setTimeout(r, 1150));
+  return { w, main, segments, later, tick, badge: w.document.getElementById("qbadge") };
+}
+
+test("an automatic drop to Low is remembered, said once, and explained in Settings", (t) => {
+  const { w, badge } = onAutoLow(t);
+  assert.match(w.document.getElementById("err").textContent, /Switched to Low/);
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "auto:1");
+  const note = w.document.getElementById("autoLowNote");
+  assert.equal(note.hidden, false);
+  assert.match(note.textContent, /chosen by the player/);
+  assert.equal(badge.textContent, "LOW");
+
+  // A later reload: still the player's choice, not announced again.
+  const again = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "low", "bilbycast.dvr.autolow.bigshow": "auto:1" } });
+  t.after(() => closePage(again));
+  assert.equal(again.document.getElementById("err").textContent, "", "said once");
+  assert.equal(again.document.getElementById("autoLowNote").hidden, false, "but Settings still explains it");
+
+  // A viewer who chose Low themselves gets no such note and no marker.
+  const own = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "low" } });
+  t.after(() => closePage(own));
+  assert.equal(own.document.getElementById("autoLowNote").hidden, true);
+});
+
+test("the LOW badge is the way back: it opens the choice, and Full chosen there is remembered as a return", (t) => {
+  const { w, badge } = onAutoLow(t);
+  assert.notEqual(w.document.body.dataset.settings, "1");
+  badge.dispatchEvent(new w.Event("click", { bubbles: true }));
+  assert.equal(w.document.body.dataset.settings, "1", "a tap on LOW opens Settings at the choice");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low", "and changes nothing by itself");
+  const full = w.document.querySelector('input[name="q"][value="full"]');
+  full.checked = true;
+  full.dispatchEvent(new w.Event("change", { bubbles: true }));
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "full");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "tried:1");
+});
+
+test("when Low is arriving with room to spare, the badge offers Full and a tap takes it", async (t) => {
+  const { w, badge, segments, later, tick } = onAutoLow(t);
+  segments(20, 250);                      // a 2 s Low segment in a quarter of a second
+  await tick();
+  assert.equal(w.document.body.dataset.fulloffer || "0", "0", "not straight after the drop: the link has to behave for a while");
+  later(125);
+  await tick();
+  assert.equal(w.document.body.dataset.fulloffer, "1");
+  assert.equal(badge.textContent, "LOW · FULL OK");
+  assert.match(badge.title, /Tap to switch back/);
+  badge.dispatchEvent(new w.Event("click", { bubbles: true }));
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "full", "one tap, back on Full");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "tried:1");
+  assert.match(w.document.getElementById("err").textContent, /Switching back to Full/);
+});
+
+test("Full is not offered on a link that only just carries Low, and the offer is withdrawn on trouble", async (t) => {
+  const slow = onAutoLow(t);
+  slow.segments(20, 900);                 // the tablet of 2026-10-10: Low in 0.45 of real time
+  slow.later(600);
+  await slow.tick();
+  assert.equal(slow.w.document.body.dataset.fulloffer || "0", "0", "three times this would not fit");
+  assert.equal(slow.badge.textContent, "LOW");
+
+  // Mostly fast with a slow tail is not "with room to spare" either.
+  const mixed = onAutoLow(t);
+  mixed.segments(16, 200); mixed.segments(4, 1500);
+  mixed.later(600);
+  await mixed.tick();
+  assert.equal(mixed.w.document.body.dataset.fulloffer || "0", "0");
+
+  const good = onAutoLow(t);
+  good.segments(20, 200);
+  good.later(125);
+  await good.tick();
+  assert.equal(good.w.document.body.dataset.fulloffer, "1", "fixture: offered");
+  for (const cb of good.w.hlsHandlers.hlsError || []) cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+  await good.tick();
+  assert.equal(good.w.document.body.dataset.fulloffer, "0", "a stall takes the offer away");
+  assert.equal(good.badge.textContent, "LOW");
+});
+
+test("a return that fails is slower to be offered again", async (t) => {
+  // Back on Full after one drop ("tried:1"); the link starves again.
+  const w0 = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.autolow.bigshow": "tried:1" } });
+  t.after(() => closePage(w0));
+  const m0 = w0.document.getElementById("main");
+  let ahead = 0;
+  Object.defineProperty(m0, "buffered", { get: () => ({ length: 1, start: () => 0, end: () => m0.currentTime + ahead }), configurable: true });
+  m0.play();
+  m0.dispatchEvent(new w0.Event("playing"));
+  for (let i = 0; i < 3; i++) for (const cb of w0.hlsHandlers.hlsFragLoaded || []) {
+    cb("hlsFragLoaded", { frag: { sn: i, duration: 2, stats: { loaded: 2e6, loading: { start: 1000, first: 1100, end: 5000 } } }, stats: { loaded: 2e6 } });
+  }
+  for (let i = 0; i < 3; i++) { ahead = 0; m0.dispatchEvent(new w0.Event("waiting")); ahead = 12; m0.dispatchEvent(new w0.Event("progress")); }
+  assert.equal(w0.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low");
+  assert.equal(w0.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "1:2", "the second drop is counted");
+
+  const second = onAutoLow(t, { storage: { "bilbycast.dvr.autolow.bigshow": "1:2" } });
+  assert.equal(second.w.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "auto:2");
+  second.segments(20, 200);
+  second.later(125);
+  await second.tick();
+  assert.equal(second.w.document.body.dataset.fulloffer || "0", "0", "two minutes was enough the first time, not the second");
+  second.later(245);
+  await second.tick();
+  assert.equal(second.w.document.body.dataset.fulloffer, "1", "four minutes is");
+});
+
+// The relay lost its window at a restart and the edge's index went on naming
+// 135 sheets it no longer had; a tablet on 5 Mbit/s asked for 388 of them in
+// three minutes while its picture was failing to start.
+test("thumbnail sheets the relay does not have stop the prefetch instead of being asked for one after another", async (t) => {
+  const asked = [];
+  const vtt = ["WEBVTT", "X-BILBYCAST-EPOCH: " + new Date(T0).toISOString(), ""];
+  const stamp = (n) => "00:" + String(Math.floor(n / 60)).padStart(2, "0") + ":" + String(n % 60).padStart(2, "0") + ".000";
+  for (let i = 0; i < 50; i++) {
+    vtt.push(stamp(i * 2) + " --> " + stamp(i * 2 + 2), "thumbs-" + String(i).padStart(5, "0") + ".jpg#xywh=0,0,160,90", "");
+  }
+  const fetch = async (url) => {
+    const path = url.split("?")[0];
+    if (/thumbs\.vtt$/.test(path)) return { ok: true, status: 200, text: async () => vtt.join("\n"), headers: { get: () => null } };
+    if (/thumbs-\d+\.jpg$/.test(path)) { asked.push(path); return { ok: false, status: 404, blob: async () => null, headers: { get: () => null } }; }
+    return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), text: async () => "" };
+  };
+  // Prefetch starts eight seconds after playback does; do not wait for it.
+  const w = loadPage({ clock: true, token: TOKEN, fetch });
+  t.after(() => closePage(w));
+  const realSetTimeout = w.setTimeout.bind(w);
+  w.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, ms === 8000 ? 10 : ms, ...rest);
+  w.document.getElementById("main").dispatchEvent(new w.Event("playing"));
+  await new Promise((r) => setTimeout(r, 3500));   // ten prefetch steps' worth
+  assert.equal(asked.length, 3, "three misses and it stops: " + asked.length + " were asked for");
+  assert.equal(new Set(asked).size, 3, "and no sheet is asked for twice");
 });

@@ -943,6 +943,26 @@ backstop, an order of magnitude above any expiry the manager sets, so a manager
 that never comes back does not leave clips for ever.
 
 
+### A relay restart keeps the window
+
+A session's window is a per-stream storage policy the manager pushes, and
+per-stream policies are deliberately not written to the relay's config: a
+session that ended while the relay was down must not come back holding disk.
+The node default is short (60 s). So a relay that restarts adopts the
+segments and thumbnail sheets already on disk and **does not trim them by age
+until the manager has named its per-stream policies** — which it does within
+a minute of the relay reconnecting — or until ten minutes have passed
+(`origin::ADOPT_HOLD`). The byte bound and the free-space floor apply
+throughout. Before this (fixed 2026-10-10) the first segment PUT after a
+restart evicted the whole adopted window against the 60 s default, some forty
+seconds before the manager's push said to keep it: every restart cost every
+viewer their rewind, and left the edge's thumbnail index naming sheets the
+relay no longer had.
+
+The player defends itself against that last condition regardless: three
+thumbnail sheets in a row that the relay does not have pause the background
+prefetch for a minute, doubling to ten, and one sheet that arrives resets it.
+
 ### Live delay, falling back and catching up
 
 **Settings → Live delay** is how many seconds behind the live edge **Live**
@@ -971,6 +991,15 @@ From that starting point the player moves by itself:
   page says so, reloads on Low, and says so again. Pauses on a link that is
   fetching faster than real time move the live point back instead and leave
   the picture on Full. Never upgraded automatically; nothing is lower than Low.
+- **Back to Full** by the viewer, with a prompt. An automatic drop is
+  remembered for as long as it stands (`bilbycast.dvr.autolow.<stream>`):
+  Settings says the player chose Low, and the **LOW** badge on the picture is
+  a control — a tap opens Settings at the choice. When Low has arrived with
+  room to spare (nine in ten of the last twenty segments fetched in under a
+  fifth of their length) and there has been no trouble for two minutes, the
+  badge reads **LOW · FULL OK** and a tap returns to Full. The return is
+  offered, never taken. A return that fails doubles the quiet time before the
+  next offer (two minutes, four, eight … thirty).
 - **Pressing Live** (or `End`) drops whatever the link had pushed the live point
   to and returns to the preference at once.
 
