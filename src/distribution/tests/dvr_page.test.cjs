@@ -1326,6 +1326,11 @@ test("after a stall the player holds until a couple of segments are buffered, th
     configurable: true,
   });
   main.play();
+  // Start-up is not a slow link: before anything has played, a stall is just
+  // hls.js filling, and holding there costs every viewer a notice.
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.equal(main.paused, false, "the first stall before anything has played is not held");
+  main.dispatchEvent(new w.Event("playing"));
   main.dispatchEvent(new w.Event("waiting"));
   assert.equal(main.paused, true, "a stall with one second ahead holds playback");
   assert.match(err.textContent, /Buffering… 1 of 4 s/, "the viewer is told what it is waiting for");
@@ -1346,6 +1351,36 @@ test("after a stall the player holds until a couple of segments are buffered, th
   ahead = 9;
   main.dispatchEvent(new w.Event("progress"));
   assert.equal(main.paused, true, "a deliberate pause is not undone by the buffer filling");
+});
+
+// "Sits with state Buffering 2 of 4 s" on the tablet, 2026-10-10: its browser
+// never fired `progress` for MSE appends, so a hold that waited for that event
+// never ended. The buffer is polled now, and a segment landing is a check too.
+test("a hold ends when the buffer grows even if the browser never fires progress", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  let ahead = 1;
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + ahead }),
+    configurable: true,
+  });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.equal(main.paused, true, "fixture: holding");
+  // hls.js reports a segment buffered; no element event at all.
+  ahead = 5;
+  for (const cb of w.hlsHandlers.hlsFragBuffered || []) cb("hlsFragBuffered", {});
+  assert.equal(main.paused, false, "a segment landing releases the hold");
+
+  // And with neither event, the poll finds it.
+  ahead = 1;
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.equal(main.paused, true, "fixture: holding again");
+  ahead = 6;
+  await new Promise((r) => setTimeout(r, 600));
+  assert.equal(main.paused, false, "the poll released the hold without any event");
 });
 
 test("three stalls in a minute on Full switch the page to Low and say so after the reload", (t) => {

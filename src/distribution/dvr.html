@@ -1109,6 +1109,19 @@
   // a couple of segments are buffered, then play: fewer, longer pauses and a
   // picture that runs for a stretch, which is what a viewer can actually use.
   var holdingForBuffer = false, rebufferTarget = 0;
+  // The hold is released by *polling* the buffer, not by waiting for the
+  // element's `progress` event: desktop Chrome fires that on an MSE append,
+  // the tablet's browser did not, and a hold that waits for an event that
+  // never comes is a picture that never comes back ("sits at Buffering 2 of
+  // 4 s", 2026-10-10). A hard cap as well, so whatever the buffer does the
+  // picture is never held longer than this.
+  var holdTimer = null, holdStartedAt = 0;
+  var HOLD_POLL_MS = 250, HOLD_MAX_MS = 8000;
+  // The first stall of a session is start-up, not a slow link: nothing has
+  // played yet and hls.js is still filling. Holding there costs every viewer
+  // a "Buffering" notice on a perfectly good link.
+  var hasPlayed = false;
+  main.addEventListener("playing", function () { hasPlayed = true; });
 
   /// Seconds buffered ahead of the playhead, or 0.
   function bufferedAhead(v) {
@@ -1135,16 +1148,26 @@
   }
 
   function holdForBuffer() {
-    if (mode !== "live" || holdingForBuffer || accessExpired || scrubbing) return;
+    if (mode !== "live" || holdingForBuffer || accessExpired || scrubbing || !hasPlayed) return;
     rebufferTarget = rebufferGoal();
     if (bufferedAhead(main) >= rebufferTarget) return;
     holdingForBuffer = true;
+    holdStartedAt = Date.now();
     try { main.pause(); } catch (e) {}
     showBuffering();
+    if (holdTimer === null) holdTimer = setInterval(checkHold, HOLD_POLL_MS);
+  }
+
+  /// Enough buffered, or held long enough: play. Otherwise update the notice.
+  function checkHold() {
+    if (!holdingForBuffer) { if (holdTimer !== null) { clearInterval(holdTimer); holdTimer = null; } return; }
+    if (bufferedAhead(main) >= rebufferTarget || Date.now() - holdStartedAt >= HOLD_MAX_MS) releaseHold(true);
+    else showBuffering();
   }
 
   /// Enough is buffered, or the viewer took over: play, or stop holding.
   function releaseHold(play) {
+    if (holdTimer !== null) { clearInterval(holdTimer); holdTimer = null; }
     if (!holdingForBuffer) return;
     holdingForBuffer = false;
     fail("");
@@ -1152,11 +1175,8 @@
   }
 
   main.addEventListener("waiting", function () { holdForBuffer(); });
-  main.addEventListener("progress", function () {
-    if (!holdingForBuffer) return;
-    if (bufferedAhead(main) >= rebufferTarget) releaseHold(true);
-    else showBuffering();
-  });
+  // Where the browser does fire it, this is simply sooner than the next poll.
+  main.addEventListener("progress", checkHold);
 
   // ── falling back to Low on a link that cannot carry Full ──────────────────
   // There is no bitrate ladder for hls.js to walk: Full and Low are separate
@@ -1985,7 +2005,12 @@
         }
       });
       // The link is back when a segment is.
-      hls.on(Hls.Events.FRAG_BUFFERED, function () { reconnected(video); });
+      hls.on(Hls.Events.FRAG_BUFFERED, function () {
+        reconnected(video);
+        // A segment just landed: the hold may be over, whatever the element
+        // does or does not fire.
+        if (video === main) checkHold();
+      });
       hls.loadSource(src);
       hls.attachMedia(video);
       return hls;
