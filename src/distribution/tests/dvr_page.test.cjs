@@ -1609,3 +1609,141 @@ test("a page without a token sends no report, and neither does a page whose acce
   await new Promise((r) => setTimeout(r, 10));
   assert.ok(!calls.some((c) => /metrics/.test(c)), "an expired tab has nothing to say: " + calls.join(", "));
 });
+
+// Live delay, catch-up and the trouble history, 2026-10-10. A tablet paused
+// for 27 s in its first minutes and then sat 34 s behind live for the rest of
+// the session, on a link fetching every segment four times over.
+test("the live delay is the viewer's setting: Live starts there, a poor link moves back from it, Live returns to it", (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const input = w.document.getElementById("liveDelay");
+  const hb = () => Number(w.document.body.dataset.holdback);
+  assert.equal(input.value, "8", "the default is the four segments it always was");
+  assert.equal(hb(), 8);
+
+  input.value = "15";
+  input.dispatchEvent(new w.Event("change", { bubbles: true }));
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.livedelay"), "15", "kept on the device");
+  assert.equal(hb(), 15, "and applied now, not on reload");
+
+  // Never closer than three segments, never further than a minute.
+  input.value = "2";
+  input.dispatchEvent(new w.Event("change", { bubbles: true }));
+  assert.equal(input.value, "6");
+  assert.equal(hb(), 6);
+  input.value = "500";
+  input.dispatchEvent(new w.Event("change", { bubbles: true }));
+  assert.equal(input.value, "60");
+  input.value = "10";
+  input.dispatchEvent(new w.Event("change", { bubbles: true }));
+
+  // A poor link pushes the live point back from the preference…
+  const stall = () => {
+    for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+  };
+  // (on Low, so three stalls are not a quality switch)
+  stall(); stall();
+  assert.ok(hb() > 10, "two stalls moved the live point back: " + hb());
+  assert.match(w.document.getElementById("liveDelayNow").textContent, /behind for now/, "and Settings says so");
+  // …and the viewer pressing Live returns to it at once.
+  click(w, "#btnLive");
+  assert.equal(hb(), 10, "Live is the preference again");
+  assert.equal(w.document.getElementById("liveDelayNow").textContent, "");
+
+  // A stored preference is where a fresh page starts.
+  const again = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.livedelay": "20" } });
+  t.after(() => closePage(again));
+  assert.equal(again.document.body.dataset.holdback, "20");
+  assert.equal(again.document.getElementById("liveDelay").value, "20");
+  // And nonsense in storage is the default, not a broken player.
+  const junk = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.livedelay": "banana" } });
+  t.after(() => closePage(junk));
+  assert.equal(junk.document.body.dataset.holdback, "8");
+});
+
+test("a rebuffer pause moves the live point back and is kept in the trouble history", async (t) => {
+  const posts = [];
+  const fetch = async (url, init = {}) => {
+    if (/\/metrics$/.test(url.split("?")[0])) {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200, json: async () => ({ next_report_secs: 20 }) };
+    }
+    return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), text: async () => "" };
+  };
+  const w = loadPage({ token: TOKEN, fetch });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  let ahead = 1;
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + ahead }),
+    configurable: true,
+  });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.equal(main.paused, true, "fixture: holding");
+  assert.equal(w.document.body.dataset.holdback, "10", "one pause, one segment further back");
+  ahead = 6;
+  main.dispatchEvent(new w.Event("progress"));
+  assert.equal(main.paused, false);
+
+  w.document.dispatchEvent(new w.Event("visibilitychange"));
+  await new Promise((r) => setTimeout(r, 10));
+  const r = posts[posts.length - 1];
+  assert.equal(r.v, 2);
+  assert.equal(r.holds, 1);
+  assert.equal(r.holds_1m, 1);
+  assert.equal(r.holds_5m, 1);
+  assert.equal(r.delay_pref_s, 8);
+  assert.equal(r.holdback_s, 10);
+  assert.equal(r.events.length, 1);
+  assert.equal(r.events[0].kind, "hold");
+  assert.equal(r.events[0].ahead_s, 1);
+  assert.equal(r.events[0].goal_s, 4);
+  assert.equal(typeof r.events[0].ms, "number");
+  assert.ok(!("net_type" in r), "the browser's own link guess is no longer sent");
+});
+
+test("a playhead left behind by pauses is brought back to the live point, and only while the link is quiet", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  let ahead = 30;
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + ahead }),
+    configurable: true,
+  });
+  // 50 s behind a live edge at 100, with 30 s buffered: the tablet's state.
+  main.currentTime = 50;
+  main.play();
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1, "nothing has played yet: start-up is not catch-up");
+  main.dispatchEvent(new w.Event("playing"));
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1.05, "behind the live point with a deep buffer: a touch fast");
+  assert.equal(w.document.body.dataset.catchup, "1");
+  // The rate buttons still say 100%: this is not the viewer's rate.
+  assert.equal(w.document.querySelector('[data-rate="1"]').getAttribute("aria-pressed"), "true");
+
+  // Back at the live point: ordinary speed again.
+  main.currentTime = 92;
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1, "at the live point it stops");
+  assert.equal(w.document.body.dataset.catchup, "0");
+
+  // Behind again, but the buffer is thin: playing fast would only empty it.
+  main.currentTime = 50;
+  ahead = 2;
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1, "a thin buffer is not played fast");
+
+  // Deep buffer again, catching up — and the viewer picks 50%: theirs wins.
+  ahead = 30;
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1.05);
+  click(w, '[data-rate="0.5"]');
+  assert.equal(main.playbackRate, 0.5);
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 0.5, "catch-up does not fight the viewer's own rate");
+  assert.equal(w.document.body.dataset.catchup, "0");
+});

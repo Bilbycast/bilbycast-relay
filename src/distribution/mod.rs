@@ -3201,7 +3201,9 @@ mod tests {
         // a new preference is welcome and a new secret is not. Comments are
         // skipped — this section explains itself in prose, and prose stores
         // nothing.
-        const NON_SECRET_KEYS: [&str; 9] = [
+        const NON_SECRET_KEYS: [&str; 10] = [
+            // How far behind live the viewer prefers to sit; a number.
+            "LIVEDELAY_KEY",
             "MARKS_KEY",
             "LOWRES_KEY",
             "QUALITY_KEY",

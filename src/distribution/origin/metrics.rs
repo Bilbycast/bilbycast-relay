@@ -32,7 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 
 use crate::distribution::DistributionState;
-use crate::stats::ViewerMetricReport;
+use crate::stats::{ViewerEvent, ViewerMetricReport};
 
 /// How often the page is asked to report. Carried in every reply, as the beat
 /// cadence is, so a change reaches tabs already open.
@@ -109,14 +109,41 @@ pub struct ViewerReport {
     #[serde(default)]
     pub up_s: f64,
     #[serde(default)]
-    pub net_type: String,
+    pub v: f64,
     #[serde(default)]
-    pub net_down_mbps: f64,
+    pub stalls_1m: f64,
     #[serde(default)]
-    pub net_rtt_ms: f64,
+    pub holds_1m: f64,
+    #[serde(default)]
+    pub reconnects_1m: f64,
+    #[serde(default)]
+    pub delay_pref_s: f64,
+    #[serde(default)]
+    pub catching_up: bool,
+    #[serde(default)]
+    pub events: Vec<ReportedEvent>,
     #[serde(default)]
     pub ua: String,
 }
+
+/// One event as the page sends it; bounded like everything else.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ReportedEvent {
+    #[serde(default)]
+    pub ago_s: f64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub ahead_s: f64,
+    #[serde(default)]
+    pub goal_s: f64,
+    #[serde(default)]
+    pub ms: f64,
+}
+
+/// Most events kept from one report. The page sends eight; a page that sends
+/// more has the oldest dropped.
+pub const MAX_EVENTS: usize = 8;
 
 /// Why a report was refused.
 #[derive(Debug, PartialEq)]
@@ -200,9 +227,31 @@ impl ViewerReport {
             seg_load_ms: clamp_u32(self.seg_load_ms, 600_000),
             seg_kb: clamp_u32(self.seg_kb, 10_000_000),
             up_s: clamp_u32(self.up_s, u32::MAX),
-            net_type: bounded_word(&self.net_type, 16, &[], ""),
-            net_down_mbps: clamp_f32(self.net_down_mbps, 100_000.0),
-            net_rtt_ms: clamp_u32(self.net_rtt_ms, 600_000),
+            v: clamp_u32(self.v, 1000),
+            stalls_1m: clamp_u32(self.stalls_1m, 100_000),
+            holds_1m: clamp_u32(self.holds_1m, 100_000),
+            reconnects_1m: clamp_u32(self.reconnects_1m, 100_000),
+            delay_pref_s: clamp_f32(self.delay_pref_s, 600.0),
+            catching_up: self.catching_up,
+            events: {
+                let skip = self.events.len().saturating_sub(MAX_EVENTS);
+                self.events
+                    .into_iter()
+                    .skip(skip)
+                    .map(|e| ViewerEvent {
+                        ago_s: clamp_u32(e.ago_s, 86_400),
+                        kind: bounded_word(
+                            &e.kind,
+                            16,
+                            &["stall", "hold", "reconnect", "downgrade"],
+                            "unknown",
+                        ),
+                        ahead_s: clamp_f32(e.ahead_s, 3600.0),
+                        goal_s: clamp_f32(e.goal_s, 3600.0),
+                        ms: clamp_u32(e.ms, 3_600_000),
+                    })
+                    .collect()
+            },
             ua: bounded_word(&self.ua, 120, &[], ""),
         }
     }
@@ -410,8 +459,16 @@ mod tests {
             bw_kbps: f64::INFINITY,
             ahead_s: f64::NAN,
             seg_ttfb_ms: 1e12,
-            net_type: "4g\u{0}\u{7}".into(),
-            ua: "x".repeat(500),
+            ua: "x\u{0}\u{7}".repeat(250),
+            v: 2.0,
+            events: (0..20)
+                .map(|i| ReportedEvent {
+                    ago_s: f64::from(i),
+                    kind: if i == 19 { "hold".into() } else { "<script>".into() },
+                    ms: -5.0,
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         }
         .sanitize("show");
@@ -421,8 +478,13 @@ mod tests {
         assert_eq!(r.bw_kbps, 0);
         assert_eq!(r.ahead_s, 0.0);
         assert_eq!(r.seg_ttfb_ms, 600_000);
-        assert_eq!(r.net_type, "4g");
-        assert_eq!(r.ua.len(), 120);
+        assert_eq!(r.ua, "x".repeat(120), "control characters dropped, then cut");
+        assert_eq!(r.v, 2);
+        assert_eq!(r.events.len(), MAX_EVENTS, "the newest eight of twenty");
+        assert_eq!(r.events[0].ago_s, 12);
+        assert_eq!(r.events[0].kind, "unknown");
+        assert_eq!(r.events[7].kind, "hold");
+        assert_eq!(r.events[7].ms, 0);
     }
 
     #[test]

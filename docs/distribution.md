@@ -942,6 +942,35 @@ with no record beside it, an emptied stream directory — and holds a seven-day
 backstop, an order of magnitude above any expiry the manager sets, so a manager
 that never comes back does not leave clips for ever.
 
+
+### Live delay, falling back and catching up
+
+**Settings → Live delay** is how many seconds behind the live edge **Live**
+puts the playhead (default 8, range 6–60, remembered per device under
+`bilbycast.dvr.livedelay`). At the live edge the buffer ahead can never be
+deeper than the distance behind live, so this number *is* the forward buffer:
+further back is steadier on a poor connection, closer is nearer the moment.
+
+From that starting point the player moves by itself:
+
+- **Back** when the link struggles. Every rebuffer pause, and the second stall
+  inside a minute, moves the live point one segment further back — up to twelve
+  seconds past the preference — and it earns a second back for every
+  trouble-free two minutes.
+- **Forward** when the link is healthy. A pause leaves the playhead later by
+  its own length; with thirty seconds trouble-free and at least six seconds
+  buffered, the player runs at 1.05× until it is back at the live point, then
+  returns to 1×. The rate buttons never show it and any transport control ends
+  it.
+- **Pressing Live** (or `End`) drops whatever the link had pushed the live point
+  to and returns to the preference at once.
+
+The debug panel (`?debug=1`) shows the preference, the current hold-back, the
+distance behind live, whether it is catching up, and a **trouble** list — the
+last twenty stalls, pauses, reconnects and downgrades with the buffer each
+happened at — which, unlike the transport log beneath it, does not scroll away.
+The newest eight ride the playback report to the manager.
+
 ### Picture modes
 
 Three points on the curve, chosen in Settings. They are genuinely different

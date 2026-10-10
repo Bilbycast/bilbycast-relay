@@ -192,13 +192,39 @@ pub struct ViewerMetricReport {
     pub seg_kb: u32,
     /// Seconds since the page loaded.
     pub up_s: u32,
-    /// The browser's own reading of its link (`navigator.connection`), when it
-    /// offers one: effective type, downlink Mbit/s, round trip ms.
-    pub net_type: String,
-    pub net_down_mbps: f32,
-    pub net_rtt_ms: u32,
+    /// The report's own version. 2 and later carry the last-minute counts,
+    /// the event history, the preferred delay and `catching_up`; the manager
+    /// judges an older report by the five-minute counts alone. 0 from a page
+    /// that predates the field.
+    pub v: u32,
+    /// The same three counters over the last minute, so a viewer who has
+    /// recovered is not read as struggling for five.
+    pub stalls_1m: u32,
+    pub holds_1m: u32,
+    pub reconnects_1m: u32,
+    /// Seconds behind live the viewer prefers (their setting); `holdback_s`
+    /// is where the link has pushed it for now.
+    pub delay_pref_s: f32,
+    /// Whether the player is running a touch fast to win back delay.
+    pub catching_up: bool,
+    /// The most recent trouble, oldest first: at most eight.
+    pub events: Vec<ViewerEvent>,
     /// The browser, truncated — enough to tell a tablet from a desktop.
     pub ua: String,
+}
+
+/// One stall, rebuffer pause, reconnect or downgrade a player went through.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ViewerEvent {
+    /// Seconds before the report it happened.
+    pub ago_s: u32,
+    /// `stall`, `hold`, `reconnect` or `downgrade`.
+    pub kind: String,
+    /// Seconds buffered ahead when it happened.
+    pub ahead_s: f32,
+    /// For a hold: the buffer it waited for, and how long it held (ms).
+    pub goal_s: f32,
+    pub ms: u32,
 }
 
 /// Snapshot of the distribution subsystem telemetry.
