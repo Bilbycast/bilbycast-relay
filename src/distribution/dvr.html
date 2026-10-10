@@ -968,6 +968,135 @@
   // the LL-HLS hold-back convention.
   var LIVE_BACKOFF = 3;
 
+  // ── riding out a poor link ───────────────────────────────────────────────
+  // First field use on a weak 4G link (2026-10-10): the picture reached the
+  // end of its buffer and never came back, Full and Balanced alike. Three
+  // things, each handled below:
+  //  * hls.js raised a fatal network error once its retries ran out, and the
+  //    page ended the session instead of calling startLoad() to resume;
+  //  * every buffer stall was answered with a seek to the live point, which
+  //    on a slow link lands on a position with nothing buffered either;
+  //  * the live point sat a fixed three seconds behind the edge, so a link
+  //    that could not keep up had no slack to play from.
+  // How far behind the edge "live" sits now. Starts at LIVE_BACKOFF and grows
+  // by one segment each time the buffer runs dry, so a link that keeps
+  // stalling plays from further back and has more ahead of it. Relaxes again
+  // after a stall-free spell.
+  var liveHoldBack = LIVE_BACKOFF;
+  var HOLDBACK_MAX = 15;        // seconds; past this the viewer would notice the delay
+  var HOLDBACK_RELAX_MS = 120000; // a stall-free two minutes earns a second back
+  var stallCount = 0, lastStallAt = 0, holdbackRelaxTimer = null;
+
+  // Reconnecting after hls.js gave up: attempts, each further apart, until a
+  // segment lands or the page closes.
+  var reconnectTimer = null, reconnectAttempts = 0, reconnectingLabel = null;
+  var RECONNECT_FIRST_MS = 1000, RECONNECT_MAX_MS = 15000;
+  // hls.js's media-error recovery is good for a few goes, not forever.
+  var mediaRecoveries = [];
+
+  function segmentSeconds() {
+    try {
+      var lv = mainHls && mainHls.levels && mainHls.levels[mainHls.currentLevel];
+      var d = lv && lv.details && lv.details.targetduration;
+      if (d > 0 && d < 30) return d;
+    } catch (e) {}
+    return 2;
+  }
+
+  /// Hand the current hold-back to hls.js, which computes liveSyncPosition
+  /// from its config on every playlist refresh.
+  function applyHoldBack() {
+    if (mainHls && mainHls.config) mainHls.config.liveSyncDuration = liveHoldBack;
+    // Published for the debug panel and the page tests.
+    document.body.dataset.holdback = String(liveHoldBack);
+  }
+
+  /// One stall episode. Stalls inside a minute of each other count as the
+  /// same bad patch; a fresh patch moves the live point back a segment.
+  function noteStall() {
+    var now = Date.now();
+    if (now - lastStallAt > 60000) stallCount = 0;
+    lastStallAt = now;
+    stallCount++;
+    if (stallCount >= 2 && liveHoldBack < HOLDBACK_MAX) {
+      liveHoldBack = Math.min(HOLDBACK_MAX, liveHoldBack + segmentSeconds());
+      applyHoldBack();
+      // Earn it back slowly: one second per stall-free period, down to the
+      // default, so a link that recovers is not stuck watching late.
+      if (holdbackRelaxTimer === null) {
+        holdbackRelaxTimer = setInterval(function () {
+          if (Date.now() - lastStallAt < HOLDBACK_RELAX_MS) return;
+          liveHoldBack = Math.max(LIVE_BACKOFF, liveHoldBack - 1);
+          applyHoldBack();
+          if (liveHoldBack === LIVE_BACKOFF) { clearInterval(holdbackRelaxTimer); holdbackRelaxTimer = null; }
+        }, HOLDBACK_RELAX_MS);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /// Is the playhead sitting past the live point — parked beyond the last
+  /// decodable frame? That is the stall a seek fixes. The other kind, an
+  /// empty buffer on a slow link, is not: hls.js is fetching and resumes
+  /// when a segment lands, and a seek would only land somewhere emptier.
+  function stalledPastEdge(v) {
+    var r = range(v);
+    return !!(r && v.currentTime > r.end - 0.5);
+  }
+
+  function scheduleReconnect(hls, video, label) {
+    if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+    var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
+    reconnectAttempts++;
+    reconnectingLabel = label;
+    fail("Connection lost — reconnecting" + (reconnectAttempts > 1 ? " (attempt " + reconnectAttempts + ")" : "") + "…");
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      // -1 resumes from where it stopped; hls.js refetches the playlist and
+      // carries on from the current position.
+      try { hls.startLoad(-1); } catch (e) {}
+      if (video === main && !main.paused) main.play().catch(function () {});
+    }, delay);
+  }
+
+  /// A segment landed: the link is back.
+  function reconnected(video) {
+    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (reconnectAttempts === 0 && reconnectingLabel === null) return;
+    reconnectAttempts = 0;
+    reconnectingLabel = null;
+    fail("");
+    // Live rejoins the edge rather than resuming into a stale buffer.
+    if (video === main && mode === "live") goLive();
+  }
+
+  /// hls.js's own media-error recovery, bounded: three goes in thirty
+  /// seconds, the second and later swapping the audio codec as its docs ask.
+  function recoverMedia(hls) {
+    var now = Date.now();
+    mediaRecoveries = mediaRecoveries.filter(function (t) { return now - t < 30000; });
+    if (mediaRecoveries.length >= 3) return false;
+    var again = mediaRecoveries.length > 0;
+    mediaRecoveries.push(now);
+    try {
+      if (again && hls.swapAudioCodec) hls.swapAudioCodec();
+      hls.recoverMediaError();
+    } catch (e) { return false; }
+    return true;
+  }
+
+  // A link that comes back, or a tab that comes back, is worth an attempt
+  // now rather than at the end of the current back-off.
+  function reconnectNow() {
+    if (reconnectTimer === null || !mainHls) return;
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    reconnectAttempts = Math.max(0, reconnectAttempts - 1);
+    scheduleReconnect(mainHls, main, reconnectingLabel || "main");
+  }
+  window.addEventListener("online", reconnectNow);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) reconnectNow(); });
+
   // Hysteresis for the LIVE badge.
   //
   // Live playback deliberately sits ~LIVE_BACKOFF behind the edge, and the
@@ -1677,6 +1806,23 @@
         backBufferLength: 120,
         maxBufferLength: 30,
         lowLatencyMode: false,
+        // Where "live" sits behind the edge; raised by noteStall on a link
+        // that keeps running dry.
+        liveSyncDuration: liveHoldBack,
+        // More patience than the defaults (two playlist retries, six segment
+        // retries, a second apart) before anything is called fatal: a bad
+        // patch of 4G exhausts those in under a minute. Fatal is recovered
+        // above in any case; this keeps the common dip from getting there.
+        playlistLoadPolicy: { default: {
+          maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 20000,
+          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 500, maxRetryDelayMs: 4000, backoff: "exponential" },
+          errorRetry:   { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
+        } },
+        fragLoadPolicy: { default: {
+          maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 120000,
+          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 500, maxRetryDelayMs: 4000, backoff: "exponential" },
+          errorRetry:   { maxNumRetry: 8, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
+        } },
         // Every manifest and segment fetch carries the credential. Applies to
         // both because hls.js routes them through the same hook.
         xhrSetup: function (xhr) {
@@ -1715,6 +1861,17 @@
         }
 
         if (data.fatal) {
+          // hls.js giving up on the network is not the link being gone: its
+          // contract is that the page calls startLoad() to resume, and the
+          // picture stayed stopped because nothing did. Reconnect for as long
+          // as the page is open; the beat keeps counting the viewer. A media
+          // error gets hls.js's own recovery, a few times. The rest is the
+          // end, as before.
+          if (data.type === "networkError") {
+            scheduleReconnect(hls, video, label);
+            return;
+          }
+          if (data.type === "mediaError" && recoverMedia(hls)) return;
           fail(label + ": " + data.type + " / " + data.details);
           // hls.js never retries a 4xx and nothing here re-attaches, so a
           // fatal error on the main element is the picture stopping for
@@ -1722,11 +1879,18 @@
           // own fatal error leaves the visible picture running.
           if (video === main) stopBeating();
         } else if (data.details === "bufferStalledError") {
-          // Usually means the playhead is sitting past what is buffered.
-          // Nudge back to the live sync point rather than sitting black.
-          if (video === main && mode === "live") goLive();
+          // Two kinds of stall, one seek. Past the edge: nudge back to the
+          // live point. Empty buffer on a slow link: leave hls.js to fetch,
+          // and move the live point further back so there is more ahead of
+          // the playhead next time (see noteStall).
+          if (video === main) {
+            var grew = noteStall();
+            if (mode === "live" && (stalledPastEdge(main) || grew)) goLive();
+          }
         }
       });
+      // The link is back when a segment is.
+      hls.on(Hls.Events.FRAG_BUFFERED, function () { reconnected(video); });
       hls.loadSource(src);
       hls.attachMedia(video);
       return hls;
@@ -1783,7 +1947,7 @@
       return mainHls.liveSyncPosition;
     }
     var r = range(main);
-    return r ? Math.max(r.start, r.end - LIVE_BACKOFF) : null;
+    return r ? Math.max(r.start, r.end - liveHoldBack) : null;
   }
 
   function goLive() {
@@ -5212,6 +5376,7 @@
   renderMarks();
   startMarksPoll();
   mainHls = attach(main, MAIN, "main");
+  applyHoldBack();
   // The proxy is NOT attached up front. Two live MSE elements hold two
   // decoders, and Chrome's hardware decoder budget is small and shared —
   // exhausting it makes the *visible* element play with no picture, which

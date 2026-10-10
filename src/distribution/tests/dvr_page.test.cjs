@@ -87,12 +87,19 @@ function loadPage(opts = {}) {
       }]
     : undefined;
   window.hlsHandlers = {};
-  window.Hls = function () {
+  // What the page asked of hls.js, for the recovery tests: `startLoad`,
+  // `recoverMediaError`, `swapAudioCodec`.
+  window.hlsCalls = [];
+  window.Hls = function (config) {
     return {
+      config: config || {},
       loadSource() {},
       attachMedia() {},
       on(ev, cb) { (window.hlsHandlers[ev] = window.hlsHandlers[ev] || []).push(cb); },
       destroy() {},
+      startLoad(pos) { window.hlsCalls.push(["startLoad", pos]); },
+      recoverMediaError() { window.hlsCalls.push(["recoverMediaError"]); },
+      swapAudioCodec() { window.hlsCalls.push(["swapAudioCodec"]); },
       liveSyncPosition: 100,
       levels,
       currentLevel: 0,
@@ -100,7 +107,7 @@ function loadPage(opts = {}) {
   };
   if (opts.fetch) window.fetch = opts.fetch;
   window.Hls.isSupported = () => !opts.nativeHls;
-  window.Hls.Events = { ERROR: "hlsError", MANIFEST_PARSED: "hlsManifestParsed" };
+  window.Hls.Events = { ERROR: "hlsError", MANIFEST_PARSED: "hlsManifestParsed", FRAG_BUFFERED: "hlsFragBuffered" };
 
   for (const id of ["main", "proxy"]) {
     const v = window.document.getElementById(id);
@@ -1273,4 +1280,81 @@ test("the self-test ends a loop before it drives the player", (t) => {
   assert.equal(w.document.body.dataset.loop, "1", "fixture: the loop should have started");
   click(w, "#stRun");
   assert.equal(w.document.body.dataset.loop, "0", "the self-test ran with a loop fencing the transport");
+});
+
+// First field use on a weak link, 2026-10-10: the picture reached the end of
+// its buffer and never came back. hls.js had raised a fatal network error
+// and the page ended the session instead of resuming it.
+test("a fatal network error is reconnected, not the end of the session", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const err = w.document.getElementById("err");
+  for (const cb of w.hlsHandlers.hlsError || []) {
+    cb("hlsError", { type: "networkError", details: "levelLoadError", fatal: true, response: { code: 0 } });
+  }
+  assert.match(err.textContent, /reconnecting/i, "the viewer is told the link dropped, not shown an hls.js code");
+  assert.equal(w.hlsCalls.length, 0, "the first attempt waits for its back-off");
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.deepEqual(w.hlsCalls[0], ["startLoad", -1], "hls.js is asked to resume from where it stopped");
+
+  // Still failing: the next attempt is further off, and the notice counts.
+  for (const cb of w.hlsHandlers.hlsError || []) {
+    cb("hlsError", { type: "networkError", details: "fragLoadError", fatal: true, response: { code: 0 } });
+  }
+  assert.match(err.textContent, /attempt 2/, "a second attempt says so");
+
+  // A segment lands: the notice clears and live rejoins the edge.
+  const main = w.document.getElementById("main");
+  main.currentTime = 40;
+  for (const cb of w.hlsHandlers.hlsFragBuffered || []) cb("hlsFragBuffered", {});
+  assert.equal(err.textContent, "", "the reconnect notice is cleared once a segment arrives");
+  assert.equal(main.currentTime, 100, "live rejoined the edge rather than resuming a stale buffer");
+});
+
+test("a fatal media error gets hls.js's recovery a bounded number of times", (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const fire = () => {
+    for (const cb of w.hlsHandlers.hlsError || []) {
+      cb("hlsError", { type: "mediaError", details: "bufferAppendError", fatal: true });
+    }
+  };
+  fire();
+  assert.deepEqual(w.hlsCalls, [["recoverMediaError"]]);
+  fire();
+  assert.deepEqual(w.hlsCalls.slice(1), [["swapAudioCodec"], ["recoverMediaError"]], "the second go swaps the audio codec first");
+  fire();
+  fire();
+  assert.equal(w.document.getElementById("err").textContent.includes("mediaError"), true, "the fourth within thirty seconds is the end");
+});
+
+test("a stall on an empty buffer is left to hls.js, a stall past the edge is nudged back, and repeated stalls move live earlier", (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  const stall = () => {
+    for (const cb of w.hlsHandlers.hlsError || []) {
+      cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+    }
+  };
+  // Mid-window with nothing buffered ahead: hls.js is fetching; do not seek.
+  main.currentTime = 50;
+  stall();
+  assert.equal(main.currentTime, 50, "an empty buffer is not a reason to seek");
+  // Past the live point, up against the seekable end: the parked-beyond-the-
+  // last-frame case. The stub's live point is 100; let the edge run on past
+  // it, as a live playlist does, and park the playhead there.
+  Object.defineProperty(main, "seekable", {
+    get: () => ({ length: 1, start: () => 0, end: () => 105 }),
+    configurable: true,
+  });
+  main.currentTime = 104.8;
+  stall();
+  assert.equal(main.currentTime, 100, "parked past the edge is nudged to the live point");
+  // Two stalls in a minute: the live point moves a segment further back, so
+  // there is more buffer ahead next time, and hls.js is told.
+  const hls = w.mainHlsForTests ? w.mainHlsForTests() : null;
+  assert.ok(w.document.body.dataset.holdback, "the page publishes its hold-back for inspection");
+  assert.ok(Number(w.document.body.dataset.holdback) > 3, "after repeated stalls live sits further behind the edge: " + w.document.body.dataset.holdback);
+  if (hls) assert.equal(hls.config.liveSyncDuration, Number(w.document.body.dataset.holdback));
 });
