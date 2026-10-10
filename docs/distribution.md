@@ -961,7 +961,16 @@ From that starting point the player moves by itself:
   its own length; with thirty seconds trouble-free and at least six seconds
   buffered, the player runs at 1.05× until it is back at the live point, then
   returns to 1×. The rate buttons never show it and any transport control ends
-  it.
+  it. Delay the viewer made themselves — a pause, a passage at 50% — is left
+  alone until they press Live. The wait after a seek is not counted as a
+  pause at all.
+- **Down to Low** when the link cannot carry Full. Three stalls in a minute,
+  or three rebuffer pauses in a minute while segments are arriving slower than
+  they play (the middle of the last three fetches taking more than 0.8 of the
+  segment's length, or one still in flight after one and a half times it). The
+  page says so, reloads on Low, and says so again. Pauses on a link that is
+  fetching faster than real time move the live point back instead and leave
+  the picture on Full. Never upgraded automatically; nothing is lower than Low.
 - **Pressing Live** (or `End`) drops whatever the link had pushed the live point
   to and returns to the preference at once.
 

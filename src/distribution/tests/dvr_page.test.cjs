@@ -107,7 +107,10 @@ function loadPage(opts = {}) {
   };
   if (opts.fetch) window.fetch = opts.fetch;
   window.Hls.isSupported = () => !opts.nativeHls;
-  window.Hls.Events = { ERROR: "hlsError", MANIFEST_PARSED: "hlsManifestParsed", FRAG_BUFFERED: "hlsFragBuffered" };
+  window.Hls.Events = {
+    ERROR: "hlsError", MANIFEST_PARSED: "hlsManifestParsed", FRAG_BUFFERED: "hlsFragBuffered",
+    FRAG_LOADING: "hlsFragLoading", FRAG_LOADED: "hlsFragLoaded", LEVEL_LOADED: "hlsLevelLoaded",
+  };
 
   for (const id of ["main", "proxy"]) {
     const v = window.document.getElementById(id);
@@ -1817,4 +1820,101 @@ test("the wait after a seek holds the picture but is not counted as trouble", as
   assert.equal(r.holds, 0, "not counted");
   assert.equal(r.hold_ms, 0);
   assert.equal(r.events.length, 0, "not in the trouble history");
+});
+
+// The gap left open at the last review, closed: a link that cannot carry Full
+// does not stall, it pauses — and pauses were not what the drop to Low counted.
+// Throttled to 2.5 Mbit/s the player held for 8 s in every 10 and stayed on Full.
+function pausingPage(t, loadMs) {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  const st = { ahead: 0 };
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + st.ahead }),
+    configurable: true,
+  });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  // Segments of two seconds, each taking `loadMs` to fetch.
+  const segment = (sn, ms) => {
+    for (const cb of w.hlsHandlers.hlsFragLoading || []) cb("hlsFragLoading", { frag: { sn, duration: 2 } });
+    for (const cb of w.hlsHandlers.hlsFragLoaded || []) {
+      cb("hlsFragLoaded", { frag: { sn, duration: 2, stats: { loaded: 2e6, loading: { start: 1000, first: 1100, end: 1000 + ms } } }, stats: { loaded: 2e6 } });
+    }
+  };
+  for (let i = 0; i < 3; i++) segment(100 + i, loadMs);
+  const pause = () => {
+    st.ahead = 0;
+    main.dispatchEvent(new w.Event("waiting"));
+    const held = main.paused;
+    st.ahead = 12;
+    main.dispatchEvent(new w.Event("progress"));
+    return held;
+  };
+  return { w, main, pause, segment };
+}
+
+test("three rebuffer pauses in a minute on a link fetching slower than real time switch Full to Low", (t) => {
+  const { w, pause } = pausingPage(t, 4000);   // a 2 s segment in 4 s: the 2026-10-10 tablet
+  const q = () => w.localStorage.getItem("bilbycast.dvr.quality.bigshow");
+  assert.equal(pause(), true, "fixture: a pause");
+  pause();
+  assert.equal(q(), null, "two pauses are weather");
+  pause();
+  assert.equal(q(), "low", "the third on a starved link is a rendition the link cannot carry");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "1", "and the reloaded page will say so");
+  assert.match(w.document.getElementById("err").textContent, /switching to Low/);
+  // Seen in a real browser: a stall and another `waiting` land in the moment
+  // before the reload. Neither may replace the notice with "Buffering…".
+  for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+  pause();
+  assert.match(w.document.getElementById("err").textContent, /switching to Low/, "the notice survives until the reload");
+});
+
+test("the same pauses on a link fetching faster than real time leave the viewer on Full", (t) => {
+  const { w, pause } = pausingPage(t, 500);    // a 2 s segment in half a second: the same tablet, later
+  for (let i = 0; i < 6; i++) pause();
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null,
+    "a fast link that pauses is not a link that needs Low");
+  assert.ok(Number(w.document.body.dataset.holdback) > 8, "it gets a later live point instead");
+});
+
+test("one slow segment among fast ones is not a slow link, and a segment that never arrives is", async (t) => {
+  const a = pausingPage(t, 500);
+  a.segment(200, 4000);                         // one bad fetch: the mean of (2.0, 0.25, 0.25) is above the line…
+  a.segment(201, 500); a.segment(202, 500);     // …but the middle one is not, and the link is fine
+  for (let i = 0; i < 3; i++) a.pause();
+  assert.equal(a.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null);
+
+  // Nothing has finished slowly, but the segment in flight is long overdue.
+  const b = pausingPage(t, 500);
+  const RealNow = b.w.Date.now;
+  for (const cb of b.w.hlsHandlers.hlsFragLoading || []) cb("hlsFragLoading", { frag: { sn: 300, duration: 2 } });
+  b.w.Date.now = () => RealNow() + 4000;         // four seconds into a two-second segment
+  for (let i = 0; i < 3; i++) b.pause();
+  b.w.Date.now = RealNow;
+  assert.equal(b.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low");
+});
+
+test("on Low already, or when the pauses were seeks, nothing is switched", (t) => {
+  const w = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "balanced" } });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  let ahead = 0;
+  Object.defineProperty(main, "buffered", { get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + ahead }), configurable: true });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  for (let i = 0; i < 3; i++) for (const cb of w.hlsHandlers.hlsFragLoaded || []) {
+    cb("hlsFragLoaded", { frag: { sn: i, duration: 2, stats: { loaded: 2e6, loading: { start: 0, first: 100, end: 5000 } } }, stats: { loaded: 2e6 } });
+  }
+  for (let i = 0; i < 4; i++) { ahead = 0; main.dispatchEvent(new w.Event("waiting")); ahead = 12; main.dispatchEvent(new w.Event("progress")); }
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "balanced", "Balanced is already the low rendition moving; there is nothing lower");
+
+  const full = pausingPage(t, 4000);
+  for (let i = 0; i < 4; i++) {
+    full.main.dispatchEvent(new full.w.Event("seeking"));
+    full.pause();
+  }
+  assert.equal(full.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null, "the wait after a seek is not a rebuffer pause");
 });

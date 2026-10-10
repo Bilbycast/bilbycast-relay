@@ -1252,7 +1252,10 @@
   }
 
   function holdForBuffer() {
-    if (mode !== "live" || holdingForBuffer || accessExpired || scrubbing || !hasPlayed) return;
+    // Nor once the page has decided to switch to Low: it reloads in a moment,
+    // and a hold started in that moment replaced "switching to Low" with
+    // "Buffering…" — the one notice that explains what is about to happen.
+    if (mode !== "live" || holdingForBuffer || accessExpired || scrubbing || !hasPlayed || downgrading) return;
     rebufferTarget = rebufferGoal();
     if (bufferedAhead(main) >= rebufferTarget) return;
     holdingForBuffer = true;
@@ -1275,6 +1278,12 @@
     // the second — the tablet that prompted this paused five times at start
     // on a link that then carried the feed four times over.
     growHoldBack("hold");
+    // And if this is the third in a minute on a link that is losing ground,
+    // the rendition is the problem, not the buffer: go to Low instead.
+    // Not held: the page reloads in a moment, and a hold left standing would
+    // be released by the next buffer check, which clears the notice that
+    // says why the picture is about to change.
+    if (maybeDowngrade()) { holdingForBuffer = false; holdEvent = null; return; }
     logDiag("HOLD ahead=" + bufferedAhead(main).toFixed(1) + " goal=" + rebufferTarget);
     try { main.pause(); } catch (e) {}
     showBuffering();
@@ -1366,10 +1375,46 @@
   // the honest answer. Quality changes by reload (see the Settings radios),
   // which keeps the token and the marks; a marker tells the reloaded page
   // to say what happened. Never upgraded automatically.
+  //
+  // **Or three rebuffer pauses in a minute, on a link fetching slower than
+  // real time.** Stalls were the only trigger, and a starved link does not
+  // stall: the browser says `waiting`, the page holds for the buffer, and
+  // that is a pause, not a stall. Throttled to 2.5 Mbit/s on Full the player
+  // held for eight seconds in every ten and never left Full; a tablet in the
+  // field did the same for nine minutes (29 pauses, 155 s held, four stalls).
+  //
+  // Pauses alone are not enough, though. The same tablet, on a link carrying
+  // the feed four times over, paused five times while starting and then
+  // played perfectly — switching that viewer to Low would have cost them the
+  // picture for nothing. What separates the two is how the segments are
+  // arriving: a two-second segment that takes four seconds to fetch is a link
+  // that cannot carry this rendition; one that takes half a second is not.
+  var SLOW_LOAD_RATIO = 0.8;      // fetch time / media time; above this the link is losing ground
+  var STARVED_HOLDS = 3, STARVED_WINDOW_MS = 60000;
+  var segLoadRatios = [], segLoadingSince = 0, segLoadingSecs = 0;
+  /// Is the link fetching this rendition slower than it plays?
+  function slowLink() {
+    // A segment still on its way after one and a half times its length is
+    // slow whatever came before it — and on a badly starved link it may be
+    // the only evidence, the earlier ones having never finished.
+    if (segLoadingSince && segLoadingSecs > 0 &&
+        Date.now() - segLoadingSince > segLoadingSecs * 1500) return true;
+    if (segLoadRatios.length < 2) return false;
+    // The middle of the last three, not their mean: one bad fetch on a good
+    // link is 2.0 among 0.25s, and a mean would call that link slow. With
+    // only two to go on, the better of them.
+    var sorted = segLoadRatios.slice().sort(function (a, b) { return a - b; });
+    return sorted[sorted.length === 3 ? 1 : 0] > SLOW_LOAD_RATIO;
+  }
+  function starvedByPauses() {
+    return recentCount(holdTimes, STARVED_WINDOW_MS) >= STARVED_HOLDS && slowLink();
+  }
   var AUTOLOW_KEY = "bilbycast.dvr.autolow." + STREAM;
   var downgrading = false;
   function maybeDowngrade() {
-    if (downgrading || quality !== "full" || stallCount < 3) return false;
+    if (downgrading || quality !== "full") return false;
+    var starved = stallCount < 3 && starvedByPauses();
+    if (stallCount < 3 && !starved) return false;
     try {
       window.localStorage.setItem(QUALITY_KEY, "low");
       window.localStorage.removeItem(LOWRES_KEY);
@@ -1377,7 +1422,12 @@
     } catch (e) { return false; }
     downgrading = true;
     noteEvent({ kind: "downgrade", ahead: bufferedAhead(main) });
-    logDiag("DOWNGRADE to low after " + stallCount + " stalls");
+    // Tell the manager now: the reload discards this page's history, and the
+    // operator watching the roll should see why the viewer's row changes.
+    try { reportMetrics(); } catch (e) { /* a lost report costs a number */ }
+    logDiag(starved
+      ? "DOWNGRADE to low after " + recentCount(holdTimes, STARVED_WINDOW_MS) + " pauses in a minute on a link fetching slower than real time"
+      : "DOWNGRADE to low after " + stallCount + " stalls");
     fail("This link cannot keep up with Full — switching to Low…");
     setTimeout(function () { try { location.reload(); } catch (e) {} }, 1500);
     return true;
@@ -2261,7 +2311,12 @@
       });
       // What the transport is doing, for the debug panel.
       hls.on(Hls.Events.FRAG_LOADING, function (_e, d) {
-        if (video === main && d && d.frag) logDiag("load sn=" + d.frag.sn);
+        if (video !== main || !d || !d.frag) return;
+        logDiag("load sn=" + d.frag.sn);
+        if (d.frag.sn !== "initSegment" && d.frag.duration > 0) {
+          segLoadingSince = Date.now();
+          segLoadingSecs = d.frag.duration;
+        }
       });
       hls.on(Hls.Events.FRAG_LOADED, function (_e, d) {
         if (video !== main || !d || !d.frag) return;
@@ -2272,6 +2327,13 @@
           total: st.end && st.start ? Math.round(st.end - st.start) : 0,
           kb: typeof kb === "number" ? kb : 0
         };
+        if (d.frag.sn !== "initSegment" && d.frag.duration > 0) {
+          segLoadingSince = 0;
+          if (st.end && st.start) {
+            segLoadRatios.push((st.end - st.start) / (d.frag.duration * 1000));
+            if (segLoadRatios.length > 3) segLoadRatios.shift();
+          }
+        }
         logDiag("got  sn=" + d.frag.sn + " " + kb + "KB ttfb=" + (st.first && st.start ? Math.round(st.first - st.start) : "?") + "ms total=" + (st.end && st.start ? Math.round(st.end - st.start) : "?") + "ms");
       });
       hls.on(Hls.Events.LEVEL_LOADED, function (_e, d) {
@@ -4941,6 +5003,7 @@
         "  ahead=" + bufferedAhead(main).toFixed(1) + "s  catchingUp=" + catchingUp +
         (delayIsViewers ? " (off: the delay is the viewer's own; Live clears it)" : "") +
         "  holding=" + holdingForBuffer + "  stalls=" + stallCount +
+        "  slowLink=" + slowLink() + (segLoadRatios.length ? " (fetch/play " + segLoadRatios.map(function (x) { return x.toFixed(2); }).join(" ") + ")" : "") +
         "  bwEstimate=" + (mainHls && mainHls.bandwidthEstimate ? Math.round(mainHls.bandwidthEstimate / 1000) + "kbps" : "n/a"),
       "client=" + CLIENT + "  reports every " + (METRICS_MS / 1000) + "s" +
         "  stalls=" + (stallTimes.total || 0) + "/" + recentCount(stallTimes) + " (5m)" +
