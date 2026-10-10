@@ -1220,6 +1220,10 @@
   // a "Buffering" notice on a perfectly good link.
   var hasPlayed = false;
   main.addEventListener("playing", function () { hasPlayed = true; });
+  // When the playhead last jumped, and whether the hold in progress is the
+  // link's (counted) or a seek's (not) — see holdForBuffer.
+  var lastSeekAt = 0, SEEK_SETTLE_MS = 2500, holdCounts = true;
+  main.addEventListener("seeking", function () { lastSeekAt = Date.now(); });
 
   /// Seconds buffered ahead of the playhead, or 0.
   function bufferedAhead(v) {
@@ -1253,6 +1257,15 @@
     if (bufferedAhead(main) >= rebufferTarget) return;
     holdingForBuffer = true;
     holdStartedAt = Date.now();
+    // A seek empties the decoder and the browser says `waiting` — after the
+    // Live button, after the delay setting moves, after any jump. The picture
+    // is still held until there is something to play, but that is not the
+    // link struggling: it is not counted, not logged as trouble, and does not
+    // move the live point. (A real browser showed it: one seek in live mode
+    // read as a rebuffer pause and pushed the live point back two seconds,
+    // the moment after the viewer had asked for it closer.)
+    holdCounts = !(main.seeking || holdStartedAt - lastSeekAt < SEEK_SETTLE_MS);
+    if (!holdCounts) { logDiag("HOLD after a seek (not counted) goal=" + rebufferTarget); try { main.pause(); } catch (e) {} showBuffering(); if (holdTimer === null) holdTimer = setInterval(checkHold, HOLD_POLL_MS); return; }
     lastHoldAt = holdStartedAt;
     metricsEvent(holdTimes);
     holdEvent = noteEvent({ kind: "hold", ahead: bufferedAhead(main), goal: rebufferTarget, ms: 0 });
@@ -1280,8 +1293,7 @@
     if (holdTimer !== null) { clearInterval(holdTimer); holdTimer = null; }
     if (!holdingForBuffer) return;
     holdingForBuffer = false;
-    holdTotalMs += Date.now() - holdStartedAt;
-    lastHoldAt = Date.now();
+    if (holdCounts) { holdTotalMs += Date.now() - holdStartedAt; lastHoldAt = Date.now(); }
     if (holdEvent) { holdEvent.ms = Date.now() - holdStartedAt; holdEvent = null; }
     logDiag("RELEASE after " + ((Date.now() - holdStartedAt) / 1000).toFixed(1) + "s ahead=" + bufferedAhead(main).toFixed(1) + (play ? "" : " (viewer)"));
     fail("");
@@ -1306,13 +1318,22 @@
   var CATCHUP_RATE = 1.05, CATCHUP_QUIET_MS = 30000;
   var CATCHUP_START_S = 3, CATCHUP_STOP_S = 0.5, CATCHUP_MIN_AHEAD_S = 6;
   var catchingUp = false;
+  // Delay the viewer made themselves is theirs to keep. Pausing for a minute,
+  // or watching a passage at 50%, leaves the playhead behind in live mode
+  // just as a rebuffer does — and quietly running 5% fast for the next twenty
+  // minutes to "fix" it would be the player overruling the operator. Set by
+  // the viewer's own pause and by any rate other than 1; cleared when Live
+  // puts the playhead back at the live point. (Found reviewing this before
+  // rollout: nothing distinguished the two kinds of late.)
+  var delayIsViewers = false;
   function behindLive() {
     var r = range(main);
     return r ? Math.max(0, r.end - main.currentTime) : 0;
   }
   function tendLatency() {
     var able = mode === "live" && rate === 1 && !loop && !main.paused && !holdingForBuffer &&
-               !scrubbing && !accessExpired && hasPlayed && reconnectTimer === null;
+               !scrubbing && !accessExpired && hasPlayed && reconnectTimer === null &&
+               !delayIsViewers;
     var quiet = Date.now() - Math.max(lastStallAt, lastHoldAt) >= CATCHUP_QUIET_MS;
     var excess = behindLive() - liveHoldBack;
     var ahead = bufferedAhead(main);
@@ -1440,7 +1461,7 @@
       holds: holdTimes.total || 0,
       holds_5m: recentCount(holdTimes),
       holds_1m: recentCount(holdTimes, 60000),
-      hold_ms: holdTotalMs + (holdingForBuffer ? Date.now() - holdStartedAt : 0),
+      hold_ms: holdTotalMs + (holdingForBuffer && holdCounts ? Date.now() - holdStartedAt : 0),
       reconnects: reconnectTimes.total || 0,
       reconnects_5m: recentCount(reconnectTimes),
       reconnects_1m: recentCount(reconnectTimes, 60000),
@@ -2415,6 +2436,7 @@
     stopShuttle();
     releaseHold(false);
     stopCatchUp();
+    delayIsViewers = false;
     if (byViewer === true) resetHoldBack();
     setMode("live");
     var t = liveTarget();
@@ -2528,6 +2550,7 @@
     if (r < 0 || Math.abs(r) > 1) { startShuttle(r); syncRateButtons(); return; }
     stopShuttle();
     if (mode === "shuttle") setMode("scrub");
+    if (r !== 1) delayIsViewers = true;
     rate = r;
     main.playbackRate = r;
     main.play().catch(function () {});
@@ -4916,6 +4939,7 @@
       "lastHlsError=" + (lastHlsError || "none"),
       "holdback=" + liveHoldBack + "s (prefers " + preferredDelay + "s)  behindLive=" + behindLive().toFixed(1) + "s" +
         "  ahead=" + bufferedAhead(main).toFixed(1) + "s  catchingUp=" + catchingUp +
+        (delayIsViewers ? " (off: the delay is the viewer's own; Live clears it)" : "") +
         "  holding=" + holdingForBuffer + "  stalls=" + stallCount +
         "  bwEstimate=" + (mainHls && mainHls.bandwidthEstimate ? Math.round(mainHls.bandwidthEstimate / 1000) + "kbps" : "n/a"),
       "client=" + CLIENT + "  reports every " + (METRICS_MS / 1000) + "s" +
@@ -5342,6 +5366,7 @@
     stopLoop();
     stopShuttle();
     if (mode === "shuttle") setMode("scrub");
+    delayIsViewers = true;
     rate = 1;
     main.pause();
     proxy.pause();

@@ -1747,3 +1747,74 @@ test("a playhead left behind by pauses is brought back to the live point, and on
   assert.equal(main.playbackRate, 0.5, "catch-up does not fight the viewer's own rate");
   assert.equal(w.document.body.dataset.catchup, "0");
 });
+
+// Found reviewing before rollout: a viewer who pauses, or watches a passage
+// slowly, is behind live by choice. Catch-up is for delay the link caused.
+test("delay the viewer made by pausing or slowing down is not played fast; Live clears that", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + 30 }),
+    configurable: true,
+  });
+  main.currentTime = 50;
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  // The viewer pauses, then plays again: still 50 s behind, by their choice.
+  click(w, "#btnPause");
+  click(w, "#btnPlay");
+  assert.equal(main.paused, false, "fixture: playing again");
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1, "a deliberate pause is not won back behind the viewer's back");
+  assert.equal(w.document.body.dataset.catchup || "0", "0");
+
+  // Live puts them at the live point; from there the link's delay is fair game.
+  click(w, "#btnLive");
+  main.currentTime = 50;   // as a run of rebuffer pauses would leave it
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1.05, "after Live, delay is the link's again");
+
+  // Half speed and back: theirs again.
+  click(w, '[data-rate="0.5"]');
+  click(w, '[data-rate="1"]');
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1, "a passage watched slowly is not sped through afterwards");
+});
+
+// Seen in a real browser before rollout: a seek fires `waiting`, and the page
+// read that as the link struggling. It still holds the picture until there is
+// something to play; it no longer counts it or moves the live point.
+test("the wait after a seek holds the picture but is not counted as trouble", async (t) => {
+  const posts = [];
+  const fetch = async (url, init = {}) => {
+    if (/\/metrics$/.test(url.split("?")[0])) {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200, json: async () => ({ next_report_secs: 20 }) };
+    }
+    return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), text: async () => "" };
+  };
+  const w = loadPage({ token: TOKEN, fetch });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  let ahead = 0;
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + ahead }),
+    configurable: true,
+  });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  main.dispatchEvent(new w.Event("seeking"));
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.equal(main.paused, true, "the picture is held until there is something to play");
+  assert.equal(w.document.body.dataset.holdback, "8", "but the live point does not move for a seek");
+  ahead = 6;
+  main.dispatchEvent(new w.Event("progress"));
+  assert.equal(main.paused, false);
+  w.document.dispatchEvent(new w.Event("visibilitychange"));
+  await new Promise((r) => setTimeout(r, 10));
+  const r = posts[posts.length - 1];
+  assert.equal(r.holds, 0, "not counted");
+  assert.equal(r.hold_ms, 0);
+  assert.equal(r.events.length, 0, "not in the trouble history");
+});
