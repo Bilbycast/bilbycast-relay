@@ -978,12 +978,21 @@
   //    on a slow link lands on a position with nothing buffered either;
   //  * the live point sat a fixed three seconds behind the edge, so a link
   //    that could not keep up had no slack to play from.
-  // How far behind the edge "live" sits now. Starts at LIVE_BACKOFF and grows
+  // How far behind the edge "live" sits now. Starts at HOLDBACK_MIN and grows
   // by one segment each time the buffer runs dry, so a link that keeps
   // stalling plays from further back and has more ahead of it. Relaxes again
   // after a stall-free spell.
-  var liveHoldBack = LIVE_BACKOFF;
-  var HOLDBACK_MAX = 15;        // seconds; past this the viewer would notice the delay
+  // **At the live edge the buffer ahead can never be deeper than the distance
+  // behind live** — the next segment does not exist yet. hls.js's default
+  // kept live three segments back (6 s here); the first attempt at this set
+  // it to 3 s, which left the player one and a half segments from the edge
+  // with nothing to fetch most of the time, and read on a tablet as "it only
+  // buffers after it runs dry, then loads four seconds". Four segments of
+  // slack by default: the edge publishes in bursts, and a viewer who wants
+  // the last two seconds back has the Live button.
+  var HOLDBACK_MIN = 8;
+  var liveHoldBack = HOLDBACK_MIN;
+  var HOLDBACK_MAX = 20;        // seconds; past this the viewer would notice the delay
   var HOLDBACK_RELAX_MS = 120000; // a stall-free two minutes earns a second back
   var stallCount = 0, lastStallAt = 0, holdbackRelaxTimer = null;
 
@@ -1030,9 +1039,9 @@
       if (holdbackRelaxTimer === null) {
         holdbackRelaxTimer = setInterval(function () {
           if (Date.now() - lastStallAt < HOLDBACK_RELAX_MS) return;
-          liveHoldBack = Math.max(LIVE_BACKOFF, liveHoldBack - 1);
+          liveHoldBack = Math.max(HOLDBACK_MIN, liveHoldBack - 1);
           applyHoldBack();
-          if (liveHoldBack === LIVE_BACKOFF) { clearInterval(holdbackRelaxTimer); holdbackRelaxTimer = null; }
+          if (liveHoldBack === HOLDBACK_MIN) { clearInterval(holdbackRelaxTimer); holdbackRelaxTimer = null; }
         }, HOLDBACK_RELAX_MS);
       }
       return true;
@@ -1139,7 +1148,9 @@
   /// How much to have ahead before playing again: two segments, more on a
   /// link whose hold-back has already grown, never more than ten seconds.
   function rebufferGoal() {
-    return Math.min(10, Math.max(2 * segmentSeconds(), liveHoldBack));
+    // Half the hold-back: enough to run for a stretch, and reachable without
+    // waiting for the buffer to reach the edge itself.
+    return Math.min(8, Math.max(2 * segmentSeconds(), liveHoldBack / 2));
   }
 
   function showBuffering() {

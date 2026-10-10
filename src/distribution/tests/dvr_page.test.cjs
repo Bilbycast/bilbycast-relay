@@ -1452,6 +1452,6 @@ test("a stall on an empty buffer is left to hls.js, a stall past the edge is nud
   // there is more buffer ahead next time, and hls.js is told.
   const hls = w.mainHlsForTests ? w.mainHlsForTests() : null;
   assert.ok(w.document.body.dataset.holdback, "the page publishes its hold-back for inspection");
-  assert.ok(Number(w.document.body.dataset.holdback) > 3, "after repeated stalls live sits further behind the edge: " + w.document.body.dataset.holdback);
+  assert.ok(Number(w.document.body.dataset.holdback) > 8, "after repeated stalls live sits further behind the edge than the 8 s default: " + w.document.body.dataset.holdback);
   if (hls) assert.equal(hls.config.liveSyncDuration, Number(w.document.body.dataset.holdback));
 });
