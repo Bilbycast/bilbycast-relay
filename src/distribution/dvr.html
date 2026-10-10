@@ -1059,6 +1059,12 @@
   }
 
   function scheduleReconnect(hls, video, label) {
+    // Only the picture the viewer is watching is worth a notice and a retry
+    // loop. The still-frame element in Balanced fetches on demand; a fatal
+    // error there is logged and left — the next stop re-attaches it.
+    // Expired access is not a link problem either: the 401/403 branch has
+    // already told the viewer, and retrying would only hammer a refusal.
+    if (video !== main || accessExpired) { logDiag("fatal on " + label + " — not reconnecting"); return; }
     if (reconnectTimer !== null) clearTimeout(reconnectTimer);
     var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
     reconnectAttempts++;
@@ -1075,6 +1081,7 @@
 
   /// A segment landed: the link is back.
   function reconnected(video) {
+    if (video !== main) return;
     if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (reconnectAttempts === 0 && reconnectingLabel === null) return;
     reconnectAttempts = 0;
@@ -2004,13 +2011,17 @@
           // live point. Empty buffer on a slow link: leave hls.js to fetch,
           // and move the live point further back so there is more ahead of
           // the playhead next time (see noteStall).
-          if (video === main) {
+          // Only a stall in *live* is evidence about the link. A stall while
+          // scrubbing, jogging or looping is the seek itself, and counting
+          // those grew the hold-back and could have switched a reviewer to
+          // Low for stepping through frames.
+          if (video === main && mode === "live") {
             // Moving the live point back is for the *next* re-sync; seeking
             // forward to it now would discard the buffer that is still ahead
             // of a playhead that has fallen behind — the "pause, then the
             // buffer starts again from nothing" seen on a contended tablet.
             noteStall();
-            if (mode === "live" && stalledPastEdge(main)) goLive();
+            if (stalledPastEdge(main)) goLive();
             else if (!maybeDowngrade()) holdForBuffer();
           }
         }
@@ -2053,6 +2064,9 @@
     var t = playhead(from);
     mode = next;
     document.body.dataset.mode = next;
+    // A hold belongs to live playback; a viewer who starts scrubbing or
+    // shuttling has taken over, and the notice must not linger over them.
+    if (next !== "live") releaseHold(false);
     var to = activeVideo();
     if (to !== from) {
       // Hand over by *content*, not by number: the two elements do not share a

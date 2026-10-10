@@ -1408,6 +1408,63 @@ test("three stalls in a minute on Full switch the page to Low and say so after t
   assert.equal(again.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low");
 });
 
+// Review before rollout, 2026-10-10: the reconnect loop and the stall logic
+// must only act on the picture the viewer is watching, in live mode.
+test("the still-frame element, expired access, and stalls while scrubbing do not drive reconnects or the link logic", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const err = w.document.getElementById("err");
+  const main = w.document.getElementById("main");
+  // Attach the proxy/still element, as a jog does, so its handlers exist.
+  key(w, ".");
+  const fire = (label, data) => {
+    for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", data);
+  };
+  // A fatal network error on the still element: no notice, no reconnect.
+  w.hlsCalls.length = 0;
+  fire("still", { type: "networkError", details: "fragLoadError", fatal: true });
+  // Every attached instance receives the stub's broadcast; the main one DOES
+  // reconnect, so distinguish by what the notice says afterwards once a
+  // segment lands on main.
+  for (const cb of w.hlsHandlers.hlsFragBuffered || []) cb("hlsFragBuffered", {});
+  assert.equal(err.textContent, "", "a segment landing on main clears everything the broadcast caused");
+
+  // Stalls while scrubbing count for nothing.
+  assert.equal(w.document.body.dataset.mode, "scrub", "fixture: a jog step leaves live for scrub");
+  const hb = w.document.body.dataset.holdback;
+  for (let i = 0; i < 4; i++) fire("main", { type: "mediaError", details: "bufferStalledError", fatal: false });
+  assert.equal(w.document.body.dataset.holdback, hb, "scrub stalls do not move the live point");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null, "scrub stalls do not switch quality");
+  assert.equal(main.paused, true, "jog leaves the element paused; no hold was started");
+
+  // Expired access: no reconnect loop on top of the expiry notice.
+  key(w, "End");
+  fire("main", { type: "networkError", details: "fragLoadError", fatal: false, response: { code: 403 } });
+  assert.match(err.textContent, /expired/);
+  fire("main", { type: "networkError", details: "levelLoadError", fatal: true, response: { code: 0 } });
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.match(err.textContent, /expired/, "the expiry notice is not replaced by a reconnect notice");
+  assert.ok(!w.hlsCalls.some((c) => c[0] === "startLoad"), "no resume is attempted against withdrawn access");
+});
+
+test("leaving live ends a buffering hold", (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  const err = w.document.getElementById("err");
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + 1 }),
+    configurable: true,
+  });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.match(err.textContent, /Buffering/, "fixture: holding");
+  key(w, ".");   // a jog step: the viewer has taken over
+  assert.equal(err.textContent, "", "the hold and its notice end when the viewer leaves live");
+  assert.equal(w.document.body.dataset.mode, "scrub");
+});
+
 test("a fatal media error gets hls.js's recovery a bounded number of times", (t) => {
   const w = loadPage({ token: "t.ok" });
   t.after(() => closePage(w));
