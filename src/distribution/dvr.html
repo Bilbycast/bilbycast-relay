@@ -1000,6 +1000,17 @@
   // segment lands or the page closes.
   var reconnectTimer = null, reconnectAttempts = 0, reconnectingLabel = null;
   var RECONNECT_FIRST_MS = 1000, RECONNECT_MAX_MS = 15000;
+
+  // A rolling log of what the transport saw — segment timings, stalls, holds,
+  // errors — shown in the debug panel (`&debug=1`). Added because a tablet in
+  // the field showed gaps of five to ten seconds with nothing downloading
+  // that no throttled desktop could reproduce; the page is the only witness.
+  var diag = [], DIAG_LINES = 40, diagT0 = Date.now();
+  function logDiag(msg) {
+    var t = ((Date.now() - diagT0) / 1000).toFixed(1);
+    diag.push(t + "s " + msg);
+    if (diag.length > DIAG_LINES) diag.shift();
+  }
   // hls.js's media-error recovery is good for a few goes, not forever.
   var mediaRecoveries = [];
 
@@ -1031,9 +1042,11 @@
     if (now - lastStallAt > 60000) stallCount = 0;
     lastStallAt = now;
     stallCount++;
+    logDiag("STALL #" + stallCount + " ahead=" + bufferedAhead(main).toFixed(1) + " t=" + main.currentTime.toFixed(1));
     if (stallCount >= 2 && liveHoldBack < HOLDBACK_MAX) {
       liveHoldBack = Math.min(HOLDBACK_MAX, liveHoldBack + segmentSeconds());
       applyHoldBack();
+      logDiag("holdback -> " + liveHoldBack + "s");
       // Earn it back slowly: one second per stall-free period, down to the
       // default, so a link that recovers is not stuck watching late.
       if (holdbackRelaxTimer === null) {
@@ -1069,6 +1082,7 @@
     var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
     reconnectAttempts++;
     reconnectingLabel = label;
+    logDiag("RECONNECT attempt " + reconnectAttempts + " in " + delay + "ms");
     fail("Connection lost — reconnecting" + (reconnectAttempts > 1 ? " (attempt " + reconnectAttempts + ")" : "") + "…");
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null;
@@ -1171,6 +1185,7 @@
     if (bufferedAhead(main) >= rebufferTarget) return;
     holdingForBuffer = true;
     holdStartedAt = Date.now();
+    logDiag("HOLD ahead=" + bufferedAhead(main).toFixed(1) + " goal=" + rebufferTarget);
     try { main.pause(); } catch (e) {}
     showBuffering();
     if (holdTimer === null) holdTimer = setInterval(checkHold, HOLD_POLL_MS);
@@ -1188,6 +1203,7 @@
     if (holdTimer !== null) { clearInterval(holdTimer); holdTimer = null; }
     if (!holdingForBuffer) return;
     holdingForBuffer = false;
+    logDiag("RELEASE after " + ((Date.now() - holdStartedAt) / 1000).toFixed(1) + "s ahead=" + bufferedAhead(main).toFixed(1) + (play ? "" : " (viewer)"));
     fail("");
     if (play && mode === "live") main.play().catch(function () {});
   }
@@ -1213,6 +1229,7 @@
       window.localStorage.setItem(AUTOLOW_KEY, "1");
     } catch (e) { return false; }
     downgrading = true;
+    logDiag("DOWNGRADE to low after " + stallCount + " stalls");
     fail("This link cannot keep up with Full — switching to Low…");
     setTimeout(function () { try { location.reload(); } catch (e) {} }, 1500);
     return true;
@@ -1941,14 +1958,20 @@
         // retries, a second apart) before anything is called fatal: a bad
         // patch of 4G exhausts those in under a minute. Fatal is recovered
         // above in any case; this keeps the common dip from getting there.
+        // And give up on a *hung* request sooner. A lossy wifi stalls a TCP
+        // connection rather than slowing it: the request just sits there. The
+        // default waits ten seconds for the first byte before retrying, which
+        // on a tablet read as "five to ten seconds with nothing downloading,
+        // then a burst". Four seconds to first byte, and a segment that is
+        // still arriving after twelve is abandoned and refetched.
         playlistLoadPolicy: { default: {
-          maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 20000,
-          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 500, maxRetryDelayMs: 4000, backoff: "exponential" },
+          maxTimeToFirstByteMs: 4000, maxLoadTimeMs: 8000,
+          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 250, maxRetryDelayMs: 2000, backoff: "exponential" },
           errorRetry:   { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
         } },
         fragLoadPolicy: { default: {
-          maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 120000,
-          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 500, maxRetryDelayMs: 4000, backoff: "exponential" },
+          maxTimeToFirstByteMs: 4000, maxLoadTimeMs: 12000,
+          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 250, maxRetryDelayMs: 2000, backoff: "exponential" },
           errorRetry:   { maxNumRetry: 8, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
         } },
         // Every manifest and segment fetch carries the credential. Applies to
@@ -1957,9 +1980,23 @@
           if (TOKEN_IN_HEADER && TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
         }
       });
+      // What the transport is doing, for the debug panel.
+      hls.on(Hls.Events.FRAG_LOADING, function (_e, d) {
+        if (video === main && d && d.frag) logDiag("load sn=" + d.frag.sn);
+      });
+      hls.on(Hls.Events.FRAG_LOADED, function (_e, d) {
+        if (video !== main || !d || !d.frag) return;
+        var st = (d.frag.stats && d.frag.stats.loading) || {};
+        var kb = d.stats && d.stats.loaded ? Math.round(d.stats.loaded / 1024) : (d.frag.stats && d.frag.stats.loaded ? Math.round(d.frag.stats.loaded / 1024) : "?");
+        logDiag("got  sn=" + d.frag.sn + " " + kb + "KB ttfb=" + (st.first && st.start ? Math.round(st.first - st.start) : "?") + "ms total=" + (st.end && st.start ? Math.round(st.end - st.start) : "?") + "ms");
+      });
+      hls.on(Hls.Events.LEVEL_LOADED, function (_e, d) {
+        if (video === main && d && d.details) logDiag("playlist " + (d.details.fragments ? d.details.fragments.length : "?") + " segs, edge=" + (typeof d.details.edge === "number" ? d.details.edge.toFixed(1) : "?"));
+      });
       hls.on(Hls.Events.ERROR, function (_e, data) {
         if (!data) return;
         lastHlsError = label + ":" + data.details + (data.fatal ? " (fatal)" : "");
+        if (video === main) logDiag("ERR " + data.details + (data.fatal ? " FATAL" : "") + (data.response && data.response.code ? " http=" + data.response.code : ""));
 
         // An expiring viewing token is the one failure a viewer can act on, so
         // it must not arrive as a generic stall.
@@ -4597,6 +4634,14 @@
           return a === null || b === null ? "n/a" : ((b - a) / 1000).toFixed(3) + "s";
         })() + "  (the two elements are on the same instant when skew is 0)",
       "lastHlsError=" + (lastHlsError || "none"),
+      "holdback=" + liveHoldBack + "s  holding=" + holdingForBuffer + "  stalls=" + stallCount +
+        "  bwEstimate=" + (mainHls && mainHls.bandwidthEstimate ? Math.round(mainHls.bandwidthEstimate / 1000) + "kbps" : "n/a") +
+        "  net=" + (function () {
+          var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+          return c ? (c.effectiveType || "?") + " " + (c.downlink !== undefined ? c.downlink + "Mbps" : "") + " rtt=" + (c.rtt !== undefined ? c.rtt + "ms" : "?") : "n/a";
+        })(),
+      "transport log (newest last):",
+      diag.slice(-18).join("\n"),
       // The preview has three independent ways to be silently absent: no
       // index published, no absolute time on the playlist to map through, or
       // a position the index does not cover. They look identical on screen,
