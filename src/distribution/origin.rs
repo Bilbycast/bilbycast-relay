@@ -45,6 +45,7 @@ use tokio::sync::Mutex;
 use super::{token, DistributionState};
 
 mod marks;
+pub mod metrics;
 
 /// How the origin store is sized. Bundled so the knobs travel together — they
 /// interact, and reading one without the others is misleading.
@@ -351,7 +352,34 @@ pub struct OriginStore {
     /// Store-wide for the same reason as `clip_admission`: marks are made by
     /// hand.
     marks_lock: Arc<tokio::sync::Mutex<()>>,
+    /// While non-zero and in the future (ms on `started`'s clock): segments
+    /// adopted from a previous run are not trimmed *by age*. See
+    /// [`ADOPT_HOLD`].
+    adopt_hold_until_ms: AtomicU64,
 }
+
+/// How long a restarted relay waits for the manager's storage policy before
+/// trimming an adopted window by age on its own defaults.
+///
+/// **A restart used to destroy every DVR window.** The window a session keeps
+/// is a per-stream override the manager pushes, and per-stream overrides are
+/// deliberately not persisted (a session that ended while the relay was down
+/// must not come back holding disk). So a restarted relay adopted two hours of
+/// segments, held them against its *node default* — sixty seconds — and the
+/// first PUT, two seconds later, evicted the lot. The manager's push naming
+/// the session's real window arrived about forty seconds after that, to a
+/// directory holding a minute of media. Seen in production 2026-10-10: 7442
+/// segments adopted, every viewer's rewind gone, and the edge's thumbnail
+/// index naming 135 sprite sheets the relay no longer had — which every
+/// player then asked for, three a second, on exactly the links that could
+/// least afford it.
+///
+/// The hold ends the moment the manager names its per-stream policies (an
+/// empty list counts: that is the manager saying no session wants more than
+/// the default), or after this long if it never does. It suspends the age
+/// test only. The byte bound and the free-space floor still apply, so a
+/// relay that restarts with a full disk still makes room.
+pub const ADOPT_HOLD: Duration = Duration::from_secs(600);
 
 /// Marker written into the origin root, so the store can tell a directory it
 /// owns — and may therefore adopt from, and evict within — from one an
@@ -728,6 +756,7 @@ impl OriginStore {
             started: Instant::now(),
             clip_admission: Arc::new(std::sync::Mutex::new(())),
             marks_lock: Arc::new(tokio::sync::Mutex::new(())),
+            adopt_hold_until_ms: AtomicU64::new(0),
         };
         store.adopt_existing();
         Ok(store)
@@ -866,11 +895,38 @@ impl OriginStore {
             streams += 1;
         }
         if adopted > 0 {
+            // At least 1: zero means "no hold", and a store adopted in its
+            // first millisecond must still have one.
+            self.adopt_hold_until_ms.store(
+                (self.now_ms() + ADOPT_HOLD.as_millis() as u64).max(1),
+                Ordering::Relaxed,
+            );
             tracing::info!(
                 adopted,
                 streams,
                 megabytes = bytes as f64 / 1e6,
-                "origin: adopted segments from a previous run; retention trims them as normal"
+                hold_secs = ADOPT_HOLD.as_secs(),
+                "origin: adopted segments from a previous run; not trimmed by age until the \
+                 manager names its per-stream policies, or the hold runs out"
+            );
+        }
+    }
+
+    /// Whether adopted segments are still being held for the manager's
+    /// policy — see [`ADOPT_HOLD`].
+    pub fn adopt_hold_active(&self) -> bool {
+        let until = self.adopt_hold_until_ms.load(Ordering::Relaxed);
+        until != 0 && self.now_ms() < until
+    }
+
+    /// The manager has named its per-stream policies: every stream now has
+    /// the window it should, so age-based trimming resumes.
+    pub fn manager_policy_received(&self) {
+        if self.adopt_hold_until_ms.swap(0, Ordering::Relaxed) != 0 {
+            tracing::info!(
+                stream_overrides = self.stream_policy.len(),
+                "origin: the manager's storage policy is in force; adopted segments are \
+                 trimmed to it from here"
             );
         }
     }
@@ -1096,6 +1152,8 @@ impl OriginStore {
     /// player to protect and the floor would otherwise pin those segments on
     /// disk forever.
     async fn evict(&self, origin: &StreamOrigin, pol: &OriginPolicy, floor: usize) {
+        // Read once: the hold ending mid-loop only means the next PUT trims.
+        let held = self.adopt_hold_active();
         loop {
             let mut order = origin.order.lock().await;
             if order.len() <= floor {
@@ -1109,7 +1167,9 @@ impl OriginStore {
                 order.pop_front();
                 continue;
             };
-            let too_old = meta.stored_at.elapsed() >= pol.retention;
+            // Not by age while a restarted relay is still waiting to be told
+            // what window each stream keeps — see `ADOPT_HOLD`.
+            let too_old = !held && meta.stored_at.elapsed() >= pol.retention;
             let too_big = origin.bytes.load(Ordering::Relaxed) > pol.max_bytes_per_stream;
             if !too_old && !too_big {
                 break;
@@ -2479,6 +2539,7 @@ pub fn routes() -> Router<Arc<DistributionState>> {
         .merge(clip_media)
         .merge(clip_control)
         .merge(marks::routes())
+        .merge(metrics::routes())
 }
 
 /// `PUT /origin/{stream}/{file}` — accept an edge CMAF/HLS upload.
@@ -4342,6 +4403,9 @@ seg-1.m4s
             min_segments: 0,
             idle_grace: std::time::Duration::from_secs(60),
         });
+        // The manager has said what each stream keeps (nothing more than the
+        // default here), so the hold on adopted segments is over.
+        s.manager_policy_received();
         // Any PUT runs the sweep.
         s.put("s", "seg-00002.m4s", Bytes::from_static(b"zz")).await.unwrap();
         assert!(
@@ -4349,6 +4413,114 @@ seg-1.m4s
             "a ten-minute-old segment survived a one-minute retention"
         );
         assert!(s.get("s", "seg-00002.m4s").await.is_some());
+    }
+
+    /// What a previous run left behind: `n` segments in `stream`, the oldest
+    /// `oldest_secs` old, two seconds apart.
+    fn left_behind(tmp: &tempfile::TempDir, stream: &str, n: usize, oldest_secs: u64) {
+        let root = tmp.path().join("origin");
+        std::fs::create_dir_all(root.join(stream)).unwrap();
+        std::fs::write(root.join(ORIGIN_MARKER), b"x").unwrap();
+        for i in 0..n {
+            let p = root.join(stream).join(format!("seg-{i:05}.m4s"));
+            std::fs::write(&p, vec![0u8; 10]).unwrap();
+            age(&p, Duration::from_secs(oldest_secs.saturating_sub(2 * i as u64)));
+        }
+    }
+
+    fn one_minute() -> OriginPolicy {
+        OriginPolicy {
+            retention: Duration::from_secs(60),
+            max_bytes_per_stream: u64::MAX,
+            min_segments: 0,
+            idle_grace: Duration::from_secs(60),
+        }
+    }
+
+    /// The production failure of 2026-10-10. A session's window is a
+    /// per-stream override that is not persisted, so a restarted relay held
+    /// two hours of adopted media against its sixty-second default and the
+    /// first PUT evicted all of it — forty seconds before the manager's push
+    /// said to keep it.
+    #[tokio::test]
+    async fn a_restart_keeps_the_window_until_the_manager_says_what_each_stream_keeps() {
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "show", 100, 7000);
+        let s = store(&tmp, 0);
+        s.set_default_policy(one_minute());
+        assert!(s.adopt_hold_active());
+
+        // The edge is still pushing: the first PUT after the restart.
+        put_seg(&s, "show", "seg-09000.m4s", 10).await;
+        s.sweep().await;
+        assert!(
+            s.get("show", "seg-00000.m4s").await.is_some(),
+            "the adopted window was trimmed to the node default before the manager spoke"
+        );
+        assert_eq!(s.usage()[0].segments, 101);
+
+        // The manager's push: this stream keeps two hours.
+        s.apply_policy_update(&OriginPolicyUpdate {
+            default: None,
+            per_stream: Some(vec![(
+                "show".into(),
+                OriginPolicyPatch { retention_secs: Some(7200), ..Default::default() },
+            )]),
+        });
+        s.manager_policy_received();
+        assert!(!s.adopt_hold_active());
+        put_seg(&s, "show", "seg-09001.m4s", 10).await;
+        s.sweep().await;
+        assert!(
+            s.get("show", "seg-00000.m4s").await.is_some(),
+            "a 7000 s old segment inside a 7200 s window was evicted"
+        );
+        assert_eq!(s.usage()[0].segments, 102, "nothing lost across the restart");
+    }
+
+    /// The other half: a session that ended while the relay was down. The
+    /// manager names no override for it, and the window goes — which is the
+    /// reason overrides are not persisted in the first place.
+    #[tokio::test]
+    async fn a_stream_the_manager_names_no_window_for_is_trimmed_once_it_has_spoken() {
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "ended", 100, 7000);
+        let s = store(&tmp, 0);
+        s.set_default_policy(one_minute());
+        put_seg(&s, "ended", "seg-09000.m4s", 10).await;
+        assert_eq!(s.usage()[0].segments, 101, "held while the manager has not spoken");
+
+        // An empty list is the manager speaking: no session wants more.
+        s.apply_policy_update(&OriginPolicyUpdate { default: None, per_stream: Some(vec![]) });
+        s.manager_policy_received();
+        put_seg(&s, "ended", "seg-09001.m4s", 10).await;
+        assert!(s.get("ended", "seg-00000.m4s").await.is_none());
+        assert!(s.get("ended", "seg-00099.m4s").await.is_none(), "6802 s old, one-minute window");
+        assert!(s.get("ended", "seg-09001.m4s").await.is_some());
+    }
+
+    /// The hold suspends the age test and nothing else: a restart with the
+    /// stream over its byte bound still makes room.
+    #[tokio::test]
+    async fn the_hold_does_not_suspend_the_byte_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "big", 100, 7000);
+        let s = store(&tmp, 0);
+        s.set_default_policy(OriginPolicy { max_bytes_per_stream: 300, ..one_minute() });
+        assert!(s.adopt_hold_active());
+        put_seg(&s, "big", "seg-09000.m4s", 10).await;
+        assert!(s.usage()[0].bytes <= 300, "held past its byte bound: {}", s.usage()[0].bytes);
+        assert!(s.get("big", "seg-00000.m4s").await.is_none(), "oldest first");
+        assert!(s.get("big", "seg-09000.m4s").await.is_some());
+    }
+
+    /// A store that adopted nothing has nothing to hold: a first start, or a
+    /// stream that began after the restart, trims by age from the outset.
+    #[tokio::test]
+    async fn a_store_that_adopted_nothing_holds_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        assert!(!s.adopt_hold_active());
     }
 
     /// Adoption puts the queue in age order, not directory order.

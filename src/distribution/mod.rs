@@ -74,6 +74,10 @@ pub struct DistributionState {
     pub events: EventSender,
     /// Rate limit on the `webrtc_negotiation_panic` event.
     negotiation_panics: EventGate,
+    /// What each viewer's player last reported about its own playback
+    /// (`POST /origin/{stream}/metrics`), carried to the manager on the
+    /// health tick.
+    pub viewer_metrics: Arc<origin::metrics::ViewerMetrics>,
 }
 
 /// A rate limit for one event: the first occurrence is reported, then at most
@@ -227,6 +231,7 @@ impl DistributionState {
             ingests: DashMap::new(),
             viewers_by_ip: DashMap::new(),
             events,
+            viewer_metrics: origin::metrics::ViewerMetrics::new(),
             negotiation_panics: EventGate::new(NEGOTIATION_PANIC_EVENT_INTERVAL),
         })
     }
@@ -327,6 +332,14 @@ pub async fn run_distribution(
                         }
                         let update = rx.borrow_and_update().clone();
                         origin.apply_policy_update(&update);
+                        // The manager has named what each stream keeps (an
+                        // empty list included): segments adopted at startup
+                        // are trimmed to that from here, not before. A push
+                        // carrying only the node default says nothing about
+                        // any session's window, and does not end the hold.
+                        if update.per_stream.is_some() {
+                            origin.manager_policy_received();
+                        }
                         let d = origin.default_policy();
                         tracing::info!(
                             retention_secs = d.retention.as_secs(),
@@ -364,6 +377,15 @@ pub async fn run_distribution(
         });
     }
 
+    let state = DistributionState::new(
+        hub.clone(),
+        origin.clone(),
+        config.clone(),
+        control.clone(),
+        cancel.clone(),
+        events.clone(),
+    );
+
     // Telemetry: periodically publish hub + origin counters onto RelayStats so
     // the manager-client health builder (and the local REST/metrics surface)
     // can report per-relay viewer counts. Off the request path.
@@ -372,6 +394,7 @@ pub async fn run_distribution(
         let origin = origin.clone();
         let stats = relay_stats.clone();
         let cancel = cancel.clone();
+        let viewer_metrics = state.viewer_metrics.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
@@ -399,20 +422,14 @@ pub async fn run_distribution(
                                 })
                                 .collect(),
                         );
+                        // The players' own reports ride the same tick; the
+                        // health builder reads the published copy.
+                        stats.set_viewer_metrics(viewer_metrics.snapshot());
                     }
                 }
             }
         });
     }
-
-    let state = DistributionState::new(
-        hub.clone(),
-        origin.clone(),
-        config.clone(),
-        control.clone(),
-        cancel.clone(),
-        events.clone(),
-    );
 
     // Cascade supervisor: reconcile the running WHEP-client pulls against the
     // (manager-updatable) cascade source list.
@@ -1903,8 +1920,11 @@ mod tests {
             f.contains(r#"if (quality === "full")"#),
             "the badge shows even when nothing is reduced: {f}"
         );
+        // "LOW", or "LOW · FULL OK" when the link looks able to carry Full
+        // again — either way a reduced moving picture says so, and a
+        // full-resolution still says HD.
         assert!(
-            f.contains(r#"hd ? "HD" : "LOW""#),
+            f.contains(r#"hd ? "HD" : ("#) && f.contains(r#": "LOW")"#),
             "the badge does not distinguish a full-resolution still: {f}"
         );
         assert!(
@@ -3192,10 +3212,15 @@ mod tests {
         // a new preference is welcome and a new secret is not. Comments are
         // skipped — this section explains itself in prose, and prose stores
         // nothing.
-        const NON_SECRET_KEYS: [&str; 8] = [
+        const NON_SECRET_KEYS: [&str; 10] = [
+            // How far behind live the viewer prefers to sit; a number.
+            "LIVEDELAY_KEY",
             "MARKS_KEY",
             "LOWRES_KEY",
             "QUALITY_KEY",
+            // The "switched to Low" marker a reload reads once; a flag, not
+            // a credential (see `maybeDowngrade` on the page).
+            "AUTOLOW_KEY",
             "CLIP_PRE_KEY",
             "CLIP_POST_KEY",
             "LOOP_PRE_KEY",

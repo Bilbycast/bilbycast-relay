@@ -134,6 +134,7 @@ So roll out in this order:
 | `POST` | `/origin/{stream}/marks` | Add a mark `{at, name?, colour?, exported?}` — `at` in wall-clock ms; the same instant twice is one mark; `404` while the relay holds no directory for the stream (viewer token, always) |
 | `PATCH` | `/origin/{stream}/marks/{id}` | Rename, recolour or flag exported (viewer token, always) |
 | `DELETE` | `/origin/{stream}/marks/{id}` | Remove a mark; removing one already gone succeeds (viewer token, always) |
+| `POST` | `/origin/{stream}/metrics` | A player's report on its own playback (`{client, quality, mode, playing, ahead_s, bw_kbps, stalls_5m, …}`, ≤ 8 KiB); the freshest report per `client` is kept for 90 s and listed under `distribution.viewer_metrics` in the relay's health (at most 200, freshest first); replies `{next_report_secs}` (viewer token, always) |
 | `GET` | `/distribution/health` | Liveness |
 
 **The signaling + origin listener is plain HTTP.** Browsers require a secure
@@ -940,6 +941,73 @@ sweep additionally clears what only it can see — an abandoned `.part`, media
 with no record beside it, an emptied stream directory — and holds a seven-day
 backstop, an order of magnitude above any expiry the manager sets, so a manager
 that never comes back does not leave clips for ever.
+
+
+### A relay restart keeps the window
+
+A session's window is a per-stream storage policy the manager pushes, and
+per-stream policies are deliberately not written to the relay's config: a
+session that ended while the relay was down must not come back holding disk.
+The node default is short (60 s). So a relay that restarts adopts the
+segments and thumbnail sheets already on disk and **does not trim them by age
+until the manager has named its per-stream policies** — which it does within
+a minute of the relay reconnecting — or until ten minutes have passed
+(`origin::ADOPT_HOLD`). The byte bound and the free-space floor apply
+throughout. Before this (fixed 2026-10-10) the first segment PUT after a
+restart evicted the whole adopted window against the 60 s default, some forty
+seconds before the manager's push said to keep it: every restart cost every
+viewer their rewind, and left the edge's thumbnail index naming sheets the
+relay no longer had.
+
+The player defends itself against that last condition regardless: three
+thumbnail sheets in a row that the relay does not have pause the background
+prefetch for a minute, doubling to ten, and one sheet that arrives resets it.
+
+### Live delay, falling back and catching up
+
+**Settings → Live delay** is how many seconds behind the live edge **Live**
+puts the playhead (default 8, range 6–60, remembered per device under
+`bilbycast.dvr.livedelay`). At the live edge the buffer ahead can never be
+deeper than the distance behind live, so this number *is* the forward buffer:
+further back is steadier on a poor connection, closer is nearer the moment.
+
+From that starting point the player moves by itself:
+
+- **Back** when the link struggles. Every rebuffer pause, and the second stall
+  inside a minute, moves the live point one segment further back — up to twelve
+  seconds past the preference — and it earns a second back for every
+  trouble-free two minutes.
+- **Forward** when the link is healthy. A pause leaves the playhead later by
+  its own length; with thirty seconds trouble-free and at least six seconds
+  buffered, the player runs at 1.05× until it is back at the live point, then
+  returns to 1×. The rate buttons never show it and any transport control ends
+  it. Delay the viewer made themselves — a pause, a passage at 50% — is left
+  alone until they press Live. The wait after a seek is not counted as a
+  pause at all.
+- **Down to Low** when the link cannot carry Full. Three stalls in a minute,
+  or three rebuffer pauses in a minute while segments are arriving slower than
+  they play (the middle of the last three fetches taking more than 0.8 of the
+  segment's length, or one still in flight after one and a half times it). The
+  page says so, reloads on Low, and says so again. Pauses on a link that is
+  fetching faster than real time move the live point back instead and leave
+  the picture on Full. Never upgraded automatically; nothing is lower than Low.
+- **Back to Full** by the viewer, with a prompt. An automatic drop is
+  remembered for as long as it stands (`bilbycast.dvr.autolow.<stream>`):
+  Settings says the player chose Low, and the **LOW** badge on the picture is
+  a control — a tap opens Settings at the choice. When Low has arrived with
+  room to spare (nine in ten of the last twenty segments fetched in under a
+  fifth of their length) and there has been no trouble for two minutes, the
+  badge reads **LOW · FULL OK** and a tap returns to Full. The return is
+  offered, never taken. A return that fails doubles the quiet time before the
+  next offer (two minutes, four, eight … thirty).
+- **Pressing Live** (or `End`) drops whatever the link had pushed the live point
+  to and returns to the preference at once.
+
+The debug panel (`?debug=1`) shows the preference, the current hold-back, the
+distance behind live, whether it is catching up, and a **trouble** list — the
+last twenty stalls, pauses, reconnects and downgrades with the buffer each
+happened at — which, unlike the transport log beneath it, does not scroll away.
+The newest eight ride the playback report to the manager.
 
 ### Picture modes
 
