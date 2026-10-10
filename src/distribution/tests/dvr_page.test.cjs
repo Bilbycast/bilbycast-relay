@@ -1447,6 +1447,30 @@ test("the still-frame element, expired access, and stalls while scrubbing do not
   assert.ok(!w.hlsCalls.some((c) => c[0] === "startLoad"), "no resume is attempted against withdrawn access");
 });
 
+// The relay saw a tablet cancel the same 2 MB Full segment over and over while
+// its page sat black: a link too slow to finish the first segment never
+// stalls, so nothing fell back. Load timeouts before first play count.
+test("segment loads timing out before anything has played fall back to Low", (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const fire = (details) => {
+    for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", { type: "networkError", details, fatal: false });
+  };
+  fire("fragLoadTimeOut"); fire("fragLoadTimeOut");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null, "two timeouts are weather");
+  fire("fragLoadError");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low", "the third is a link that cannot carry Full");
+  assert.match(w.document.getElementById("err").textContent, /switching to Low/);
+
+  // Once something has played, timeouts are the stall logic's business, not this branch's.
+  const again = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "full" } });
+  t.after(() => closePage(again));
+  const main = again.document.getElementById("main");
+  main.play(); main.dispatchEvent(new again.Event("playing"));
+  for (let i = 0; i < 4; i++) for (const cb of again.hlsHandlers.hlsError || []) cb("hlsError", { type: "networkError", details: "fragLoadTimeOut", fatal: false });
+  assert.equal(again.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "full", "after first play a timeout alone does not switch quality");
+});
+
 test("leaving live ends a buffering hold", (t) => {
   const w = loadPage({ token: "t.ok" });
   t.after(() => closePage(w));

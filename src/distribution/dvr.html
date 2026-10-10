@@ -2043,6 +2043,17 @@
           // good — a viewer nobody should still be counting. The proxy's
           // own fatal error leaves the visible picture running.
           if (video === main) stopBeating();
+        } else if (video === main && mode === "live" && !hasPlayed
+                   && /^(frag|level|manifest)Load(TimeOut|Error)$/.test(data.details || "")) {
+          // **A link too slow to deliver the first segment never stalls.**
+          // Nothing has played, so the stall-based fallback below cannot
+          // fire, and hls.js retries the same segment it cannot finish in
+          // time — the relay saw the tablet cancel the same 2 MB segment
+          // over and over while the page sat black (2026-10-10). A load
+          // timing out or failing before first play is the same evidence
+          // as a stall, and counts the same way.
+          noteStall();
+          maybeDowngrade();
         } else if (data.details === "bufferStalledError") {
           // Two kinds of stall, one seek. Past the edge: nudge back to the
           // live point. Empty buffer on a slow link: leave hls.js to fetch,
