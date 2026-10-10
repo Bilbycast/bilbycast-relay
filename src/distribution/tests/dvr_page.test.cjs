@@ -1303,12 +1303,74 @@ test("a fatal network error is reconnected, not the end of the session", async (
   }
   assert.match(err.textContent, /attempt 2/, "a second attempt says so");
 
-  // A segment lands: the notice clears and live rejoins the edge.
+  // A segment lands: the notice clears and playback carries on from where it
+  // stopped — jumping to the edge would discard what a slow link had buffered.
   const main = w.document.getElementById("main");
   main.currentTime = 40;
   for (const cb of w.hlsHandlers.hlsFragBuffered || []) cb("hlsFragBuffered", {});
   assert.equal(err.textContent, "", "the reconnect notice is cleared once a segment arrives");
-  assert.equal(main.currentTime, 100, "live rejoined the edge rather than resuming a stale buffer");
+  assert.equal(main.currentTime, 40, "resumed in place; the Live button is the viewer's");
+});
+
+// "The playback hits the end of the buffer and stops, the buffer doesn't seem
+// to start growing again … then it pauses 3–5 s before the buffer begins to
+// grow, plays until exhausted" — a tablet on contended wifi, 2026-10-10.
+test("after a stall the player holds until a couple of segments are buffered, then plays", (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  const err = w.document.getElementById("err");
+  let ahead = 1;
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + ahead }),
+    configurable: true,
+  });
+  main.play();
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.equal(main.paused, true, "a stall with one second ahead holds playback");
+  assert.match(err.textContent, /Buffering… 1 of 4 s/, "the viewer is told what it is waiting for");
+  ahead = 2.5;
+  main.dispatchEvent(new w.Event("progress"));
+  assert.equal(main.paused, true, "still short of the goal");
+  assert.match(err.textContent, /2 of 4 s/);
+  ahead = 4.5;
+  main.dispatchEvent(new w.Event("progress"));
+  assert.equal(main.paused, false, "enough buffered: play");
+  assert.equal(err.textContent, "", "the buffering notice is cleared");
+  // The viewer pressing Pause while holding wins: progress must not restart.
+  main.dispatchEvent(new w.Event("waiting"));
+  ahead = 1;
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.equal(main.paused, true);
+  click(w, "#btnPause");
+  ahead = 9;
+  main.dispatchEvent(new w.Event("progress"));
+  assert.equal(main.paused, true, "a deliberate pause is not undone by the buffer filling");
+});
+
+test("three stalls in a minute on Full switch the page to Low and say so after the reload", (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const stall = () => {
+    for (const cb of w.hlsHandlers.hlsError || []) {
+      cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+    }
+  };
+  stall(); stall();
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null, "two stalls are weather");
+  stall();
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low", "the third is a link that cannot carry Full");
+  assert.equal(w.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), "1");
+  assert.match(w.document.getElementById("err").textContent, /switching to Low/);
+
+  // The reloaded page explains, then clears the marker so it is said once.
+  const again = loadPage({ token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "low", "bilbycast.dvr.autolow.bigshow": "1" } });
+  t.after(() => closePage(again));
+  assert.match(again.document.getElementById("err").textContent, /Switched to Low/);
+  assert.equal(again.localStorage.getItem("bilbycast.dvr.autolow.bigshow"), null);
+  // Already on Low: stalls do not try to go lower.
+  for (let i = 0; i < 4; i++) for (const cb of again.hlsHandlers.hlsError || []) cb("hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+  assert.equal(again.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low");
 });
 
 test("a fatal media error gets hls.js's recovery a bounded number of times", (t) => {

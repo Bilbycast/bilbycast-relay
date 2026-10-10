@@ -1007,6 +1007,10 @@
   /// from its config on every playlist refresh.
   function applyHoldBack() {
     if (mainHls && mainHls.config) mainHls.config.liveSyncDuration = liveHoldBack;
+    // The LIVE badge's band follows the hold-back, or a deliberately later
+    // live point would read as "behind".
+    LIVE_ENTER = liveHoldBack + 3;
+    LIVE_LEAVE = liveHoldBack + 9;
     // Published for the debug panel and the page tests.
     document.body.dataset.holdback = String(liveHoldBack);
   }
@@ -1067,8 +1071,9 @@
     reconnectAttempts = 0;
     reconnectingLabel = null;
     fail("");
-    // Live rejoins the edge rather than resuming into a stale buffer.
-    if (video === main && mode === "live") goLive();
+    // Resume where it stopped. Rejoining the edge here threw away whatever a
+    // slow link had managed to buffer and started it from zero; the LIVE badge
+    // says the viewer is behind, and the Live button is theirs to press.
   }
 
   /// hls.js's own media-error recovery, bounded: three goes in thirty
@@ -1096,6 +1101,91 @@
   }
   window.addEventListener("online", reconnectNow);
   document.addEventListener("visibilitychange", function () { if (!document.hidden) reconnectNow(); });
+
+  // ── rebuffering with hysteresis ───────────────────────────────────────────
+  // A media element resumes the instant it has *any* data, so on a link that
+  // delivers slower than the stream plays, the picture ran a second, stalled,
+  // ran a second — the buffer could never get ahead. Hold after a stall until
+  // a couple of segments are buffered, then play: fewer, longer pauses and a
+  // picture that runs for a stretch, which is what a viewer can actually use.
+  var holdingForBuffer = false, rebufferTarget = 0;
+
+  /// Seconds buffered ahead of the playhead, or 0.
+  function bufferedAhead(v) {
+    try {
+      var b = v.buffered;
+      for (var i = 0; i < b.length; i++) {
+        if (v.currentTime >= b.start(i) - 0.1 && v.currentTime <= b.end(i) + 0.1) {
+          return Math.max(0, b.end(i) - v.currentTime);
+        }
+      }
+    } catch (e) {}
+    return 0;
+  }
+
+  /// How much to have ahead before playing again: two segments, more on a
+  /// link whose hold-back has already grown, never more than ten seconds.
+  function rebufferGoal() {
+    return Math.min(10, Math.max(2 * segmentSeconds(), liveHoldBack));
+  }
+
+  function showBuffering() {
+    if (!holdingForBuffer) return;
+    fail("Buffering… " + Math.floor(bufferedAhead(main)) + " of " + Math.ceil(rebufferTarget) + " s");
+  }
+
+  function holdForBuffer() {
+    if (mode !== "live" || holdingForBuffer || accessExpired || scrubbing) return;
+    rebufferTarget = rebufferGoal();
+    if (bufferedAhead(main) >= rebufferTarget) return;
+    holdingForBuffer = true;
+    try { main.pause(); } catch (e) {}
+    showBuffering();
+  }
+
+  /// Enough is buffered, or the viewer took over: play, or stop holding.
+  function releaseHold(play) {
+    if (!holdingForBuffer) return;
+    holdingForBuffer = false;
+    fail("");
+    if (play && mode === "live") main.play().catch(function () {});
+  }
+
+  main.addEventListener("waiting", function () { holdForBuffer(); });
+  main.addEventListener("progress", function () {
+    if (!holdingForBuffer) return;
+    if (bufferedAhead(main) >= rebufferTarget) releaseHold(true);
+    else showBuffering();
+  });
+
+  // ── falling back to Low on a link that cannot carry Full ──────────────────
+  // There is no bitrate ladder for hls.js to walk: Full and Low are separate
+  // playlists. So the page does the one step itself: three stalls in a
+  // minute on Full is a link that cannot carry ~9 Mbit/s, and Low (~3) is
+  // the honest answer. Quality changes by reload (see the Settings radios),
+  // which keeps the token and the marks; a marker tells the reloaded page
+  // to say what happened. Never upgraded automatically.
+  var AUTOLOW_KEY = "bilbycast.dvr.autolow." + STREAM;
+  var downgrading = false;
+  function maybeDowngrade() {
+    if (downgrading || quality !== "full" || stallCount < 3) return false;
+    try {
+      window.localStorage.setItem(QUALITY_KEY, "low");
+      window.localStorage.removeItem(LOWRES_KEY);
+      window.localStorage.setItem(AUTOLOW_KEY, "1");
+    } catch (e) { return false; }
+    downgrading = true;
+    fail("This link cannot keep up with Full — switching to Low…");
+    setTimeout(function () { try { location.reload(); } catch (e) {} }, 1500);
+    return true;
+  }
+  function announceAutoLow() {
+    var was = null;
+    try { was = window.localStorage.getItem(AUTOLOW_KEY); window.localStorage.removeItem(AUTOLOW_KEY); } catch (e) {}
+    if (was !== "1") return;
+    fail("Switched to Low: this link could not keep up with Full. Change it in Settings.");
+    setTimeout(function () { if (errEl.textContent.indexOf("Switched to Low") === 0) fail(""); }, 10000);
+  }
 
   // Hysteresis for the LIVE badge.
   //
@@ -1884,8 +1974,13 @@
           // and move the live point further back so there is more ahead of
           // the playhead next time (see noteStall).
           if (video === main) {
-            var grew = noteStall();
-            if (mode === "live" && (stalledPastEdge(main) || grew)) goLive();
+            // Moving the live point back is for the *next* re-sync; seeking
+            // forward to it now would discard the buffer that is still ahead
+            // of a playhead that has fallen behind — the "pause, then the
+            // buffer starts again from nothing" seen on a contended tablet.
+            noteStall();
+            if (mode === "live" && stalledPastEdge(main)) goLive();
+            else if (!maybeDowngrade()) holdForBuffer();
           }
         }
       });
@@ -1953,6 +2048,7 @@
   function goLive() {
     stopLoop();
     stopShuttle();
+    releaseHold(false);
     setMode("live");
     var t = liveTarget();
     // Only nudge if we are actually away from live; forcing a seek on every
@@ -2055,6 +2151,7 @@
 
 
   function setRate(r) {
+    releaseHold(false);
     fail("");
     stopLoop();
     // A shuttle rate is a SEEK rate, and it is one in both directions. Routing
@@ -4840,6 +4937,7 @@
   /// so a stopped transport shows the full-resolution frame rather than the
   /// low-res proxy still.
   function pauseTransport() {
+    releaseHold(false);
     stopLoop();
     stopShuttle();
     if (mode === "shuttle") setMode("scrub");
@@ -5377,6 +5475,7 @@
   startMarksPoll();
   mainHls = attach(main, MAIN, "main");
   applyHoldBack();
+  announceAutoLow();
   // The proxy is NOT attached up front. Two live MSE elements hold two
   // decoders, and Chrome's hardware decoder budget is small and shared —
   // exhausting it makes the *visible* element play with no picture, which
