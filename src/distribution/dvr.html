@@ -117,8 +117,11 @@
     font-size: 11px; font-weight: 700; letter-spacing: .09em;
     background: rgba(20,26,32,.8); color: var(--dim); backdrop-filter: blur(6px);
   }
-  body[data-q="1"] #qbadge { display: block; }
+  body[data-q="1"] #qbadge { display: block; cursor: pointer; pointer-events: auto; }
   #qbadge.hd { background: var(--accent); color: #04241c; }
+  /* The connection looks able to carry Full again: the badge says so, in the
+     accent, and a tap takes the viewer back. */
+  #qbadge.offer { background: var(--accent); color: #04241c; }
   #status {
     display: none; position: absolute; left: 68px; top: 16px; z-index: 6;
     font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--dim);
@@ -542,7 +545,7 @@
   <div id="scrimTop" aria-hidden="true"></div>
 
   <div id="badge">live</div>
-  <div id="qbadge" aria-hidden="true"></div>
+  <div id="qbadge" role="button" tabindex="0"></div>
   <button id="zoomBadge" type="button" title="Reset zoom (0)">1.0&times;</button>
   <div id="status">—</div>
   <pre id="debug"></pre>
@@ -691,6 +694,20 @@
        the frame you are looking at is sharp without paying for sharpness while
        it moves. Shuttle and scrub work in all three, because the
        low-resolution rendition is all-intra. Takes effect on reload.</p>
+    <p class="note" id="autoLowNote" hidden></p>
+    <fieldset class="clips">
+      <legend>Live delay</legend>
+      <label class="opt num">
+        <span>Seconds <b>behind live</b></span>
+        <input type="number" id="liveDelay" min="6" max="60" step="1" value="8">
+      </label>
+      <p class="note" id="liveDelayNow"></p>
+    </fieldset>
+    <p class="note">Where <b>Live</b> puts you. Further back is a deeper
+       buffer and a steadier picture on a poor connection; closer is nearer
+       the moment. If the connection struggles the player drops further back
+       by itself, and plays a touch fast to come back once it recovers;
+       pressing Live returns here at once. Remembered by this device.</p>
     <fieldset class="clips">
       <legend>Clip export</legend>
       <label class="opt num">
@@ -967,6 +984,686 @@
   // paints and hls.js reports bufferStalledError. Three target durations is
   // the LL-HLS hold-back convention.
   var LIVE_BACKOFF = 3;
+
+  // ── riding out a poor link ───────────────────────────────────────────────
+  // First field use on a weak 4G link (2026-10-10): the picture reached the
+  // end of its buffer and never came back, Full and Balanced alike. Three
+  // things, each handled below:
+  //  * hls.js raised a fatal network error once its retries ran out, and the
+  //    page ended the session instead of calling startLoad() to resume;
+  //  * every buffer stall was answered with a seek to the live point, which
+  //    on a slow link lands on a position with nothing buffered either;
+  //  * the live point sat a fixed three seconds behind the edge, so a link
+  //    that could not keep up had no slack to play from.
+  // How far behind the edge "live" sits now. Starts at the preference and grows
+  // by one segment each time the buffer runs dry, so a link that keeps
+  // stalling plays from further back and has more ahead of it. Relaxes again
+  // after a stall-free spell.
+  // **At the live edge the buffer ahead can never be deeper than the distance
+  // behind live** — the next segment does not exist yet. hls.js's default
+  // kept live three segments back (6 s here); the first attempt at this set
+  // it to 3 s, which left the player one and a half segments from the edge
+  // with nothing to fetch most of the time, and read on a tablet as "it only
+  // buffers after it runs dry, then loads four seconds". Four segments of
+  // slack by default: the edge publishes in bursts, and a viewer who wants
+  // the last two seconds back has the Live button.
+  //
+  // **The starting point is the viewer's to choose** (Settings, "Live
+  // delay"). It is where Live puts the playhead; a poor link moves the live
+  // point further back from there, a quiet spell earns it back, and pressing
+  // Live again returns to the preference at once. Kept per device, not per
+  // feed: it describes the link the device is on. Never below three segments,
+  // for the reason above.
+  var LIVEDELAY_KEY = "bilbycast.dvr.livedelay";
+  var LIVEDELAY_DEFAULT = 8, LIVEDELAY_MIN = 6, LIVEDELAY_MAX = 60;
+  var preferredDelay = LIVEDELAY_DEFAULT;
+  try {
+    var storedDelay = parseInt(window.localStorage.getItem(LIVEDELAY_KEY), 10);
+    if (isFinite(storedDelay) && storedDelay >= LIVEDELAY_MIN && storedDelay <= LIVEDELAY_MAX) preferredDelay = storedDelay;
+  } catch (e) { /* blocked: the default */ }
+  var liveHoldBack = preferredDelay;
+  /// How far a poor link may push the live point: twelve seconds past the
+  /// preference. Past that the viewer would rather be told than delayed.
+  function holdbackMax() { return Math.min(LIVEDELAY_MAX + 12, preferredDelay + 12); }
+  var HOLDBACK_RELAX_MS = 120000; // a trouble-free two minutes earns a second back
+  var stallCount = 0, lastStallAt = 0, lastHoldAt = 0, holdbackRelaxTimer = null;
+
+  /// Move the live point one segment further back, and start earning it back.
+  /// Shared by stalls and rebuffer pauses: both say the playhead was too
+  /// close to the edge for this link.
+  function growHoldBack(why) {
+    if (liveHoldBack >= holdbackMax()) return false;
+    liveHoldBack = Math.min(holdbackMax(), liveHoldBack + segmentSeconds());
+    applyHoldBack();
+    logDiag("holdback -> " + liveHoldBack + "s (" + why + ")");
+    // Earn it back slowly: one second per trouble-free period, down to the
+    // preference, so a link that recovers is not stuck watching late.
+    if (holdbackRelaxTimer === null) {
+      holdbackRelaxTimer = setInterval(function () {
+        if (Date.now() - Math.max(lastStallAt, lastHoldAt) < HOLDBACK_RELAX_MS) return;
+        liveHoldBack = Math.max(preferredDelay, liveHoldBack - 1);
+        applyHoldBack();
+        if (liveHoldBack <= preferredDelay) stopRelaxing();
+      }, HOLDBACK_RELAX_MS);
+    }
+    return true;
+  }
+  function stopRelaxing() {
+    if (holdbackRelaxTimer !== null) { clearInterval(holdbackRelaxTimer); holdbackRelaxTimer = null; }
+  }
+  /// Back to the viewer's preference, now: Live was pressed, or the setting
+  /// changed. Whatever the link did before is forgotten with it.
+  function resetHoldBack() {
+    stopRelaxing();
+    liveHoldBack = preferredDelay;
+    stallCount = 0;
+    applyHoldBack();
+  }
+
+  // Reconnecting after hls.js gave up: attempts, each further apart, until a
+  // segment lands or the page closes.
+  var reconnectTimer = null, reconnectAttempts = 0, reconnectingLabel = null, lastReconnectAt = 0;
+  var RECONNECT_FIRST_MS = 1000, RECONNECT_MAX_MS = 15000;
+
+  // A rolling log of what the transport saw — segment timings, stalls, holds,
+  // errors — shown in the debug panel (`&debug=1`). Added because a tablet in
+  // the field showed gaps of five to ten seconds with nothing downloading
+  // that no throttled desktop could reproduce; the page is the only witness.
+  var diag = [], DIAG_LINES = 40, diagT0 = Date.now();
+  function logDiag(msg) {
+    var t = ((Date.now() - diagT0) / 1000).toFixed(1);
+    diag.push(t + "s " + msg);
+    if (diag.length > DIAG_LINES) diag.shift();
+  }
+  // What went wrong, kept apart from the transport log. That log holds forty
+  // lines — eleven seconds of a healthy session — so the five pauses a tablet
+  // took at start-up had scrolled away long before anyone opened the panel.
+  // These do not scroll: the last twenty stalls, pauses, reconnects and
+  // downgrades, each with the buffer it happened at. Shown in the debug
+  // panel and sent, newest eight, with the playback report.
+  var playEvents = [], PLAY_EVENTS_KEPT = 20, holdEvent = null;
+  function noteEvent(ev) {
+    ev.at = Date.now();
+    playEvents.push(ev);
+    if (playEvents.length > PLAY_EVENTS_KEPT) playEvents.shift();
+    return ev;
+  }
+  function eventLine(ev) {
+    return "-" + Math.round((Date.now() - ev.at) / 1000) + "s " + ev.kind +
+      " ahead=" + (ev.ahead || 0).toFixed(1) + "s" +
+      (ev.kind === "hold" ? " goal=" + (ev.goal || 0).toFixed(1) + "s held=" + (ev === holdEvent ? "…" : ((ev.ms || 0) / 1000).toFixed(1) + "s") : "");
+  }
+  // hls.js's media-error recovery is good for a few goes, not forever.
+  var mediaRecoveries = [];
+
+  function segmentSeconds() {
+    try {
+      var lv = mainHls && mainHls.levels && mainHls.levels[mainHls.currentLevel];
+      var d = lv && lv.details && lv.details.targetduration;
+      if (d > 0 && d < 30) return d;
+    } catch (e) {}
+    return 2;
+  }
+
+  /// Hand the current hold-back to hls.js, which computes liveSyncPosition
+  /// from its config on every playlist refresh.
+  function applyHoldBack() {
+    if (mainHls && mainHls.config) mainHls.config.liveSyncDuration = liveHoldBack;
+    // The LIVE badge's band follows the hold-back, or a deliberately later
+    // live point would read as "behind".
+    LIVE_ENTER = liveHoldBack + 3;
+    LIVE_LEAVE = liveHoldBack + 9;
+    // Published for the debug panel and the page tests.
+    document.body.dataset.holdback = String(liveHoldBack);
+    if (typeof showLiveDelay === "function") { try { showLiveDelay(); } catch (e) {} }
+  }
+
+  /// One stall episode. Stalls inside a minute of each other count as the
+  /// same bad patch; a fresh patch moves the live point back a segment.
+  function noteStall() {
+    var now = Date.now();
+    if (now - lastStallAt > 60000) stallCount = 0;
+    lastStallAt = now;
+    stallCount++;
+    metricsEvent(stallTimes);
+    logDiag("STALL #" + stallCount + " ahead=" + bufferedAhead(main).toFixed(1) + " t=" + main.currentTime.toFixed(1));
+    noteEvent({ kind: "stall", ahead: bufferedAhead(main) });
+    if (stallCount >= 2) return growHoldBack("stall");
+    return false;
+  }
+
+  /// Is the playhead sitting past the live point — parked beyond the last
+  /// decodable frame? That is the stall a seek fixes. The other kind, an
+  /// empty buffer on a slow link, is not: hls.js is fetching and resumes
+  /// when a segment lands, and a seek would only land somewhere emptier.
+  function stalledPastEdge(v) {
+    var r = range(v);
+    return !!(r && v.currentTime > r.end - 0.5);
+  }
+
+  function scheduleReconnect(hls, video, label) {
+    // Only the picture the viewer is watching is worth a notice and a retry
+    // loop. The still-frame element in Balanced fetches on demand; a fatal
+    // error there is logged and left — the next stop re-attaches it.
+    // Expired access is not a link problem either: the 401/403 branch has
+    // already told the viewer, and retrying would only hammer a refusal.
+    if (video !== main || accessExpired) { logDiag("fatal on " + label + " — not reconnecting"); return; }
+    if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+    var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
+    reconnectAttempts++;
+    reconnectingLabel = label;
+    lastReconnectAt = Date.now();
+    metricsEvent(reconnectTimes);
+    noteEvent({ kind: "reconnect", ahead: bufferedAhead(main) });
+    logDiag("RECONNECT attempt " + reconnectAttempts + " in " + delay + "ms");
+    fail("Connection lost — reconnecting" + (reconnectAttempts > 1 ? " (attempt " + reconnectAttempts + ")" : "") + "…");
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      // -1 resumes from where it stopped; hls.js refetches the playlist and
+      // carries on from the current position.
+      try { hls.startLoad(-1); } catch (e) {}
+      if (video === main && !main.paused) main.play().catch(function () {});
+    }, delay);
+  }
+
+  /// A segment landed: the link is back.
+  function reconnected(video) {
+    if (video !== main) return;
+    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (reconnectAttempts === 0 && reconnectingLabel === null) return;
+    reconnectAttempts = 0;
+    reconnectingLabel = null;
+    fail("");
+    // Resume where it stopped. Rejoining the edge here threw away whatever a
+    // slow link had managed to buffer and started it from zero; the LIVE badge
+    // says the viewer is behind, and the Live button is theirs to press.
+  }
+
+  /// hls.js's own media-error recovery, bounded: three goes in thirty
+  /// seconds, the second and later swapping the audio codec as its docs ask.
+  function recoverMedia(hls) {
+    var now = Date.now();
+    mediaRecoveries = mediaRecoveries.filter(function (t) { return now - t < 30000; });
+    if (mediaRecoveries.length >= 3) return false;
+    var again = mediaRecoveries.length > 0;
+    mediaRecoveries.push(now);
+    try {
+      if (again && hls.swapAudioCodec) hls.swapAudioCodec();
+      hls.recoverMediaError();
+    } catch (e) { return false; }
+    return true;
+  }
+
+  // A link that comes back, or a tab that comes back, is worth an attempt
+  // now rather than at the end of the current back-off.
+  function reconnectNow() {
+    if (reconnectTimer === null || !mainHls) return;
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    reconnectAttempts = Math.max(0, reconnectAttempts - 1);
+    scheduleReconnect(mainHls, main, reconnectingLabel || "main");
+  }
+  window.addEventListener("online", reconnectNow);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) reconnectNow(); });
+
+  // ── rebuffering with hysteresis ───────────────────────────────────────────
+  // A media element resumes the instant it has *any* data, so on a link that
+  // delivers slower than the stream plays, the picture ran a second, stalled,
+  // ran a second — the buffer could never get ahead. Hold after a stall until
+  // a couple of segments are buffered, then play: fewer, longer pauses and a
+  // picture that runs for a stretch, which is what a viewer can actually use.
+  var holdingForBuffer = false, rebufferTarget = 0;
+  // The hold is released by *polling* the buffer, not by waiting for the
+  // element's `progress` event: desktop Chrome fires that on an MSE append,
+  // the tablet's browser did not, and a hold that waits for an event that
+  // never comes is a picture that never comes back ("sits at Buffering 2 of
+  // 4 s", 2026-10-10). A hard cap as well, so whatever the buffer does the
+  // picture is never held longer than this.
+  var holdTimer = null, holdStartedAt = 0;
+  var HOLD_POLL_MS = 250, HOLD_MAX_MS = 8000;
+  // The first stall of a session is start-up, not a slow link: nothing has
+  // played yet and hls.js is still filling. Holding there costs every viewer
+  // a "Buffering" notice on a perfectly good link.
+  var hasPlayed = false;
+  main.addEventListener("playing", function () { hasPlayed = true; });
+  // When the playhead last jumped, and whether the hold in progress is the
+  // link's (counted) or a seek's (not) — see holdForBuffer.
+  var lastSeekAt = 0, SEEK_SETTLE_MS = 2500, holdCounts = true;
+  main.addEventListener("seeking", function () { lastSeekAt = Date.now(); });
+
+  /// Seconds buffered ahead of the playhead, or 0.
+  function bufferedAhead(v) {
+    try {
+      var b = v.buffered;
+      for (var i = 0; i < b.length; i++) {
+        if (v.currentTime >= b.start(i) - 0.1 && v.currentTime <= b.end(i) + 0.1) {
+          return Math.max(0, b.end(i) - v.currentTime);
+        }
+      }
+    } catch (e) {}
+    return 0;
+  }
+
+  /// How much to have ahead before playing again: two segments, more on a
+  /// link whose hold-back has already grown, never more than ten seconds.
+  function rebufferGoal() {
+    // Half the hold-back: enough to run for a stretch, and reachable without
+    // waiting for the buffer to reach the edge itself.
+    return Math.min(8, Math.max(2 * segmentSeconds(), liveHoldBack / 2));
+  }
+
+  function showBuffering() {
+    if (!holdingForBuffer) return;
+    fail("Buffering… " + Math.floor(bufferedAhead(main)) + " of " + Math.ceil(rebufferTarget) + " s");
+  }
+
+  function holdForBuffer() {
+    // Nor once the page has decided to switch to Low: it reloads in a moment,
+    // and a hold started in that moment replaced "switching to Low" with
+    // "Buffering…" — the one notice that explains what is about to happen.
+    if (mode !== "live" || holdingForBuffer || accessExpired || scrubbing || !hasPlayed || downgrading) return;
+    rebufferTarget = rebufferGoal();
+    if (bufferedAhead(main) >= rebufferTarget) return;
+    holdingForBuffer = true;
+    holdStartedAt = Date.now();
+    // A seek empties the decoder and the browser says `waiting` — after the
+    // Live button, after the delay setting moves, after any jump. The picture
+    // is still held until there is something to play, but that is not the
+    // link struggling: it is not counted, not logged as trouble, and does not
+    // move the live point. (A real browser showed it: one seek in live mode
+    // read as a rebuffer pause and pushed the live point back two seconds,
+    // the moment after the viewer had asked for it closer.)
+    holdCounts = !(main.seeking || holdStartedAt - lastSeekAt < SEEK_SETTLE_MS);
+    if (!holdCounts) { logDiag("HOLD after a seek (not counted) goal=" + rebufferTarget); try { main.pause(); } catch (e) {} showBuffering(); if (holdTimer === null) holdTimer = setInterval(checkHold, HOLD_POLL_MS); return; }
+    lastHoldAt = holdStartedAt;
+    metricsEvent(holdTimes);
+    holdEvent = noteEvent({ kind: "hold", ahead: bufferedAhead(main), goal: rebufferTarget, ms: 0 });
+    // A pause costs the viewer its own length in delay, for good, unless the
+    // live point moves with it: then the catch-up below has somewhere honest
+    // to return to, and the next pause is less likely. Every pause, not only
+    // the second — the tablet that prompted this paused five times at start
+    // on a link that then carried the feed four times over.
+    growHoldBack("hold");
+    // And if this is the third in a minute on a link that is losing ground,
+    // the rendition is the problem, not the buffer: go to Low instead.
+    // Not held: the page reloads in a moment, and a hold left standing would
+    // be released by the next buffer check, which clears the notice that
+    // says why the picture is about to change.
+    if (maybeDowngrade()) { holdingForBuffer = false; holdEvent = null; return; }
+    logDiag("HOLD ahead=" + bufferedAhead(main).toFixed(1) + " goal=" + rebufferTarget);
+    try { main.pause(); } catch (e) {}
+    showBuffering();
+    if (holdTimer === null) holdTimer = setInterval(checkHold, HOLD_POLL_MS);
+  }
+
+  /// Enough buffered, or held long enough: play. Otherwise update the notice.
+  function checkHold() {
+    if (!holdingForBuffer) { if (holdTimer !== null) { clearInterval(holdTimer); holdTimer = null; } return; }
+    if (bufferedAhead(main) >= rebufferTarget || Date.now() - holdStartedAt >= HOLD_MAX_MS) releaseHold(true);
+    else showBuffering();
+  }
+
+  /// Enough is buffered, or the viewer took over: play, or stop holding.
+  function releaseHold(play) {
+    if (holdTimer !== null) { clearInterval(holdTimer); holdTimer = null; }
+    if (!holdingForBuffer) return;
+    holdingForBuffer = false;
+    if (holdCounts) { holdTotalMs += Date.now() - holdStartedAt; lastHoldAt = Date.now(); }
+    if (holdEvent) { holdEvent.ms = Date.now() - holdStartedAt; holdEvent = null; }
+    logDiag("RELEASE after " + ((Date.now() - holdStartedAt) / 1000).toFixed(1) + "s ahead=" + bufferedAhead(main).toFixed(1) + (play ? "" : " (viewer)"));
+    fail("");
+    if (play && mode === "live") main.play().catch(function () {});
+  }
+
+  main.addEventListener("waiting", function () { holdForBuffer(); });
+
+  // ── winning the delay back ───────────────────────────────────────────────
+  // Every pause leaves the playhead later by its own length, and nothing gave
+  // that back: a tablet that paused for 27 s in its first minutes sat 34 s
+  // behind live for the rest of the session, on a link fetching each
+  // two-second segment in half a second, with thirty seconds buffered ahead.
+  // So when the playhead is further back than the live point, the buffer is
+  // comfortable and there has been no trouble for half a minute, play a
+  // touch fast until it is back. Five per cent is below what anyone notices
+  // in speech or motion, and wins a second every twenty.
+  //
+  // It only ever touches `main.playbackRate` while the viewer's own rate is
+  // 1 — `rate` and the rate buttons never see it — and lets go the moment
+  // anything else wants the transport.
+  var CATCHUP_RATE = 1.05, CATCHUP_QUIET_MS = 30000;
+  var CATCHUP_START_S = 3, CATCHUP_STOP_S = 0.5, CATCHUP_MIN_AHEAD_S = 6;
+  var catchingUp = false;
+  // Delay the viewer made themselves is theirs to keep. Pausing for a minute,
+  // or watching a passage at 50%, leaves the playhead behind in live mode
+  // just as a rebuffer does — and quietly running 5% fast for the next twenty
+  // minutes to "fix" it would be the player overruling the operator. Set by
+  // the viewer's own pause and by any rate other than 1; cleared when Live
+  // puts the playhead back at the live point. (Found reviewing this before
+  // rollout: nothing distinguished the two kinds of late.)
+  var delayIsViewers = false;
+  function behindLive() {
+    var r = range(main);
+    return r ? Math.max(0, r.end - main.currentTime) : 0;
+  }
+  function tendLatency() {
+    var able = mode === "live" && rate === 1 && !loop && !main.paused && !holdingForBuffer &&
+               !scrubbing && !accessExpired && hasPlayed && reconnectTimer === null &&
+               !delayIsViewers;
+    var quiet = Date.now() - Math.max(lastStallAt, lastHoldAt) >= CATCHUP_QUIET_MS;
+    var excess = behindLive() - liveHoldBack;
+    var ahead = bufferedAhead(main);
+    if (catchingUp) {
+      if (!able || !quiet || excess <= CATCHUP_STOP_S || ahead < CATCHUP_MIN_AHEAD_S / 2) stopCatchUp();
+    } else if (able && quiet && excess > CATCHUP_START_S && ahead >= CATCHUP_MIN_AHEAD_S) {
+      catchingUp = true;
+      document.body.dataset.catchup = "1";
+      main.playbackRate = CATCHUP_RATE;
+      logDiag("CATCHUP start: " + excess.toFixed(1) + "s to win back, ahead=" + ahead.toFixed(1));
+    }
+  }
+  function stopCatchUp() {
+    if (!catchingUp) return;
+    catchingUp = false;
+    document.body.dataset.catchup = "0";
+    // Only if it is still ours: a rate button, a loop or a shuttle that took
+    // the transport has already set what it wants.
+    if (main.playbackRate === CATCHUP_RATE) main.playbackRate = (rate > 0 && rate <= 1) ? rate : 1;
+    logDiag("CATCHUP stop: " + (behindLive() - liveHoldBack).toFixed(1) + "s from the live point");
+  }
+  setInterval(function () { tendLatency(); tendReturnOffer(); }, 1000);
+  // Where the browser does fire it, this is simply sooner than the next poll.
+  main.addEventListener("progress", checkHold);
+
+  // ── falling back to Low on a link that cannot carry Full ──────────────────
+  // There is no bitrate ladder for hls.js to walk: Full and Low are separate
+  // playlists. So the page does the one step itself: three stalls in a
+  // minute on Full is a link that cannot carry ~9 Mbit/s, and Low (~3) is
+  // the honest answer. Quality changes by reload (see the Settings radios),
+  // which keeps the token and the marks; a marker tells the reloaded page
+  // to say what happened. Never upgraded automatically.
+  //
+  // **Or three rebuffer pauses in a minute, on a link fetching slower than
+  // real time.** Stalls were the only trigger, and a starved link does not
+  // stall: the browser says `waiting`, the page holds for the buffer, and
+  // that is a pause, not a stall. Throttled to 2.5 Mbit/s on Full the player
+  // held for eight seconds in every ten and never left Full; a tablet in the
+  // field did the same for nine minutes (29 pauses, 155 s held, four stalls).
+  //
+  // Pauses alone are not enough, though. The same tablet, on a link carrying
+  // the feed four times over, paused five times while starting and then
+  // played perfectly — switching that viewer to Low would have cost them the
+  // picture for nothing. What separates the two is how the segments are
+  // arriving: a two-second segment that takes four seconds to fetch is a link
+  // that cannot carry this rendition; one that takes half a second is not.
+  var SLOW_LOAD_RATIO = 0.8;      // fetch time / media time; above this the link is losing ground
+  var STARVED_HOLDS = 3, STARVED_WINDOW_MS = 60000;
+  var segLoadRatios = [], segLoadingSince = 0, segLoadingSecs = 0;
+  /// Is the link fetching this rendition slower than it plays?
+  function slowLink() {
+    // A segment still on its way after one and a half times its length is
+    // slow whatever came before it — and on a badly starved link it may be
+    // the only evidence, the earlier ones having never finished.
+    if (segLoadingSince && segLoadingSecs > 0 &&
+        Date.now() - segLoadingSince > segLoadingSecs * 1500) return true;
+    if (segLoadRatios.length < 2) return false;
+    // The middle of the last three, not their mean: one bad fetch on a good
+    // link is 2.0 among 0.25s, and a mean would call that link slow. With
+    // only two to go on, the better of them.
+    var sorted = segLoadRatios.slice().sort(function (a, b) { return a - b; });
+    return sorted[sorted.length === 3 ? 1 : 0] > SLOW_LOAD_RATIO;
+  }
+  function starvedByPauses() {
+    return recentCount(holdTimes, STARVED_WINDOW_MS) >= STARVED_HOLDS && slowLink();
+  }
+  //
+  // **And a way back.** The first cut announced the switch once and forgot
+  // it: the reloaded page was simply "on Low", the notice pointed at Settings
+  // and vanished after ten seconds, and a viewer whose connection recovered —
+  // a tablet walking back into coverage — stayed on a 360p picture for the
+  // rest of the event unless they went looking. So the drop is remembered for
+  // as long as it stands, and three things follow from that:
+  //   * the LOW badge is a control: a tap opens Settings at the choice;
+  //   * when the link has carried Low with room to spare for long enough,
+  //     the badge reads "LOW · FULL OK" and a tap returns to Full;
+  //   * Settings says the choice was the player's, not the viewer's.
+  // The return is offered, never taken: a reload in the middle of a passage
+  // is the viewer's to choose, and a player that flips itself between the
+  // two every few minutes on a marginal link is worse than either.
+  //
+  // The marker carries how many times this has happened: "1" / "1:N" asks the
+  // reloaded page to say so, "auto:N" is Low standing by the player's choice,
+  // "tried:N" is back on Full after N drops. Each failed return doubles how
+  // long the link must behave before Full is offered again.
+  var AUTOLOW_KEY = "bilbycast.dvr.autolow." + STREAM;
+  function autoLowRead() {
+    var raw = null;
+    try { raw = window.localStorage.getItem(AUTOLOW_KEY); } catch (e) {}
+    var m = /^(1|auto|tried)(?::(\d+))?$/.exec(raw || "");
+    if (!m) return { state: "", n: 0 };
+    return { state: m[1], n: Math.min(8, Math.max(1, parseInt(m[2] || "1", 10))) };
+  }
+  function autoLowWrite(state, n) {
+    try {
+      if (!state) window.localStorage.removeItem(AUTOLOW_KEY);
+      else window.localStorage.setItem(AUTOLOW_KEY, state === "1" && n <= 1 ? "1" : state + ":" + n);
+    } catch (e) {}
+  }
+  var autoLowTimes = 0;          // how many automatic drops this viewer has had
+  var returnOffered = false;
+  var FULL_OK_RATIO = 0.2;       // Low fetched this fast leaves room for a rendition three times its size
+  var FULL_OK_SEGMENTS = 20;     // forty seconds of them, nine in ten under the line
+  var FULL_OK_QUIET_MS = 120000; // and this long without trouble, doubled per failed return
+  var returnRatios = [];
+  function returnQuietMs() {
+    return Math.min(30 * 60000, FULL_OK_QUIET_MS * Math.pow(2, Math.max(0, autoLowTimes - 1)));
+  }
+  /// Does the link look able to carry Full? Judged on how fast Low arrives:
+  /// Full is about three times the size, so Low in a fifth of real time is
+  /// Full in well under it.
+  function linkCouldCarryFull() {
+    if (returnRatios.length < FULL_OK_SEGMENTS) return false;
+    var sorted = returnRatios.slice().sort(function (a, b) { return a - b; });
+    return sorted[Math.floor(sorted.length * 0.9)] <= FULL_OK_RATIO;
+  }
+  function tendReturnOffer() {
+    if (!autoLowApplied || quality !== "low" || downgrading) return;
+    var now = Date.now();
+    var quietFor = now - Math.max(lastStallAt, lastHoldAt, metricsT0, lastReconnectAt);
+    var ok = hasPlayed && mode === "live" && !holdingForBuffer && reconnectTimer === null &&
+             quietFor >= returnQuietMs() && linkCouldCarryFull();
+    // Withdrawn the moment the link stops looking able; offered again only
+    // after the full quiet period, so the badge does not flicker.
+    if (ok !== returnOffered) {
+      returnOffered = ok;
+      document.body.dataset.fulloffer = ok ? "1" : "0";
+      logDiag(ok ? "FULL offered: Low is arriving fast enough to carry it" : "FULL offer withdrawn");
+      syncQualityBadge();
+    }
+  }
+  /// Back to Full at the viewer's request. Remembers that it was a return,
+  /// so a second drop waits longer before offering a third try.
+  function returnToFull() {
+    try {
+      window.localStorage.setItem(QUALITY_KEY, "full");
+      window.localStorage.removeItem(LOWRES_KEY);
+    } catch (e) { return; }
+    autoLowWrite("tried", Math.max(1, autoLowTimes));
+    fail("Switching back to Full…");
+    setTimeout(function () { try { location.reload(); } catch (e) {} }, 600);
+  }
+  var downgrading = false;
+  function maybeDowngrade() {
+    if (downgrading || quality !== "full") return false;
+    var starved = stallCount < 3 && starvedByPauses();
+    if (stallCount < 3 && !starved) return false;
+    try {
+      window.localStorage.setItem(QUALITY_KEY, "low");
+      window.localStorage.removeItem(LOWRES_KEY);
+      // One more than however many times it has happened before a return.
+      var before = autoLowRead();
+      window.localStorage.setItem(AUTOLOW_KEY, before.state === "tried" ? "1:" + (before.n + 1) : "1");
+    } catch (e) { return false; }
+    downgrading = true;
+    noteEvent({ kind: "downgrade", ahead: bufferedAhead(main) });
+    // Tell the manager now: the reload discards this page's history, and the
+    // operator watching the roll should see why the viewer's row changes.
+    try { reportMetrics(); } catch (e) { /* a lost report costs a number */ }
+    logDiag(starved
+      ? "DOWNGRADE to low after " + recentCount(holdTimes, STARVED_WINDOW_MS) + " pauses in a minute on a link fetching slower than real time"
+      : "DOWNGRADE to low after " + stallCount + " stalls");
+    fail("This link cannot keep up with Full — switching to Low…");
+    setTimeout(function () { try { location.reload(); } catch (e) {} }, 1500);
+    return true;
+  }
+  function announceAutoLow() {
+    var was = autoLowRead();
+    autoLowTimes = was.n;
+    // Only while it still stands. A viewer who has since chosen something
+    // else in Settings made a choice of their own, and the marker goes.
+    if ((was.state === "1" || was.state === "auto") && quality !== "low") { autoLowWrite("", 0); autoLowTimes = 0; return; }
+    if (was.state !== "1" && was.state !== "auto") return;
+    autoLowApplied = true;
+    var note = document.getElementById("autoLowNote");
+    if (note) {
+      note.hidden = false;
+      note.textContent = "Low was chosen by the player: this connection could not keep up with Full. " +
+        "Pick Full above to go back. When the connection looks able, the LOW badge on the picture " +
+        "reads FULL OK and a tap on it returns to Full.";
+    }
+    if (was.state !== "1") return;       // already said, on an earlier load
+    autoLowWrite("auto", was.n);
+    fail("Switched to Low: this connection could not keep up with Full. Tap LOW to change it.");
+    setTimeout(function () { if (errEl.textContent.indexOf("Switched to Low") === 0) fail(""); }, 10000);
+  }
+
+  // ── playback metrics, reported to the relay ───────────────────────────────
+  // What the debug panel shows, sent to the relay every twenty seconds
+  // (`POST /origin/{stream}/metrics`) so an operator can see how the picture
+  // is going for the people watching without asking them. The relay carries
+  // the latest report per client to the manager on its health tick; the
+  // manager puts a login's name beside it by the same client id, which the
+  // portal beat also carries. A viewer on a one-off link never beats, so
+  // their report stays anonymous — a row with a buffer reading, no name.
+  //
+  // The id is minted per page load, and is neither the token (two devices
+  // sharing a login can hold byte-identical tokens) nor the holder (which is
+  // never presented to the relay by design).
+  var CLIENT = (function () {
+    try {
+      var b = new Uint8Array(8);
+      window.crypto.getRandomValues(b);
+      var out = "";
+      for (var i = 0; i < b.length; i++) out += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+      return out;
+    } catch (e) {
+      return Math.random().toString(16).slice(2, 10) + Math.random().toString(16).slice(2, 10);
+    }
+  })();
+  var METRICS_MS = 20000, metricsTimer = null, metricsT0 = Date.now();
+  var stallTimes = [], holdTimes = [], reconnectTimes = [], holdTotalMs = 0;
+  var lastSegment = { ttfb: 0, total: 0, kb: 0 };
+  var autoLowApplied = false;
+  var METRICS_WINDOW_MS = 5 * 60 * 1000;
+  /// One event of a kind, kept for the five-minute count; the lifetime total
+  /// is the list's own counter so trimming the window loses nothing.
+  function metricsEvent(list) {
+    var now = Date.now();
+    list.push(now);
+    list.total = (list.total || 0) + 1;
+    while (list.length && now - list[0] > METRICS_WINDOW_MS) list.shift();
+  }
+  function recentCount(list, withinMs) {
+    var now = Date.now();
+    while (list.length && now - list[0] > METRICS_WINDOW_MS) list.shift();
+    if (!withinMs) return list.length;
+    var n = 0;
+    for (var i = list.length - 1; i >= 0 && now - list[i] <= withinMs; i--) n++;
+    return n;
+  }
+  function metricsSample() {
+    var q = main.getVideoPlaybackQuality ? main.getVideoPlaybackQuality() : null;
+    var r = range(main);
+    var now = Date.now();
+    return {
+      // 2: carries the last-minute counts, the event history, the preferred
+      // delay and whether it is catching up; the manager judges a report
+      // without them by the five-minute counts alone.
+      v: 2,
+      client: CLIENT,
+      quality: quality,
+      auto_low: autoLowApplied,
+      mode: mode,
+      playing: mode === "live" && !main.paused && !holdingForBuffer,
+      holdback_s: liveHoldBack,
+      delay_pref_s: preferredDelay,
+      catching_up: catchingUp,
+      ahead_s: Math.round(bufferedAhead(main) * 10) / 10,
+      behind_live_s: r ? Math.max(0, Math.round((r.end - main.currentTime) * 10) / 10) : 0,
+      bw_kbps: mainHls && mainHls.bandwidthEstimate > 0 ? Math.round(mainHls.bandwidthEstimate / 1000) : 0,
+      stalls: stallTimes.total || 0,
+      stalls_5m: recentCount(stallTimes),
+      stalls_1m: recentCount(stallTimes, 60000),
+      holds: holdTimes.total || 0,
+      holds_5m: recentCount(holdTimes),
+      holds_1m: recentCount(holdTimes, 60000),
+      hold_ms: holdTotalMs + (holdingForBuffer && holdCounts ? Date.now() - holdStartedAt : 0),
+      reconnects: reconnectTimes.total || 0,
+      reconnects_5m: recentCount(reconnectTimes),
+      reconnects_1m: recentCount(reconnectTimes, 60000),
+      decoded: q ? q.totalVideoFrames : 0,
+      dropped: q ? q.droppedVideoFrames : 0,
+      seg_ttfb_ms: lastSegment.ttfb,
+      seg_load_ms: lastSegment.total,
+      seg_kb: lastSegment.kb,
+      up_s: Math.round((Date.now() - metricsT0) / 1000),
+      events: playEvents.slice(-8).map(function (ev) {
+        return {
+          ago_s: Math.round((now - ev.at) / 1000),
+          kind: ev.kind,
+          ahead_s: Math.round((ev.ahead || 0) * 10) / 10,
+          goal_s: Math.round((ev.goal || 0) * 10) / 10,
+          ms: ev === holdEvent ? now - holdStartedAt : (ev.ms || 0)
+        };
+      }),
+      ua: String(navigator.userAgent || "").slice(0, 120)
+    };
+  }
+  /// Only a credentialed, live-access, visible page reports: the relay
+  /// refuses a report without a token, an expired tab has nothing to say,
+  /// and a background tab's numbers describe nothing anyone is watching.
+  function mayReport() {
+    return !!(TOKEN && !accessExpired && !document.hidden);
+  }
+  function reportMetrics() {
+    if (!mayReport()) return;
+    var headers = { "Content-Type": "application/json" };
+    if (TOKEN_IN_HEADER && TOKEN) headers.Authorization = "Bearer " + TOKEN;
+    var sample = metricsSample();
+    fetch(url(STREAM, "metrics"), { method: "POST", headers: headers, cache: "no-store", body: JSON.stringify(sample) })
+      .then(function (r) { return r.ok ? r.json().catch(function () { return null; }) : null; })
+      .then(function (body) {
+        // The cadence is the relay's to set, as the beat's is the manager's;
+        // never faster than every ten seconds whatever it says.
+        if (body && body.next_report_secs > 0) {
+          var ms = Math.min(Math.max(10000, body.next_report_secs * 1000), 0x7fffffff);
+          if (ms !== METRICS_MS) { METRICS_MS = ms; stopReporting(); startReporting(); }
+        }
+      })
+      .catch(function () { /* a lost report costs a number on an operator's screen, not a picture */ });
+  }
+  function startReporting() {
+    if (metricsTimer !== null || !TOKEN) return;
+    metricsTimer = setInterval(reportMetrics, METRICS_MS);
+    // The first report waits a full interval: a page that has loaded nothing
+    // yet has only zeros to send.
+  }
+  function stopReporting() {
+    if (metricsTimer !== null) { clearInterval(metricsTimer); metricsTimer = null; }
+  }
+  // Coming back to the foreground reports now, so a viewer who was just told
+  // "it looks fine here" shows up on the operator's screen at once.
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && metricsTimer !== null) reportMetrics();
+  });
 
   // Hysteresis for the LIVE badge.
   //
@@ -1677,15 +2374,71 @@
         backBufferLength: 120,
         maxBufferLength: 30,
         lowLatencyMode: false,
+        // Where "live" sits behind the edge; raised by noteStall on a link
+        // that keeps running dry.
+        liveSyncDuration: liveHoldBack,
+        // More patience than the defaults (two playlist retries, six segment
+        // retries, a second apart) before anything is called fatal: a bad
+        // patch of 4G exhausts those in under a minute. Fatal is recovered
+        // above in any case; this keeps the common dip from getting there.
+        // And give up on a *hung* request sooner. A lossy wifi stalls a TCP
+        // connection rather than slowing it: the request just sits there. The
+        // default waits ten seconds for the first byte before retrying, which
+        // on a tablet read as "five to ten seconds with nothing downloading,
+        // then a burst". Four seconds to first byte, and a segment that is
+        // still arriving after twelve is abandoned and refetched.
+        playlistLoadPolicy: { default: {
+          maxTimeToFirstByteMs: 4000, maxLoadTimeMs: 8000,
+          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 250, maxRetryDelayMs: 2000, backoff: "exponential" },
+          errorRetry:   { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
+        } },
+        fragLoadPolicy: { default: {
+          maxTimeToFirstByteMs: 4000, maxLoadTimeMs: 12000,
+          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 250, maxRetryDelayMs: 2000, backoff: "exponential" },
+          errorRetry:   { maxNumRetry: 8, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
+        } },
         // Every manifest and segment fetch carries the credential. Applies to
         // both because hls.js routes them through the same hook.
         xhrSetup: function (xhr) {
           if (TOKEN_IN_HEADER && TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
         }
       });
+      // What the transport is doing, for the debug panel.
+      hls.on(Hls.Events.FRAG_LOADING, function (_e, d) {
+        if (video !== main || !d || !d.frag) return;
+        logDiag("load sn=" + d.frag.sn);
+        if (d.frag.sn !== "initSegment" && d.frag.duration > 0) {
+          segLoadingSince = Date.now();
+          segLoadingSecs = d.frag.duration;
+        }
+      });
+      hls.on(Hls.Events.FRAG_LOADED, function (_e, d) {
+        if (video !== main || !d || !d.frag) return;
+        var st = (d.frag.stats && d.frag.stats.loading) || {};
+        var kb = d.stats && d.stats.loaded ? Math.round(d.stats.loaded / 1024) : (d.frag.stats && d.frag.stats.loaded ? Math.round(d.frag.stats.loaded / 1024) : "?");
+        lastSegment = {
+          ttfb: st.first && st.start ? Math.round(st.first - st.start) : 0,
+          total: st.end && st.start ? Math.round(st.end - st.start) : 0,
+          kb: typeof kb === "number" ? kb : 0
+        };
+        if (d.frag.sn !== "initSegment" && d.frag.duration > 0) {
+          segLoadingSince = 0;
+          if (st.end && st.start) {
+            segLoadRatios.push((st.end - st.start) / (d.frag.duration * 1000));
+            if (segLoadRatios.length > 3) segLoadRatios.shift();
+            returnRatios.push((st.end - st.start) / (d.frag.duration * 1000));
+            if (returnRatios.length > FULL_OK_SEGMENTS) returnRatios.shift();
+          }
+        }
+        logDiag("got  sn=" + d.frag.sn + " " + kb + "KB ttfb=" + (st.first && st.start ? Math.round(st.first - st.start) : "?") + "ms total=" + (st.end && st.start ? Math.round(st.end - st.start) : "?") + "ms");
+      });
+      hls.on(Hls.Events.LEVEL_LOADED, function (_e, d) {
+        if (video === main && d && d.details) logDiag("playlist " + (d.details.fragments ? d.details.fragments.length : "?") + " segs, edge=" + (typeof d.details.edge === "number" ? d.details.edge.toFixed(1) : "?"));
+      });
       hls.on(Hls.Events.ERROR, function (_e, data) {
         if (!data) return;
         lastHlsError = label + ":" + data.details + (data.fatal ? " (fatal)" : "");
+        if (video === main) logDiag("ERR " + data.details + (data.fatal ? " FATAL" : "") + (data.response && data.response.code ? " http=" + data.response.code : ""));
 
         // An expiring viewing token is the one failure a viewer can act on, so
         // it must not arrive as a generic stall.
@@ -1715,17 +2468,60 @@
         }
 
         if (data.fatal) {
+          // hls.js giving up on the network is not the link being gone: its
+          // contract is that the page calls startLoad() to resume, and the
+          // picture stayed stopped because nothing did. Reconnect for as long
+          // as the page is open; the beat keeps counting the viewer. A media
+          // error gets hls.js's own recovery, a few times. The rest is the
+          // end, as before.
+          if (data.type === "networkError") {
+            scheduleReconnect(hls, video, label);
+            return;
+          }
+          if (data.type === "mediaError" && recoverMedia(hls)) return;
           fail(label + ": " + data.type + " / " + data.details);
           // hls.js never retries a 4xx and nothing here re-attaches, so a
           // fatal error on the main element is the picture stopping for
           // good — a viewer nobody should still be counting. The proxy's
           // own fatal error leaves the visible picture running.
           if (video === main) stopBeating();
+        } else if (video === main && mode === "live" && !hasPlayed
+                   && /^(frag|level|manifest)Load(TimeOut|Error)$/.test(data.details || "")) {
+          // **A link too slow to deliver the first segment never stalls.**
+          // Nothing has played, so the stall-based fallback below cannot
+          // fire, and hls.js retries the same segment it cannot finish in
+          // time — the relay saw the tablet cancel the same 2 MB segment
+          // over and over while the page sat black (2026-10-10). A load
+          // timing out or failing before first play is the same evidence
+          // as a stall, and counts the same way.
+          noteStall();
+          maybeDowngrade();
         } else if (data.details === "bufferStalledError") {
-          // Usually means the playhead is sitting past what is buffered.
-          // Nudge back to the live sync point rather than sitting black.
-          if (video === main && mode === "live") goLive();
+          // Two kinds of stall, one seek. Past the edge: nudge back to the
+          // live point. Empty buffer on a slow link: leave hls.js to fetch,
+          // and move the live point further back so there is more ahead of
+          // the playhead next time (see noteStall).
+          // Only a stall in *live* is evidence about the link. A stall while
+          // scrubbing, jogging or looping is the seek itself, and counting
+          // those grew the hold-back and could have switched a reviewer to
+          // Low for stepping through frames.
+          if (video === main && mode === "live") {
+            // Moving the live point back is for the *next* re-sync; seeking
+            // forward to it now would discard the buffer that is still ahead
+            // of a playhead that has fallen behind — the "pause, then the
+            // buffer starts again from nothing" seen on a contended tablet.
+            noteStall();
+            if (stalledPastEdge(main)) goLive();
+            else if (!maybeDowngrade()) holdForBuffer();
+          }
         }
+      });
+      // The link is back when a segment is.
+      hls.on(Hls.Events.FRAG_BUFFERED, function () {
+        reconnected(video);
+        // A segment just landed: the hold may be over, whatever the element
+        // does or does not fire.
+        if (video === main) checkHold();
       });
       hls.loadSource(src);
       hls.attachMedia(video);
@@ -1758,6 +2554,9 @@
     var t = playhead(from);
     mode = next;
     document.body.dataset.mode = next;
+    // A hold belongs to live playback; a viewer who starts scrubbing or
+    // shuttling has taken over, and the notice must not linger over them.
+    if (next !== "live") releaseHold(false);
     var to = activeVideo();
     if (to !== from) {
       // Hand over by *content*, not by number: the two elements do not share a
@@ -1783,12 +2582,20 @@
       return mainHls.liveSyncPosition;
     }
     var r = range(main);
-    return r ? Math.max(r.start, r.end - LIVE_BACKOFF) : null;
+    return r ? Math.max(r.start, r.end - liveHoldBack) : null;
   }
 
-  function goLive() {
+  /// `byViewer` is the Live button or its key: the viewer asking for live as
+  /// they prefer it, so whatever the link pushed the live point back to is
+  /// dropped. The page's own calls (start-up, a stall past the edge, a
+  /// shuttle running off the end) keep what the link has earned.
+  function goLive(byViewer) {
     stopLoop();
     stopShuttle();
+    releaseHold(false);
+    stopCatchUp();
+    delayIsViewers = false;
+    if (byViewer === true) resetHoldBack();
     setMode("live");
     var t = liveTarget();
     // Only nudge if we are actually away from live; forcing a seek on every
@@ -1891,6 +2698,7 @@
 
 
   function setRate(r) {
+    releaseHold(false);
     fail("");
     stopLoop();
     // A shuttle rate is a SEEK rate, and it is one in both directions. Routing
@@ -1900,6 +2708,7 @@
     if (r < 0 || Math.abs(r) > 1) { startShuttle(r); syncRateButtons(); return; }
     stopShuttle();
     if (mode === "shuttle") setMode("scrub");
+    if (r !== 1) delayIsViewers = true;
     rate = r;
     main.playbackRate = r;
     main.play().catch(function () {});
@@ -3665,12 +4474,27 @@
     if (quality === "full") { document.body.dataset.q = "0"; return; }
     document.body.dataset.q = "1";
     var hd = stillShowing;
-    qbadge.textContent = hd ? "HD" : "LOW";
+    var offer = !hd && returnOffered;
+    qbadge.textContent = hd ? "HD" : (offer ? "LOW \u00B7 FULL OK" : "LOW");
     qbadge.title = hd
       ? "Stopped, so this frame is at full resolution"
-      : "Moving picture is the low-resolution rendition";
-    qbadge.className = hd ? "hd" : "";
+      : offer
+        ? "This connection looks able to carry Full again. Tap to switch back."
+        : "Moving picture is the low-resolution rendition. Tap to change it.";
+    qbadge.className = hd ? "hd" : (offer ? "offer" : "");
   }
+  /// The badge is the way back: straight to Full when it is on offer,
+  /// otherwise to the choice in Settings.
+  function qbadgePressed() {
+    if (returnOffered && quality === "low") { returnToFull(); return; }
+    openSettings();
+    var first = document.querySelector('input[name="q"]');
+    if (first && first.scrollIntoView) { try { first.scrollIntoView({ block: "center" }); } catch (e) {} }
+  }
+  qbadge.addEventListener("click", qbadgePressed);
+  qbadge.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); qbadgePressed(); }
+  });
 
   function toggleDrawer() {
     if (document.body.dataset.drawer === "1") closeDrawer(); else openDrawer();
@@ -4012,7 +4836,11 @@
     var opts = {};
     if (TOKEN_IN_HEADER && TOKEN) opts.headers = { Authorization: "Bearer " + TOKEN };
     fetch(url(STREAM, uri), opts)
-      .then(function (r) { return r.ok ? r.blob() : null; })
+      .then(function (r) {
+        if (r.ok) { sheetMisses = 0; sheetMissRounds = 0; return r.blob(); }
+        noteSheetMiss();
+        return null;
+      })
       .then(function (b) {
         if (!b || sheetUrls[uri] !== entry) return;
         entry.url = URL.createObjectURL(b);
@@ -4053,6 +4881,27 @@
   /// Gap between prefetches. Slow on purpose: there is no deadline, and the
   /// media stream has one.
   var PREFETCH_GAP_MS = 350;
+  /// Sheets the index names and the relay does not have.
+  ///
+  /// The index is the edge's and the sheets are the relay's, and the two can
+  /// disagree for hours: a relay that lost its window (a restart, before
+  /// 2026-10-10's fix; a retention change; a full disk) goes on being told
+  /// about sheets it no longer holds until they age out of the edge's list.
+  /// The prefetcher then walked every one of them — a tablet on a 5 Mbit/s
+  /// link asked for 388 missing sheets in three minutes, three a second,
+  /// while its picture was failing to start. Three misses in a row now stop
+  /// the sweep for a minute, doubling to ten; one sheet that arrives resets
+  /// it. A drag still asks for exactly the sheet under the thumb.
+  var SHEET_MISS_LIMIT = 3, SHEET_MISS_PAUSE_MS = 60000, SHEET_MISS_PAUSE_MAX_MS = 600000;
+  var sheetMisses = 0, sheetMissRounds = 0, prefetchPausedUntil = 0;
+  function noteSheetMiss() {
+    sheetMisses++;
+    if (sheetMisses < SHEET_MISS_LIMIT) return;
+    sheetMisses = 0;
+    prefetchPausedUntil = Date.now() + Math.min(SHEET_MISS_PAUSE_MAX_MS, SHEET_MISS_PAUSE_MS * Math.pow(2, sheetMissRounds));
+    sheetMissRounds++;
+    logDiag("thumbnail sheets missing on the relay; prefetch paused " + Math.round((prefetchPausedUntil - Date.now()) / 1000) + "s");
+  }
   /// How long after playback starts before any of this begins.
   var PREFETCH_START_DELAY_MS = 8000;
   var prefetchTimer = null, prefetchStarted = false;
@@ -4089,7 +4938,7 @@
     // pair loops forever, re-downloading the window at `PREFETCH_GAP_MS` and
     // churning blob URLs for as long as the tab is open. Eviction is left to
     // the operator's own fetches, which at least have a deadline behind them.
-    if (!scrubbing && sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES) {
+    if (!scrubbing && Date.now() >= prefetchPausedUntil && sheetBytes + sheetBytesMax <= SHEET_CACHE_BYTES) {
       var uri = nextSheetToPrefetch();
       if (uri) sheetUrl(uri);   // the fetch, the cache and the trim are shared
     }
@@ -4286,6 +5135,22 @@
           return a === null || b === null ? "n/a" : ((b - a) / 1000).toFixed(3) + "s";
         })() + "  (the two elements are on the same instant when skew is 0)",
       "lastHlsError=" + (lastHlsError || "none"),
+      "holdback=" + liveHoldBack + "s (prefers " + preferredDelay + "s)  behindLive=" + behindLive().toFixed(1) + "s" +
+        "  ahead=" + bufferedAhead(main).toFixed(1) + "s  catchingUp=" + catchingUp +
+        (delayIsViewers ? " (off: the delay is the viewer's own; Live clears it)" : "") +
+        "  holding=" + holdingForBuffer + "  stalls=" + stallCount +
+        (autoLowApplied ? "  autoLow x" + autoLowTimes + " fullOffered=" + returnOffered + " (needs " + Math.round(returnQuietMs() / 1000) + "s quiet, 9 in 10 of " + returnRatios.length + "/" + FULL_OK_SEGMENTS + " fetches under " + FULL_OK_RATIO + ")" : "") +
+        "  slowLink=" + slowLink() + (segLoadRatios.length ? " (fetch/play " + segLoadRatios.map(function (x) { return x.toFixed(2); }).join(" ") + ")" : "") +
+        "  bwEstimate=" + (mainHls && mainHls.bandwidthEstimate ? Math.round(mainHls.bandwidthEstimate / 1000) + "kbps" : "n/a"),
+      "client=" + CLIENT + "  reports every " + (METRICS_MS / 1000) + "s" +
+        "  stalls=" + (stallTimes.total || 0) + "/" + recentCount(stallTimes) + " (5m)" +
+        "  holds=" + (holdTimes.total || 0) + " " + Math.round(holdTotalMs / 1000) + "s" +
+        "  reconnects=" + (reconnectTimes.total || 0) +
+        "  lastSeg=" + lastSegment.kb + "KB ttfb=" + lastSegment.ttfb + "ms total=" + lastSegment.total + "ms",
+      "trouble (newest last; does not scroll away):",
+      playEvents.length ? playEvents.map(eventLine).join("\n") : "  none",
+      "transport log (newest last):",
+      diag.slice(-18).join("\n"),
       // The preview has three independent ways to be silently absent: no
       // index published, no absolute time on the playlist to map through, or
       // a position the index does not cover. They look identical on screen,
@@ -4301,7 +5166,7 @@
   requestAnimationFrame(tickLoop);
 
   // ── controls ───────────────────────────────────────────────────────────
-  btnLive.addEventListener("click", goLive);
+  btnLive.addEventListener("click", function () { goLive(true); });
   // Separate play and pause rather than one toggle: on a transport you press
   // the control you want, without first reading the button to find out what
   // it currently means.
@@ -4629,6 +5494,27 @@
     dbg = e.target.checked ? document.getElementById("debug") : null;
     document.body.dataset.debug = e.target.checked ? "1" : "0";
   });
+  // Live delay: seeded from the preference, applied as it changes.
+  var liveDelayInput = document.getElementById("liveDelay");
+  var liveDelayNow = document.getElementById("liveDelayNow");
+  liveDelayInput.value = preferredDelay;
+  function showLiveDelay() {
+    liveDelayNow.textContent = liveHoldBack > preferredDelay
+      ? "Playing " + liveHoldBack + " s behind for now: the connection needed it. Press Live to return to " + preferredDelay + " s."
+      : "";
+  }
+  liveDelayInput.addEventListener("change", function () {
+    var n = parseInt(liveDelayInput.value, 10);
+    if (!isFinite(n)) n = LIVEDELAY_DEFAULT;
+    n = Math.min(LIVEDELAY_MAX, Math.max(LIVEDELAY_MIN, n));
+    liveDelayInput.value = n;
+    preferredDelay = n;
+    try { window.localStorage.setItem(LIVEDELAY_KEY, String(n)); } catch (err) { /* will not stick */ }
+    // Takes effect now. In live that means going there; anywhere else it is
+    // where the next Live lands.
+    if (mode === "live") goLive(true); else resetHoldBack();
+    showLiveDelay();
+  });
   document.querySelectorAll('input[name="q"]').forEach(function (r) {
     r.checked = (r.value === quality);
     r.addEventListener("change", function () {
@@ -4637,6 +5523,11 @@
         window.localStorage.setItem(QUALITY_KEY, r.value);
         window.localStorage.removeItem(LOWRES_KEY);   // the boolean it replaced
       } catch (err) { /* nothing to do: the setting simply will not stick */ }
+      // The player's own drop to Low no longer stands. Going back to Full
+      // from it is remembered as a return (so a second drop is slower to
+      // offer a third try); anything else is simply the viewer's choice.
+      if (autoLowApplied && r.value === "full") autoLowWrite("tried", Math.max(1, autoLowTimes));
+      else autoLowWrite("", 0);
     // Reload rather than re-attach. Swapping the stream under a running
     // player means tearing down hls.js, re-seeking and re-deriving the clock
     // mid-session; a reload does all of that correctly and keeps the token
@@ -4676,9 +5567,11 @@
   /// so a stopped transport shows the full-resolution frame rather than the
   /// low-res proxy still.
   function pauseTransport() {
+    releaseHold(false);
     stopLoop();
     stopShuttle();
     if (mode === "shuttle") setMode("scrub");
+    delayIsViewers = true;
     rate = 1;
     main.pause();
     proxy.pause();
@@ -4703,7 +5596,7 @@
       case "l": cycleShuttle(1); break;
       case ",": jog(-1); break;
       case ".": jog(1); break;
-      case "End": goLive(); break;
+      case "End": goLive(true); break;
       case "f": case "F": toggleFullscreen(); break;
       case "m": case "M": addMark(); break;
       case "o": case "O": toggleLoop(); break;
@@ -5139,7 +6032,8 @@
   function beatNow() {
     if (!mayBeat() || document.hidden) return;
     var url = PORTAL_URL.replace(/\/+$/, "") + "/api/beat?stream=" +
-              encodeURIComponent(STREAM) + "&held=" + encodeURIComponent(HOLDER);
+              encodeURIComponent(STREAM) + "&held=" + encodeURIComponent(HOLDER) +
+              "&client=" + encodeURIComponent(CLIENT);
     // POST, because it writes. No body and no custom header, so it stays a
     // "simple" request and costs no preflight — the beat must not turn one
     // round trip into two, every minute, per viewer.
@@ -5207,11 +6101,14 @@
   }
   scheduleRenewal();
   startBeating();
+  startReporting();
   syncQualityBadge();   // setMode returns early at startup, so seed it here
   loadMarks();
   renderMarks();
   startMarksPoll();
   mainHls = attach(main, MAIN, "main");
+  applyHoldBack();
+  announceAutoLow();
   // The proxy is NOT attached up front. Two live MSE elements hold two
   // decoders, and Chrome's hardware decoder budget is small and shared —
   // exhausting it makes the *visible* element play with no picture, which

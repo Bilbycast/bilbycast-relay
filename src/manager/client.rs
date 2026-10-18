@@ -941,6 +941,12 @@ fn build_health_message(
             // stats tick is bandwidth for nothing. Additive — an older manager
             // parses the object loosely and ignores it.
             "origin_streams": d.origin_streams,
+            // What each viewer's player last reported about its playback —
+            // buffer ahead, stalls, reconnects, bandwidth estimate — freshest
+            // first, bounded (`origin::metrics::MAX_REPORTED`). The manager
+            // joins each to a portal login by `client` and shows it on the
+            // DVR Sessions page. Additive, as above.
+            "viewer_metrics": d.viewer_metrics,
         });
     }
     // Advertised viewer base URL — the runtime (manager-pushed) value wins over

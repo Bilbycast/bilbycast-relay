@@ -340,7 +340,9 @@ Default binds are `:4485` for the HTTP surface (WHEP signalling, the built-in
 ingest — both dual-stack, both overridable via `distribution.http_addrs` /
 `distribution.ingest_addrs`. The origin's segment root defaults to
 `/var/lib/bilbycast/relay/origin` (`distribution.origin_storage_dir`) and is
-re-adopted on restart rather than wiped. Full reference:
+re-adopted on restart rather than wiped — and held, untrimmed by age, until
+the manager has re-sent each session's window (see *A relay restart keeps the
+window* in the reference). Full reference:
 [`distribution.md`](distribution.md).
 
 **The viewer portal is a separate binary and a separate process.** `bilbycast-portal`
