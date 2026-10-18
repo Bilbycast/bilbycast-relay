@@ -242,6 +242,82 @@ impl DistributionState {
     }
 }
 
+/// Apply the manager's storage-policy pushes and stream drops to the origin
+/// store, on a task of its own, until `cancel` fires.
+fn follow_manager_storage(
+    origin: Arc<OriginStore>,
+    control: &DistributionControl,
+    cancel: CancellationToken,
+) {
+    let mut rx = control.subscribe_origin();
+    // The drop queue, taken once — the origin store is its only consumer.
+    let mut drops = control.take_drops();
+    let retained = control.origin_policy_now();
+    tokio::spawn(async move {
+        // `subscribe` marks the current value as seen, so a push that
+        // landed while the store was being built — plausible, since
+        // `OriginStore::new` walks the root, which on a deep DVR window is
+        // thousands of files — would never be delivered. Apply what is
+        // retained before waiting for the next change.
+        if retained.default.is_some() || retained.per_stream.is_some() {
+            origin.take_manager_policy(&retained);
+        }
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                // A stream the manager says nothing will want again: a
+                // deleted session's. Retention would hold it until the
+                // *node default* expired, which is unrelated to the window
+                // that session asked for.
+                Some(stream) = async {
+                    match drops.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Nothing to receive from; park this arm for good
+                        // rather than spinning on a ready `None`.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // A retirement takes the media and leaves the clips —
+                    // the session is over, what somebody exported from it
+                    // is not. A plain drop takes the lot, which is what
+                    // happens once the clips' own retention runs out.
+                    if let Some(name) =
+                        stream.strip_prefix(crate::distribution_control::RETIRE_PREFIX)
+                    {
+                        origin.retire_stream(name).await;
+                        continue;
+                    }
+                    origin.remove_stream(&stream).await;
+                    tracing::info!(
+                        stream = %stream,
+                        "distribution origin: stream dropped at the manager's request"
+                    );
+                }
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        break; // control dropped
+                    }
+                    let update = rx.borrow_and_update().clone();
+                    origin.take_manager_policy(&update);
+                    let d = origin.default_policy();
+                    tracing::info!(
+                        retention_secs = d.retention.as_secs(),
+                        max_bytes_per_stream = d.max_bytes_per_stream,
+                        min_segments = d.min_segments,
+                        idle_grace_secs = d.idle_grace.as_secs(),
+                        stream_overrides = update
+                            .per_stream
+                            .as_ref()
+                            .map(|v| v.len())
+                            .unwrap_or(0),
+                        "distribution origin: storage policy updated by manager"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Run the whole viewer-distribution subsystem: the ingest listener + the
 /// browser-facing HTTP signaling / origin listeners. Returns when the
 /// subsystem's cancel token fires or every listener dies.
@@ -279,85 +355,7 @@ pub async fn run_distribution(
     // seed; from here the manager owns retention, and a DVR session can widen
     // the window for its own stream without holding every other stream's disk
     // for the same hour.
-    {
-        let origin = origin.clone();
-        let cancel = cancel.clone();
-        let mut rx = control.subscribe_origin();
-        // The drop queue, taken once — the origin store is its only consumer.
-        let mut drops = control.take_drops();
-        let retained = control.origin_policy_now();
-        tokio::spawn(async move {
-            // `subscribe` marks the current value as seen, so a push that
-            // landed while the store was being built — plausible, since
-            // `OriginStore::new` walks the root, which on a deep DVR window is
-            // thousands of files — would never be delivered. Apply what is
-            // retained before waiting for the next change.
-            if retained.default.is_some() || retained.per_stream.is_some() {
-                origin.apply_policy_update(&retained);
-            }
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    // A stream the manager says nothing will want again: a
-                    // deleted session's. Retention would hold it until the
-                    // *node default* expired, which is unrelated to the window
-                    // that session asked for.
-                    Some(stream) = async {
-                        match drops.as_mut() {
-                            Some(rx) => rx.recv().await,
-                            // Nothing to receive from; park this arm for good
-                            // rather than spinning on a ready `None`.
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        // A retirement takes the media and leaves the clips —
-                        // the session is over, what somebody exported from it
-                        // is not. A plain drop takes the lot, which is what
-                        // happens once the clips' own retention runs out.
-                        if let Some(name) =
-                            stream.strip_prefix(crate::distribution_control::RETIRE_PREFIX)
-                        {
-                            origin.retire_stream(name).await;
-                            continue;
-                        }
-                        origin.remove_stream(&stream).await;
-                        tracing::info!(
-                            stream = %stream,
-                            "distribution origin: stream dropped at the manager's request"
-                        );
-                    }
-                    changed = rx.changed() => {
-                        if changed.is_err() {
-                            break; // control dropped
-                        }
-                        let update = rx.borrow_and_update().clone();
-                        origin.apply_policy_update(&update);
-                        // The manager has named what each stream keeps (an
-                        // empty list included): segments adopted at startup
-                        // are trimmed to that from here, not before. A push
-                        // carrying only the node default says nothing about
-                        // any session's window, and does not end the hold.
-                        if update.per_stream.is_some() {
-                            origin.manager_policy_received();
-                        }
-                        let d = origin.default_policy();
-                        tracing::info!(
-                            retention_secs = d.retention.as_secs(),
-                            max_bytes_per_stream = d.max_bytes_per_stream,
-                            min_segments = d.min_segments,
-                            idle_grace_secs = d.idle_grace.as_secs(),
-                            stream_overrides = update
-                                .per_stream
-                                .as_ref()
-                                .map(|v| v.len())
-                                .unwrap_or(0),
-                            "distribution origin: storage policy updated by manager"
-                        );
-                    }
-                }
-            }
-        });
-    }
+    follow_manager_storage(origin.clone(), &control, cancel.clone());
 
     // Retention sweep. Eviction is otherwise driven only by arriving segments,
     // so a stream whose producer stops keeps its disk indefinitely — past
@@ -864,6 +862,17 @@ pub(super) fn check_viewer_token(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<(), Response> {
+    accepted_viewer_token(st, stream_id, headers, query).map(drop)
+}
+
+/// [`check_viewer_token`], handing back the credential it accepted — for a
+/// route that bounds what one credential may do, not only whether it may.
+pub(super) fn accepted_viewer_token(
+    st: &DistributionState,
+    stream_id: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<String, Response> {
     let rt = st.control.load();
     let Some(ref secret) = rt.token_secret else {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "token gate misconfigured").into_response());
@@ -876,7 +885,7 @@ pub(super) fn check_viewer_token(
             .into_response());
     };
     match token::verify_viewer_token(secret, stream_id, &tok) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(tok),
         Err(e) => Err((StatusCode::FORBIDDEN, format!("viewer token rejected: {e}")).into_response()),
     }
 }

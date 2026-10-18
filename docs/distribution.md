@@ -134,7 +134,7 @@ So roll out in this order:
 | `POST` | `/origin/{stream}/marks` | Add a mark `{at, name?, colour?, exported?}` — `at` in wall-clock ms; the same instant twice is one mark; `404` while the relay holds no directory for the stream (viewer token, always) |
 | `PATCH` | `/origin/{stream}/marks/{id}` | Rename, recolour or flag exported (viewer token, always) |
 | `DELETE` | `/origin/{stream}/marks/{id}` | Remove a mark; removing one already gone succeeds (viewer token, always) |
-| `POST` | `/origin/{stream}/metrics` | A player's report on its own playback (`{client, quality, mode, playing, ahead_s, bw_kbps, stalls_5m, …}`, ≤ 8 KiB); the freshest report per `client` is kept for 90 s and listed under `distribution.viewer_metrics` in the relay's health (at most 200, freshest first); replies `{next_report_secs}` (viewer token, always) |
+| `POST` | `/origin/{stream}/metrics` | A player's report on its own playback (`{client, quality, mode, playing, ahead_s, bw_kbps, stalls_5m, …}`, ≤ 8 KiB); `404` for a stream the origin is not serving, `429` for a ninth client under one token on one stream; the freshest report per `client` is kept for 90 s and listed under `distribution.viewer_metrics` in the relay's health (at most 200, shared across streams, with `distribution.viewer_metrics_streams` saying per stream how many reported and how many were listed — see [Playback reports](#playback-reports)); replies `{next_report_secs}` (viewer token, always) |
 | `GET` | `/distribution/health` | Liveness |
 
 **The signaling + origin listener is plain HTTP.** Browsers require a secure
@@ -949,19 +949,97 @@ A session's window is a per-stream storage policy the manager pushes, and
 per-stream policies are deliberately not written to the relay's config: a
 session that ended while the relay was down must not come back holding disk.
 The node default is short (60 s). So a relay that restarts adopts the
-segments and thumbnail sheets already on disk and **does not trim them by age
-until the manager has named its per-stream policies** — which it does within
-a minute of the relay reconnecting — or until ten minutes have passed
-(`origin::ADOPT_HOLD`). The byte bound and the free-space floor apply
-throughout. Before this (fixed 2026-10-10) the first segment PUT after a
-restart evicted the whole adopted window against the 60 s default, some forty
-seconds before the manager's push said to keep it: every restart cost every
-viewer their rewind, and left the edge's thumbnail index naming sheets the
-relay no longer had.
+segments and thumbnail sheets already on disk and **holds every stream that
+adopted something from the node default until the manager has named its
+per-stream policies** (an empty list counts), or until ten minutes have passed
+(`origin::ADOPT_HOLD`). Before this (fixed 2026-10-10) the first segment PUT
+after a restart evicted the whole adopted window against the 60 s default,
+some forty seconds before the manager's push said to keep it: every restart
+cost every viewer their rewind, and left the edge's thumbnail index naming
+sheets the relay no longer had.
+
+What the hold does to a stream it covers:
+
+* **No trimming by age.**
+* **The byte cap is the default plus what the stream adopted.** A session's
+  own cap arrives in the same per-stream policy as its retention, and a long
+  window is bigger than the default cap (8 GiB holds about 2 h 20 min of an
+  8 Mbit/s main rendition, against a 4 h default session) — which is why the
+  manager sizes each session's cap itself. Judged against the default cap, the
+  adopted window lost its oldest part on the first PUT just as it had to the
+  age test, and the main rendition then held less window than its all-intra
+  proxy. Growth after the restart is still held to the default cap on top of
+  what was adopted.
+* **The free-space floor applies throughout**, so a relay that restarts with
+  a full disk still makes room.
+
+A stream that began after the restart adopted nothing and is not held. A push
+the manager made while the store was still walking the adopted files is
+applied from the retained value and ends the hold the same way as one that
+arrives later.
+
+The manager names per-stream policies within a minute of the relay
+reconnecting **only to a relay with DVR work** — a session whose window it is
+sending or withdrawing there. On any other relay the hold runs its full ten
+minutes after every restart, and a live stream that resumed keeps ten minutes
+of segments instead of its retention for that long. A hold that runs out is
+logged at `warn` ("the manager named no per-stream storage policy within the
+hold"): that is the moment the adopted windows are trimmed to the default, and
+the line to look for when viewers lost their rewind across a restart with the
+manager unreachable.
 
 The player defends itself against that last condition regardless: three
 thumbnail sheets in a row that the relay does not have pause the background
 prefetch for a minute, doubling to ten, and one sheet that arrives resets it.
+
+### Playback reports
+
+The DVR page reports its own playback to `POST /origin/{stream}/metrics`
+every twenty seconds (the reply's `next_report_secs` sets the cadence; the
+page will not go faster than ten): buffer ahead, distance behind live,
+stalls, rebuffer pauses and reconnects over its lifetime, the last five
+minutes and the last minute, the bandwidth estimate, dropped frames, the last
+segment's timing, the live delay it prefers and the hold-back the link has
+pushed it to, whether it is catching up, whether it dropped itself to Low, and
+its last eight trouble events. Every field is clamped on arrival; the relay
+does not try to verify the numbers.
+
+- **One id per tab.** The page keeps its `client` id in `sessionStorage`, per
+  stream, and mints a new one only when none is stored or when it arrives with
+  a new claim's token. A reload — the downgrade to Low, a return to Full, a
+  quality change — reports under the same id, so its report replaces the last
+  one instead of leaving it behind under an id nobody holds. A page another
+  device has taken the viewing over from stops reporting.
+- **A stream the origin is serving.** A report for anything else is `404`, as
+  marks answer for a stream with no directory: a viewer token outlives its
+  session by hours, and a tab left open on a dropped session must not hold a
+  report slot.
+- **A few clients per credential.** Any id is accepted from a token holder,
+  and behind the TLS terminator every peer is loopback, so the token is the
+  only thing that tells one viewer's reports from another's: at most eight
+  clients per presented token per stream, counted on a SHA-256 of the token,
+  never the token. A ninth is `429`; nothing already held is evicted for it.
+  Eight covers one device and its renewals, or a link opened on a laptop and a
+  tablet. A viewing link handed to more people than that plays for all of
+  them, but only the first eight report.
+- **Shared fairly on health.** The freshest report per client is kept for 90 s
+  (at most 500 clients per stream, 64 streams). At most 200 ride each health
+  message as `distribution.viewer_metrics`, the cap split across streams by
+  water-filling: an equal share each, and what a quieter stream leaves goes to
+  the busier ones, so one feed's audience, or one link's holder, cannot push
+  another feed's reports out. Within a stream the freshest are listed first.
+  Beside the list, `distribution.viewer_metrics_streams` carries one
+  `{stream, reporting, listed}` per stream with a live report, so the manager
+  can say "showing 200 of 340" rather than reading the cut as viewers who
+  are not reporting. 200 reports is under 400 KB with every field at its
+  limit, about 180 KB as tablets send them.
+- **No viewer address.** Behind the terminator it would be loopback for
+  everyone.
+
+A manager that predates the viewer roll keeps a relay's whole health and sends
+it to every open dashboard about twice a second, so on a relay with many
+reporting viewers upgrade the manager first; a current manager takes the list
+out of health as it arrives and keeps it for the DVR Sessions page alone.
 
 ### Live delay, falling back and catching up
 
