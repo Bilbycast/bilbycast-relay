@@ -578,40 +578,50 @@ impl DistributionConfig {
                 );
             }
         }
-        if self.cascade_sources.len() > 64 {
-            anyhow::bail!("distribution.cascade_sources: at most 64 entries");
-        }
+        validate_cascade_sources(&self.cascade_sources, "distribution.cascade_sources")?;
         // Loaded anyway — refusing would stop an existing relay booting on
         // upgrade — but said, because all but one of the entries are dropped.
+        // (A `configure_distribution` push naming one twice is refused.)
         for stream in duplicate_local_streams(&self.cascade_sources) {
             tracing::warn!(
                 "distribution.cascade_sources: local_stream '{stream}' appears more than once; \
                  only the last entry is pulled"
             );
         }
-        for (i, src) in self.cascade_sources.iter().enumerate() {
-            if !(src.upstream_whep_url.starts_with("http://")
-                || src.upstream_whep_url.starts_with("https://"))
-            {
-                anyhow::bail!(
-                    "distribution.cascade_sources[{i}].upstream_whep_url must start with http:// or https://"
-                );
-            }
-            if src.upstream_whep_url.len() > 2048 {
-                anyhow::bail!("distribution.cascade_sources[{i}].upstream_whep_url too long");
-            }
-            let s = src.local_stream.trim();
-            if s.is_empty()
-                || s.len() > 128
-                || !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            {
-                anyhow::bail!(
-                    "distribution.cascade_sources[{i}].local_stream must be 1..=128 chars of [A-Za-z0-9._-]"
-                );
-            }
-        }
         Ok(())
     }
+}
+
+/// The checks every cascade source list must pass wherever it comes from — the
+/// config file at load and a `configure_distribution` push — in one place so
+/// the two cannot drift. `field` names the list in the error.
+///
+/// Duplicate `local_stream`s are deliberately not checked here: load accepts
+/// them with a warning (refusing would stop a relay booting on upgrade) and a
+/// push refuses them, see [`duplicate_local_streams`]. An error never echoes
+/// the URL, which can carry a credential.
+pub fn validate_cascade_sources(sources: &[CascadeSource], field: &str) -> anyhow::Result<()> {
+    if sources.len() > 64 {
+        anyhow::bail!("{field}: at most 64 entries (got {})", sources.len());
+    }
+    for (i, src) in sources.iter().enumerate() {
+        if !(src.upstream_whep_url.starts_with("http://")
+            || src.upstream_whep_url.starts_with("https://"))
+        {
+            anyhow::bail!("{field}[{i}].upstream_whep_url must start with http:// or https://");
+        }
+        if src.upstream_whep_url.len() > 2048 {
+            anyhow::bail!("{field}[{i}].upstream_whep_url too long (max 2048 chars)");
+        }
+        let s = src.local_stream.trim();
+        if s.is_empty()
+            || s.len() > 128
+            || !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            anyhow::bail!("{field}[{i}].local_stream must be 1..=128 chars of [A-Za-z0-9._-]");
+        }
+    }
+    Ok(())
 }
 
 /// Structured-JSON log shipper configuration. See the

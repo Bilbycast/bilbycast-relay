@@ -1578,7 +1578,11 @@ nearby viewers. **Implemented** (`src/distribution/cascade.rs`):
   as `?token=`; either way `get_config` and the relay's log show it redacted.
   Each `local_stream` may appear once: pulls are keyed by it, so of two entries
   only the last would run. A `configure_distribution` push naming one twice is
-  refused; a config file that does is still loaded, with a warning.
+  refused; a config file that does is still loaded, with a warning. Otherwise a
+  pushed list is checked exactly as the config file is (`http://` or
+  `https://`, URL at most 2048 chars, `local_stream` 1–128 chars of
+  `[A-Za-z0-9._-]`, at most 64 entries — one validator for both), and a list
+  that fails refuses the whole push.
 - **Upgrade the upstream end first.** A relay of this version pulling from a
   relay released through v0.15.0 panics the upstream on every attempt and,
   retrying every 3 s, leaks one of the upstream's per-IP viewer slots each

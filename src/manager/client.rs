@@ -679,8 +679,9 @@ fn restore_redacted_cascade_source(
 }
 
 /// Parse a pushed `cascade_sources` list into what the relay will run: each
-/// entry deserialised, no `local_stream` twice, and every redaction marker
-/// restored. Reads the current set; applies nothing.
+/// entry deserialised, every redaction marker restored, the result through the
+/// same validator config load uses (`config::validate_cascade_sources`), and
+/// no `local_stream` twice. Reads the current set; applies nothing.
 fn parse_cascade_sources(
     arr: &[serde_json::Value],
     current: &[crate::config::CascadeSource],
@@ -702,6 +703,11 @@ fn parse_cascade_sources(
         restore_redacted_cascade_source(src, current)
             .map_err(|e| format!("cascade_sources[{i}]: {e}"))?;
     }
+    // After the restore, so what is checked is what would run. A pushed source
+    // used to skip every check a config file gets — a scheme the pull cannot
+    // dial, a stream name no viewer URL can present, any number of entries.
+    crate::config::validate_cascade_sources(&sources, "cascade_sources")
+        .map_err(|e| e.to_string())?;
     Ok(sources)
 }
 
@@ -2038,5 +2044,125 @@ mod redaction_tests {
         configure_distribution(Some(&control), &startup, &path, &accepted).expect("accepted");
         assert_eq!(control.load().token_secret.as_deref(), Some(NEW_SECRET));
         assert_eq!(on_disk().as_deref(), Some(NEW_SECRET));
+    }
+
+    /// A pushed cascade list that config load would refuse is refused whole:
+    /// the error names the entry and the reason, and nothing in the push —
+    /// not the secret, not the gate, not the list — is applied.
+    fn assert_push_refused(sources: serde_json::Value, reason: &str) {
+        const NEW_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let kept = source("feed", "http://origin.example/whep/feed", None);
+        let control = control_with(
+            &DistributionConfig { token_secret: Some(TOKEN_SECRET.into()), ..Default::default() },
+            vec![kept.clone()],
+        );
+        let err = push(
+            &control,
+            serde_json::json!({
+                "type": "configure_distribution",
+                "token_secret": NEW_SECRET,
+                "require_viewer_token": true,
+                "cascade_sources": sources,
+            }),
+        )
+        .expect_err("config load refuses this list, so the push must too");
+        assert!(err.contains(reason), "{err}");
+        let rt = control.load();
+        assert_eq!(rt.token_secret.as_deref(), Some(TOKEN_SECRET), "{err}: secret applied");
+        assert!(!rt.require_viewer_token, "{err}: gate applied");
+        assert_eq!(control.cascade_now(), vec![kept], "{err}: list applied");
+    }
+
+    fn entry(url: &str, stream: &str) -> serde_json::Value {
+        serde_json::json!({ "upstream_whep_url": url, "local_stream": stream })
+    }
+
+    #[test]
+    fn a_pushed_source_with_a_scheme_the_pull_cannot_use_is_refused() {
+        assert_push_refused(
+            serde_json::json!([
+                entry("http://ok.example/whep/a", "a"),
+                entry("ftp://up.example/whep/b", "b"),
+            ]),
+            "cascade_sources[1].upstream_whep_url must start with http:// or https://",
+        );
+    }
+
+    #[test]
+    fn a_pushed_source_with_an_overlong_url_is_refused() {
+        let long = format!("http://up.example/whep/{}", "x".repeat(2048));
+        assert_push_refused(
+            serde_json::json!([entry(&long, "a")]),
+            "cascade_sources[0].upstream_whep_url too long",
+        );
+    }
+
+    #[test]
+    fn a_pushed_source_with_an_empty_stream_name_is_refused() {
+        assert_push_refused(
+            serde_json::json!([entry("http://up.example/whep/a", "  ")]),
+            "cascade_sources[0].local_stream must be 1..=128 chars of [A-Za-z0-9._-]",
+        );
+    }
+
+    #[test]
+    fn a_pushed_source_with_a_stream_name_outside_the_charset_is_refused() {
+        assert_push_refused(
+            serde_json::json!([entry("http://up.example/whep/a", "../etc")]),
+            "cascade_sources[0].local_stream must be 1..=128 chars of [A-Za-z0-9._-]",
+        );
+    }
+
+    #[test]
+    fn a_pushed_source_with_an_overlong_stream_name_is_refused() {
+        assert_push_refused(
+            serde_json::json!([entry("http://up.example/whep/a", &"s".repeat(129))]),
+            "cascade_sources[0].local_stream must be 1..=128 chars of [A-Za-z0-9._-]",
+        );
+    }
+
+    #[test]
+    fn a_push_with_more_than_64_sources_is_refused() {
+        let many: Vec<serde_json::Value> = (0..65)
+            .map(|i| entry(&format!("http://up.example/whep/s{i}"), &format!("s{i}")))
+            .collect();
+        assert_push_refused(serde_json::json!(many), "cascade_sources: at most 64 entries (got 65)");
+    }
+
+    /// The validator is the one config load uses, so a list it accepts on load
+    /// is accepted on a push — duplicates aside, which load warns about and a
+    /// push refuses.
+    #[test]
+    fn a_push_accepts_what_config_load_accepts() {
+        let control = control_with(&DistributionConfig::default(), vec![]);
+        let list: Vec<CascadeSource> = (0..64)
+            .map(|i| source(&format!("s{i}"), &format!("https://up.example/whep/s{i}"), None))
+            .collect();
+        let loads = |sources: &[CascadeSource]| {
+            RelayConfig {
+                distribution: Some(DistributionConfig {
+                    cascade_sources: sources.to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        };
+        assert!(loads(&list));
+        push(
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "cascade_sources": list }),
+        )
+        .expect("what load accepts, a push accepts");
+        assert_eq!(control.cascade_now().len(), 64);
+
+        let twice = vec![source("a", "http://x.example/whep/a", None), source("a", "http://y.example/whep/a", None)];
+        assert!(loads(&twice), "load takes duplicates, with a warning");
+        assert!(push(
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "cascade_sources": twice }),
+        )
+        .is_err());
     }
 }
