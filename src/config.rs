@@ -581,6 +581,14 @@ impl DistributionConfig {
         if self.cascade_sources.len() > 64 {
             anyhow::bail!("distribution.cascade_sources: at most 64 entries");
         }
+        // Loaded anyway — refusing would stop an existing relay booting on
+        // upgrade — but said, because all but one of the entries are dropped.
+        for stream in duplicate_local_streams(&self.cascade_sources) {
+            tracing::warn!(
+                "distribution.cascade_sources: local_stream '{stream}' appears more than once; \
+                 only the last entry is pulled"
+            );
+        }
         for (i, src) in self.cascade_sources.iter().enumerate() {
             if !(src.upstream_whep_url.starts_with("http://")
                 || src.upstream_whep_url.starts_with("https://"))
@@ -992,9 +1000,15 @@ impl RelayConfig {
 
 /// What `get_config` puts in place of a credential the relay holds.
 ///
-/// A credential that is set reads as this marker and one that is not set stays
-/// absent, so the manager can still say "a token secret is configured" without
-/// learning it. The same marker on the way back in means "keep what you have"
+/// It replaces a credential that is set in the config `get_config` serialises,
+/// and a credential that is not set there stays absent. **That config is the
+/// startup snapshot**, not the live one: a `token_secret` (or cascade source)
+/// first pushed by `configure_distribution` after the relay started reads as
+/// absent until the next restart, when the persisted copy is loaded. So the
+/// marker means "this relay started with one", and absence means only "it did
+/// not start with one" — not "there is none".
+///
+/// The same marker on the way back in means "keep what you have"
 /// (`apply_configure_distribution`), never a value: see
 /// [`is_redaction_marker`].
 pub const REDACTED: &str = "***REDACTED***";
@@ -1010,6 +1024,113 @@ fn redact(field: &mut Option<String>) {
     }
 }
 
+/// Words that make a field or query-parameter name a credential.
+const CREDENTIAL_WORDS: &[&str] = &[
+    "secret", "secrets", "token", "tokens", "password", "passwd", "pass", "pwd",
+    "passphrase", "psk", "bearer", "auth", "authorization", "hmac", "key", "keys",
+    "apikey", "credential", "credentials", "sig", "signature",
+];
+
+/// Does `name` — a config field or a URL query key — name a credential?
+///
+/// By whole words (split on `_`, `-` and `.`, case-insensitive), so `author` or
+/// `monkey` is not one and `stream_key`, `access_token` and `hmac` are. A name
+/// whose last word is `path`, `file` or `dir` (`tls_key_path`) names where a
+/// credential lives, not the credential, and is not one: the relay never sends
+/// what a path points at.
+pub fn is_credential_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(['_', '-', '.'])
+        .filter(|w| !w.is_empty())
+        .collect();
+    if matches!(words.last(), Some(&("path" | "file" | "dir"))) {
+        return false;
+    }
+    words.iter().any(|w| CREDENTIAL_WORDS.contains(w))
+}
+
+/// `url` with any credential it carries replaced by [`REDACTED`]: the userinfo
+/// (`user:pass@`) as a whole, and the value of every query or fragment
+/// parameter whose key [`is_credential_name`] (`?token=`, `?access_token=`,
+/// `#access_token=`). Everything else is left byte for byte, so two URLs that
+/// differ only in their credentials redact to the same string — which is what
+/// lets a push carrying a redacted URL be matched back to the one it came from.
+///
+/// Idempotent: a redacted URL redacts to itself.
+pub fn redact_url(url: &str) -> String {
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (url, None),
+    };
+    let (before_query, query) = match before_fragment.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (before_fragment, None),
+    };
+    let mut out = String::with_capacity(url.len());
+    match before_query.find("://") {
+        Some(i) => {
+            let (scheme, rest) = before_query.split_at(i + 3);
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(authority_end);
+            out.push_str(scheme);
+            match authority.rfind('@') {
+                Some(at) => {
+                    out.push_str(REDACTED);
+                    out.push_str(&authority[at..]);
+                }
+                None => out.push_str(authority),
+            }
+            out.push_str(path);
+        }
+        None => out.push_str(before_query),
+    }
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(&redact_params(q));
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(&redact_params(f));
+    }
+    out
+}
+
+fn redact_params(params: &str) -> String {
+    params
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) if !value.is_empty() && is_credential_name(key) => {
+                format!("{key}={REDACTED}")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Does `url` hold a redacted credential, i.e. did it come from `get_config`?
+pub fn url_holds_marker(url: &str) -> bool {
+    url.contains(REDACTED)
+}
+
+/// Each `local_stream` that appears more than once in `sources`, once.
+///
+/// The cascade supervisor keys its pulls by `local_stream`, so of several
+/// entries for one stream only the **last** is pulled; the others are silently
+/// dropped. A push carrying one is refused; a config file carrying one is still
+/// loaded (refusing it would stop a relay booting on upgrade) and warned about.
+pub fn duplicate_local_streams(sources: &[CascadeSource]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut dup = Vec::new();
+    for s in sources {
+        if !seen.insert(s.local_stream.as_str()) && !dup.contains(&s.local_stream) {
+            dup.push(s.local_stream.clone());
+        }
+    }
+    dup
+}
+
 // Every `redact_secrets` below destructures its struct **without `..`**, so a
 // field added to any of them does not compile until somebody has decided
 // whether it is a credential. That is the point: the old `get_config` named
@@ -1017,8 +1138,9 @@ fn redact(field: &mut Option<String>) {
 // how `distribution.token_secret` — the key every viewer and ingest token is
 // signed with — went out to anyone with View on the relay.
 //
-// Paths and URLs are not credentials and are left alone; what a path points
-// at never leaves the relay.
+// Paths are not credentials and are left alone; what a path points at never
+// leaves the relay. URLs are left alone except for a credential carried in
+// one ([`redact_url`]).
 
 impl RelayConfig {
     /// This config as the manager's `get_config` may see it: every credential
@@ -1070,7 +1192,9 @@ impl ManagerConfig {
     fn redact_secrets(&mut self) {
         let ManagerConfig {
             enabled: _,
-            urls: _,
+            // Validated only as `wss://`, so one can carry a userinfo or a
+            // query credential for whatever fronts the manager.
+            urls,
             accept_self_signed_cert: _,
             // The SHA-256 of the manager's own certificate: public.
             cert_fingerprint: _,
@@ -1078,6 +1202,9 @@ impl ManagerConfig {
             node_id: _,
             node_secret,
         } = self;
+        for url in urls {
+            *url = redact_url(url);
+        }
         redact(registration_token);
         redact(node_secret);
     }
@@ -1086,11 +1213,14 @@ impl ManagerConfig {
 impl LoggingConfig {
     fn redact_secrets(&mut self) {
         let LoggingConfig { json_target } = self;
+        // One arm per variant, each naming every field: a credential added to
+        // any target (a token for an HTTP shipper, say) does not compile here
+        // until it has been redacted or waved through on purpose.
         match json_target {
-            None
-            | Some(JsonLogTarget::Stdout { format: _ })
-            | Some(JsonLogTarget::File { path: _, format: _, max_size_mb: _, max_backups: _ })
-            | Some(JsonLogTarget::Syslog { addr: _, format: _ }) => {}
+            None => {}
+            Some(JsonLogTarget::Stdout { format: _ }) => {}
+            Some(JsonLogTarget::File { path: _, format: _, max_size_mb: _, max_backups: _ }) => {}
+            Some(JsonLogTarget::Syslog { addr: _, format: _ }) => {}
         }
     }
 }
@@ -1126,7 +1256,10 @@ impl DistributionConfig {
 
 impl CascadeSource {
     fn redact_secrets(&mut self) {
-        let CascadeSource { upstream_whep_url: _, local_stream: _, token } = self;
+        // The upstream's WHEP endpoint takes `?token=` as well as a Bearer
+        // header, so the URL can carry the same credential `token` does.
+        let CascadeSource { upstream_whep_url, local_stream: _, token } = self;
+        *upstream_whep_url = redact_url(upstream_whep_url);
         redact(token);
     }
 }
@@ -1222,9 +1355,10 @@ mod tests {
 
     // ── get_config redaction ──
     //
-    // The fixture is written as full struct literals, never `..Default`, so a
-    // field added to any of these structs does not compile here until it has
-    // a value — and a populated value is what the tests below need to see it.
+    // The fixtures are written as full struct literals, never `..Default`, so a
+    // field added to any of these structs (or to any log target) does not
+    // compile here until it has a value — and a populated value is what the
+    // tests below need to see it.
 
     const API_TOKEN: &str = "planted-api-token-0123456789abcdef0123456789";
     const REGISTRATION_TOKEN: &str = "planted-registration-token";
@@ -1232,8 +1366,12 @@ mod tests {
     const TOKEN_SECRET: &str = "5ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7";
     const CASCADE_TOKEN_A: &str = "planted-cascade-token-a";
     const CASCADE_TOKEN_B: &str = "planted-cascade-token-b";
+    const CASCADE_URL_TOKEN: &str = "planted-cascade-url-token";
+    const CASCADE_USERINFO: &str = "planted-cascade-user:planted-cascade-pass";
+    const MANAGER_USERINFO: &str = "planted-mgr-user:planted-mgr-pass";
+    const MANAGER_URL_TOKEN: &str = "planted-mgr-access-token";
 
-    /// Every credential the fixture plants. A secret field added to the
+    /// Every credential the fixtures plant. A secret field added to the
     /// structs belongs here as well as in its `redact_secrets`.
     const PLANTED: &[&str] = &[
         API_TOKEN,
@@ -1242,11 +1380,17 @@ mod tests {
         TOKEN_SECRET,
         CASCADE_TOKEN_A,
         CASCADE_TOKEN_B,
+        CASCADE_URL_TOKEN,
+        CASCADE_USERINFO,
+        MANAGER_USERINFO,
+        MANAGER_URL_TOKEN,
+        // The password half on its own, in case only a user were stripped.
+        "planted-cascade-pass",
+        "planted-mgr-pass",
     ];
 
-    /// Where `get_config` must show the marker, as JSON pointers into the
-    /// fixture. Exactly these and nothing else: anything else that changes is
-    /// operational config the manager needs to see.
+    /// Where `get_config` must show the bare marker, as JSON pointers into the
+    /// fixtures.
     const SECRET_PATHS: &[&str] = &[
         "/api_token",
         "/manager/registration_token",
@@ -1256,7 +1400,46 @@ mod tests {
         "/distribution/cascade_sources/1/token",
     ];
 
-    fn fully_populated() -> RelayConfig {
+    /// URLs that carry a credential, and what `get_config` must show for each.
+    const URL_PATHS: &[(&str, &str)] = &[
+        (
+            "/manager/urls/1",
+            "wss://***REDACTED***@manager2.example.com/ws/node?access_token=***REDACTED***&region=eu",
+        ),
+        (
+            "/distribution/cascade_sources/0/upstream_whep_url",
+            "http://origin-a.example.com:4485/whep/feed?v=2&token=***REDACTED***",
+        ),
+        (
+            "/distribution/cascade_sources/1/upstream_whep_url",
+            "http://***REDACTED***@origin-b.example.com/whep/feed2",
+        ),
+    ];
+
+    /// One of every log target. A variant added later fails the match below
+    /// until it is given a fixture here too.
+    fn log_targets() -> Vec<JsonLogTarget> {
+        let targets = vec![
+            JsonLogTarget::Stdout { format: LogFormat::Raw },
+            JsonLogTarget::File {
+                path: "/var/log/bilbycast/relay.jsonl".into(),
+                format: LogFormat::Splunk,
+                max_size_mb: 64,
+                max_backups: 5,
+            },
+            JsonLogTarget::Syslog { addr: "127.0.0.1:514".into(), format: LogFormat::Dataminer },
+        ];
+        for t in &targets {
+            match t {
+                JsonLogTarget::Stdout { .. }
+                | JsonLogTarget::File { .. }
+                | JsonLogTarget::Syslog { .. } => {}
+            }
+        }
+        targets
+    }
+
+    fn populated_with(json_target: JsonLogTarget) -> RelayConfig {
         RelayConfig {
             quic_addr: "0.0.0.0:4433".into(),
             quic_addrs: Some(vec!["0.0.0.0:4433".into(), "[::]:4433".into()]),
@@ -1274,21 +1457,19 @@ mod tests {
             max_tunnels_per_connection: 100,
             manager: Some(ManagerConfig {
                 enabled: true,
-                urls: vec!["wss://manager.example.com/ws/node".into()],
+                urls: vec![
+                    "wss://manager.example.com/ws/node".into(),
+                    format!(
+                        "wss://{MANAGER_USERINFO}@manager2.example.com/ws/node?access_token={MANAGER_URL_TOKEN}&region=eu"
+                    ),
+                ],
                 accept_self_signed_cert: false,
                 cert_fingerprint: Some("ab:cd:ef".into()),
                 registration_token: Some(REGISTRATION_TOKEN.into()),
                 node_id: Some("node-1".into()),
                 node_secret: Some(NODE_SECRET.into()),
             }),
-            logging: Some(LoggingConfig {
-                json_target: Some(JsonLogTarget::File {
-                    path: "/var/log/bilbycast/relay.jsonl".into(),
-                    format: LogFormat::Splunk,
-                    max_size_mb: 64,
-                    max_backups: 5,
-                }),
-            }),
+            logging: Some(LoggingConfig { json_target: Some(json_target) }),
             distribution: Some(DistributionConfig {
                 enabled: true,
                 http_addrs: Some(vec!["0.0.0.0:4485".into()]),
@@ -1309,18 +1490,27 @@ mod tests {
                 origin_storage_dir: Some("/var/lib/bilbycast/relay/origin".into()),
                 cascade_sources: vec![
                     CascadeSource {
-                        upstream_whep_url: "https://origin-a.example.com/whep/feed".into(),
+                        upstream_whep_url: format!(
+                            "http://origin-a.example.com:4485/whep/feed?v=2&token={CASCADE_URL_TOKEN}"
+                        ),
                         local_stream: "feed".into(),
                         token: Some(CASCADE_TOKEN_A.into()),
                     },
                     CascadeSource {
-                        upstream_whep_url: "https://origin-b.example.com/whep/feed2".into(),
+                        upstream_whep_url: format!(
+                            "http://{CASCADE_USERINFO}@origin-b.example.com/whep/feed2"
+                        ),
                         local_stream: "feed2".into(),
                         token: Some(CASCADE_TOKEN_B.into()),
                     },
                 ],
             }),
         }
+    }
+
+    /// The fully populated config, once per log target.
+    fn fixtures() -> Vec<RelayConfig> {
+        log_targets().into_iter().map(populated_with).collect()
     }
 
     /// Every string leaf of `v`, as (JSON pointer, value).
@@ -1342,89 +1532,155 @@ mod tests {
     }
 
     #[test]
-    fn the_fixture_is_a_valid_config() {
-        fully_populated().validate().expect("the fixture is a config a relay would run");
+    fn the_fixtures_are_valid_configs() {
+        for config in fixtures() {
+            config.validate().expect("each fixture is a config a relay would run");
+        }
     }
 
     /// The defect: `get_config` carried `distribution.token_secret` (the key
     /// every viewer and ingest token is signed with), the registration token
-    /// and the cascade tokens in clear, to anyone with View on the relay.
+    /// and the cascade tokens in clear, to anyone with View on the relay — and
+    /// a cascade URL carrying `?token=` went out whole.
     #[test]
     fn redacted_json_carries_no_credential() {
-        let text = fully_populated().redacted_json().to_string();
-        for secret in PLANTED {
-            assert!(!text.contains(secret), "get_config leaked {secret:?}: {text}");
+        for config in fixtures() {
+            let text = config.redacted_json().to_string();
+            for secret in PLANTED {
+                assert!(!text.contains(secret), "get_config leaked {secret:?}: {text}");
+            }
         }
     }
 
-    /// The marker sits at exactly the credential paths, and nothing else in
-    /// the config is touched — the manager still sees the operational config.
+    /// The marker sits at exactly the credential paths, the URLs keep all but
+    /// their credentials, and nothing else in the config is touched — the
+    /// manager still sees the operational config.
     #[test]
     fn exactly_the_credential_fields_are_redacted() {
-        let config = fully_populated();
-        let plain = serde_json::to_value(&config).unwrap();
-        let redacted = config.redacted_json();
+        for config in fixtures() {
+            let plain = serde_json::to_value(&config).unwrap();
+            let redacted = config.redacted_json();
 
-        let mut plain_leaves = Vec::new();
-        string_leaves(&plain, String::new(), &mut plain_leaves);
-        let mut redacted_leaves = Vec::new();
-        string_leaves(&redacted, String::new(), &mut redacted_leaves);
-        assert_eq!(
-            plain_leaves.iter().map(|(p, _)| p).collect::<Vec<_>>(),
-            redacted_leaves.iter().map(|(p, _)| p).collect::<Vec<_>>(),
-            "redaction must not add or drop a field"
-        );
+            let mut plain_leaves = Vec::new();
+            string_leaves(&plain, String::new(), &mut plain_leaves);
+            let mut redacted_leaves = Vec::new();
+            string_leaves(&redacted, String::new(), &mut redacted_leaves);
+            assert_eq!(
+                plain_leaves.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                redacted_leaves.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                "redaction must not add or drop a field"
+            );
 
-        let mut changed: Vec<&str> = plain_leaves
-            .iter()
-            .zip(&redacted_leaves)
-            .filter(|((_, a), (_, b))| a != b)
-            .map(|((p, _), _)| p.as_str())
-            .collect();
-        changed.sort_unstable();
-        let mut expected = SECRET_PATHS.to_vec();
-        expected.sort_unstable();
-        assert_eq!(changed, expected);
+            let mut changed: Vec<&str> = plain_leaves
+                .iter()
+                .zip(&redacted_leaves)
+                .filter(|((_, a), (_, b))| a != b)
+                .map(|((p, _), _)| p.as_str())
+                .collect();
+            changed.sort_unstable();
+            let mut expected: Vec<&str> = SECRET_PATHS.to_vec();
+            expected.extend(URL_PATHS.iter().map(|(p, _)| *p));
+            expected.sort_unstable();
+            assert_eq!(changed, expected);
 
-        for path in SECRET_PATHS {
-            assert_eq!(redacted.pointer(path).and_then(|v| v.as_str()), Some(REDACTED), "{path}");
+            for path in SECRET_PATHS {
+                assert_eq!(redacted.pointer(path).and_then(|v| v.as_str()), Some(REDACTED), "{path}");
+            }
+            for (path, shown) in URL_PATHS {
+                assert_eq!(redacted.pointer(path).and_then(|v| v.as_str()), Some(*shown), "{path}");
+            }
+            // Numbers and booleans come through untouched as well.
+            assert_eq!(redacted["distribution"]["require_viewer_token"], true);
+            assert_eq!(redacted["max_connections_per_ip"], 64);
         }
-        // Numbers and booleans come through untouched as well.
-        assert_eq!(redacted["distribution"]["require_viewer_token"], true);
-        assert_eq!(redacted["max_connections_per_ip"], 64);
     }
 
     /// A backstop for a credential added later and waved through as `_`: any
     /// string field whose *name* says it is a credential must be the marker.
     #[test]
     fn no_field_named_like_a_credential_goes_out_in_clear() {
-        let redacted = fully_populated().redacted_json();
-        let mut leaves = Vec::new();
-        string_leaves(&redacted, String::new(), &mut leaves);
-        let mut seen = 0;
-        for (path, value) in &leaves {
-            let name = path
-                .rsplit('/')
-                .find(|seg| seg.parse::<usize>().is_err())
-                .unwrap_or_default();
-            let credential_like = ["secret", "token", "password", "passphrase", "credential"]
-                .iter()
-                .any(|w| name.contains(w))
-                || name == "key"
-                || name.ends_with("_key");
-            if credential_like {
-                seen += 1;
-                assert_eq!(value, REDACTED, "{path} looks like a credential and went out as {value:?}");
+        for config in fixtures() {
+            let redacted = config.redacted_json();
+            let mut leaves = Vec::new();
+            string_leaves(&redacted, String::new(), &mut leaves);
+            let mut seen = 0;
+            for (path, value) in &leaves {
+                let name = path
+                    .rsplit('/')
+                    .find(|seg| seg.parse::<usize>().is_err())
+                    .unwrap_or_default();
+                if is_credential_name(name) {
+                    seen += 1;
+                    assert_eq!(value, REDACTED, "{path} looks like a credential and went out as {value:?}");
+                }
             }
+            assert_eq!(seen, SECRET_PATHS.len(), "the name check saw every credential path");
         }
-        assert_eq!(seen, SECRET_PATHS.len(), "the name check saw every credential path");
     }
 
-    /// Set-but-redacted and unset must stay distinguishable: the marker says a
-    /// credential is configured, an absent key says none is.
+    #[test]
+    fn credential_names_are_recognised_by_whole_word() {
+        for name in [
+            "token", "api_token", "token_secret", "node_secret", "registration_token",
+            "access_token", "password", "passphrase", "psk", "bearer", "auth", "auth_token",
+            "hmac", "hmac_key", "key", "stream_key", "apikey", "sig", "Signature", "X-Api-Key",
+        ] {
+            assert!(is_credential_name(name), "{name} is a credential");
+        }
+        for name in [
+            // A path names where a credential lives, not the credential.
+            "tls_key_path", "tls_cert_path", "listen_password_file", "key_dir",
+            // Not a credential word, only containing one.
+            "author", "monkey", "keystone", "passthrough", "tokenizer",
+            "upstream_whep_url", "local_stream", "node_id", "cert_fingerprint", "v", "region",
+        ] {
+            assert!(!is_credential_name(name), "{name} is not a credential");
+        }
+    }
+
+    #[test]
+    fn redact_url_hides_credentials_and_nothing_else() {
+        for (url, shown) in [
+            ("http://h:4485/whep/feed", "http://h:4485/whep/feed"),
+            ("http://h/whep/feed?v=2", "http://h/whep/feed?v=2"),
+            ("http://h/whep/feed?token=abc", "http://h/whep/feed?token=***REDACTED***"),
+            ("http://h/w?a=1&Token=abc&b=2", "http://h/w?a=1&Token=***REDACTED***&b=2"),
+            ("http://h/w?access_token=abc", "http://h/w?access_token=***REDACTED***"),
+            ("http://h/w#access_token=abc&s=1", "http://h/w#access_token=***REDACTED***&s=1"),
+            ("http://u:p@h:80/w", "http://***REDACTED***@h:80/w"),
+            ("wss://u@h/ws?x=1", "wss://***REDACTED***@h/ws?x=1"),
+            // `@` in the path is not a userinfo.
+            ("http://h/w/a@b", "http://h/w/a@b"),
+            // Nothing to hide in an empty value or a bare key.
+            ("http://h/w?token=&token", "http://h/w?token=&token"),
+            ("http://h/w?ingest_token=abc", "http://h/w?ingest_token=***REDACTED***"),
+        ] {
+            assert_eq!(redact_url(url), shown, "{url}");
+            assert_eq!(redact_url(shown), shown, "idempotent on {shown}");
+        }
+        assert!(url_holds_marker(&redact_url("http://h/w?token=abc")));
+        assert!(!url_holds_marker("http://h/w?v=2"));
+    }
+
+    #[test]
+    fn duplicate_local_streams_are_named_once_each() {
+        let s = |stream: &str| CascadeSource {
+            upstream_whep_url: format!("http://h/whep/{stream}"),
+            local_stream: stream.into(),
+            token: None,
+        };
+        assert!(duplicate_local_streams(&[s("a"), s("b")]).is_empty());
+        assert_eq!(duplicate_local_streams(&[s("a"), s("b"), s("a"), s("a"), s("b")]), ["a", "b"]);
+        // Loaded anyway, with a warning: refusing would stop a relay booting.
+        let d = DistributionConfig { cascade_sources: vec![s("a"), s("a")], ..Default::default() };
+        assert!(d.validate().is_ok());
+    }
+
+    /// Set-but-redacted and unset must stay distinguishable: the marker says
+    /// the config held a credential, an absent key says it held none.
     #[test]
     fn an_unset_credential_stays_absent() {
-        let mut config = fully_populated();
+        let mut config = fixtures().remove(0);
         config.api_token = None;
         let manager = config.manager.as_mut().unwrap();
         manager.registration_token = None;
@@ -1455,13 +1711,14 @@ mod tests {
     /// a relay that persisted the marker would lock itself out on restart.
     #[test]
     fn redacting_leaves_the_config_and_its_on_disk_form_alone() {
-        let config = fully_populated();
-        let _ = config.redacted_json();
-        let on_disk = serde_json::to_string_pretty(&config).unwrap();
-        for secret in PLANTED {
-            assert!(on_disk.contains(secret), "{secret:?} must still be written to config.json");
+        for config in fixtures() {
+            let _ = config.redacted_json();
+            let on_disk = serde_json::to_string_pretty(&config).unwrap();
+            for secret in PLANTED {
+                assert!(on_disk.contains(secret), "{secret:?} must still be written to config.json");
+            }
+            assert!(!on_disk.contains(REDACTED));
         }
-        assert!(!on_disk.contains(REDACTED));
     }
 
     #[test]

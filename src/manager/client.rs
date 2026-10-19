@@ -189,15 +189,18 @@ async fn manager_client_loop(
             continue;
         }
         let current_url = config.urls[cursor % config.urls.len()].clone();
+        // For the log only: a manager URL may carry a credential for whatever
+        // fronts the manager (a userinfo, a `?token=`).
+        let shown_url = crate::config::redact_url(&current_url);
         tracing::info!(
-            "Connecting to manager at {current_url} (url {} of {})",
+            "Connecting to manager at {shown_url} (url {} of {})",
             (cursor % config.urls.len()) + 1,
             config.urls.len(),
         );
 
         match try_connect(&current_url, &config, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender, distribution_control.as_ref()).await {
             Ok(ConnectResult::Closed) => {
-                tracing::info!("Manager connection to {current_url} closed normally");
+                tracing::info!("Manager connection to {shown_url} closed normally");
                 event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, "Manager connection lost, rotating to next URL");
             }
             Ok(ConnectResult::Registered {
@@ -214,7 +217,7 @@ async fn manager_client_loop(
                 persist_credentials(&relay_config, &config_path, &node_id, &node_secret);
             }
             Err(e) => {
-                tracing::warn!("Manager connection to {current_url} failed: {e}");
+                tracing::warn!("Manager connection to {shown_url} failed: {e}");
                 event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Manager connection lost, rotating to next URL: {}", e));
             }
         }
@@ -626,39 +629,91 @@ fn parse_origin_policy_patch(
     Ok(patch)
 }
 
-/// A cascade source pushed back with `get_config`'s redaction marker as its
-/// token keeps the token this relay already holds for **that** source — the
-/// same `local_stream` pulling from the same `upstream_whep_url`. The marker is
-/// not a token: sent upstream it would be refused on every retry, silently.
+/// Undo `get_config`'s redaction on a cascade source pushed back with it.
 ///
-/// With nothing to keep (a new source, or one whose upstream changed), the
-/// source is refused rather than pulled with the marker as its credential.
-fn restore_redacted_cascade_token(
+/// A source carries the marker if its `token` is the marker or its
+/// `upstream_whep_url` holds one (a `?token=` or a userinfo, see
+/// [`crate::config::redact_url`]). It is matched against the source this relay
+/// **runs** for the same `local_stream` — the last entry for that stream, which
+/// is the one the cascade supervisor keeps — and only when that source redacts
+/// to exactly the URL pushed. The real URL and the real token then come back
+/// from it. The marker is not a credential: pulled with it, the upstream would
+/// refuse every retry, silently.
+///
+/// With nothing to restore from (a new source, an upstream that changed, a
+/// source with no token to keep), the push is refused rather than run with the
+/// marker as its credential.
+fn restore_redacted_cascade_source(
     src: &mut crate::config::CascadeSource,
     current: &[crate::config::CascadeSource],
 ) -> Result<(), String> {
-    if !src.token.as_deref().is_some_and(crate::config::is_redaction_marker) {
+    use crate::config::{is_redaction_marker, redact_url, url_holds_marker};
+    let url_redacted = url_holds_marker(&src.upstream_whep_url);
+    let token_redacted = src.token.as_deref().is_some_and(is_redaction_marker);
+    if !url_redacted && !token_redacted {
         return Ok(());
     }
-    let kept = current
-        .iter()
-        .find(|c| c.local_stream == src.local_stream && c.upstream_whep_url == src.upstream_whep_url)
-        .and_then(|c| c.token.clone());
-    match kept {
-        Some(token) => {
-            src.token = Some(token);
-            Ok(())
-        }
-        None => Err(format!(
-            "token is the redaction marker, but this relay holds no token for '{}' from {} to keep — send the token itself",
+    let nothing_to_keep = || {
+        format!(
+            "'{}' carries the redaction marker, but this relay runs no source for it that \
+             redacts to {} — send the credential itself",
             src.local_stream, src.upstream_whep_url
-        )),
+        )
+    };
+    let running = current
+        .iter()
+        .rev()
+        .find(|c| c.local_stream == src.local_stream)
+        .filter(|c| redact_url(&c.upstream_whep_url) == src.upstream_whep_url)
+        .ok_or_else(nothing_to_keep)?;
+    let token = if token_redacted {
+        Some(running.token.clone().ok_or_else(nothing_to_keep)?)
+    } else {
+        src.token.clone()
+    };
+    if url_redacted {
+        src.upstream_whep_url = running.upstream_whep_url.clone();
     }
+    src.token = token;
+    Ok(())
+}
+
+/// Parse a pushed `cascade_sources` list into what the relay will run: each
+/// entry deserialised, no `local_stream` twice, and every redaction marker
+/// restored. Reads the current set; applies nothing.
+fn parse_cascade_sources(
+    arr: &[serde_json::Value],
+    current: &[crate::config::CascadeSource],
+) -> Result<Vec<crate::config::CascadeSource>, String> {
+    let mut sources = Vec::with_capacity(arr.len());
+    for v in arr {
+        let src: crate::config::CascadeSource = serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid cascade source: {e}"))?;
+        sources.push(src);
+    }
+    // The supervisor keys pulls by `local_stream` and keeps the last, so a
+    // second entry would be acked and silently never pulled.
+    if let Some(stream) = crate::config::duplicate_local_streams(&sources).first() {
+        return Err(format!(
+            "cascade_sources: local_stream '{stream}' appears more than once"
+        ));
+    }
+    for (i, src) in sources.iter_mut().enumerate() {
+        restore_redacted_cascade_source(src, current)
+            .map_err(|e| format!("cascade_sources[{i}]: {e}"))?;
+    }
+    Ok(sources)
 }
 
 /// Apply a manager `configure_distribution` command onto the runtime control
 /// cell (secret / gates / public IP+URL / storage policy / cascade sources).
 /// Partial: only the fields present in the action are changed.
+///
+/// **All or nothing.** Every key is parsed, validated and (for a redaction
+/// marker) restored before anything is applied, so a refused push changes
+/// nothing. It used to apply the secret and the gates first and refuse a bad
+/// cascade source or policy after — leaving a new secret live, acked as a
+/// failure, and never persisted, so the relay lost it at its next restart.
 fn apply_configure_distribution(
     control: Option<&Arc<DistributionControl>>,
     action: &serde_json::Value,
@@ -670,6 +725,8 @@ fn apply_configure_distribution(
         );
     };
     use crate::distribution_control::DistUpdate;
+
+    // ── Parse and validate everything first: only this half may refuse. ──
     let mut update = DistUpdate::default();
     // `get_config` shows a set secret as the redaction marker. A push that
     // carries the marker back is "keep the one you have" — never a value, and
@@ -727,7 +784,6 @@ fn apply_configure_distribution(
         }
         update.public_base_url = Some(s);
     }
-    control.apply(update);
 
     // Storage policy: node-wide default plus per-stream overrides. Both
     // optional, so a push that only rotates the token secret leaves retention
@@ -760,20 +816,18 @@ fn apply_configure_distribution(
         origin_update.per_stream = Some(per_stream);
         origin_touched = true;
     }
+
+    let cascade = match action.get("cascade_sources").and_then(|v| v.as_array()) {
+        Some(arr) => Some(parse_cascade_sources(arr, &control.cascade_now())?),
+        None => None,
+    };
+
+    // ── Apply. Everything above has been accepted. ──
+    control.apply(update);
     if origin_touched {
         control.set_origin_policy(origin_update);
     }
-
-    if let Some(arr) = action.get("cascade_sources").and_then(|v| v.as_array()) {
-        let current = control.cascade_now();
-        let mut sources = Vec::with_capacity(arr.len());
-        for (i, v) in arr.iter().enumerate() {
-            let mut src: crate::config::CascadeSource = serde_json::from_value(v.clone())
-                .map_err(|e| format!("invalid cascade source: {e}"))?;
-            restore_redacted_cascade_token(&mut src, &current)
-                .map_err(|e| format!("cascade_sources[{i}]: {e}"))?;
-            sources.push(src);
-        }
+    if let Some(sources) = cascade {
         control.set_cascade(sources);
     }
 
@@ -797,6 +851,20 @@ fn apply_configure_distribution(
     }
 
     tracing::info!("configure_distribution applied from manager");
+    Ok(())
+}
+
+/// The whole `configure_distribution` command as the handler runs it: apply,
+/// and persist to `config.json` only what was applied, so the config survives a
+/// relay restart without the manager having to re-push.
+fn configure_distribution(
+    control: Option<&Arc<DistributionControl>>,
+    relay_config: &RelayConfig,
+    config_path: &PathBuf,
+    action: &serde_json::Value,
+) -> Result<(), String> {
+    apply_configure_distribution(control, action)?;
+    persist_distribution_config(control, relay_config, config_path);
     Ok(())
 }
 
@@ -1132,12 +1200,8 @@ async fn handle_manager_message<S>(
             // owns the operational policy so the operator never hand-edits the
             // relay's config.json.
             if action_type == "configure_distribution" {
-                let result = apply_configure_distribution(distribution_control, action);
-                // Persist to config.json so the config survives a relay restart
-                // without needing the manager to re-push.
-                if result.is_ok() {
-                    persist_distribution_config(distribution_control, relay_config, config_path);
-                }
+                let result =
+                    configure_distribution(distribution_control, relay_config, config_path, action);
                 let ack = serde_json::json!({
                     "type": "command_ack",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -1689,7 +1753,7 @@ mod redaction_tests {
                 token_secret: Some(TOKEN_SECRET.into()),
                 cascade_sources: vec![source(
                     "feed",
-                    "https://origin.example/whep/feed",
+                    "http://origin.example/whep/feed?token=planted-url-token",
                     Some("planted-cascade-token"),
                 )],
                 ..Default::default()
@@ -1706,6 +1770,7 @@ mod redaction_tests {
             "planted-node-secret",
             TOKEN_SECRET,
             "planted-cascade-token",
+            "planted-url-token",
         ] {
             assert!(!text.contains(secret), "get_config leaked {secret:?}");
         }
@@ -1717,7 +1782,7 @@ mod redaction_tests {
         assert_eq!(payload["manager"]["node_id"], "node-1");
         assert_eq!(
             payload["distribution"]["cascade_sources"][0]["upstream_whep_url"],
-            "https://origin.example/whep/feed"
+            "http://origin.example/whep/feed?token=***REDACTED***"
         );
     }
 
@@ -1806,5 +1871,172 @@ mod redaction_tests {
         ] {
             assert!(rotated_secret(&bad).is_err(), "{bad}");
         }
+    }
+
+    fn control_with(
+        cfg: &DistributionConfig,
+        cascade: Vec<CascadeSource>,
+    ) -> Arc<DistributionControl> {
+        DistributionControl::new(RuntimeDistConfig::from_config(cfg, None), cascade)
+    }
+
+    fn push(control: &Arc<DistributionControl>, action: serde_json::Value) -> Result<(), String> {
+        apply_configure_distribution(Some(control), &action)
+    }
+
+    /// A source exactly as `get_config` showed it — the token in its URL and
+    /// its header token both redacted — comes back as the real one.
+    #[test]
+    fn a_source_pushed_back_as_shown_gets_its_real_url_and_token() {
+        let real_url = "http://origin.example:4485/whep/feed?v=2&token=the-url-token";
+        let control =
+            control_with(&DistributionConfig::default(), vec![source("feed", real_url, Some("the-header-token"))]);
+        let shown = crate::config::redact_url(real_url);
+        assert!(!shown.contains("the-url-token"));
+
+        push(
+            &control,
+            serde_json::json!({
+                "type": "configure_distribution",
+                "cascade_sources": [{ "upstream_whep_url": shown, "local_stream": "feed", "token": REDACTED }],
+            }),
+        )
+        .expect("the source as shown is accepted");
+        assert_eq!(control.cascade_now(), vec![source("feed", real_url, Some("the-header-token"))]);
+
+        // A redacted URL with a fresh header token: the URL comes back, the
+        // new token is kept.
+        push(
+            &control,
+            serde_json::json!({
+                "type": "configure_distribution",
+                "cascade_sources": [{ "upstream_whep_url": shown, "local_stream": "feed", "token": "a-new-token" }],
+            }),
+        )
+        .expect("a fresh token beside a redacted URL is accepted");
+        assert_eq!(control.cascade_now(), vec![source("feed", real_url, Some("a-new-token"))]);
+    }
+
+    /// A redacted URL is only ever matched to the source it was shown for.
+    #[test]
+    fn a_redacted_url_with_nothing_to_restore_from_is_refused() {
+        let real_url = "http://origin.example/whep/feed?token=the-url-token";
+        let control = control_with(&DistributionConfig::default(), vec![source("feed", real_url, None)]);
+        for (stream, url) in [
+            // another stream's URL
+            ("other", "http://origin.example/whep/feed?token=***REDACTED***"),
+            // the upstream moved
+            ("feed", "http://moved.example/whep/feed?token=***REDACTED***"),
+            // a userinfo the source never had
+            ("feed", "http://***REDACTED***@origin.example/whep/feed?token=***REDACTED***"),
+        ] {
+            let err = push(
+                &control,
+                serde_json::json!({
+                    "type": "configure_distribution",
+                    "cascade_sources": [{ "upstream_whep_url": url, "local_stream": stream }],
+                }),
+            )
+            .expect_err("nothing to restore from: refuse rather than pull with the marker");
+            assert!(err.contains("redaction marker"), "{err}");
+        }
+        assert_eq!(control.cascade_now(), vec![source("feed", real_url, None)], "unchanged");
+    }
+
+    /// Two entries for one `local_stream` would be acked and one silently never
+    /// pulled — the supervisor keys pulls by stream. Refused on the push.
+    #[test]
+    fn a_push_naming_one_stream_twice_is_refused() {
+        let control = control_with(&DistributionConfig::default(), vec![]);
+        let err = push(
+            &control,
+            serde_json::json!({
+                "type": "configure_distribution",
+                "require_viewer_token": true,
+                "cascade_sources": [
+                    { "upstream_whep_url": "http://a.example/whep/feed", "local_stream": "feed" },
+                    { "upstream_whep_url": "http://b.example/whep/feed", "local_stream": "feed" },
+                ],
+            }),
+        )
+        .expect_err("a duplicate local_stream is refused");
+        assert!(err.contains("'feed' appears more than once"), "{err}");
+        assert!(control.cascade_now().is_empty());
+        assert!(!control.load().require_viewer_token, "a refused push applies nothing");
+    }
+
+    /// A config file may still hold two entries for a stream (it is loaded
+    /// with a warning). The supervisor runs the **last**, so that is the one a
+    /// marker is restored from.
+    #[test]
+    fn the_restore_follows_the_entry_the_supervisor_runs() {
+        let a = "http://a.example/whep/feed";
+        let b = "http://b.example/whep/feed";
+        let control = control_with(
+            &DistributionConfig::default(),
+            vec![source("feed", a, Some("token-a")), source("feed", b, Some("token-b"))],
+        );
+        let marker_for = |url: &str| {
+            serde_json::json!({
+                "type": "configure_distribution",
+                "cascade_sources": [{ "upstream_whep_url": url, "local_stream": "feed", "token": REDACTED }],
+            })
+        };
+        assert!(push(&control, marker_for(a)).is_err(), "the shadowed entry is not what runs");
+        push(&control, marker_for(b)).expect("the running entry restores");
+        assert_eq!(control.cascade_now(), vec![source("feed", b, Some("token-b"))]);
+    }
+
+    /// A refused push applies nothing — not the secret, not the gates, not the
+    /// storage policy — and so leaves `config.json` as it was. Before, the new
+    /// secret went live and the refusal skipped the persist, so the relay ran
+    /// on a secret it would forget at its next restart.
+    #[test]
+    fn a_refused_push_leaves_the_old_secret_live_and_on_disk() {
+        const NEW_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.json");
+        let startup = RelayConfig {
+            distribution: Some(DistributionConfig {
+                token_secret: Some(TOKEN_SECRET.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&startup).unwrap()).unwrap();
+        let control = control_with(startup.distribution.as_ref().unwrap(), vec![]);
+        let on_disk = || -> Option<String> {
+            let c: RelayConfig =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            c.distribution.and_then(|d| d.token_secret)
+        };
+
+        let refused = serde_json::json!({
+            "type": "configure_distribution",
+            "token_secret": NEW_SECRET,
+            "require_viewer_token": true,
+            "origin_policy": { "retention_secs": 600 },
+            "cascade_sources": [
+                { "upstream_whep_url": "http://up.example/whep/new", "local_stream": "new", "token": REDACTED }
+            ],
+        });
+        configure_distribution(Some(&control), &startup, &path, &refused)
+            .expect_err("an unrestorable marker refuses the push");
+        let rt = control.load();
+        assert_eq!(rt.token_secret.as_deref(), Some(TOKEN_SECRET), "the old secret stays live");
+        assert!(!rt.require_viewer_token, "the gate in the refused push is not applied");
+        assert!(
+            control.subscribe_origin().borrow().default.is_none(),
+            "the storage policy in the refused push is not applied"
+        );
+        assert!(control.cascade_now().is_empty());
+        assert_eq!(on_disk().as_deref(), Some(TOKEN_SECRET), "and the old secret stays on disk");
+
+        // The same push without the bad row lands, live and on disk.
+        let mut accepted = refused.clone();
+        accepted["cascade_sources"] = serde_json::json!([]);
+        configure_distribution(Some(&control), &startup, &path, &accepted).expect("accepted");
+        assert_eq!(control.load().token_secret.as_deref(), Some(NEW_SECRET));
+        assert_eq!(on_disk().as_deref(), Some(NEW_SECRET));
     }
 }

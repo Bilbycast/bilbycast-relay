@@ -106,10 +106,12 @@ pub async fn run_cascade(
     public_ip: Option<IpAddr>,
     cancel: CancellationToken,
 ) {
+    // The URL can carry the upstream viewer token (`?token=`), so it is logged
+    // redacted, like everything else that leaves the process.
     tracing::info!(
         "cascade: pulling '{}' from {} -> local stream '{}'",
         source.local_stream,
-        source.upstream_whep_url,
+        crate::config::redact_url(&source.upstream_whep_url),
         source.local_stream
     );
     loop {
@@ -187,7 +189,9 @@ async fn cascade_attempt(
 pub(crate) async fn whep_post(url: &str, token: Option<&str>, offer: &str) -> Result<String> {
     let rest = url
         .strip_prefix("http://")
-        .ok_or_else(|| anyhow!("cascade upstream must be http:// (got {url})"))?;
+        .ok_or_else(|| {
+            anyhow!("cascade upstream must be http:// (got {})", crate::config::redact_url(url))
+        })?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
