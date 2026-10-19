@@ -250,7 +250,7 @@ The opaque forwarder is stateless — a restart drops connected edges, which all
 | End-to-end | ChaCha20-Poly1305 between edges (relay sees only ciphertext) |
 | REST API | Optional Bearer token authentication |
 | Tunnel binding | Optional per-tunnel HMAC-SHA256 bind tokens (managed via manager) |
-| Config read-back | The manager's `get_config` shows every credential the relay holds (API token, registration token, node secret, distribution token secret, cascade upstream tokens) as `***REDACTED***` |
+| Config read-back | The manager's `get_config` shows every credential the relay holds (API token, registration token, node secret, distribution token secret, cascade upstream tokens, and a credential carried in a manager or cascade URL) as `***REDACTED***` |
 | ALPN | `bilbycast-relay` protocol enforced |
 
 ## Testing

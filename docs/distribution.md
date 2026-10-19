@@ -1574,6 +1574,11 @@ nearby viewers. **Implemented** (`src/distribution/cascade.rs`):
   ```
 
   Relay-to-relay signalling uses plain `http://` on a trusted network in v1.
+  The upstream token can go in `token` (sent as a Bearer header) or in the URL
+  as `?token=`; either way `get_config` and the relay's log show it redacted.
+  Each `local_stream` may appear once: pulls are keyed by it, so of two entries
+  only the last would run. A `configure_distribution` push naming one twice is
+  refused; a config file that does is still loaded, with a warning.
 - **Upgrade the upstream end first.** A relay of this version pulling from a
   relay released through v0.15.0 panics the upstream on every attempt and,
   retrying every 3 s, leaks one of the upstream's per-IP viewer slots each
@@ -1691,14 +1696,18 @@ See `../../testbed/configs/relay-distribution.json`:
 - `token_secret` must be the **same** 64-hex value the manager holds so its
   minted tokens validate.
   The relay never reports it back: `get_config` shows a set secret as
-  `"***REDACTED***"` (and each cascade source's `token` likewise), because the
-  manager serves a node's config to anyone with View on it. The marker pushed
-  back on `configure_distribution` keeps the current value: a `token_secret`
-  of `"***REDACTED***"` leaves the secret as it is and applies the rest of the
-  push, and a cascade source whose `token` is the marker keeps the token of the
-  source with the same `local_stream` and `upstream_whep_url` — or, when there
-  is none, the push is refused rather than pulling upstream with the marker as
-  its credential.
+  `"***REDACTED***"` (and each cascade source's `token` likewise, plus a
+  `?token=` or userinfo inside its `upstream_whep_url`), because the manager
+  serves a node's config to anyone with View on it. `get_config` reads the
+  config the relay started with, so a secret first pushed after start shows as
+  absent until the next restart. The marker pushed back on
+  `configure_distribution` keeps the current value: a `token_secret` of
+  `"***REDACTED***"` leaves the secret as it is and applies the rest of the
+  push, and a cascade source carrying the marker (in `token` or its URL) gets
+  the real URL and token of the source the relay runs for that `local_stream`
+  whose redacted URL is the one pushed — or, when there is none, the push is
+  refused rather than pulling upstream with the marker as its credential.
+  A refused push applies nothing, live or on disk.
 - `portal_url` is where the DVR player renews a viewer token. Leaving it blank
   disables renewal outright — `scheduleRenewal()` returns immediately — which
   turns the token's lifetime into a hard limit, silently. It is also pushable
