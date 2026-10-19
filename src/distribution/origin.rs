@@ -311,6 +311,11 @@ struct StreamOrigin {
     /// began after the restart. Only read while the store's [`ADOPT_HOLD`]
     /// lasts: a stream that adopted nothing is not held.
     adopted_bytes: AtomicU64,
+    /// How far apart, in milliseconds, the oldest and newest segments adopted
+    /// for this stream were written: the retention the previous run kept it
+    /// to. With `adopted_bytes`, what tells a window the node default keeps
+    /// anyway from one only a per-stream policy keeps, when the hold lapses.
+    adopted_span_ms: AtomicU64,
 }
 
 impl StreamOrigin {
@@ -323,6 +328,7 @@ impl StreamOrigin {
             dir,
             last_put_ms: AtomicU64::new(now_ms),
             adopted_bytes: AtomicU64::new(0),
+            adopted_span_ms: AtomicU64::new(0),
         }
     }
 }
@@ -391,11 +397,29 @@ pub struct OriginStore {
 /// same per-stream policy as its retention, and the node default is smaller
 /// than a long session's window — which is why the manager sizes a session's
 /// own cap — so judging the adopted window against the default byte cap
-/// would trim it before the manager spoke just as the age test did. Growth
-/// after the restart is still held to the default cap on top of what was
-/// adopted, and the free-space floor applies throughout, so a relay that
-/// restarts with a full disk still makes room.
+/// would trim it before the manager spoke just as the age test did. Within a
+/// run, growth after the restart is still held to the default cap on top of
+/// what was adopted; across restarts the widening stops at
+/// [`MAX_ADOPT_WIDENING`]. The free-space floor applies throughout, so a
+/// relay that restarts with a full disk still makes room.
 pub const ADOPT_HOLD: Duration = Duration::from_secs(600);
+
+/// The most the restart hold widens one stream's byte cap by, whatever the
+/// stream adopted.
+///
+/// Each start adopts whatever the last one left — including what the last one
+/// grew while it was itself held, untrimmed by age. So a relay restarting
+/// faster than the hold lapses (a crash loop under `Restart=always`) widened
+/// every start's cap by everything the start before had kept: a stream grew by
+/// its whole ingest every cycle, with no byte bound at all, where before the
+/// widening the default cap bounded it.
+///
+/// 128 GiB is above the largest window the manager sizes a session's own cap
+/// for — twelve hours, its playlist bound, and a minute's margin at its
+/// assumed 25 Mbit/s peak, 126 GiB — so it trims nothing a session could have
+/// kept, and a stream held across any number of restarts is trimmed to the
+/// default cap plus this.
+pub const MAX_ADOPT_WIDENING: u64 = 128 * 1024 * 1024 * 1024;
 
 /// Marker written into the origin root, so the store can tell a directory it
 /// owns — and may therefore adopt from, and evict within — from one an
@@ -875,6 +899,7 @@ impl OriginStore {
             // eviction drops from. `Reverse` reads backwards next to that:
             // reversing the age *ordering* is what puts the largest age first.
             found.sort_by_key(|f| std::cmp::Reverse(f.3));
+            let span = found[0].3.saturating_sub(found[found.len() - 1].3);
 
             let origin = self.ensure(&stream);
             let mut stream_bytes = 0u64;
@@ -910,6 +935,7 @@ impl OriginStore {
             }
             drop(order);
             origin.adopted_bytes.store(stream_bytes, Ordering::Relaxed);
+            origin.adopted_span_ms.store(span.as_millis() as u64, Ordering::Relaxed);
             bytes += stream_bytes;
             streams += 1;
         }
@@ -938,6 +964,11 @@ impl OriginStore {
     /// next eviction trims every adopted window to the node default, which on
     /// a DVR session is every viewer's rewind, and the operator reading the
     /// log afterwards needs to know it was the clock and not the manager.
+    /// Said at `warn` only when it costs a window, though (see
+    /// [`windows_the_default_cuts`](Self::windows_the_default_cuts)): the
+    /// manager names per-stream policies only to a relay with DVR work, so on
+    /// any other relay every restart lapses, and a warning there on every one
+    /// teaches whoever reads the log to pass over the one that matters.
     pub fn adopt_hold_active(&self) -> bool {
         let until = self.adopt_hold_until_ms.load(Ordering::Relaxed);
         if until == 0 {
@@ -951,13 +982,45 @@ impl OriginStore {
             .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            tracing::warn!(
-                hold_secs = ADOPT_HOLD.as_secs(),
-                "origin: the manager named no per-stream storage policy within the hold; \
-                 adopted segments are trimmed to the node default from here"
-            );
+            let cut = self.windows_the_default_cuts();
+            if cut.is_empty() {
+                tracing::info!(
+                    hold_secs = ADOPT_HOLD.as_secs(),
+                    "origin: the restart hold ran out; every adopted window fits the node \
+                     default, and is trimmed to it from here"
+                );
+            } else {
+                tracing::warn!(
+                    hold_secs = ADOPT_HOLD.as_secs(),
+                    streams = ?cut,
+                    "origin: the manager named no per-stream storage policy within the hold; \
+                     adopted windows wider than the node default are trimmed to it from here"
+                );
+            }
         }
         false
+    }
+
+    /// The streams whose adopted window is wider than the policy now in force
+    /// for them, by bytes or by the span of time it covers: what only a
+    /// per-stream policy would have kept, and a lapsed hold trims away. A
+    /// window the previous run kept to the default is never on it, however
+    /// old its segments are by now.
+    fn windows_the_default_cuts(&self) -> Vec<String> {
+        let mut cut: Vec<String> = self
+            .streams
+            .iter()
+            .filter(|e| {
+                let origin = e.value();
+                let pol = self.policy_for(e.key());
+                origin.adopted_bytes.load(Ordering::Relaxed) > pol.max_bytes_per_stream
+                    || Duration::from_millis(origin.adopted_span_ms.load(Ordering::Relaxed))
+                        > pol.retention
+            })
+            .map(|e| e.key().clone())
+            .collect();
+        cut.sort();
+        cut
     }
 
     /// The manager has named its per-stream policies: every stream now has
@@ -1221,9 +1284,9 @@ impl OriginStore {
         // Read once: the hold ending mid-loop only means the next PUT trims.
         // Held, a stream that adopted a window keeps it from the default's age
         // test and byte cap alike, and what arrives after the restart is still
-        // bounded by the cap — see `ADOPT_HOLD`.
+        // bounded by the cap — see `ADOPT_HOLD` and `MAX_ADOPT_WIDENING`.
         let adopted = if self.adopt_hold_active() {
-            origin.adopted_bytes.load(Ordering::Relaxed)
+            origin.adopted_bytes.load(Ordering::Relaxed).min(MAX_ADOPT_WIDENING)
         } else {
             0
         };
@@ -4615,6 +4678,46 @@ seg-1.m4s
         assert!(s.get("big", "seg-09002.m4s").await.is_some());
     }
 
+    /// A relay restarting faster than the hold lapses adopts, at each start,
+    /// what the start before grew while it was held. Widened by all of it, the
+    /// cap compounded from start to start and a crash-looping stream had no
+    /// byte bound at all. The window here is a sparse file, since the store
+    /// goes by a segment's length: it stands for what earlier held starts
+    /// left, already at the ceiling.
+    #[tokio::test]
+    async fn a_crash_loop_cannot_widen_the_hold_without_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("origin");
+        std::fs::create_dir_all(root.join("live")).unwrap();
+        std::fs::write(root.join(ORIGIN_MARKER), b"x").unwrap();
+        let window = root.join("live/seg-00000.m4s");
+        std::fs::File::create(&window).unwrap().set_len(MAX_ADOPT_WIDENING).unwrap();
+        age(&window, Duration::from_secs(700));
+        let default = OriginPolicy { max_bytes_per_stream: 300, ..one_minute() };
+
+        // A start that grows it, held, by the default cap's worth...
+        let first = store(&tmp, 0);
+        first.set_default_policy(default);
+        for i in 0..3 {
+            put_seg(&first, "live", &format!("seg-{:05}.m4s", 9000 + i), 100).await;
+        }
+        assert_eq!(first.usage()[0].bytes, MAX_ADOPT_WIDENING + 300, "fixture: held, nothing trimmed");
+        drop(first);
+
+        // ...and dies before the hold lapses. The next start adopts all of it.
+        let second = store(&tmp, 0);
+        second.set_default_policy(default);
+        assert!(second.adopt_hold_active());
+        put_seg(&second, "live", "seg-09003.m4s", 100).await;
+        let bytes = second.usage()[0].bytes;
+        assert!(
+            bytes <= MAX_ADOPT_WIDENING + 300,
+            "the widening compounded across the restart: {bytes} bytes held"
+        );
+        assert!(!window.exists(), "oldest first");
+        assert!(second.get("live", "seg-09000.m4s").await.is_some());
+    }
+
     /// The session's own cap, larger than both the default and the window,
     /// arrives after the restart: nothing adopted was lost on the way.
     #[tokio::test]
@@ -4694,6 +4797,71 @@ seg-1.m4s
         assert_eq!(s.adopt_hold_until_ms.load(Ordering::Relaxed), 0, "the lapse went unremarked");
         assert!(!s.adopt_hold_active());
         assert!(s.get("show", "seg-00000.m4s").await.is_none(), "trimmed to the default");
+    }
+
+    /// What `f` logs, as the relay's own log reads.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(log.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// The lapse said at `warn` that adopted windows were trimmed to the
+    /// default — on every restart of a relay with no DVR work, where the
+    /// manager names no per-stream policy, the hold always lapses, and the
+    /// window was the default's anyway. Said that often, it is the line an
+    /// operator silences, and then it is not there when a DVR relay's windows
+    /// are the ones cut.
+    #[test]
+    fn a_lapse_warns_only_when_it_cuts_a_window_the_default_would_not_keep() {
+        let lapse = |s: &OriginStore| {
+            s.adopt_hold_until_ms.store(s.now_ms().max(1), Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(5));
+            logged(|| assert!(!s.adopt_hold_active()))
+        };
+
+        // A live stream the previous run kept to the default: eighteen
+        // seconds of it, a minute old by now.
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "live", 10, 70);
+        let s = store(&tmp, 0);
+        s.set_default_policy(one_minute());
+        let log = lapse(&s);
+        assert!(log.contains("INFO") && log.contains("the restart hold ran out"), "{log}");
+        assert!(!log.contains("WARN"), "a routine lapse warned: {log}");
+
+        // A DVR window beside it, 198 s against a one-minute default.
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "live", 10, 70);
+        left_behind(&tmp, "show", 100, 7000);
+        let s = store(&tmp, 0);
+        s.set_default_policy(one_minute());
+        let log = lapse(&s);
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains(r#"streams=["show"]"#), "the window cut, and only it: {log}");
+
+        // Wider by bytes is wider too.
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "live", 10, 70);
+        let s = store(&tmp, 0);
+        s.set_default_policy(OriginPolicy { max_bytes_per_stream: 50, ..one_minute() });
+        assert!(lapse(&s).contains(r#"streams=["live"]"#));
     }
 
     /// A push that lands while the store is still adopting is applied from the

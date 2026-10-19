@@ -25,12 +25,22 @@
 //! on a one-off link never beats, so their report stays anonymous — which is
 //! still a row with a buffer reading, where before there was nothing.
 //!
-//! **One credential is a few devices, not a stream's worth.** A token holder
-//! can name any client id it likes, and the peer is loopback for everyone, so
-//! the only thing that tells one viewer's reports from another's is the token
-//! presented with them: at most [`MAX_CLIENTS_PER_TOKEN`] clients per token
-//! per stream, counted on a hash of it. Past that a new client is refused,
+//! **One token is a few devices, not a stream's worth.** A token holder can
+//! name any client id it likes, and the peer is loopback for everyone, so the
+//! only thing that tells one viewer's reports from another's is the credential
+//! presented with them: at most [`MAX_CLIENTS_PER_TOKEN`] clients per viewer
+//! token per stream, counted on a hash of its [`Signature`] — the one thing a
+//! token has however its text is spelled. Past that a new client is refused,
 //! never swapped for one already held.
+//!
+//! That bounds one minted token, not the person holding it. A portal claim,
+//! an operator's Watch and every visit to a manager viewing link
+//! (`/watch/{stream}?k=`) each mint a token of their own, so each visitor to a
+//! link reports under their own; and somebody who can mint — a link's key or a
+//! portal login in hand — can have a new token every second and fill a
+//! stream's table after all. What no token holder can do is push another
+//! stream's reports out of health (see [`ViewerMetrics::snapshot`]), or touch
+//! playback: the page ignores a refused report.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -42,6 +52,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use sha2::{Digest, Sha256};
 
+use crate::distribution::token::Signature;
 use crate::distribution::DistributionState;
 use crate::stats::{ViewerEvent, ViewerMetricReport, ViewerMetricStream, ViewerMetricsSnapshot};
 
@@ -58,14 +69,16 @@ pub const REPORT_TTL: Duration = Duration::from_secs(90);
 /// without limit.
 pub const MAX_CLIENTS_PER_STREAM: usize = 500;
 
-/// Most clients one presented viewer token holds a report for, per stream.
+/// Most clients one viewer token holds a report for, per stream.
 ///
 /// A tab keeps its id across reloads and a renewal brings a new token to the
-/// same id, so a token is one device, or a link opened on a laptop and a
-/// tablet. Eight is room for that and no room to fill a stream's table, or its
-/// share of [`MAX_REPORTED`], from one link that has been passed around. A
-/// client past it is refused, never swapped for one already held: the reports
-/// a stream keeps stay those of the viewers who came first.
+/// same id, so a token is one device, or a tokened address opened on a laptop
+/// and a tablet. Eight is room for that and no room to fill a stream's table,
+/// or its share of [`MAX_REPORTED`], from one token — a `…?token=` address
+/// passed around, or a script holding one, however it rewrites the text. It
+/// does not bound whoever can mint tokens: see the module doc. A client past
+/// it is refused, never swapped for one already held: the reports a stream
+/// keeps stay those of the viewers who came first.
 pub const MAX_CLIENTS_PER_TOKEN: usize = 8;
 
 /// Most streams with reports. A report is accepted only for a stream the
@@ -183,7 +196,7 @@ pub enum MetricRefusal {
     /// The stream already holds [`MAX_CLIENTS_PER_STREAM`] clients and this
     /// is a new one.
     TooManyClients,
-    /// The token presented already holds reports for
+    /// The credential presented already holds reports for
     /// [`MAX_CLIENTS_PER_TOKEN`] other clients on this stream.
     TooManyForToken,
     /// The relay already holds reports for [`MAX_STREAMS`] streams and this is
@@ -191,12 +204,13 @@ pub enum MetricRefusal {
     TooManyStreams,
 }
 
-/// What a client's reports are counted against: a hash of the token they
-/// were presented with, so the store never holds a credential.
+/// What a client's reports are counted against: a hash of the signature of
+/// the token they were presented with — one per credential, however its text
+/// was spelled — so the store holds neither.
 type TokenKey = [u8; 16];
 
-fn token_key(token: &str) -> TokenKey {
-    let digest = Sha256::digest(token.as_bytes());
+fn token_key(signature: &[u8]) -> TokenKey {
+    let digest = Sha256::digest(signature);
     let mut key = [0u8; 16];
     key.copy_from_slice(&digest[..16]);
     key
@@ -318,15 +332,16 @@ impl ViewerMetrics {
         Arc::new(Self::default())
     }
 
-    /// Keep this report, replacing the client's previous one. `token` is the
-    /// viewer token it was presented with, already verified.
+    /// Keep this report, replacing the client's previous one. `credential`
+    /// is the signature of the viewer token it was presented with, already
+    /// verified.
     pub fn record(
         &self,
         stream: &str,
-        token: &str,
+        credential: &Signature,
         report: ViewerReport,
     ) -> Result<(), MetricRefusal> {
-        self.record_at(stream, token_key(token), report, Instant::now())
+        self.record_at(stream, token_key(credential), report, Instant::now())
     }
 
     fn record_at(
@@ -480,13 +495,13 @@ async fn metrics_post(
     let Some(stream) = crate::distribution::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
-    let token = match crate::distribution::accepted_viewer_token(
+    let credential = match crate::distribution::accepted_viewer_token(
         &st,
         &stream,
         &headers,
         query.as_deref(),
     ) {
-        Ok(token) => token,
+        Ok(credential) => credential,
         Err(resp) => return resp,
     };
     let no_store = [(header::CACHE_CONTROL, "no-store")];
@@ -498,7 +513,7 @@ async fn metrics_post(
         )
             .into_response();
     }
-    match st.viewer_metrics.record(&stream, &token, report) {
+    match st.viewer_metrics.record(&stream, &credential, report) {
         Ok(()) => (
             StatusCode::OK,
             no_store,
@@ -547,7 +562,7 @@ mod tests {
     /// A token of its own for every client, so the per-token bound stays out
     /// of tests about something else.
     fn own(client: &str) -> TokenKey {
-        token_key(client)
+        token_key(client.as_bytes())
     }
 
     #[test]
@@ -671,7 +686,7 @@ mod tests {
     fn one_token_reports_for_a_few_clients_and_is_refused_past_them() {
         let m = ViewerMetrics::default();
         let t0 = Instant::now();
-        let link = token_key("1790000000.abc");
+        let link = token_key(b"one token");
         for i in 0..MAX_CLIENTS_PER_TOKEN {
             m.record_at("show", link, report(&format!("tab{i}")), t0).unwrap();
         }
@@ -685,10 +700,10 @@ mod tests {
         let snap = m.snapshot_at(t0 + Duration::from_secs(20));
         assert_eq!(snap.streams[0].reporting, MAX_CLIENTS_PER_TOKEN);
         // Another credential is another viewer, and the bound is per stream.
-        m.record_at("show", token_key("1790000000.def"), report("tab-extra"), t0).unwrap();
+        m.record_at("show", token_key(b"another token"), report("tab-extra"), t0).unwrap();
         m.record_at("other", link, report("tab-extra"), t0).unwrap();
         // A renewal brings a new token to the same tab: still that one client.
-        m.record_at("show", token_key("1790001800.abc"), report("tab1"), t0).unwrap();
+        m.record_at("show", token_key(b"its renewal"), report("tab1"), t0).unwrap();
         m.record_at("show", link, report("tab-late"), t0).unwrap();
         // A client that has gone frees its place.
         let later = t0 + REPORT_TTL;
@@ -837,5 +852,44 @@ mod tests {
 
         st.origin.retire_stream("feed").await;
         assert_eq!(post(&st, "feed", &viewer, "tab").await, StatusCode::NOT_FOUND);
+    }
+
+    /// One token can be written any number of ways — zeros or a `+` before
+    /// its expiry, its hex in capitals, its one stream listed in the
+    /// multi-stream form — and every spelling verifies. Counted by the text it
+    /// arrived as, each spelling was a credential with eight clients of its
+    /// own, and one holder filled a stream's table after all.
+    #[tokio::test]
+    async fn one_token_is_one_credential_however_it_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let exp = crate::stats::now_epoch_ms() / 1000 + 300;
+        let viewer = crate::distribution::token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+        st.origin.put("feed", "seg-00001.m4s", bytes::Bytes::from_static(b"x")).await.unwrap();
+
+        let (e, sig) = viewer.split_once('.').unwrap();
+        let upper = sig.to_ascii_uppercase();
+        let spellings = [
+            viewer.clone(),
+            format!("0{viewer}"),
+            format!("00000{viewer}"),
+            format!("+{viewer}"),
+            format!("{e}.{upper}"),
+            format!("{e}.{}{}", &upper[..32], &sig[32..]),
+            format!("{e}.feed.{sig}"),
+            format!("+0{e}.feed.{upper}"),
+        ];
+        assert_eq!(spellings.len(), MAX_CLIENTS_PER_TOKEN);
+        for (i, token) in spellings.iter().enumerate() {
+            assert_eq!(post(&st, "feed", token, &format!("tab{i}")).await, StatusCode::OK, "{token}");
+        }
+        assert_eq!(
+            post(&st, "feed", &format!("00{e}.feed.{sig}"), "tab-extra").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a ninth client under one credential, spelled anew"
+        );
+        // Another credential is another viewer.
+        let other = crate::distribution::token::mint_viewer_token(SECRET, "feed", exp + 1).unwrap();
+        assert_eq!(post(&st, "feed", &other, "tab-extra").await, StatusCode::OK);
     }
 }

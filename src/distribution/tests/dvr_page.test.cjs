@@ -107,7 +107,7 @@ function loadPage(opts = {}) {
     : undefined;
   window.hlsHandlers = {};
   // What the page asked of hls.js, for the recovery tests: `startLoad`,
-  // `recoverMediaError`, `swapAudioCodec`.
+  // `stopLoad`, `recoverMediaError`, `swapAudioCodec`.
   window.hlsCalls = [];
   window.hlsInstances = [];
   window.Hls = function (config) {
@@ -122,6 +122,7 @@ function loadPage(opts = {}) {
       },
       destroy() {},
       startLoad(pos) { window.hlsCalls.push(["startLoad", pos]); inst.loads.push(pos); },
+      stopLoad() { window.hlsCalls.push(["stopLoad"]); },
       recoverMediaError() { window.hlsCalls.push(["recoverMediaError"]); },
       swapAudioCodec() { window.hlsCalls.push(["swapAudioCodec"]); },
       liveSyncPosition: 100,
@@ -2122,9 +2123,10 @@ test("one slow segment among fast ones is not a slow link, and a segment that ne
   // its bytes still arriving.
   const b = pausingPage(t, 500);
   const RealNow = b.w.Date.now;
-  for (const cb of b.w.hlsHandlers.hlsFragLoading || []) cb("hlsFragLoading", { frag: { sn: 300, duration: 2, stats: { loaded: 6e5 } } });
+  const crawling = { sn: 300, duration: 2, stats: { loaded: 6e5 } };
+  for (const cb of b.w.hlsHandlers.hlsFragLoading || []) cb("hlsFragLoading", { frag: crawling });
   b.w.Date.now = () => RealNow() + 4000;         // four seconds into a two-second segment
-  for (let i = 0; i < 3; i++) b.pause();
+  for (let i = 0; i < 3; i++) { crawling.stats.loaded += 1e5; b.pause(); }
   b.w.Date.now = RealNow;
   assert.equal(b.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low");
 });
@@ -2147,6 +2149,15 @@ test("an outage on Full is not a slow link, and the drop to Low never reloads in
   for (let i = 0; i < 4; i++) dead.pause();
   dead.w.Date.now = RealNow;
   assert.equal(q(dead.w), null, "a request with nothing arriving read as a link too slow for Full");
+
+  // One whose bytes stopped part-way: lossy wifi stalls the connection, and
+  // hls.js waits twelve seconds before giving the request up.
+  const stalled = pausingPage(t, 500);
+  inFlight(stalled.w, 6e5);
+  stalled.w.Date.now = () => RealNow() + 4000;
+  for (let i = 0; i < 4; i++) stalled.pause();
+  stalled.w.Date.now = RealNow;
+  assert.equal(q(stalled.w), null, "a request whose bytes had stopped read as a link too slow for Full");
 
   // A segment that failed is over: hls.js's wait before the retry is not a slow fetch.
   const retry = pausingPage(t, 500);
@@ -2180,6 +2191,98 @@ test("an outage on Full is not a slow link, and the drop to Low never reloads in
   assert.equal(slow.w.reloads, 0, "reloaded with nothing having arrived since the decision");
   for (const cb of slow.w.hlsHandlers.hlsLevelLoaded || []) cb("hlsLevelLoaded", { details: { fragments: [] } });
   assert.equal(slow.w.reloads, 1, "a playlist arriving lets the reload go");
+  // Main goes on loading until the new page arrives. A second reload cancels
+  // the navigation under way and starts it over.
+  for (const cb of slow.w.hlsHandlers.hlsLevelLoaded || []) cb("hlsLevelLoaded", { details: { fragments: [] } });
+  for (const cb of slow.w.hlsHandlers.hlsFragLoaded || []) {
+    cb("hlsFragLoaded", { frag: { sn: 400, duration: 2, stats: { loaded: 2e6, loading: { start: 0, first: 100, end: 4000 } } }, stats: { loaded: 2e6 } });
+  }
+  assert.equal(slow.w.reloads, 1, "each load after the decision sent the reload again");
+  assert.deepEqual(slow.w.hlsCalls.filter((c) => c[0] === "stopLoad"), [["stopLoad"]],
+    "the page leaving went on loading Full against the one arriving");
+});
+
+// 2026-10 re-review: the guard above refused while a reconnect notice stood,
+// and only a segment landing clears that notice — which a link back but too
+// slow to finish a segment never does. Such a link held on Full for good.
+test("a link back from an outage but too slow for Full still drops to Low", async (t) => {
+  const q = (w) => w.localStorage.getItem("bilbycast.dvr.quality.bigshow");
+  const fatal = (details, code) => ({ type: "networkError", details, fatal: true, response: { code } });
+
+  // After play: a playlist went fatal, the attempt ran and the playlist is
+  // back, and the segment in flight crawls.
+  const a = pausingPage(t, 500);
+  const hls = instanceOn(a.w, "main");
+  raise(hls, "hlsError", fatal("levelLoadError", 0));
+  a.w.dispatchEvent(new a.w.Event("online"));
+  raise(hls, "hlsLevelLoaded", { details: { fragments: [] } });
+  const RealNow = a.w.Date.now;
+  const crawling = { sn: 300, duration: 2, stats: { loaded: 1e5 } };
+  raise(hls, "hlsFragLoading", { frag: crawling });
+  for (let i = 0; i < 3; i++) {
+    a.w.Date.now = () => RealNow() + 4000 + i * 1000;
+    crawling.stats.loaded += 2e5;
+    a.pause();
+  }
+  a.w.Date.now = RealNow;
+  assert.equal(q(a.w), "low", "a starved link stayed on Full once it had needed a reconnect");
+
+  // Before first play: the feed was missing for a moment — a relay restart —
+  // and is back, on a link that cannot finish a Full segment in time.
+  const b = loadPage({ token: "t.ok" });
+  t.after(() => closePage(b));
+  const first = instanceOn(b, "main");
+  raise(first, "hlsError", fatal("manifestLoadError", 404));
+  b.dispatchEvent(new b.Event("online"));
+  raise(first, "hlsLevelLoaded", { details: { fragments: [] } });
+  for (let i = 0; i < 3; i++) raise(first, "hlsError", fragError("fragLoadTimeOut", 9e5));
+  assert.equal(q(b), "low", "a link too slow for a first segment sat black after a reconnect");
+
+  // What the buffer did during the outage is not counted once the link is back.
+  const c = pausingPage(t, 4000);
+  const during = instanceOn(c.w, "main");
+  raise(during, "hlsError", fatal("levelLoadError", 0));
+  for (let i = 0; i < 3; i++) {
+    c.pause();
+    raise(during, "hlsError", { type: "mediaError", details: "bufferStalledError", fatal: false });
+  }
+  c.w.Date.now = () => RealNow() + 10;
+  c.w.dispatchEvent(new c.w.Event("online"));
+  raise(during, "hlsLevelLoaded", { details: { fragments: [] } });
+  c.w.Date.now = () => RealNow() + 1000;
+  c.pause();
+  c.w.Date.now = RealNow;
+  assert.equal(q(c.w), null, "the outage's pauses and stalls decided the drop once the link was back");
+});
+
+// 2026-10 re-review: a portal tab whose main picture had stopped for good
+// stopped beating and reporting — until its next renewal, which started the
+// beat again, and the reports with it, from a black picture.
+test("a renewal does not bring back the beat or the reports of a picture that has gone", async (t) => {
+  const net = reportingNetwork();
+  const renewals = [];
+  const fetch = async (url, init = {}) => {
+    if (/\/api\/renew\?/.test(url)) {
+      renewals.push(url);
+      const token = (Math.floor(Date.now() / 1000) + 3600) + ".fresh";
+      return { ok: true, status: 200, json: async () => ({ token, holder: "h1" }) };
+    }
+    return net.fetch(url, init);
+  };
+  // Inside the renewal's lead time, so the renewal runs at once.
+  const w = loadPage({ token: (Math.floor(Date.now() / 1000) + 60) + ".sig", hold: "h1", fetch });
+  t.after(() => closePage(w));
+  assert.ok(net.seen.some((s) => s.kind === "beat"), "fixture: a portal tab, beating");
+  // hls.js's recovery spent, then the fatal error once more: the picture is over.
+  const hls = instanceOn(w, "main");
+  for (let i = 0; i < 4; i++) raise(hls, "hlsError", { type: "mediaError", details: "bufferAppendError", fatal: true });
+  assert.match(w.document.getElementById("err").textContent, /mediaError/, "fixture: the picture has gone");
+  net.seen.length = 0;
+  await settle();
+  assert.equal(renewals.length, 1, "fixture: the renewal ran, and succeeded");
+  w.document.dispatchEvent(new w.Event("visibilitychange"));
+  await settle();
+  assert.deepEqual(net.seen, [], "the renewal brought a dead tab back into the count");
 });
 
 test("on Low already, or when the pauses were seeks, nothing is switched", (t) => {

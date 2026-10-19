@@ -865,14 +865,17 @@ pub(super) fn check_viewer_token(
     accepted_viewer_token(st, stream_id, headers, query).map(drop)
 }
 
-/// [`check_viewer_token`], handing back the credential it accepted — for a
-/// route that bounds what one credential may do, not only whether it may.
+/// [`check_viewer_token`], handing back the [`token::Signature`] of the
+/// credential it accepted — for a route that bounds what one credential may
+/// do, not only whether it may. The signature, not the token: one credential
+/// verifies under any number of spellings, and a bound counted on the text
+/// would give each spelling a bound of its own.
 pub(super) fn accepted_viewer_token(
     st: &DistributionState,
     stream_id: &str,
     headers: &HeaderMap,
     query: Option<&str>,
-) -> Result<String, Response> {
+) -> Result<token::Signature, Response> {
     let rt = st.control.load();
     let Some(ref secret) = rt.token_secret else {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "token gate misconfigured").into_response());
@@ -884,10 +887,8 @@ pub(super) fn accepted_viewer_token(
         )
             .into_response());
     };
-    match token::verify_viewer_token(secret, stream_id, &tok) {
-        Ok(()) => Ok(tok),
-        Err(e) => Err((StatusCode::FORBIDDEN, format!("viewer token rejected: {e}")).into_response()),
-    }
+    token::verify_viewer_token(secret, stream_id, &tok)
+        .map_err(|e| (StatusCode::FORBIDDEN, format!("viewer token rejected: {e}")).into_response())
 }
 
 /// Minimal built-in WHEP player page.
@@ -2748,15 +2749,21 @@ mod tests {
 
         // A fatal hls.js error on the main element is a fourth terminal
         // state — nothing retries a 4xx or re-attaches — and it must end the
-        // beat too, without the proxy's fatal error doing the same.
+        // beat too, without the proxy's fatal error doing the same; and for
+        // good, through the predicate, so the next renewal's restart of the
+        // beat does not count the dead tab again.
         let fatal = html
             .split("if (data.fatal) {")
             .nth(1)
             .and_then(|after| after.split("} else if").next())
             .expect("no fatal branch in the hls.js error handler");
         assert!(
-            fatal.contains("if (video === main) stopBeating();"),
+            fatal.contains("if (video === main) { pictureEnded = true; stopBeating(); }"),
             "a dead main picture keeps beating: {fatal}"
+        );
+        assert!(
+            may.contains("!pictureEnded"),
+            "a renewal starts the beat of a picture that has gone: {may}"
         );
 
         // A stopped beat stays stopped.
