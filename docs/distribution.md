@@ -996,7 +996,9 @@ prefetch for a minute, doubling to ten, and one sheet that arrives resets it.
 
 The DVR page reports its own playback to `POST /origin/{stream}/metrics`
 every twenty seconds (the reply's `next_report_secs` sets the cadence; the
-page will not go faster than ten): buffer ahead, distance behind live,
+page will not go faster than ten), and once about two seconds after the
+picture first starts, so a page that has just loaded, or reloaded, shows up
+without waiting out the interval: buffer ahead, distance behind live,
 stalls, rebuffer pauses and reconnects over its lifetime, the last five
 minutes and the last minute, the bandwidth estimate, dropped frames, the last
 segment's timing, the live delay it prefers and the hold-back the link has
@@ -1004,12 +1006,22 @@ pushed it to, whether it is catching up, whether it dropped itself to Low, and
 its last eight trouble events. Every field is clamped on arrival; the relay
 does not try to verify the numbers.
 
-- **One id per tab.** The page keeps its `client` id in `sessionStorage`, per
-  stream, and mints a new one only when none is stored or when it arrives with
-  a new claim's token. A reload — the downgrade to Low, a return to Full, a
-  quality change — reports under the same id, so its report replaces the last
-  one instead of leaving it behind under an id nobody holds. A page another
-  device has taken the viewing over from stops reporting.
+- **One id per tab.** The page keeps its `client` id in `sessionStorage`
+  under `bilbycast.dvr.client.<stream>`, and mints a new one only when none is
+  stored (or the stored one breaks the relay's id rule) or when the page
+  arrives with a token in its address — a link opened afresh, or a new portal
+  claim. The id is forgotten with the token, so what comes back by the
+  portal's link reports under a new one. A reload — the downgrade to Low, a
+  return to Full, a quality change — reports under the same id, so its report
+  replaces the last one instead of leaving it behind under an id nobody holds.
+  With site data blocked nothing is kept, and each load mints its own.
+- **Only while somebody is watching.** A hidden tab sends nothing, nor does
+  one whose access has ended. A portal tab also stops for good once its beat
+  has ended: when another device signs in with the login and the portal
+  answers `held: false`, or when its main picture has stopped for good. The
+  count has let go of that tab, and a report from it would be joined to
+  nobody: an anonymous viewer on the operator's screen who is not there. A
+  tab on a viewing link never beats, so only the first two apply to it.
 - **A stream the origin is serving.** A report for anything else is `404`, as
   marks answer for a stream with no directory: a viewer token outlives its
   session by hours, and a tab left open on a dropped session must not hold a
@@ -1059,16 +1071,30 @@ From that starting point the player moves by itself:
   its own length; with thirty seconds trouble-free and at least six seconds
   buffered, the player runs at 1.05× until it is back at the live point, then
   returns to 1×. The rate buttons never show it and any transport control ends
-  it. Delay the viewer made themselves — a pause, a passage at 50% — is left
+  it, Play and 100% included; after those two it starts again at the next
+  one-second check if the playhead is still behind and the link still quiet.
+  Delay the viewer made themselves — a pause, a passage at 50% — is left
   alone until they press Live. The wait after a seek is not counted as a
   pause at all.
 - **Down to Low** when the link cannot carry Full. Three stalls in a minute,
   or three rebuffer pauses in a minute while segments are arriving slower than
   they play (the middle of the last three fetches taking more than 0.8 of the
-  segment's length, or one still in flight after one and a half times it). The
-  page says so, reloads on Low, and says so again. Pauses on a link that is
-  fetching faster than real time move the live point back instead and leave
-  the picture on Full. Never upgraded automatically; nothing is lower than Low.
+  segment's length, or one still in flight after one and a half times it, its
+  bytes still arriving; a request that failed is over, and the wait for its
+  retry is not timed as a slow fetch). Before anything has played, a segment
+  that runs out of time while its bytes are arriving counts as a stall; an
+  error status, a request that never had a byte and a playlist failure do
+  not, because they are the relay or the route not being there, and Low would
+  not arrive either. Nothing is decided while the page is reconnecting or the
+  browser reports itself offline: an outage makes every one of those signs
+  read as a link too slow for Full. The page says so, reloads on Low and says
+  so again. The reload waits until the notice has been up for a second and a
+  half and the link has carried a playlist or a segment since the decision,
+  and never goes out while the browser is offline, so a link that fails in
+  that moment holds the reload back until it returns instead of taking it
+  into the browser's error page. Pauses on a link that is fetching faster than real time move the live point
+  back instead and leave the picture on Full. Never upgraded automatically;
+  nothing is lower than Low.
 - **Back to Full** by the viewer, with a prompt. An automatic drop is
   remembered for as long as it stands (`bilbycast.dvr.autolow.<stream>`):
   Settings says the player chose Low, and the **LOW** badge on the picture is
@@ -1106,7 +1132,10 @@ low-resolution rendition is all-intra.
 
 **Balanced is the interesting one.** Resolution matters most when someone has
 stopped to look at something, and that is exactly when a fetch is affordable:
-one segment when you stop instead of a megabyte a second forever.
+one segment when you stop instead of a megabyte a second forever. A rebuffer
+pause is not that moment: the link has nothing to spare then, so a hold
+waiting on the buffer fetches no still, and one already up gives way to the
+Buffering notice as the hold starts.
 
 **Full stays the default.** A quieter default would silently soften the picture
 for viewers who never asked; the ladder exists for links that need it.
@@ -1365,9 +1394,12 @@ What an operator should expect across a relay restart now is a gap of a
 segment or two, not of a window. Media segments survive it — they were on disk
 and readable throughout. Manifests and `init.mp4` do not: they are memory-only
 and die with the process, so until the edge re-publishes them (it does, within
-a segment or two) a viewer's manifest fetch 404s and the page does not start.
-Reloading after that heals it; the head-trim above keeps the playlist honest
-while the two catch up. Two things do still need care:
+a segment or two) a viewer's manifest fetch 404s. The page asks again, after a
+second and then doubling up to fifteen, and at once when the browser comes
+back online or the tab back to the foreground, under "This feed is not
+available right now — retrying…"; it starts by itself once the manifest is
+back, and the head-trim above keeps the playlist honest while the two catch
+up. Two things do still need care:
 
 * **Point `origin_storage_dir` at the same directory across the restart.**
   Adoption is what makes the restart cheap, and it can only adopt what it
