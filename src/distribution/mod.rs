@@ -3263,23 +3263,26 @@ mod tests {
         for line in html.lines().filter(|l| l.contains("_KEY = ")) {
             let name = line.trim_start().trim_start_matches("var ");
             let name = name.split(' ').next().unwrap_or("");
-            // Three kinds, and the distinction is the point: preferences in
-            // localStorage, the credential, and the id of the device holding
-            // the login — not a credential, but per-tab state like the token.
+            // Four kinds, and the distinction is the point: preferences in
+            // localStorage, the credential, the id of the device holding the
+            // login, and the id this tab reports its playback under. Neither
+            // id is a credential, but both are per-tab state like the token.
             assert!(
                 NON_SECRET_KEYS.contains(&name)
                     || name == "TOKEN_KEY"
-                    || name == "HOLD_KEY",
+                    || name == "HOLD_KEY"
+                    || name == "CLIENT_KEY",
                 "a storage key this test has never seen: {name} — add it to the \
                  non-secret list if it holds a preference, and think hard first \
                  if it does not"
             );
         }
-        // And the two per-tab keys belong to the per-tab store alone. The
+        // And the three per-tab keys belong to the per-tab store alone. The
         // holder id is not a credential — it opens nothing — but a device that
         // kept it across tabs would go on claiming to be the one watching
-        // after the tab that took the feed had closed.
-        for key in ["TOKEN_KEY", "HOLD_KEY"] {
+        // after the tab that took the feed had closed. The report id is the
+        // same: shared across tabs, two pictures would report as one viewer.
+        for key in ["TOKEN_KEY", "HOLD_KEY", "CLIENT_KEY"] {
             for line in html.lines().filter(|l| l.contains(key)) {
                 assert!(
                     !line.contains("localStorage"),
