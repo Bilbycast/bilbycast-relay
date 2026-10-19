@@ -1560,8 +1560,10 @@ test("the second picture's fatal error is not the viewer's, and it is resumed wh
 
 // The relay saw a tablet cancel the same 2 MB Full segment over and over while
 // its page sat black: a link too slow to finish the first segment never
-// stalls, so nothing fell back. A segment that was arriving and timed out
-// before first play counts.
+// stalls, so nothing fell back. A segment that had bytes and timed out before
+// first play counts, even with its bytes stopped short of the end — the
+// fragments below never gain — because nothing played yet tells a dead spot
+// from a slow link between bursts.
 /// A segment request that ended with `loaded` bytes received, as hls.js
 /// reports it.
 const fragError = (details, loaded, code) => ({

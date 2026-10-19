@@ -2681,11 +2681,16 @@
           // fire, and hls.js retries the same segment it cannot finish in
           // time — the relay saw the tablet cancel the same 2 MB segment
           // over and over while the page sat black (2026-10-10). A segment
-          // that was arriving and ran out of time before first play is the
-          // same evidence as a stall, and counts the same way. Nothing else
-          // is: an error status, a request that never had a byte, or a
-          // playlist failing is the relay or the route not being there — a
-          // restart, a dead spot — and Low would not arrive either.
+          // that had bytes and ran out of time before first play is the
+          // same evidence as a stall, and counts the same way — even one
+          // whose bytes had stopped. slowLink's in-flight test asks for bytes
+          // still arriving; this one deliberately does not, because with
+          // nothing played there is no telling a dead spot from a slow, lossy
+          // link between bursts, and missing a slow link is what kept the
+          // page black on Full.
+          // Nothing else counts: an error status, a request that never had a
+          // byte, or a playlist failing is the relay or the route not being
+          // there — a restart, a dead spot — and Low would not arrive either.
           noteStall();
           maybeDowngrade();
         } else if (data.details === "bufferStalledError") {
