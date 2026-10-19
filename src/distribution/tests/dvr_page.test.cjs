@@ -19,9 +19,9 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
-let JSDOM;
+let JSDOM, VirtualConsole;
 try {
-  ({ JSDOM } = require("jsdom"));
+  ({ JSDOM, VirtualConsole } = require("jsdom"));
 } catch (e) {
   // Where the suite is meant to run, a skip would be a green run that tested
   // nothing.
@@ -52,22 +52,41 @@ const HTML = fs
 /// `fetch` at all, as jsdom ships none. `opts.storage` is in `localStorage`
 /// before the page's script runs, and `opts.blockStorage` makes every access
 /// to it throw, as a browser with site data blocked does. `opts.token` is the
-/// viewer token in the page's URL, as the portal hands it out.
+/// viewer token in the page's URL, as the portal hands it out, and
+/// `opts.hold` the holder id the portal hands out with it. `opts.session` is
+/// in `sessionStorage` first, which is how a test reloads a tab: no token in
+/// the URL, the tab's own copy instead.
 /// `opts.nativeHls` leaves hls.js unsupported, so the page plays the way
 /// Safari on iOS does: no request headers, the token in the query instead.
 ///
 /// hls.js's event handlers are kept on `window.hlsHandlers`, so a test can
-/// raise the errors the real one would.
+/// raise the errors the real one would — on every instance at once, as most
+/// tests want. Each instance is also on `window.hlsInstances`, with its own
+/// handlers, the element it was attached to, and what it was asked to load,
+/// for a test about one of them alone. jsdom navigates nowhere, so a reload
+/// is counted on `window.reloads` instead.
 function loadPage(opts = {}) {
+  const query = [
+    opts.token ? "token=" + encodeURIComponent(opts.token) : "",
+    opts.hold ? "hold=" + encodeURIComponent(opts.hold) : "",
+  ].filter(Boolean).join("&");
+  const virtualConsole = new VirtualConsole().forwardTo(console, { jsdomErrors: "none" });
+  let reloads = 0;
+  virtualConsole.on("jsdomError", (e) => {
+    if (/navigation to another Document/.test(e.message)) reloads += 1;
+    else console.error(e.type === "unhandled-exception" ? e.cause.stack : e.message);
+  });
   const dom = new JSDOM(HTML, {
     runScripts: "outside-only",
     pretendToBeVisual: true,
+    virtualConsole,
     // An origin, so `localStorage` exists: marks fall back to it.
-    url: "https://relay.test/dvr/bigshow" +
-      (opts.token ? "?token=" + encodeURIComponent(opts.token) : ""),
+    url: "https://relay.test/dvr/bigshow" + (query ? "?" + query : ""),
   });
   const { window } = dom;
+  Object.defineProperty(window, "reloads", { get: () => reloads });
   for (const [k, v] of Object.entries(opts.storage || {})) window.localStorage.setItem(k, v);
+  for (const [k, v] of Object.entries(opts.session || {})) window.sessionStorage.setItem(k, v);
   if (opts.blockStorage) {
     Object.defineProperty(window, "localStorage", {
       get() { throw new window.DOMException("blocked", "SecurityError"); },
@@ -90,20 +109,27 @@ function loadPage(opts = {}) {
   // What the page asked of hls.js, for the recovery tests: `startLoad`,
   // `recoverMediaError`, `swapAudioCodec`.
   window.hlsCalls = [];
+  window.hlsInstances = [];
   window.Hls = function (config) {
-    return {
+    const inst = {
       config: config || {},
-      loadSource() {},
-      attachMedia() {},
-      on(ev, cb) { (window.hlsHandlers[ev] = window.hlsHandlers[ev] || []).push(cb); },
+      handlers: {}, media: null, sources: [], loads: [],
+      loadSource(src) { inst.sources.push(src); },
+      attachMedia(v) { inst.media = v; },
+      on(ev, cb) {
+        (window.hlsHandlers[ev] = window.hlsHandlers[ev] || []).push(cb);
+        (inst.handlers[ev] = inst.handlers[ev] || []).push(cb);
+      },
       destroy() {},
-      startLoad(pos) { window.hlsCalls.push(["startLoad", pos]); },
+      startLoad(pos) { window.hlsCalls.push(["startLoad", pos]); inst.loads.push(pos); },
       recoverMediaError() { window.hlsCalls.push(["recoverMediaError"]); },
       swapAudioCodec() { window.hlsCalls.push(["swapAudioCodec"]); },
       liveSyncPosition: 100,
       levels,
       currentLevel: 0,
     };
+    window.hlsInstances.push(inst);
+    return inst;
   };
   if (opts.fetch) window.fetch = opts.fetch;
   window.Hls.isSupported = () => !opts.nativeHls;
@@ -173,6 +199,12 @@ function closePage(w) {
 const click = (w, sel) => w.document.querySelector(sel).dispatchEvent(
   new w.Event("click", { bubbles: true })
 );
+/// The newest hls.js instance attached to the element with this id.
+const instanceOn = (w, id) => w.hlsInstances.filter((i) => i.media && i.media.id === id).pop();
+/// Raise an hls.js event on one instance only.
+const raise = (inst, ev, data) => {
+  for (const cb of inst.handlers[ev] || []) cb(ev, data);
+};
 
 test("the page loads and wires its controls", (t) => {
   const w = loadPage();
@@ -1320,6 +1352,56 @@ test("a fatal network error is reconnected, not the end of the session", async (
   assert.equal(main.currentTime, 40, "resumed in place; the Live button is the viewer's");
 });
 
+// 2026-10 review: a manifest that never arrived was "resumed" with startLoad(),
+// which does nothing before hls.js has parsed one — and since nothing then
+// failed, nothing tried again. "Connection lost — reconnecting…" stayed up for
+// good while the page fetched nothing at all.
+test("a manifest that never arrived is asked for again, and a feed the relay does not have says so", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const err = w.document.getElementById("err");
+  const hls = instanceOn(w, "main");
+  const manifest = "/origin/bigshow/manifest.m3u8";
+  assert.deepEqual(hls.sources, [manifest], "fixture: the one load at attach");
+  raise(hls, "hlsError", { type: "networkError", details: "manifestLoadError", fatal: true, response: { code: 502 } });
+  assert.match(err.textContent, /Connection lost — reconnecting/);
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.deepEqual(hls.sources, [manifest, manifest], "the manifest is asked for again");
+  assert.deepEqual(hls.loads, [], "only startLoad() was tried, which does nothing before a manifest");
+  assert.equal(hls.config.manifestLoadPolicy.default.errorRetry.maxNumRetry, 6,
+    "the manifest has the playlists' patience, not hls.js's one retry");
+
+  // The relay has no such playlist: retried all the same, and said plainly.
+  raise(hls, "hlsError", { type: "networkError", details: "manifestLoadError", fatal: true, response: { code: 404 } });
+  assert.match(err.textContent, /not available right now — retrying \(attempt 2\)/);
+  assert.doesNotMatch(err.textContent, /Connection lost/);
+});
+
+// 2026-10 review: `online`, and a tab coming back, went back through
+// scheduleReconnect — the same back-off again from zero, and one more
+// reconnect on the operator's screen each time.
+test("the link or the tab coming back retries at once, and is not another reconnect", async (t) => {
+  const posts = [];
+  const fetch = async (url, init = {}) => {
+    if (/\/metrics$/.test(url.split("?")[0])) {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200, json: async () => ({ next_report_secs: 20 }) };
+    }
+    return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), text: async () => "" };
+  };
+  const w = loadPage({ token: TOKEN, fetch });
+  t.after(() => closePage(w));
+  const hls = instanceOn(w, "main");
+  raise(hls, "hlsError", { type: "networkError", details: "levelLoadError", fatal: true, response: { code: 0 } });
+  assert.deepEqual(hls.loads, [], "fixture: waiting out the back-off");
+  w.dispatchEvent(new w.Event("online"));
+  assert.deepEqual(hls.loads, [-1], "the link is back: resumed now, not after another back-off");
+  w.document.dispatchEvent(new w.Event("visibilitychange"));
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(posts[posts.length - 1].reconnects, 1, "one loss of the link, one reconnect");
+  assert.deepEqual(hls.loads, [-1], "the attempt was run early, not run and then left pending as well");
+});
+
 // "The playback hits the end of the buffer and stops, the buffer doesn't seem
 // to start growing again … then it pauses 3–5 s before the buffer begins to
 // grow, plays until exhausted" — a tablet on contended wifi, 2026-10-10.
@@ -1418,25 +1500,18 @@ test("three stalls in a minute on Full switch the page to Low and say so after t
 });
 
 // Review before rollout, 2026-10-10: the reconnect loop and the stall logic
-// must only act on the picture the viewer is watching, in live mode.
-test("the still-frame element, expired access, and stalls while scrubbing do not drive reconnects or the link logic", async (t) => {
+// must only act on the picture the viewer is watching, in live mode. (The
+// second picture's own fatal error has a test of its own, below.)
+test("expired access, and stalls while scrubbing, do not drive reconnects or the link logic", async (t) => {
   const w = loadPage({ token: "t.ok" });
   t.after(() => closePage(w));
   const err = w.document.getElementById("err");
   const main = w.document.getElementById("main");
-  // Attach the proxy/still element, as a jog does, so its handlers exist.
-  key(w, ".");
+  key(w, ".");   // a jog step: out of live, into scrub
   const fire = (label, data) => {
     for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", data);
   };
-  // A fatal network error on the still element: no notice, no reconnect.
   w.hlsCalls.length = 0;
-  fire("still", { type: "networkError", details: "fragLoadError", fatal: true });
-  // Every attached instance receives the stub's broadcast; the main one DOES
-  // reconnect, so distinguish by what the notice says afterwards once a
-  // segment lands on main.
-  for (const cb of w.hlsHandlers.hlsFragBuffered || []) cb("hlsFragBuffered", {});
-  assert.equal(err.textContent, "", "a segment landing on main clears everything the broadcast caused");
 
   // Stalls while scrubbing count for nothing.
   assert.equal(w.document.body.dataset.mode, "scrub", "fixture: a jog step leaves live for scrub");
@@ -1456,19 +1531,61 @@ test("the still-frame element, expired access, and stalls while scrubbing do not
   assert.ok(!w.hlsCalls.some((c) => c[0] === "startLoad"), "no resume is attempted against withdrawn access");
 });
 
+// 2026-10 review: a fatal error on the proxy (Full) or the still (Balanced) was
+// logged and left, under a comment saying the next use would re-attach it.
+// Nothing did, and every later shuttle ran on a frozen picture.
+test("the second picture's fatal error is not the viewer's, and it is resumed when next needed", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const err = w.document.getElementById("err");
+  click(w, "#btnFf");   // the first shuttle attaches the proxy
+  const proxy = instanceOn(w, "proxy");
+  const main = instanceOn(w, "main");
+  assert.ok(proxy, "fixture: a shuttle in Full attaches the proxy");
+  const fatal = { type: "networkError", details: "fragLoadError", fatal: true, response: { code: 0 } };
+  raise(proxy, "hlsError", fatal);
+  assert.equal(err.textContent, "", "no notice: the picture on screen is fine");
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.deepEqual(proxy.loads, [], "not retried in the background on the link that has just failed");
+  assert.deepEqual(main.loads, [], "and main is not reconnected for it");
+  click(w, "#btnFf");   // the next shuttle needs it
+  assert.deepEqual(proxy.loads, [-1], "resumed when the viewer next asks for it");
+
+  // Dead again, and the link comes back first: resumed then.
+  raise(proxy, "hlsError", fatal);
+  w.dispatchEvent(new w.Event("online"));
+  assert.deepEqual(proxy.loads, [-1, -1], "resumed when the link comes back");
+});
+
 // The relay saw a tablet cancel the same 2 MB Full segment over and over while
 // its page sat black: a link too slow to finish the first segment never
-// stalls, so nothing fell back. Load timeouts before first play count.
+// stalls, so nothing fell back. A segment that was arriving and timed out
+// before first play counts.
+/// A segment request that ended with `loaded` bytes received, as hls.js
+/// reports it.
+const fragError = (details, loaded, code) => ({
+  type: "networkError", details, fatal: false,
+  frag: { sn: 7, duration: 2, stats: { loaded } },
+  response: code ? { code } : undefined,
+});
 test("segment loads timing out before anything has played fall back to Low", (t) => {
   const w = loadPage({ token: "t.ok" });
   t.after(() => closePage(w));
-  const fire = (details) => {
-    for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", { type: "networkError", details, fatal: false });
+  const fire = (data) => {
+    for (const cb of w.hlsHandlers.hlsError || []) cb("hlsError", data);
   };
-  fire("fragLoadTimeOut"); fire("fragLoadTimeOut");
-  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null, "two timeouts are weather");
-  fire("fragLoadError");
-  assert.equal(w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low", "the third is a link that cannot carry Full");
+  const q = () => w.localStorage.getItem("bilbycast.dvr.quality.bigshow");
+  fire(fragError("fragLoadTimeOut", 9e5)); fire(fragError("fragLoadTimeOut", 9e5));
+  assert.equal(q(), null, "two timeouts are weather");
+  // A relay restarting behind the terminator, a dead spot, a playlist that
+  // did not come: none of it is a link too slow for Full.
+  fire(fragError("fragLoadError", 0, 502));
+  fire(fragError("fragLoadTimeOut", 0));
+  fire({ type: "networkError", details: "levelLoadTimeOut", fatal: false });
+  fire({ type: "networkError", details: "manifestLoadError", fatal: false, response: { code: 502 } });
+  assert.equal(q(), null, "an error status, a request with no bytes, or a playlist is not a slow link");
+  fire(fragError("fragLoadTimeOut", 9e5));
+  assert.equal(q(), "low", "the third segment that ran out of time is a link that cannot carry Full");
   assert.match(w.document.getElementById("err").textContent, /switching to Low/);
 
   // Once something has played, timeouts are the stall logic's business, not this branch's.
@@ -1476,7 +1593,7 @@ test("segment loads timing out before anything has played fall back to Low", (t)
   t.after(() => closePage(again));
   const main = again.document.getElementById("main");
   main.play(); main.dispatchEvent(new again.Event("playing"));
-  for (let i = 0; i < 4; i++) for (const cb of again.hlsHandlers.hlsError || []) cb("hlsError", { type: "networkError", details: "fragLoadTimeOut", fatal: false });
+  for (let i = 0; i < 4; i++) for (const cb of again.hlsHandlers.hlsError || []) cb("hlsError", fragError("fragLoadTimeOut", 9e5));
   assert.equal(again.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "full", "after first play a timeout alone does not switch quality");
 });
 
@@ -1571,7 +1688,7 @@ test("a page with a token reports its playback to the relay under a client id, a
   assert.equal(posts[0].url, "/origin/bigshow/metrics");
   assert.equal(posts[0].headers.Authorization, "Bearer " + TOKEN, "the viewer token rides as a header, as every other request's does");
   const first = posts[0].body;
-  assert.match(first.client, /^[0-9a-f]{16}$/, "a per-load id: " + first.client);
+  assert.match(first.client, /^[0-9a-f]{16}$/, "a per-tab id: " + first.client);
   assert.equal(first.quality, "full");
   assert.equal(first.mode, "live");
   assert.equal(first.stalls, 0);
@@ -1612,6 +1729,93 @@ test("a page without a token sends no report, and neither does a page whose acce
   expired.document.dispatchEvent(new expired.Event("visibilitychange"));
   await new Promise((r) => setTimeout(r, 10));
   assert.ok(!calls.some((c) => /metrics/.test(c)), "an expired tab has nothing to say: " + calls.join(", "));
+});
+
+/// A relay and a portal that record which client id each report and each
+/// beat carried. `held` is what every beat is answered.
+function reportingNetwork(held = true) {
+  const seen = [];
+  const fetch = async (url, init = {}) => {
+    if (/\/metrics$/.test(url.split("?")[0])) {
+      seen.push({ kind: "report", client: JSON.parse(init.body).client });
+      return { ok: true, status: 200, json: async () => ({ next_report_secs: 20 }) };
+    }
+    if (/\/api\/beat\?/.test(url)) {
+      seen.push({ kind: "beat", client: new URLSearchParams(url.split("?")[1]).get("client") });
+      return { ok: true, status: 200, json: async () => ({ held }) };
+    }
+    return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), text: async () => "" };
+  };
+  return { seen, fetch };
+}
+const CLIENT_KEY = "bilbycast.dvr.client.bigshow";
+
+// 2026-10 review: the report id was minted per page load. A reload — the usual
+// answer to a stalling picture, and what a drop to Low does by itself — moved
+// the login's row to a new id while the old page's last report stood at the
+// relay for a minute and a half under the old one: an anonymous viewer on a
+// viewing link, often graded poor, who did not exist.
+test("a tab keeps its report id across a reload, and a new claim gets a new one", async (t) => {
+  const net = reportingNetwork();
+  const first = loadPage({ token: TOKEN, hold: "h1", fetch: net.fetch });
+  t.after(() => closePage(first));
+  first.document.dispatchEvent(new first.Event("visibilitychange"));
+  await settle();
+  const id = first.sessionStorage.getItem(CLIENT_KEY);
+  assert.match(id || "", /^[0-9a-f]{16}$/, "the id is kept in the tab");
+  assert.deepEqual(new Set(net.seen.map((s) => s.kind)), new Set(["beat", "report"]), "fixture: it beats and reports");
+  assert.ok(net.seen.every((s) => s.client === id), "the beat and the report carry the tab's id");
+
+  // A reload: no token in the URL, the tab's own copy of everything.
+  const session = { "bilbycast.dvr.token.bigshow": TOKEN, "bilbycast.dvr.hold.bigshow": "h1", [CLIENT_KEY]: id };
+  net.seen.length = 0;
+  const reloaded = loadPage({ session, fetch: net.fetch });
+  t.after(() => closePage(reloaded));
+  reloaded.document.dispatchEvent(new reloaded.Event("visibilitychange"));
+  await settle();
+  assert.ok(net.seen.length >= 2, "fixture: the reloaded page beats and reports");
+  assert.ok(net.seen.every((s) => s.client === id),
+    "the reloaded page is a new viewer: " + JSON.stringify(net.seen) + " vs " + id);
+
+  // Arriving with a token is a new claim — a new device — and a new id.
+  const claimed = loadPage({ token: TOKEN, hold: "h2", session, fetch: net.fetch });
+  t.after(() => closePage(claimed));
+  const fresh = claimed.sessionStorage.getItem(CLIENT_KEY);
+  assert.match(fresh || "", /^[0-9a-f]{16}$/);
+  assert.notEqual(fresh, id, "a new claim reported as the device it replaced");
+
+  // And a refused token takes the id with it, as it takes the holder.
+  for (const cb of claimed.hlsHandlers.hlsError || []) {
+    cb("hlsError", { type: "networkError", details: "fragLoadError", fatal: false, response: { code: 403 } });
+  }
+  assert.equal(claimed.sessionStorage.getItem(CLIENT_KEY), null);
+});
+
+test("the first report goes out once the picture starts, not a full interval later", async (t) => {
+  const net = reportingNetwork();
+  const w = loadPage({ token: TOKEN, fetch: net.fetch });
+  t.after(() => closePage(w));
+  await settle();
+  assert.equal(net.seen.length, 0, "a page with nothing playing has only zeros to send");
+  w.document.getElementById("main").dispatchEvent(new w.Event("playing"));
+  await new Promise((r) => setTimeout(r, 2300));
+  assert.equal(net.seen.filter((s) => s.kind === "report").length, 1, "the first report waited for the twenty-second interval");
+});
+
+// 2026-10 review: a device another sign-in had displaced went on reporting
+// under an id the login's row no longer named — read as an anonymous viewer
+// on a viewing link — until its token ran out.
+test("a tab whose login another device has taken stops reporting", async (t) => {
+  const net = reportingNetwork(false);
+  const w = loadPage({ token: TOKEN, hold: "h1", fetch: net.fetch });
+  t.after(() => closePage(w));
+  await settle();                // the first beat, answered `held: false`
+  assert.deepEqual(net.seen.map((s) => s.kind), ["beat"], "fixture: one beat");
+  w.document.dispatchEvent(new w.Event("visibilitychange"));
+  await settle();
+  assert.deepEqual(net.seen.map((s) => s.kind), ["beat"], "a displaced tab reported");
+  // The picture is left alone: telling the viewer is the renewal's job.
+  assert.equal(w.document.getElementById("err").textContent, "");
 });
 
 // Live delay, catch-up and the trouble history, 2026-10-10. A tablet paused
@@ -1786,6 +1990,32 @@ test("delay the viewer made by pausing or slowing down is not played fast; Live 
   assert.equal(main.playbackRate, 1, "a passage watched slowly is not sped through afterwards");
 });
 
+// 2026-10 review: Play or 100% during a catch-up set the rate to 1 under it,
+// and the catch-up — which only lets go of a rate of its own — went on
+// "catching up" at 1x, reported so, and never won the delay back.
+test("Play during a catch-up ends it, and a catch-up that starts again runs at its own rate", async (t) => {
+  const w = loadPage({ token: "t.ok" });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  Object.defineProperty(main, "buffered", {
+    get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + 30 }),
+    configurable: true,
+  });
+  main.currentTime = 50;
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(main.playbackRate, 1.05, "fixture: catching up");
+  click(w, "#btnPlay");
+  assert.equal(main.playbackRate, 1);
+  assert.equal(w.document.body.dataset.catchup, "0", "still catching up at 1x");
+  // Still behind, the link still quiet, the rate the viewer's 1: it is the
+  // link's delay, and fair game again on the next tick — at 1.05x.
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(w.document.body.dataset.catchup, "1");
+  assert.equal(main.playbackRate, 1.05, "catching up, at 1x");
+});
+
 // Seen in a real browser before rollout: a seek fires `waiting`, and the page
 // read that as the link struggling. It still holds the picture until there is
 // something to play; it no longer counts it or moves the live point.
@@ -1888,14 +2118,68 @@ test("one slow segment among fast ones is not a slow link, and a segment that ne
   for (let i = 0; i < 3; i++) a.pause();
   assert.equal(a.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null);
 
-  // Nothing has finished slowly, but the segment in flight is long overdue.
+  // Nothing has finished slowly, but the segment in flight is long overdue,
+  // its bytes still arriving.
   const b = pausingPage(t, 500);
   const RealNow = b.w.Date.now;
-  for (const cb of b.w.hlsHandlers.hlsFragLoading || []) cb("hlsFragLoading", { frag: { sn: 300, duration: 2 } });
+  for (const cb of b.w.hlsHandlers.hlsFragLoading || []) cb("hlsFragLoading", { frag: { sn: 300, duration: 2, stats: { loaded: 6e5 } } });
   b.w.Date.now = () => RealNow() + 4000;         // four seconds into a two-second segment
   for (let i = 0; i < 3; i++) b.pause();
   b.w.Date.now = RealNow;
   assert.equal(b.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), "low");
+});
+
+// A dead spot on Full, 2026-10 review: the buffer ran dry, each eight-second
+// hold timed out into the next, and the request in flight was timed as a slow
+// fetch — so on the third hold the page "switched to Low" by reloading itself
+// into the dead link, and the browser's own offline page took its place.
+test("an outage on Full is not a slow link, and the drop to Low never reloads into a dead link", async (t) => {
+  const q = (w) => w.localStorage.getItem("bilbycast.dvr.quality.bigshow");
+  const inFlight = (w, loaded) => {
+    for (const cb of w.hlsHandlers.hlsFragLoading || []) cb("hlsFragLoading", { frag: { sn: 300, duration: 2, stats: { loaded } } });
+  };
+
+  // A request that has had no bytes at all, long overdue: the link is not there.
+  const dead = pausingPage(t, 500);
+  const RealNow = dead.w.Date.now;
+  inFlight(dead.w, 0);
+  dead.w.Date.now = () => RealNow() + 4000;
+  for (let i = 0; i < 4; i++) dead.pause();
+  dead.w.Date.now = RealNow;
+  assert.equal(q(dead.w), null, "a request with nothing arriving read as a link too slow for Full");
+
+  // A segment that failed is over: hls.js's wait before the retry is not a slow fetch.
+  const retry = pausingPage(t, 500);
+  inFlight(retry.w, 6e5);
+  for (const cb of retry.w.hlsHandlers.hlsError || []) cb("hlsError", fragError("fragLoadTimeOut", 6e5));
+  retry.w.Date.now = () => RealNow() + 4000;
+  for (let i = 0; i < 4; i++) retry.pause();
+  retry.w.Date.now = RealNow;
+  assert.equal(q(retry.w), null, "the back-off after a failed segment was timed as a slow fetch");
+
+  // A genuinely slow link, but hls.js has given up and the page is reconnecting.
+  const reconnecting = pausingPage(t, 4000);
+  for (const cb of reconnecting.w.hlsHandlers.hlsError || []) {
+    cb("hlsError", { type: "networkError", details: "levelLoadError", fatal: true, response: { code: 0 } });
+  }
+  for (let i = 0; i < 4; i++) reconnecting.pause();
+  assert.equal(q(reconnecting.w), null, "dropped to Low in the middle of a reconnect");
+
+  // The same, with the browser saying it is offline.
+  const offline = pausingPage(t, 4000);
+  Object.defineProperty(offline.w.navigator, "onLine", { get: () => false, configurable: true });
+  for (let i = 0; i < 4; i++) offline.pause();
+  assert.equal(q(offline.w), null, "dropped to Low while the browser was offline");
+
+  // A slow link that is there: the drop is decided, and the reload waits
+  // until the link has carried something since.
+  const slow = pausingPage(t, 4000);
+  for (let i = 0; i < 3; i++) slow.pause();
+  assert.equal(q(slow.w), "low", "fixture: a starved link is dropped to Low");
+  await new Promise((r) => setTimeout(r, 1600));
+  assert.equal(slow.w.reloads, 0, "reloaded with nothing having arrived since the decision");
+  for (const cb of slow.w.hlsHandlers.hlsLevelLoaded || []) cb("hlsLevelLoaded", { details: { fragments: [] } });
+  assert.equal(slow.w.reloads, 1, "a playlist arriving lets the reload go");
 });
 
 test("on Low already, or when the pauses were seeks, nothing is switched", (t) => {
@@ -1918,6 +2202,52 @@ test("on Low already, or when the pauses were seeks, nothing is switched", (t) =
     full.pause();
   }
   assert.equal(full.w.localStorage.getItem("bilbycast.dvr.quality.bigshow"), null, "the wait after a seek is not a rebuffer pause");
+});
+
+// 2026-10 review: a rebuffer hold pauses main, and in Balanced a paused main is
+// what asks for the full-resolution still — so every hold on a starved 360p
+// link started fetching the 1080p rendition over it.
+test("in Balanced a rebuffer hold fetches no full-resolution still; the viewer's own pause does", async (t) => {
+  const w = loadPage({ clock: true, token: "t.ok", storage: { "bilbycast.dvr.quality.bigshow": "balanced" } });
+  t.after(() => closePage(w));
+  const main = w.document.getElementById("main");
+  let ahead = 1;
+  Object.defineProperty(main, "buffered", { get: () => ({ length: 1, start: () => 0, end: () => main.currentTime + ahead }), configurable: true });
+  main.play();
+  main.dispatchEvent(new w.Event("playing"));
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.match(w.document.getElementById("err").textContent, /Buffering/, "fixture: holding");
+  await new Promise((r) => setTimeout(r, 700));    // past the render tick and the still's settle
+  assert.equal(instanceOn(w, "proxy"), undefined, "a hold attached the 1080p still on a link that had run dry");
+  assert.notEqual(w.document.body.dataset.picture, "proxy");
+
+  ahead = 6;
+  main.dispatchEvent(new w.Event("progress"));
+  assert.equal(main.paused, false, "fixture: the hold is over");
+  click(w, "#btnPause");
+  await new Promise((r) => setTimeout(r, 700));
+  const still = instanceOn(w, "proxy");
+  assert.ok(still, "the viewer's own pause gets the full-resolution still");
+  assert.deepEqual(still.sources, ["/origin/bigshow/manifest.m3u8"], "from the full rendition");
+  assert.equal(w.document.body.dataset.picture, "proxy", "fixture: the still is on screen");
+
+  // Play into a link that runs dry at once: the hold takes the still down
+  // with it, rather than leaving it over the notice until the next tick.
+  ahead = 1;
+  click(w, "#btnPlay");
+  main.dispatchEvent(new w.Event("waiting"));
+  assert.match(w.document.getElementById("err").textContent, /Buffering/, "fixture: holding again");
+  assert.equal(w.document.body.dataset.picture, "main", "the still stood over the hold");
+  ahead = 6;
+  main.dispatchEvent(new w.Event("progress"));
+
+  // A still hls.js has given up on is resumed by the next stop.
+  raise(still, "hlsError", { type: "networkError", details: "fragLoadError", fatal: true, response: { code: 0 } });
+  assert.equal(w.document.getElementById("err").textContent, "", "no notice for the still");
+  click(w, "#btnPlay");
+  click(w, "#btnPause");
+  await new Promise((r) => setTimeout(r, 700));
+  assert.deepEqual(still.loads, [-1], "the next stop resumes it");
 });
 
 // "Once the viewer is dropped to Low there is no way for them to return to
