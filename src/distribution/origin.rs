@@ -400,8 +400,11 @@ pub struct OriginStore {
 /// would trim it before the manager spoke just as the age test did. Within a
 /// run, growth after the restart is still held to the default cap on top of
 /// what was adopted; across restarts the widening stops at
-/// [`MAX_ADOPT_WIDENING`]. The free-space floor applies throughout, so a
-/// relay that restarts with a full disk still makes room.
+/// [`MAX_ADOPT_WIDENING`], which bounds a stream and not the volume. The
+/// free-space floor applies throughout, so a relay that restarts with a full
+/// disk still makes room — and on a volume too small for every live stream
+/// at the default cap plus that ceiling, the floor, not the ceiling, is what
+/// a crash loop meets first.
 pub const ADOPT_HOLD: Duration = Duration::from_secs(600);
 
 /// The most the restart hold widens one stream's byte cap by, whatever the
@@ -419,6 +422,16 @@ pub const ADOPT_HOLD: Duration = Duration::from_secs(600);
 /// assumed 25 Mbit/s peak, 126 GiB — so it trims nothing a session could have
 /// kept, and a stream held across any number of restarts is trimmed to the
 /// default cap plus this.
+///
+/// **It bounds one stream, not the disk.** While the loop lasts with nothing
+/// ending each start's hold — a relay with no DVR work, or one cut off from
+/// its manager — every live stream still grows by its ingest each cycle, up
+/// to 136 GiB at the default 8 GiB cap. On an origin volume that cannot hold
+/// the live streams times that above its free-space floor, the floor binds
+/// first, not this ceiling: each sweep then gives back what the streams grew
+/// by evicting round-robin across all of them, oldest first — a DVR window on
+/// the same volume included — until the loop stops and the last start's hold
+/// lapses.
 pub const MAX_ADOPT_WIDENING: u64 = 128 * 1024 * 1024 * 1024;
 
 /// Marker written into the origin root, so the store can tell a directory it
@@ -968,7 +981,10 @@ impl OriginStore {
     /// [`windows_the_default_cuts`](Self::windows_the_default_cuts)): the
     /// manager names per-stream policies only to a relay with DVR work, so on
     /// any other relay every restart lapses, and a warning there on every one
-    /// teaches whoever reads the log to pass over the one that matters.
+    /// teaches whoever reads the log to pass over the one that matters. A
+    /// restart inside the previous run's own hold still warns for its live
+    /// streams: that run did not trim by age, so each adopted a span wider
+    /// than the default retention.
     pub fn adopt_hold_active(&self) -> bool {
         let until = self.adopt_hold_until_ms.load(Ordering::Relaxed);
         if until == 0 {

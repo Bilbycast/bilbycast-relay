@@ -968,8 +968,8 @@ What the hold does to a stream it covers:
   manager sizes each session's cap itself. Judged against the default cap, the
   adopted window lost its oldest part on the first PUT just as it had to the
   age test, and the main rendition then held less window than its all-intra
-  proxy. Growth after the restart is still held to the default cap on top of
-  what was adopted.
+  proxy. Within a run, growth after the restart is still held to the default
+  cap on top of what was adopted.
 * **The widening stops at 128 GiB** (`origin::MAX_ADOPT_WIDENING`), across
   restarts as well as within one. Each start adopts what the last one left,
   including what it grew while it was itself held, so a relay restarting
@@ -979,7 +979,15 @@ What the hold does to a stream it covers:
   the largest window the manager sizes a session's cap for (twelve hours and
   a minute at its assumed 25 Mbit/s, 126 GiB), so it costs no session its
   window, and a stream held across any number of restarts is trimmed to the
-  default cap plus that.
+  default cap plus that. **That bounds a stream, not the disk.** While the
+  loop lasts with nothing ending each start's hold — a relay with no DVR
+  work, or one cut off from its manager — every live stream still grows by
+  its ingest each cycle, up to 136 GiB at the default 8 GiB cap. On an origin
+  volume that cannot hold the live streams times that above the free-space
+  floor, the floor binds first, not the ceiling: each sweep then gives back
+  what the streams grew by evicting round-robin across all of them, oldest
+  first — a DVR window on the same volume included — until the loop stops
+  and the last start's hold lapses.
 * **The free-space floor applies throughout**, so a relay that restarts with
   a full disk still makes room.
 
@@ -999,9 +1007,13 @@ is logged at `warn` with those streams named ("the manager named no
 per-stream storage policy within the hold"): that is the moment they are
 trimmed to the default, and the line to look for when viewers lost their
 rewind across a restart with the manager unreachable. One that runs out on
-windows the default keeps anyway, as on every restart of a relay with no DVR
+windows the default keeps anyway, as on a restart of a relay with no DVR
 work, is logged at `info` ("the restart hold ran out"), so the warning keeps
-its meaning.
+its meaning. A restart inside the previous run's own hold is the exception:
+that run trimmed nothing by age, so its live streams adopted a wider span
+than the default retention and are named at `warn` too — an upgrade followed
+by another restart within ten minutes, say, or the lapse after a crash loop
+ends.
 
 The player defends itself against that last condition regardless: three
 thumbnail sheets in a row that the relay does not have pause the background
@@ -1054,7 +1066,11 @@ does not try to verify the numbers.
   script holding one — from filling a stream's table.
   It bounds one token, not a viewing link. A portal claim, an operator's
   Watch and every visit to a manager viewing link (`/watch/{stream}?k=`) each
-  mint a token of their own, so everyone a viewing link is handed to reports.
+  mint a token of their own, so everyone a viewing link is handed to reports
+  — bar a burst. A token signs only the streams it admits and its expiry, to
+  the second, so mints for one stream that land in the same second are the
+  same token and share its eight: twelve tabs that open one link in the same
+  second report as eight, and play all the same.
   Nor does it stop somebody who can mint: a link's key or a portal login is a
   new token every second, and enough of them fill a stream's table. That costs
   the roll its reports, never anyone their picture (the page ignores a refused
@@ -1108,12 +1124,18 @@ From that starting point the player moves by itself:
   bytes still arriving — gaining within the last two seconds, so a request a
   dead spot has stalled part-way does not count; a request that failed is
   over, and the wait for its retry is not timed as a slow fetch). Before
-  anything has played, a segment that runs out of time while its bytes are
-  arriving counts as a stall; an error status, a request that never had a
-  byte and a playlist failure do not, because they are the relay or the route
-  not being there, and Low would not arrive either. Nothing is decided while
-  the page is reconnecting or the browser reports itself offline: an outage
-  makes every one of those signs read as a link too slow for Full. After a
+  anything has played, a segment that runs out of time after any of its bytes
+  arrived counts as a stall, one stalled part-way included: with nothing
+  played there is no other sign of a link too slow for Full, and a slow,
+  lossy link can be between bursts when hls.js gives up on the request, so
+  leaving those out would keep the page black on Full. The cost is that three
+  part-way stalls in a minute before first play drop the page to Low over a
+  dead spot, where the offer back to Full (below) is the way back. An error
+  status, a request that never had a byte and a playlist failure do not
+  count, because they are the relay or the route not being there, and Low
+  would not arrive either. Nothing is decided while the page is reconnecting
+  or the browser reports itself offline: an outage makes every one of those
+  signs read as a link too slow for Full. After a
   reconnect the decision waits for the link to carry something — a playlist,
   a segment or a segment's bytes — rather than for a segment to land, which a
   link back but too slow for Full never does, and counts only the stalls and

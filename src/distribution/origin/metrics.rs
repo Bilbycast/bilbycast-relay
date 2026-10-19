@@ -36,11 +36,14 @@
 //! That bounds one minted token, not the person holding it. A portal claim,
 //! an operator's Watch and every visit to a manager viewing link
 //! (`/watch/{stream}?k=`) each mint a token of their own, so each visitor to a
-//! link reports under their own; and somebody who can mint — a link's key or a
-//! portal login in hand — can have a new token every second and fill a
-//! stream's table after all. What no token holder can do is push another
-//! stream's reports out of health (see [`ViewerMetrics::snapshot`]), or touch
-//! playback: the page ignores a refused report.
+//! link reports under their own — unless they arrive in the same second: a
+//! token signs only the streams it admits and its expiry, to the second, so
+//! same-second mints for one stream are one token and share its clients. And
+//! somebody who can mint — a link's key or a portal login in hand — can have
+//! a new token every second and fill a stream's table after all. What no
+//! token holder can do is push another stream's reports out of health (see
+//! [`ViewerMetrics::snapshot`]), or touch playback: the page ignores a
+//! refused report.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
