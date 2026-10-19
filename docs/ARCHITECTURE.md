@@ -393,6 +393,8 @@ box. See [`portal.md`](portal.md).
 
 Security is defense-in-depth: end-to-end encryption protects payload confidentiality, optional bind authentication prevents unauthorized tunnel hijacking, and optional API auth prevents topology enumeration.
 
+**Credentials never leave in `get_config`.** The config the relay hands the manager (`RelayConfig::redacted_json`, `config.rs`) shows `api_token`, `manager.registration_token`, `manager.node_secret`, `distribution.token_secret` and every `distribution.cascade_sources[].token` as `"***REDACTED***"` when set, and leaves them absent when not. It matters because the manager serves a node's config to anyone with View on it, and `distribution.token_secret` is the key every viewer and ingest token in the installation is signed with. The redaction is structural — each config struct is destructured without `..`, so a field added later must be classified before it compiles — and `config.json` keeps the real values.
+
 **Note on the native plain-UDP plane**: Layer 2 (QUIC + TLS 1.3) applies only to the QUIC tunnel path. The native SRT/RIST path and individual bond legs ride plain UDP with no transport-layer encryption between edge and relay — payload confidentiality there rests entirely on Layer 1 (the edge-to-edge ChaCha20-Poly1305 AEAD), which the relay never holds the key for. Layers 3 (bind auth via `Register`'s `bind_token`) and 5 (UUID tunnel isolation) still apply.
 
 ## Non-Blocking Concurrency Model

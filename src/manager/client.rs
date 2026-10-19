@@ -626,6 +626,36 @@ fn parse_origin_policy_patch(
     Ok(patch)
 }
 
+/// A cascade source pushed back with `get_config`'s redaction marker as its
+/// token keeps the token this relay already holds for **that** source — the
+/// same `local_stream` pulling from the same `upstream_whep_url`. The marker is
+/// not a token: sent upstream it would be refused on every retry, silently.
+///
+/// With nothing to keep (a new source, or one whose upstream changed), the
+/// source is refused rather than pulled with the marker as its credential.
+fn restore_redacted_cascade_token(
+    src: &mut crate::config::CascadeSource,
+    current: &[crate::config::CascadeSource],
+) -> Result<(), String> {
+    if !src.token.as_deref().is_some_and(crate::config::is_redaction_marker) {
+        return Ok(());
+    }
+    let kept = current
+        .iter()
+        .find(|c| c.local_stream == src.local_stream && c.upstream_whep_url == src.upstream_whep_url)
+        .and_then(|c| c.token.clone());
+    match kept {
+        Some(token) => {
+            src.token = Some(token);
+            Ok(())
+        }
+        None => Err(format!(
+            "token is the redaction marker, but this relay holds no token for '{}' from {} to keep — send the token itself",
+            src.local_stream, src.upstream_whep_url
+        )),
+    }
+}
+
 /// Apply a manager `configure_distribution` command onto the runtime control
 /// cell (secret / gates / public IP+URL / storage policy / cascade sources).
 /// Partial: only the fields present in the action are changed.
@@ -641,7 +671,14 @@ fn apply_configure_distribution(
     };
     use crate::distribution_control::DistUpdate;
     let mut update = DistUpdate::default();
-    if let Some(s) = action.get("token_secret").and_then(|v| v.as_str()) {
+    // `get_config` shows a set secret as the redaction marker. A push that
+    // carries the marker back is "keep the one you have" — never a value, and
+    // never a reason to abort the rest of the push.
+    if let Some(s) = action
+        .get("token_secret")
+        .and_then(|v| v.as_str())
+        .filter(|s| !crate::config::is_redaction_marker(s))
+    {
         if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err("token_secret must be exactly 64 hex chars".to_string());
         }
@@ -728,10 +765,13 @@ fn apply_configure_distribution(
     }
 
     if let Some(arr) = action.get("cascade_sources").and_then(|v| v.as_array()) {
+        let current = control.cascade_now();
         let mut sources = Vec::with_capacity(arr.len());
-        for v in arr {
-            let src: crate::config::CascadeSource = serde_json::from_value(v.clone())
+        for (i, v) in arr.iter().enumerate() {
+            let mut src: crate::config::CascadeSource = serde_json::from_value(v.clone())
                 .map_err(|e| format!("invalid cascade source: {e}"))?;
+            restore_redacted_cascade_token(&mut src, &current)
+                .map_err(|e| format!("cascade_sources[{i}]: {e}"))?;
             sources.push(src);
         }
         control.set_cascade(sources);
@@ -971,6 +1011,35 @@ fn build_health_message(
     })
 }
 
+/// The `new_secret` of a `rotate_secret` command, if it is one the relay may
+/// persist. `get_config`'s redaction marker is not a secret: persisting it
+/// would lock the relay out at its next restart.
+fn rotated_secret(action: &serde_json::Value) -> Result<&str, String> {
+    match action["new_secret"].as_str() {
+        None => Err("Missing new_secret".to_string()),
+        Some("") => Err("Empty new_secret".to_string()),
+        Some(s) if crate::config::is_redaction_marker(s) => {
+            Err("new_secret is the redaction marker, not a secret".to_string())
+        }
+        Some(s) => Ok(s),
+    }
+}
+
+/// The `config_response` the relay answers `get_config` with.
+///
+/// Every credential in the config is redacted ([`RelayConfig::redacted_json`]).
+/// On the manager, reading a node's config needs only View on it, so anything
+/// this carries in clear is handed to every user a relay is shared with — and
+/// `distribution.token_secret` is the key the manager signs every viewer and
+/// ingest token with, installation-wide.
+fn build_config_response(relay_config: &RelayConfig) -> serde_json::Value {
+    serde_json::json!({
+        "type": "config_response",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": relay_config.redacted_json()
+    })
+}
+
 // ───────────────────────────────────────────────────────
 // Command handling
 // ───────────────────────────────────────────────────────
@@ -1017,24 +1086,7 @@ async fn handle_manager_message<S>(
             // get_config sends a config_response, not a command_ack
             if action_type == "get_config" {
                 tracing::info!("Manager command: get_config");
-                let mut config_json = serde_json::to_value(relay_config).unwrap_or_default();
-                // Redact secrets
-                if let Some(mgr) = config_json.get_mut("manager")
-                    && let Some(obj) = mgr.as_object_mut()
-                        && obj.contains_key("node_secret") {
-                            obj.insert(
-                                "node_secret".to_string(),
-                                serde_json::json!("***REDACTED***"),
-                            );
-                        }
-                if config_json.get("api_token").is_some() {
-                    config_json["api_token"] = serde_json::json!("***REDACTED***");
-                }
-                let response = serde_json::json!({
-                    "type": "config_response",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "payload": config_json
-                });
+                let response = build_config_response(relay_config);
                 if let Ok(json) = serde_json::to_string(&response) {
                     let _ = ws_write.send(Message::Text(json.into())).await;
                 }
@@ -1043,29 +1095,22 @@ async fn handle_manager_message<S>(
 
             // rotate_secret is handled inline (needs config_path for persistence)
             if action_type == "rotate_secret" {
-                let result = if let Some(new_secret) = action["new_secret"].as_str() {
-                    if new_secret.is_empty() {
-                        Err("Empty new_secret".to_string())
-                    } else {
-                        tracing::info!("Manager command: rotate_secret — updating node authentication secret");
-                        // Persist new secret to config file. Through the
-                        // shared helper: rotating must not revert the
-                        // distribution config the manager pushed since startup.
-                        if let Err(e) = update_config_file(config_path, relay_config, |config| {
-                            if let Some(ref mut mgr) = config.manager {
-                                mgr.node_secret = Some(new_secret.to_string());
-                            }
-                        }) {
-                            tracing::warn!("Failed to persist rotated secret: {e}");
-                            ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
+                let result = rotated_secret(action).map(|new_secret| {
+                    tracing::info!("Manager command: rotate_secret — updating node authentication secret");
+                    // Persist new secret to config file. Through the
+                    // shared helper: rotating must not revert the
+                    // distribution config the manager pushed since startup.
+                    if let Err(e) = update_config_file(config_path, relay_config, |config| {
+                        if let Some(ref mut mgr) = config.manager {
+                            mgr.node_secret = Some(new_secret.to_string());
                         }
-                        tracing::info!("Node secret rotated and persisted");
-                        ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
-                        Ok(())
+                    }) {
+                        tracing::warn!("Failed to persist rotated secret: {e}");
+                        ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
                     }
-                } else {
-                    Err("Missing new_secret".to_string())
-                };
+                    tracing::info!("Node secret rotated and persisted");
+                    ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
+                });
 
                 let ack = serde_json::json!({
                     "type": "command_ack",
@@ -1606,5 +1651,160 @@ mod manager_contract_tests {
         let mut rx = control.subscribe_origin();
         let update = rx.borrow_and_update().clone();
         assert_eq!(update.per_stream, Some(Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use crate::config::{CascadeSource, DistributionConfig, ManagerConfig, REDACTED};
+    use crate::distribution_control::{DistributionControl, RuntimeDistConfig};
+
+    const TOKEN_SECRET: &str = "5ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7";
+
+    fn source(stream: &str, url: &str, token: Option<&str>) -> CascadeSource {
+        CascadeSource {
+            upstream_whep_url: url.into(),
+            local_stream: stream.into(),
+            token: token.map(str::to_string),
+        }
+    }
+
+    /// The handler's own response, not just the helper: what the manager
+    /// stores for `GET /api/v1/nodes/{id}/config`, which needs only View.
+    #[test]
+    fn get_config_response_carries_no_credential() {
+        let config = RelayConfig {
+            api_token: Some("planted-api-token-0123456789abcdef0123456789".into()),
+            manager: Some(ManagerConfig {
+                enabled: true,
+                urls: vec!["wss://m.example/ws/node".into()],
+                accept_self_signed_cert: false,
+                cert_fingerprint: None,
+                registration_token: Some("planted-registration-token".into()),
+                node_id: Some("node-1".into()),
+                node_secret: Some("planted-node-secret".into()),
+            }),
+            distribution: Some(DistributionConfig {
+                token_secret: Some(TOKEN_SECRET.into()),
+                cascade_sources: vec![source(
+                    "feed",
+                    "https://origin.example/whep/feed",
+                    Some("planted-cascade-token"),
+                )],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let response = build_config_response(&config);
+        assert_eq!(response["type"], "config_response");
+        let text = response.to_string();
+        for secret in [
+            "planted-api-token-0123456789abcdef0123456789",
+            "planted-registration-token",
+            "planted-node-secret",
+            TOKEN_SECRET,
+            "planted-cascade-token",
+        ] {
+            assert!(!text.contains(secret), "get_config leaked {secret:?}");
+        }
+        let payload = &response["payload"];
+        assert_eq!(payload["distribution"]["token_secret"], REDACTED);
+        assert_eq!(payload["manager"]["registration_token"], REDACTED);
+        assert_eq!(payload["distribution"]["cascade_sources"][0]["token"], REDACTED);
+        // Still the config the manager needs to show.
+        assert_eq!(payload["manager"]["node_id"], "node-1");
+        assert_eq!(
+            payload["distribution"]["cascade_sources"][0]["upstream_whep_url"],
+            "https://origin.example/whep/feed"
+        );
+    }
+
+    /// A push that carries the marker back as `token_secret` keeps the secret
+    /// the relay holds — and the rest of the push still lands. Before, the
+    /// marker failed the 64-hex check and aborted the whole command.
+    #[test]
+    fn a_redacted_token_secret_keeps_the_one_the_relay_holds() {
+        let cfg = DistributionConfig { token_secret: Some(TOKEN_SECRET.into()), ..Default::default() };
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "token_secret": REDACTED,
+                "require_viewer_token": true,
+            }),
+        )
+        .expect("the marker means keep, not a bad value");
+
+        let rt = control.load();
+        assert_eq!(rt.token_secret.as_deref(), Some(TOKEN_SECRET), "the real secret must survive");
+        assert!(rt.require_viewer_token, "the rest of the push must land");
+    }
+
+    /// The same for a cascade source's upstream token, matched on the source
+    /// it belongs to. With nothing to keep, the source is refused rather than
+    /// pulled with the marker as its credential.
+    #[test]
+    fn a_redacted_cascade_token_keeps_that_sources_token() {
+        let url = "https://origin.example/whep/feed";
+        let control = DistributionControl::new(
+            RuntimeDistConfig::from_config(&DistributionConfig::default(), None),
+            vec![source("feed", url, Some("the-upstream-token"))],
+        );
+
+        apply_configure_distribution(
+            Some(&control),
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "cascade_sources": [
+                    { "upstream_whep_url": url, "local_stream": "feed", "token": REDACTED },
+                    { "upstream_whep_url": "https://other.example/whep/x", "local_stream": "x" },
+                ],
+            }),
+        )
+        .expect("a marker on a known source is accepted");
+        let now = control.cascade_now();
+        assert_eq!(now[0].token.as_deref(), Some("the-upstream-token"));
+        assert_eq!(now[1].token, None);
+
+        for (stream, upstream) in [
+            ("new-feed", url),                            // a source the relay never had
+            ("feed", "https://moved.example/whep/feed"), // the upstream changed
+            ("x", "https://other.example/whep/x"),       // a source with no token to keep
+        ] {
+            let err = apply_configure_distribution(
+                Some(&control),
+                &serde_json::json!({
+                    "type": "configure_distribution",
+                    "cascade_sources": [
+                        { "upstream_whep_url": upstream, "local_stream": stream, "token": REDACTED }
+                    ],
+                }),
+            )
+            .expect_err("nothing to keep: refuse rather than pull with the marker");
+            assert!(err.contains("redaction marker"), "{err}");
+        }
+        assert!(
+            control.cascade_now().iter().all(|s| s.token.as_deref() != Some(REDACTED)),
+            "the marker never becomes a source's token"
+        );
+    }
+
+    #[test]
+    fn rotate_secret_refuses_the_marker() {
+        assert_eq!(
+            rotated_secret(&serde_json::json!({ "type": "rotate_secret", "new_secret": "fresh" })),
+            Ok("fresh")
+        );
+        for bad in [
+            serde_json::json!({ "type": "rotate_secret", "new_secret": REDACTED }),
+            serde_json::json!({ "type": "rotate_secret", "new_secret": "" }),
+            serde_json::json!({ "type": "rotate_secret" }),
+        ] {
+            assert!(rotated_secret(&bad).is_err(), "{bad}");
+        }
     }
 }

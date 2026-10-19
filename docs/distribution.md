@@ -1690,6 +1690,15 @@ See `../../testbed/configs/relay-distribution.json`:
   connect the media socket.
 - `token_secret` must be the **same** 64-hex value the manager holds so its
   minted tokens validate.
+  The relay never reports it back: `get_config` shows a set secret as
+  `"***REDACTED***"` (and each cascade source's `token` likewise), because the
+  manager serves a node's config to anyone with View on it. The marker pushed
+  back on `configure_distribution` keeps the current value: a `token_secret`
+  of `"***REDACTED***"` leaves the secret as it is and applies the rest of the
+  push, and a cascade source whose `token` is the marker keeps the token of the
+  source with the same `local_stream` and `upstream_whep_url` — or, when there
+  is none, the push is refused rather than pulling upstream with the marker as
+  its credential.
 - `portal_url` is where the DVR player renews a viewer token. Leaving it blank
   disables renewal outright — `scheduleRenewal()` returns immediately — which
   turns the token's lifetime into a hard limit, silently. It is also pushable
