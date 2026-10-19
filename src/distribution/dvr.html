@@ -897,6 +897,19 @@
     try { return window.sessionStorage.getItem(HOLD_KEY) || ""; }
     catch (e) { return ""; }
   }
+  /// The id this tab reports its playback under — see CLIENT, below. Same
+  /// lifetime again.
+  var CLIENT_KEY = "bilbycast.dvr.client." + STREAM;
+  function rememberClient(id) {
+    try {
+      if (id) window.sessionStorage.setItem(CLIENT_KEY, id);
+      else window.sessionStorage.removeItem(CLIENT_KEY);
+    } catch (e) { /* blocked */ }
+  }
+  function recallClient() {
+    try { return window.sessionStorage.getItem(CLIENT_KEY) || ""; }
+    catch (e) { return ""; }
+  }
   function rememberToken(t) {
     try { window.sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* blocked */ }
   }
@@ -912,9 +925,16 @@
     // Nothing is stranded — the only way back from a forgotten token is the
     // portal's link, which claims afresh and hands out a new holder with it.
     rememberHolder("");
+    // And the report id, for the same reason: what comes back by that link is
+    // a new claim, and a new id.
+    rememberClient("");
   }
 
   var TOKEN = qs.get("token") || "";
+  // A token in the URL is a page opened from a link or a new portal claim; one
+  // recalled from the tab is this page again. Taken here, because a few lines
+  // down the token leaves the URL.
+  var ARRIVED_WITH_TOKEN = !!TOKEN;
   if (TOKEN) {
     rememberToken(TOKEN);
   } else {
@@ -1141,13 +1161,36 @@
     return !!(r && v.currentTime > r.end - 0.5);
   }
 
-  function scheduleReconnect(hls, video, label) {
+  /// Set a stopped hls.js instance loading again. `startLoad(-1)` resumes from
+  /// where it stopped: hls.js refetches the playlist and carries on from the
+  /// current position. But only once it has a manifest — before that it has
+  /// no playlist to resume, the call does nothing at all, and no error
+  /// follows to schedule another go, which left "Connection lost —
+  /// reconnecting…" on screen for good. A manifest that never arrived is
+  /// asked for again instead.
+  function resumeLoading(hls, src, details) {
+    try {
+      if (/^manifest/.test(details || "")) hls.loadSource(src);
+      else hls.startLoad(-1);
+    } catch (e) {}
+  }
+
+  // What the pending reconnect will do when its back-off runs out, and what
+  // resumes the second picture once hls.js has given up on it.
+  var reconnectResume = null, proxyResume = null;
+
+  function scheduleReconnect(hls, video, label, src, details, status) {
+    // Expired access is not a link problem: the 401/403 branch has already
+    // told the viewer, and retrying would only hammer a refusal.
+    if (accessExpired) { logDiag("fatal on " + label + " — access expired, not reconnecting"); return; }
+    var resume = function () { resumeLoading(hls, src, details); };
     // Only the picture the viewer is watching is worth a notice and a retry
-    // loop. The still-frame element in Balanced fetches on demand; a fatal
-    // error there is logged and left — the next stop re-attaches it.
-    // Expired access is not a link problem either: the 401/403 branch has
-    // already told the viewer, and retrying would only hammer a refusal.
-    if (video !== main || accessExpired) { logDiag("fatal on " + label + " — not reconnecting"); return; }
+    // loop. The second one — the proxy a shuttle runs on in Full, the
+    // full-resolution still in Balanced — is off screen until it is asked
+    // for, so it is resumed when it next is (`ensureProxy`, `ensureStill`) or
+    // when the link or the tab comes back, rather than retried in the
+    // background on the link that has just failed.
+    if (video !== main) { proxyResume = resume; logDiag("fatal on " + label + " — resumed when next needed"); return; }
     if (reconnectTimer !== null) clearTimeout(reconnectTimer);
     var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
     reconnectAttempts++;
@@ -1156,20 +1199,36 @@
     metricsEvent(reconnectTimes);
     noteEvent({ kind: "reconnect", ahead: bufferedAhead(main) });
     logDiag("RECONNECT attempt " + reconnectAttempts + " in " + delay + "ms");
-    fail("Connection lost — reconnecting" + (reconnectAttempts > 1 ? " (attempt " + reconnectAttempts + ")" : "") + "…");
-    reconnectTimer = setTimeout(function () {
-      reconnectTimer = null;
-      // -1 resumes from where it stopped; hls.js refetches the playlist and
-      // carries on from the current position.
-      try { hls.startLoad(-1); } catch (e) {}
-      if (video === main && !main.paused) main.play().catch(function () {});
-    }, delay);
+    // A playlist the relay says it does not have is not a lost connection:
+    // the feed is not there, yet or any more. It is retried all the same —
+    // after a relay restart that is a few seconds, until the edge's next
+    // manifest — but the notice says what is actually happening.
+    var missing = (status === 404 || status === 410) && /^(manifest|level)/.test(details || "");
+    fail((missing ? "This feed is not available right now — retrying" : "Connection lost — reconnecting") +
+         (reconnectAttempts > 1 ? " (attempt " + reconnectAttempts + ")" : "") + "…");
+    reconnectResume = resume;
+    reconnectTimer = setTimeout(resumeMain, delay);
+  }
+  function resumeMain() {
+    reconnectTimer = null;
+    var go = reconnectResume;
+    reconnectResume = null;
+    if (go) go();
+    if (!main.paused) main.play().catch(function () {});
+  }
+  /// Resume the second picture if hls.js has given up on it.
+  function resumeProxy() {
+    if (proxyResume === null || accessExpired) return;
+    var go = proxyResume;
+    proxyResume = null;
+    logDiag("resuming the second picture");
+    go();
   }
 
   /// A segment landed: the link is back.
   function reconnected(video) {
     if (video !== main) return;
-    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; reconnectResume = null; }
     if (reconnectAttempts === 0 && reconnectingLabel === null) return;
     reconnectAttempts = 0;
     reconnectingLabel = null;
@@ -1195,12 +1254,16 @@
   }
 
   // A link that comes back, or a tab that comes back, is worth an attempt
-  // now rather than at the end of the current back-off.
+  // now rather than at the end of the current back-off. The attempt already
+  // scheduled, run early: going back through `scheduleReconnect` restarted
+  // the back-off it was meant to cut short — the same wait again, from zero —
+  // and counted a reconnect on the operator's screen for every glance back
+  // at the tab.
   function reconnectNow() {
-    if (reconnectTimer === null || !mainHls) return;
-    clearTimeout(reconnectTimer); reconnectTimer = null;
-    reconnectAttempts = Math.max(0, reconnectAttempts - 1);
-    scheduleReconnect(mainHls, main, reconnectingLabel || "main");
+    resumeProxy();
+    if (reconnectTimer === null) return;
+    clearTimeout(reconnectTimer);
+    resumeMain();
   }
   window.addEventListener("online", reconnectNow);
   document.addEventListener("visibilitychange", function () { if (!document.hidden) reconnectNow(); });
@@ -1264,6 +1327,11 @@
     rebufferTarget = rebufferGoal();
     if (bufferedAhead(main) >= rebufferTarget) return;
     holdingForBuffer = true;
+    // A hold pauses `main`, and a paused `main` is what calls for Balanced's
+    // full-resolution still (see `stillWanted`) — which fetched the 1080p
+    // rendition on the very link that had just run dry. Withdrawn here, so a
+    // still left from the viewer's own pause does not stand over the notice.
+    hideStill();
     holdStartedAt = Date.now();
     // A seek empties the decoder and the browser says `waiting` — after the
     // Live button, after the delay setting moves, after any jump. The picture
@@ -1396,13 +1464,23 @@
   // that cannot carry this rendition; one that takes half a second is not.
   var SLOW_LOAD_RATIO = 0.8;      // fetch time / media time; above this the link is losing ground
   var STARVED_HOLDS = 3, STARVED_WINDOW_MS = 60000;
-  var segLoadRatios = [], segLoadingSince = 0, segLoadingSecs = 0;
+  var segLoadRatios = [], segLoadingSince = 0, segLoadingSecs = 0, segLoadingFrag = null;
+  /// Bytes a fragment's request has received so far: hls.js's loader keeps
+  /// them on the fragment's stats as they arrive.
+  function fragBytes(frag) {
+    var st = frag && frag.stats;
+    return st && st.loaded > 0 ? st.loaded : 0;
+  }
   /// Is the link fetching this rendition slower than it plays?
   function slowLink() {
     // A segment still on its way after one and a half times its length is
     // slow whatever came before it — and on a badly starved link it may be
-    // the only evidence, the earlier ones having never finished.
-    if (segLoadingSince && segLoadingSecs > 0 &&
+    // the only evidence, the earlier ones having never finished. Only while
+    // its bytes are arriving, though. A request that has had none is a link
+    // that is not there at all: timed alone, a dead spot read as a slow link
+    // for as long as hls.js kept retrying, and Low would not have arrived
+    // over it either.
+    if (segLoadingSince && segLoadingSecs > 0 && fragBytes(segLoadingFrag) > 0 &&
         Date.now() - segLoadingSince > segLoadingSecs * 1500) return true;
     if (segLoadRatios.length < 2) return false;
     // The middle of the last three, not their mean: one bad fetch on a good
@@ -1490,9 +1568,17 @@
     fail("Switching back to Full…");
     setTimeout(function () { try { location.reload(); } catch (e) {} }, 600);
   }
-  var downgrading = false;
+  // A drop decided; whether main has loaded anything since; whether the
+  // notice has been up long enough to read.
+  var downgrading = false, downgradeLoaded = false, downgradeDue = false;
   function maybeDowngrade() {
     if (downgrading || quality !== "full") return false;
+    // Not while the link is gone. An outage makes every sign below read as
+    // "too slow for Full" — the buffer runs dry, a hold times out into the
+    // next one — and the reload to Low went out into the dead link, which
+    // put the browser's own "cannot open this page" where the player was,
+    // with nothing on the page left to bring it back.
+    if (reconnectTimer !== null || reconnectingLabel !== null || navigator.onLine === false) return false;
     var starved = stallCount < 3 && starvedByPauses();
     if (stallCount < 3 && !starved) return false;
     try {
@@ -1511,8 +1597,22 @@
       ? "DOWNGRADE to low after " + recentCount(holdTimes, STARVED_WINDOW_MS) + " pauses in a minute on a link fetching slower than real time"
       : "DOWNGRADE to low after " + stallCount + " stalls");
     fail("This link cannot keep up with Full — switching to Low…");
-    setTimeout(function () { try { location.reload(); } catch (e) {} }, 1500);
+    setTimeout(function () { downgradeDue = true; reloadForLow(); }, 1500);
     return true;
+  }
+  /// The reload goes out a moment after the notice, and only once the link
+  /// has carried a playlist or a segment since the decision — a link that
+  /// fails in that moment holds it until it is back, rather than taking it
+  /// into a browser error page.
+  function reloadForLow() {
+    if (!downgradeDue || !downgradeLoaded || navigator.onLine === false) return;
+    try { location.reload(); } catch (e) {}
+  }
+  /// Main loaded something.
+  function noteLoaded() {
+    if (!downgrading) return;
+    downgradeLoaded = true;
+    reloadForLow();
   }
   function announceAutoLow() {
     var was = autoLowRead();
@@ -1544,21 +1644,37 @@
   // portal beat also carries. A viewer on a one-off link never beats, so
   // their report stays anonymous — a row with a buffer reading, no name.
   //
-  // The id is minted per page load, and is neither the token (two devices
-  // sharing a login can hold byte-identical tokens) nor the holder (which is
-  // never presented to the relay by design).
+  // The id is neither the token (two devices sharing a login can hold
+  // byte-identical tokens) nor the holder (which is never presented to the
+  // relay by design). It is kept for the life of the TAB, as they are.
+  //
+  // It was minted per page load, and a reload — the usual answer to a picture
+  // that is stalling, and what a drop to Low or a change of quality does by
+  // itself — moved the login's row to the new id while the old page's last
+  // report stood at the relay for a minute and a half under the old one,
+  // joined to nobody: an anonymous "viewing link" viewer on the operator's
+  // screen, often graded poor, who did not exist. Kept, the reloaded page's
+  // report replaces its own. A page that arrives with a token in its URL is a
+  // new claim — a new device, as far as the count goes — and a new id.
   var CLIENT = (function () {
+    // The relay's own rule for an id. With storage blocked nothing is kept,
+    // and each load mints its own, as before.
+    var kept = ARRIVED_WITH_TOKEN ? "" : recallClient();
+    if (/^[A-Za-z0-9_-]{1,64}$/.test(kept)) return kept;
+    var out = "";
     try {
       var b = new Uint8Array(8);
       window.crypto.getRandomValues(b);
-      var out = "";
       for (var i = 0; i < b.length; i++) out += (b[i] < 16 ? "0" : "") + b[i].toString(16);
-      return out;
     } catch (e) {
-      return Math.random().toString(16).slice(2, 10) + Math.random().toString(16).slice(2, 10);
+      out = Math.random().toString(16).slice(2, 10) + Math.random().toString(16).slice(2, 10);
     }
+    rememberClient(out);
+    return out;
   })();
   var METRICS_MS = 20000, metricsTimer = null, metricsT0 = Date.now();
+  /// How long after the picture first starts the first report goes out.
+  var FIRST_REPORT_MS = 2000;
   var stallTimes = [], holdTimes = [], reconnectTimes = [], holdTotalMs = 0;
   var lastSegment = { ttfb: 0, total: 0, kb: 0 };
   var autoLowApplied = false;
@@ -1630,8 +1746,13 @@
   /// Only a credentialed, live-access, visible page reports: the relay
   /// refuses a report without a token, an expired tab has nothing to say,
   /// and a background tab's numbers describe nothing anyone is watching.
+  ///
+  /// Nor a portal tab whose beat has ended — displaced by another device
+  /// signing in with the login, or its picture over. The count has let go of
+  /// it, and a report from it was joined to nobody: an anonymous viewer on a
+  /// viewing link on the operator's screen, who was not there.
   function mayReport() {
-    return !!(TOKEN && !accessExpired && !document.hidden);
+    return !!(TOKEN && !accessExpired && !beatEnded && !document.hidden);
   }
   function reportMetrics() {
     if (!mayReport()) return;
@@ -1653,12 +1774,15 @@
   function startReporting() {
     if (metricsTimer !== null || !TOKEN) return;
     metricsTimer = setInterval(reportMetrics, METRICS_MS);
-    // The first report waits a full interval: a page that has loaded nothing
-    // yet has only zeros to send.
   }
   function stopReporting() {
     if (metricsTimer !== null) { clearInterval(metricsTimer); metricsTimer = null; }
   }
+  // The first report goes out once the picture has started, not a full
+  // interval after load: before the picture a page has only zeros to send,
+  // and after a reload the operator is reading the previous page's last
+  // report under this id until this page's replaces it.
+  main.addEventListener("playing", function () { setTimeout(reportMetrics, FIRST_REPORT_MS); }, { once: true });
   // Coming back to the foreground reports now, so a viewer who was just told
   // "it looks fine here" shows up on the operator's screen at once.
   document.addEventListener("visibilitychange", function () {
@@ -2368,6 +2492,16 @@
   function attach(video, stream, label) {
     var src = url(stream, "manifest.m3u8");
     if (window.Hls && window.Hls.isSupported()) {
+      // The manifest gets the playlists' patience too. Left at hls.js's
+      // defaults — one retry on an error, twenty seconds for a hung request —
+      // the first request a page makes was the one most likely to go fatal:
+      // on a weak link, during a relay restart, or as the reload after a drop
+      // to Low. hls.js only reads these, so one object serves both.
+      var playlistPolicy = { default: {
+        maxTimeToFirstByteMs: 4000, maxLoadTimeMs: 8000,
+        timeoutRetry: { maxNumRetry: 6, retryDelayMs: 250, maxRetryDelayMs: 2000, backoff: "exponential" },
+        errorRetry:   { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
+      } };
       var hls = new Hls({
         // A DVR window is thousands of segments; let the player hold a
         // generous back buffer so short jogs never refetch.
@@ -2387,11 +2521,8 @@
         // on a tablet read as "five to ten seconds with nothing downloading,
         // then a burst". Four seconds to first byte, and a segment that is
         // still arriving after twelve is abandoned and refetched.
-        playlistLoadPolicy: { default: {
-          maxTimeToFirstByteMs: 4000, maxLoadTimeMs: 8000,
-          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 250, maxRetryDelayMs: 2000, backoff: "exponential" },
-          errorRetry:   { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: "exponential" }
-        } },
+        manifestLoadPolicy: playlistPolicy,
+        playlistLoadPolicy: playlistPolicy,
         fragLoadPolicy: { default: {
           maxTimeToFirstByteMs: 4000, maxLoadTimeMs: 12000,
           timeoutRetry: { maxNumRetry: 6, retryDelayMs: 250, maxRetryDelayMs: 2000, backoff: "exponential" },
@@ -2410,10 +2541,12 @@
         if (d.frag.sn !== "initSegment" && d.frag.duration > 0) {
           segLoadingSince = Date.now();
           segLoadingSecs = d.frag.duration;
+          segLoadingFrag = d.frag;
         }
       });
       hls.on(Hls.Events.FRAG_LOADED, function (_e, d) {
         if (video !== main || !d || !d.frag) return;
+        noteLoaded();
         var st = (d.frag.stats && d.frag.stats.loading) || {};
         var kb = d.stats && d.stats.loaded ? Math.round(d.stats.loaded / 1024) : (d.frag.stats && d.frag.stats.loaded ? Math.round(d.frag.stats.loaded / 1024) : "?");
         lastSegment = {
@@ -2423,6 +2556,7 @@
         };
         if (d.frag.sn !== "initSegment" && d.frag.duration > 0) {
           segLoadingSince = 0;
+          segLoadingFrag = null;
           if (st.end && st.start) {
             segLoadRatios.push((st.end - st.start) / (d.frag.duration * 1000));
             if (segLoadRatios.length > 3) segLoadRatios.shift();
@@ -2433,7 +2567,9 @@
         logDiag("got  sn=" + d.frag.sn + " " + kb + "KB ttfb=" + (st.first && st.start ? Math.round(st.first - st.start) : "?") + "ms total=" + (st.end && st.start ? Math.round(st.end - st.start) : "?") + "ms");
       });
       hls.on(Hls.Events.LEVEL_LOADED, function (_e, d) {
-        if (video === main && d && d.details) logDiag("playlist " + (d.details.fragments ? d.details.fragments.length : "?") + " segs, edge=" + (typeof d.details.edge === "number" ? d.details.edge.toFixed(1) : "?"));
+        if (video !== main) return;
+        noteLoaded();
+        if (d && d.details) logDiag("playlist " + (d.details.fragments ? d.details.fragments.length : "?") + " segs, edge=" + (typeof d.details.edge === "number" ? d.details.edge.toFixed(1) : "?"));
       });
       hls.on(Hls.Events.ERROR, function (_e, data) {
         if (!data) return;
@@ -2467,15 +2603,24 @@
           return;
         }
 
+        // A segment request that failed or timed out is over, and so is the
+        // one a fatal error stops; hls.js's retry, if any, starts its own
+        // clock. Left running, the wait for that retry — or for a connection,
+        // while hls.js sits out an offline spell — was timed as a slow fetch.
+        if (video === main && (data.fatal || /^frag/.test(data.details || ""))) {
+          segLoadingSince = 0;
+          segLoadingFrag = null;
+        }
+
         if (data.fatal) {
           // hls.js giving up on the network is not the link being gone: its
-          // contract is that the page calls startLoad() to resume, and the
+          // contract is that the page resumes it (`resumeLoading`), and the
           // picture stayed stopped because nothing did. Reconnect for as long
           // as the page is open; the beat keeps counting the viewer. A media
           // error gets hls.js's own recovery, a few times. The rest is the
           // end, as before.
           if (data.type === "networkError") {
-            scheduleReconnect(hls, video, label);
+            scheduleReconnect(hls, video, label, src, data.details, status);
             return;
           }
           if (data.type === "mediaError" && recoverMedia(hls)) return;
@@ -2486,14 +2631,17 @@
           // own fatal error leaves the visible picture running.
           if (video === main) stopBeating();
         } else if (video === main && mode === "live" && !hasPlayed
-                   && /^(frag|level|manifest)Load(TimeOut|Error)$/.test(data.details || "")) {
+                   && data.details === "fragLoadTimeOut" && fragBytes(data.frag) > 0) {
           // **A link too slow to deliver the first segment never stalls.**
           // Nothing has played, so the stall-based fallback below cannot
           // fire, and hls.js retries the same segment it cannot finish in
           // time — the relay saw the tablet cancel the same 2 MB segment
-          // over and over while the page sat black (2026-10-10). A load
-          // timing out or failing before first play is the same evidence
-          // as a stall, and counts the same way.
+          // over and over while the page sat black (2026-10-10). A segment
+          // that was arriving and ran out of time before first play is the
+          // same evidence as a stall, and counts the same way. Nothing else
+          // is: an error status, a request that never had a byte, or a
+          // playlist failing is the relay or the route not being there — a
+          // restart, a dead spot — and Low would not arrive either.
           noteStall();
           maybeDowngrade();
         } else if (data.details === "bufferStalledError") {
@@ -2699,6 +2847,10 @@
 
   function setRate(r) {
     releaseHold(false);
+    // Play and 100% set the rate to 1 under a catch-up that only ever lets go
+    // of a rate of its own, which left it "catching up" at 1x for good — the
+    // report said so, and the delay was never won back.
+    stopCatchUp();
     fail("");
     stopLoop();
     // A shuttle rate is a SEEK rate, and it is one in both directions. Routing
@@ -6013,6 +6165,9 @@
    */
   var BEAT_MS = 60000;
   var beatTimer = null;
+  /// The beat ran and has stopped: this tab is not counted under its login
+  /// any more. Playback reports stop with it (`mayReport`).
+  var beatEnded = false;
 
   /* Whether this player is somebody watching, as far as the count is
    * concerned. One predicate for the timer, the first beat and the
@@ -6043,7 +6198,8 @@
         // Displaced. Stop beating and leave it there: the renewal above is
         // where a viewer is told, and it says it properly. Ending someone's
         // picture from a background timer they never asked for would be the
-        // wrong place for that news.
+        // wrong place for that news. The reports end with the beat (see
+        // `mayReport`).
         if (body && body.held === false) { stopBeating(); return; }
         // The cadence is the manager's to set, not something baked into every
         // player that was ever deployed. It travels with each reply, so a
@@ -6067,12 +6223,13 @@
 
   function startBeating() {
     if (beatTimer !== null || !mayBeat()) return;
+    beatEnded = false;
     beatTimer = setInterval(beatNow, BEAT_MS);
     beatNow();   // so somebody opening the feed appears now, not in a minute
   }
 
   function stopBeating() {
-    if (beatTimer !== null) { clearInterval(beatTimer); beatTimer = null; }
+    if (beatTimer !== null) { clearInterval(beatTimer); beatTimer = null; beatEnded = true; }
   }
 
   // Coming back to a backgrounded tab should show up immediately, not at the
@@ -6185,12 +6342,14 @@
   function pdtLinked() { return fragsFor(main) !== null && fragsFor(proxy) !== null; }
 
   /// Is a still called for right now? Stopped, not scrubbing, not shuttling.
+  /// A rebuffer hold is not a stop: it pauses `main` because the link is
+  /// short, and a 1080p fetch is the last thing that link needs.
   function stillWanted() {
-    return wantHiresStills && !scrubbing && mode !== "shuttle" && main.paused;
+    return wantHiresStills && !scrubbing && mode !== "shuttle" && main.paused && !holdingForBuffer;
   }
 
   function ensureStill() {
-    if (stillAttached) return;
+    if (stillAttached) { resumeProxy(); return; }
     stillAttached = true;
     proxyHls = attach(proxy, HIRES, "still");
     proxy.addEventListener("loadedmetadata", function () {
@@ -6303,6 +6462,7 @@
     // element would fetch the same stream twice and hold a second decoder for
     // nothing.
     if (lowRes) return;
+    resumeProxy();
     if (!proxyAttached) {
       proxyAttached = true;
       proxyHls = attach(proxy, PROXY, "proxy");
