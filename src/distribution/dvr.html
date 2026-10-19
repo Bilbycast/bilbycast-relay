@@ -900,6 +900,16 @@
   /// The id this tab reports its playback under — see CLIENT, below. Same
   /// lifetime again.
   var CLIENT_KEY = "bilbycast.dvr.client." + STREAM;
+  function rememberClient(id) {
+    try {
+      if (id) window.sessionStorage.setItem(CLIENT_KEY, id);
+      else window.sessionStorage.removeItem(CLIENT_KEY);
+    } catch (e) { /* blocked */ }
+  }
+  function recallClient() {
+    try { return window.sessionStorage.getItem(CLIENT_KEY) || ""; }
+    catch (e) { return ""; }
+  }
   function rememberToken(t) {
     try { window.sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* blocked */ }
   }
@@ -917,7 +927,7 @@
     rememberHolder("");
     // And the report id, for the same reason: what comes back by that link is
     // a new claim, and a new id.
-    try { window.sessionStorage.removeItem(CLIENT_KEY); } catch (e) { /* blocked */ }
+    rememberClient("");
   }
 
   var TOKEN = qs.get("token") || "";
@@ -1647,13 +1657,10 @@
   // report replaces its own. A page that arrives with a token in its URL is a
   // new claim — a new device, as far as the count goes — and a new id.
   var CLIENT = (function () {
-    if (!ARRIVED_WITH_TOKEN) {
-      try {
-        var kept = window.sessionStorage.getItem(CLIENT_KEY) || "";
-        // The relay's own rule for an id.
-        if (/^[A-Za-z0-9_-]{1,64}$/.test(kept)) return kept;
-      } catch (e) { /* blocked: a new id per load, as before */ }
-    }
+    // The relay's own rule for an id. With storage blocked nothing is kept,
+    // and each load mints its own, as before.
+    var kept = ARRIVED_WITH_TOKEN ? "" : recallClient();
+    if (/^[A-Za-z0-9_-]{1,64}$/.test(kept)) return kept;
     var out = "";
     try {
       var b = new Uint8Array(8);
@@ -1662,7 +1669,7 @@
     } catch (e) {
       out = Math.random().toString(16).slice(2, 10) + Math.random().toString(16).slice(2, 10);
     }
-    try { window.sessionStorage.setItem(CLIENT_KEY, out); } catch (e) { /* blocked */ }
+    rememberClient(out);
     return out;
   })();
   var METRICS_MS = 20000, metricsTimer = null, metricsT0 = Date.now();
