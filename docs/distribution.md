@@ -1068,8 +1068,10 @@ does not try to verify the numbers.
   Watch and every visit to a manager viewing link (`/watch/{stream}?k=`) each
   mint a token of their own, so everyone a viewing link is handed to reports
   — bar a burst. A token signs only the streams it admits and its expiry, to
-  the second, so mints for one stream that land in the same second are the
-  same token and share its eight: twelve tabs that open one link in the same
+  the second, and the manager sets that expiry as the mint time plus a
+  lifetime fixed per route. So mints for the same streams by the same route
+  (visits to one viewing link, say) that land in the same second are the same
+  token and share its eight: twelve tabs that open one link in the same
   second report as eight, and play all the same.
   Nor does it stop somebody who can mint: a link's key or a portal login is a
   new token every second, and enough of them fill a stream's table. That costs

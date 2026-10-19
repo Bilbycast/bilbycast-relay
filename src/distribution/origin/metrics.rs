@@ -37,8 +37,10 @@
 //! an operator's Watch and every visit to a manager viewing link
 //! (`/watch/{stream}?k=`) each mint a token of their own, so each visitor to a
 //! link reports under their own — unless they arrive in the same second: a
-//! token signs only the streams it admits and its expiry, to the second, so
-//! same-second mints for one stream are one token and share its clients. And
+//! token signs only the streams it admits and its expiry, to the second, and
+//! the manager's expiry is the mint time plus a per-route lifetime, so
+//! same-second mints of the same streams by the same route are one token and
+//! share its clients. And
 //! somebody who can mint — a link's key or a portal login in hand — can have
 //! a new token every second and fill a stream's table after all. What no
 //! token holder can do is push another stream's reports out of health (see
