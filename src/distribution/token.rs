@@ -34,10 +34,23 @@ fn decode_secret(secret_hex: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-fn compute_hmac(secret: &[u8], scope: &str, stream: &str, exp: u64) -> Vec<u8> {
+/// A verified token's signature: what names the credential, however its text
+/// was written.
+///
+/// The text does not name it. `exp` parses with any number of leading zeros or
+/// a leading `+`, the signature's hex is read in either case, and a
+/// single-stream token verifies just as well written in the multi-stream form
+/// with its one stream listed, because the HMAC is checked over the parsed
+/// values — so one credential has endless spellings, and every one of them
+/// verifies. The signature covers the scope, the stream list and the expiry,
+/// and there is one of it: anything that counts what one credential does
+/// counts this, never the text it arrived as.
+pub type Signature = [u8; 32];
+
+fn compute_hmac(secret: &[u8], scope: &str, stream: &str, exp: u64) -> Signature {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(format!("{scope}:{stream}:{exp}").as_bytes());
-    mac.finalize().into_bytes().to_vec()
+    mac.finalize().into_bytes().into()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -77,8 +90,8 @@ pub fn mint(secret_hex: &str, scope: &str, stream: &str, exp: u64) -> Result<Str
 }
 
 /// Verify a token for a given scope + stream. Checks the HMAC (constant-time)
-/// and that it has not expired.
-fn verify(secret_hex: &str, scope: &str, stream: &str, token: &str) -> Result<()> {
+/// and that it has not expired, and hands back its [`Signature`].
+fn verify(secret_hex: &str, scope: &str, stream: &str, token: &str) -> Result<Signature> {
     let secret = decode_secret(secret_hex)?;
     let (exp_str, hmac_hex) = token
         .split_once('.')
@@ -92,7 +105,7 @@ fn verify(secret_hex: &str, scope: &str, stream: &str, token: &str) -> Result<()
     if !ct_eq(&expected, &got) {
         bail!("signature mismatch");
     }
-    Ok(())
+    Ok(expected)
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
@@ -142,7 +155,7 @@ fn rendition_source(stream: &str) -> Option<&str> {
 /// (`{stream}-proxy`), so that collision is a naming choice, not an accident
 /// waiting to happen -- but it is why the suffix list is closed and why the
 /// widening is here, in one place, rather than spread across the callers.
-pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
+pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Result<Signature> {
     // Multi-stream token: it carries the list of streams it admits, between
     // the expiry and the signature.
     //
@@ -155,7 +168,7 @@ pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Resul
         return verify_multi(secret_hex, stream, token);
     }
     match verify(secret_hex, SCOPE_VIEWER, stream, token) {
-        Ok(()) => Ok(()),
+        Ok(signature) => Ok(signature),
         Err(e) => match rendition_source(stream) {
             // Fall back to the source only for a *derived* name, and only
             // after the exact match has already failed.
@@ -171,7 +184,7 @@ pub fn verify_viewer_token(secret_hex: &str, stream: &str, token: &str) -> Resul
 /// list is attacker-supplied text until the HMAC over it verifies, so reading
 /// membership first would let anyone append a stream name to someone else's
 /// token and be believed.
-fn verify_multi(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
+fn verify_multi(secret_hex: &str, stream: &str, token: &str) -> Result<Signature> {
     // `exp` is the first field and the signature the last; everything between
     // is the list, dots and all.
     let (exp_str, rest) = token
@@ -194,7 +207,7 @@ fn verify_multi(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
     // Only now is the list trustworthy.
     let admits = |name: &str| joined.split(STREAM_SEP).any(|s| s == name);
     if admits(stream) {
-        return Ok(());
+        return Ok(expected);
     }
     // A derived rendition is admitted by its source, exactly as for the
     // single-stream form — the player fetches `{s}` and `{s}-proxy` off one
@@ -202,14 +215,14 @@ fn verify_multi(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
     if let Some(source) = rendition_source(stream)
         && admits(source)
     {
-        return Ok(());
+        return Ok(expected);
     }
     bail!("token does not admit this stream")
 }
 
 /// Verify an ingest token (edge → relay distribution ingest).
 pub fn verify_ingest_token(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
-    verify(secret_hex, SCOPE_INGEST, stream, token)
+    verify(secret_hex, SCOPE_INGEST, stream, token).map(drop)
 }
 
 /// Mint a viewer token (used by tests / manager-side parity checks).
@@ -468,6 +481,33 @@ mod tests {
         let tok = mint_viewer_token(SECRET, "s", exp).unwrap();
         let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         assert!(verify_viewer_token(other, "s", &tok).is_err());
+    }
+
+    /// Every spelling of one token is the same credential: whatever counts per
+    /// credential reads the signature, so the text it arrived as must not
+    /// change it — and a different credential must not share it.
+    #[test]
+    fn every_spelling_of_a_token_verifies_to_its_one_signature() {
+        let exp = now_unix() + 300;
+        let tok = mint_viewer_token(SECRET, "show", exp).unwrap();
+        let (e, sig) = tok.split_once('.').unwrap();
+        let signature = verify_viewer_token(SECRET, "show", &tok).unwrap();
+        for spelling in [
+            format!("000{tok}"),
+            format!("+{tok}"),
+            format!("{e}.{}", sig.to_ascii_uppercase()),
+            format!("{e}.show.{sig}"),
+        ] {
+            assert_eq!(
+                verify_viewer_token(SECRET, "show", &spelling).unwrap(),
+                signature,
+                "{spelling}"
+            );
+        }
+        // The rendition is reached on the source's credential, and is it.
+        assert_eq!(verify_viewer_token(SECRET, "show-proxy", &tok).unwrap(), signature);
+        let other = mint_viewer_token(SECRET, "show", exp + 1).unwrap();
+        assert_ne!(verify_viewer_token(SECRET, "show", &other).unwrap(), signature);
     }
 
     /// Cross-crate parity: this exact vector is asserted identically in

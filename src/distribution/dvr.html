@@ -1084,6 +1084,12 @@
   // segment lands or the page closes.
   var reconnectTimer = null, reconnectAttempts = 0, reconnectingLabel = null, lastReconnectAt = 0;
   var RECONNECT_FIRST_MS = 1000, RECONNECT_MAX_MS = 15000;
+  // Whether main's link has carried anything — a playlist, a segment, a
+  // segment's bytes arriving — since hls.js last gave up on it, and when the
+  // page last tried it again. The drop to Low waits for the first and counts
+  // nothing from before the second: what the buffer did while the link was
+  // gone is no evidence about the rendition.
+  var linkSeen = true, linkTriedAt = 0;
 
   // A rolling log of what the transport saw — segment timings, stalls, holds,
   // errors — shown in the debug panel (`&debug=1`). Added because a tablet in
@@ -1195,6 +1201,7 @@
     var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_FIRST_MS * Math.pow(2, reconnectAttempts));
     reconnectAttempts++;
     reconnectingLabel = label;
+    linkSeen = false;
     lastReconnectAt = Date.now();
     metricsEvent(reconnectTimes);
     noteEvent({ kind: "reconnect", ahead: bufferedAhead(main) });
@@ -1211,6 +1218,9 @@
   }
   function resumeMain() {
     reconnectTimer = null;
+    // Trouble is counted afresh from here: see `linkTriedAt`.
+    stallCount = 0;
+    linkTriedAt = Date.now();
     var go = reconnectResume;
     reconnectResume = null;
     if (go) go();
@@ -1437,7 +1447,7 @@
     if (main.playbackRate === CATCHUP_RATE) main.playbackRate = (rate > 0 && rate <= 1) ? rate : 1;
     logDiag("CATCHUP stop: " + (behindLive() - liveHoldBack).toFixed(1) + "s from the live point");
   }
-  setInterval(function () { tendLatency(); tendReturnOffer(); }, 1000);
+  setInterval(function () { noteSegProgress(); tendLatency(); tendReturnOffer(); }, 1000);
   // Where the browser does fire it, this is simply sooner than the next poll.
   main.addEventListener("progress", checkHold);
 
@@ -1465,23 +1475,39 @@
   var SLOW_LOAD_RATIO = 0.8;      // fetch time / media time; above this the link is losing ground
   var STARVED_HOLDS = 3, STARVED_WINDOW_MS = 60000;
   var segLoadRatios = [], segLoadingSince = 0, segLoadingSecs = 0, segLoadingFrag = null;
+  // What the request in flight had received when last looked at, and when
+  // that last grew.
+  var segBytesSeen = 0, segProgressAt = 0, SEG_PROGRESS_MS = 2000;
   /// Bytes a fragment's request has received so far: hls.js's loader keeps
   /// them on the fragment's stats as they arrive.
   function fragBytes(frag) {
     var st = frag && frag.stats;
     return st && st.loaded > 0 ? st.loaded : 0;
   }
+  /// Look at the request in flight. Bytes it has gained since the last look
+  /// are a link carrying something. Looked at every second and before every
+  /// judgement, so a request that stops gaining is seen to have stopped.
+  function noteSegProgress() {
+    var b = fragBytes(segLoadingFrag);
+    if (b > segBytesSeen) { segBytesSeen = b; segProgressAt = Date.now(); linkSeen = true; }
+  }
   /// Is the link fetching this rendition slower than it plays?
   function slowLink() {
+    noteSegProgress();
     // A segment still on its way after one and a half times its length is
     // slow whatever came before it — and on a badly starved link it may be
     // the only evidence, the earlier ones having never finished. Only while
-    // its bytes are arriving, though. A request that has had none is a link
-    // that is not there at all: timed alone, a dead spot read as a slow link
-    // for as long as hls.js kept retrying, and Low would not have arrived
-    // over it either.
-    if (segLoadingSince && segLoadingSecs > 0 && fragBytes(segLoadingFrag) > 0 &&
-        Date.now() - segLoadingSince > segLoadingSecs * 1500) return true;
+    // its bytes are arriving, though: gaining within the last two seconds,
+    // not merely some having come. A request that has had none is a link that
+    // is not there at all, and one whose bytes have stopped is a connection a
+    // dead spot has stalled — lossy wifi stalls TCP rather than slowing it —
+    // and hls.js waits up to twelve seconds before it gives such a request
+    // up. Timed alone, either read as a slow link, and Low would not have
+    // arrived over it either.
+    var now = Date.now();
+    if (segLoadingSince && segLoadingSecs > 0 && segBytesSeen > 0 &&
+        now - segProgressAt < SEG_PROGRESS_MS &&
+        now - segLoadingSince > segLoadingSecs * 1500) return true;
     if (segLoadRatios.length < 2) return false;
     // The middle of the last three, not their mean: one bad fetch on a good
     // link is 2.0 among 0.25s, and a mean would call that link slow. With
@@ -1490,7 +1516,10 @@
     return sorted[sorted.length === 3 ? 1 : 0] > SLOW_LOAD_RATIO;
   }
   function starvedByPauses() {
-    return recentCount(holdTimes, STARVED_WINDOW_MS) >= STARVED_HOLDS && slowLink();
+    // The pauses since the page last tried the link again: those from before
+    // were the outage's.
+    var within = Math.min(STARVED_WINDOW_MS, Date.now() - linkTriedAt);
+    return within > 0 && recentCount(holdTimes, within) >= STARVED_HOLDS && slowLink();
   }
   //
   // **And a way back.** The first cut announced the switch once and forgot
@@ -1570,15 +1599,19 @@
   }
   // A drop decided; whether main has loaded anything since; whether the
   // notice has been up long enough to read.
-  var downgrading = false, downgradeLoaded = false, downgradeDue = false;
+  var downgrading = false, downgradeLoaded = false, downgradeDue = false, reloadSent = false;
   function maybeDowngrade() {
     if (downgrading || quality !== "full") return false;
     // Not while the link is gone. An outage makes every sign below read as
     // "too slow for Full" — the buffer runs dry, a hold times out into the
     // next one — and the reload to Low went out into the dead link, which
     // put the browser's own "cannot open this page" where the player was,
-    // with nothing on the page left to bring it back.
-    if (reconnectTimer !== null || reconnectingLabel !== null || navigator.onLine === false) return false;
+    // with nothing on the page left to bring it back. Nor once hls.js has
+    // given up on it, until the link carries something again — a playlist, a
+    // segment, a segment's bytes. Waiting for a segment to land, which is
+    // when the reconnect notice clears, waited for good on a link back but
+    // too slow to finish one: the very link Low is for.
+    if (reconnectTimer !== null || !linkSeen || navigator.onLine === false) return false;
     var starved = stallCount < 3 && starvedByPauses();
     if (stallCount < 3 && !starved) return false;
     try {
@@ -1604,12 +1637,21 @@
   /// has carried a playlist or a segment since the decision — a link that
   /// fails in that moment holds it until it is back, rather than taking it
   /// into a browser error page.
+  ///
+  /// And once. Main goes on loading until the new page arrives, and each
+  /// playlist or segment it loads asks again; a second reload cancels the
+  /// navigation under way and starts it over, on the link that has just
+  /// shown it cannot carry Full. Main stops loading there too, so the page
+  /// leaving does not compete with the one arriving.
   function reloadForLow() {
-    if (!downgradeDue || !downgradeLoaded || navigator.onLine === false) return;
+    if (reloadSent || !downgradeDue || !downgradeLoaded || navigator.onLine === false) return;
+    reloadSent = true;
+    try { if (mainHls) mainHls.stopLoad(); } catch (e) {}
     try { location.reload(); } catch (e) {}
   }
-  /// Main loaded something.
+  /// Main loaded something: the link is there.
   function noteLoaded() {
+    linkSeen = true;
     if (!downgrading) return;
     downgradeLoaded = true;
     reloadForLow();
@@ -2542,6 +2584,8 @@
           segLoadingSince = Date.now();
           segLoadingSecs = d.frag.duration;
           segLoadingFrag = d.frag;
+          segBytesSeen = fragBytes(d.frag);
+          segProgressAt = segLoadingSince;
         }
       });
       hls.on(Hls.Events.FRAG_LOADED, function (_e, d) {
@@ -2629,7 +2673,7 @@
           // fatal error on the main element is the picture stopping for
           // good — a viewer nobody should still be counting. The proxy's
           // own fatal error leaves the visible picture running.
-          if (video === main) stopBeating();
+          if (video === main) { pictureEnded = true; stopBeating(); }
         } else if (video === main && mode === "live" && !hasPlayed
                    && data.details === "fragLoadTimeOut" && fragBytes(data.frag) > 0) {
           // **A link too slow to deliver the first segment never stalls.**
@@ -6168,20 +6212,29 @@
   /// The beat ran and has stopped: this tab is not counted under its login
   /// any more. Playback reports stop with it (`mayReport`).
   var beatEnded = false;
+  /// Main's picture has stopped for good, and only a reload brings it back.
+  /// Kept apart from `beatEnded`, which a renewal clears when it starts the
+  /// beat again. That is right after a `held: false` a renewal has since
+  /// answered — the login is this tab's after all — and never for a picture
+  /// that has gone.
+  var pictureEnded = false;
 
   /* Whether this player is somebody watching, as far as the count is
-   * concerned. One predicate for the timer, the first beat and the
-   * focus-triggered one, so every path that ends the picture ends the beat.
+   * concerned. One predicate for the timer, the first beat, the
+   * focus-triggered one and the renewal's restart, so every path that ends
+   * the picture ends the beat.
    *
    * Only a portal viewer has a login to be counted under — a guest on a
    * one-off link is anonymous by design, and there is no row to touch. Past
-   * that, two terms for two different dead players: `accessExpired` is the
-   * tab whose picture ended in front of the viewer (`forgetToken` clears the
-   * stored copy, not `TOKEN` itself — the 401 branch still needs it to tell
-   * "expired" from "never had one"), and `TOKEN` is the reload with nothing
-   * to play, which sends its first beat before hls.js can 401 and latch. */
+   * that, three terms for three different dead players: `accessExpired` is
+   * the tab whose picture ended in front of the viewer (`forgetToken` clears
+   * the stored copy, not `TOKEN` itself — the 401 branch still needs it to
+   * tell "expired" from "never had one"), `pictureEnded` the one whose
+   * picture hls.js could not bring back, and `TOKEN` is the reload with
+   * nothing to play, which sends its first beat before hls.js can 401 and
+   * latch. */
   function mayBeat() {
-    return !!(PORTAL_URL && HOLDER && TOKEN && !accessExpired);
+    return !!(PORTAL_URL && HOLDER && TOKEN && !accessExpired && !pictureEnded);
   }
 
   function beatNow() {
