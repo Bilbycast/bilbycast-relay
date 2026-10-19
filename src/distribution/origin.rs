@@ -307,6 +307,10 @@ struct StreamOrigin {
     /// manifest still being served. The sweep uses this to tell "quiet" from
     /// "gone".
     last_put_ms: AtomicU64,
+    /// Bytes adopted for this stream from a previous run; 0 for a stream that
+    /// began after the restart. Only read while the store's [`ADOPT_HOLD`]
+    /// lasts: a stream that adopted nothing is not held.
+    adopted_bytes: AtomicU64,
 }
 
 impl StreamOrigin {
@@ -318,6 +322,7 @@ impl StreamOrigin {
             bytes: AtomicU64::new(0),
             dir,
             last_put_ms: AtomicU64::new(now_ms),
+            adopted_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -352,9 +357,9 @@ pub struct OriginStore {
     /// Store-wide for the same reason as `clip_admission`: marks are made by
     /// hand.
     marks_lock: Arc<tokio::sync::Mutex<()>>,
-    /// While non-zero and in the future (ms on `started`'s clock): segments
-    /// adopted from a previous run are not trimmed *by age*. See
-    /// [`ADOPT_HOLD`].
+    /// While non-zero and in the future (ms on `started`'s clock): a stream
+    /// that adopted segments from a previous run is not trimmed *by age*, and
+    /// its byte bound is widened by what it adopted. See [`ADOPT_HOLD`].
     adopt_hold_until_ms: AtomicU64,
 }
 
@@ -376,9 +381,20 @@ pub struct OriginStore {
 ///
 /// The hold ends the moment the manager names its per-stream policies (an
 /// empty list counts: that is the manager saying no session wants more than
-/// the default), or after this long if it never does. It suspends the age
-/// test only. The byte bound and the free-space floor still apply, so a
-/// relay that restarts with a full disk still makes room.
+/// the default), or after this long if it never does — which is every restart
+/// of a relay carrying no DVR session, since only a session gives the manager
+/// a per-stream policy to name. It covers only the streams that adopted
+/// something; one that began after the restart trims as normal.
+///
+/// For a stream it does cover, it suspends the age test and widens the byte
+/// bound by what the stream adopted. The window's real bound arrives in the
+/// same per-stream policy as its retention, and the node default is smaller
+/// than a long session's window — which is why the manager sizes a session's
+/// own cap — so judging the adopted window against the default byte cap
+/// would trim it before the manager spoke just as the age test did. Growth
+/// after the restart is still held to the default cap on top of what was
+/// adopted, and the free-space floor applies throughout, so a relay that
+/// restarts with a full disk still makes room.
 pub const ADOPT_HOLD: Duration = Duration::from_secs(600);
 
 /// Marker written into the origin root, so the store can tell a directory it
@@ -861,6 +877,7 @@ impl OriginStore {
             found.sort_by_key(|f| std::cmp::Reverse(f.3));
 
             let origin = self.ensure(&stream);
+            let mut stream_bytes = 0u64;
             // `try_lock`, not `blocking_lock`: the store is constructed inside
             // the async runtime (`run_distribution`), where blocking on a
             // tokio mutex panics outright. It cannot contend here — nothing
@@ -889,9 +906,11 @@ impl OriginStore {
                 origin.bytes.fetch_add(len, Ordering::Relaxed);
                 self.total_bytes.fetch_add(len, Ordering::Relaxed);
                 adopted += 1;
-                bytes += len;
+                stream_bytes += len;
             }
             drop(order);
+            origin.adopted_bytes.store(stream_bytes, Ordering::Relaxed);
+            bytes += stream_bytes;
             streams += 1;
         }
         if adopted > 0 {
@@ -906,21 +925,48 @@ impl OriginStore {
                 streams,
                 megabytes = bytes as f64 / 1e6,
                 hold_secs = ADOPT_HOLD.as_secs(),
-                "origin: adopted segments from a previous run; not trimmed by age until the \
-                 manager names its per-stream policies, or the hold runs out"
+                "origin: adopted segments from a previous run; held from the node default until \
+                 the manager names its per-stream policies, or the hold runs out"
             );
         }
     }
 
     /// Whether adopted segments are still being held for the manager's
     /// policy — see [`ADOPT_HOLD`].
+    ///
+    /// A hold found to have run out is ended here, and said so once: the
+    /// next eviction trims every adopted window to the node default, which on
+    /// a DVR session is every viewer's rewind, and the operator reading the
+    /// log afterwards needs to know it was the clock and not the manager.
     pub fn adopt_hold_active(&self) -> bool {
         let until = self.adopt_hold_until_ms.load(Ordering::Relaxed);
-        until != 0 && self.now_ms() < until
+        if until == 0 {
+            return false;
+        }
+        if self.now_ms() < until {
+            return true;
+        }
+        if self
+            .adopt_hold_until_ms
+            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!(
+                hold_secs = ADOPT_HOLD.as_secs(),
+                "origin: the manager named no per-stream storage policy within the hold; \
+                 adopted segments are trimmed to the node default from here"
+            );
+        }
+        false
     }
 
     /// The manager has named its per-stream policies: every stream now has
     /// the window it should, so age-based trimming resumes.
+    ///
+    /// Silent when the hold has already ended. Run out by time, it was ended
+    /// by the first eviction to look, which said so and trimmed the adopted
+    /// windows to the default; "in force from here" would then send whoever
+    /// reads the log looking in the wrong place.
     pub fn manager_policy_received(&self) {
         if self.adopt_hold_until_ms.swap(0, Ordering::Relaxed) != 0 {
             tracing::info!(
@@ -975,6 +1021,19 @@ impl OriginStore {
         }
     }
 
+    /// Apply a storage-policy push from the manager, ending the restart hold
+    /// when it names the per-stream policies.
+    ///
+    /// An empty list names them too: it is the manager saying no session
+    /// wants more than the default. A push carrying only the node default
+    /// says nothing about any session's window, and does not end the hold.
+    pub fn take_manager_policy(&self, update: &crate::distribution_control::OriginPolicyUpdate) {
+        self.apply_policy_update(update);
+        if update.per_stream.is_some() {
+            self.manager_policy_received();
+        }
+    }
+
     /// Replace the whole set of per-stream overrides.
     ///
     /// Deliberately a replace rather than a merge: the manager holds the
@@ -1026,6 +1085,13 @@ impl OriginStore {
         let mut components = FsPath::new(stream).components();
         matches!(components.next(), Some(std::path::Component::Normal(_)))
             && components.next().is_none()
+    }
+
+    /// Whether the store is serving `stream` as a feed: ingest has written to
+    /// it this run, or it was adopted at startup, and it has been neither
+    /// retired nor dropped since.
+    pub fn holds_stream(&self, stream: &str) -> bool {
+        self.streams.contains_key(stream)
     }
 
     fn ensure(&self, stream: &str) -> Arc<StreamOrigin> {
@@ -1153,7 +1219,16 @@ impl OriginStore {
     /// disk forever.
     async fn evict(&self, origin: &StreamOrigin, pol: &OriginPolicy, floor: usize) {
         // Read once: the hold ending mid-loop only means the next PUT trims.
-        let held = self.adopt_hold_active();
+        // Held, a stream that adopted a window keeps it from the default's age
+        // test and byte cap alike, and what arrives after the restart is still
+        // bounded by the cap — see `ADOPT_HOLD`.
+        let adopted = if self.adopt_hold_active() {
+            origin.adopted_bytes.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        let held = adopted > 0;
+        let cap = pol.max_bytes_per_stream.saturating_add(adopted);
         loop {
             let mut order = origin.order.lock().await;
             if order.len() <= floor {
@@ -1170,7 +1245,7 @@ impl OriginStore {
             // Not by age while a restarted relay is still waiting to be told
             // what window each stream keeps — see `ADOPT_HOLD`.
             let too_old = !held && meta.stored_at.elapsed() >= pol.retention;
-            let too_big = origin.bytes.load(Ordering::Relaxed) > pol.max_bytes_per_stream;
+            let too_big = origin.bytes.load(Ordering::Relaxed) > cap;
             if !too_old && !too_big {
                 break;
             }
@@ -4499,28 +4574,154 @@ seg-1.m4s
         assert!(s.get("ended", "seg-09001.m4s").await.is_some());
     }
 
-    /// The hold suspends the age test and nothing else: a restart with the
-    /// stream over its byte bound still makes room.
+    /// The byte cap a session's window is held to arrives in the same
+    /// per-stream policy as its retention, and the node default is smaller
+    /// than a long session's window. So the hold keeps what was adopted from
+    /// the default cap as it does from the default age, while growth after the
+    /// restart is still bounded by the cap — and once the manager has spoken
+    /// with no window for the stream, the default cap is back.
     #[tokio::test]
-    async fn the_hold_does_not_suspend_the_byte_bound() {
+    async fn the_hold_keeps_an_adopted_window_from_the_default_cap_and_bounds_new_growth() {
         let tmp = tempfile::tempdir().unwrap();
+        // 1000 bytes adopted, against a default cap of 300.
         left_behind(&tmp, "big", 100, 7000);
         let s = store(&tmp, 0);
-        s.set_default_policy(OriginPolicy { max_bytes_per_stream: 300, ..one_minute() });
-        assert!(s.adopt_hold_active());
+        let default = OriginPolicy {
+            retention: Duration::from_secs(7200),
+            max_bytes_per_stream: 300,
+            ..one_minute()
+        };
+        s.set_default_policy(default);
+
         put_seg(&s, "big", "seg-09000.m4s", 10).await;
-        assert!(s.usage()[0].bytes <= 300, "held past its byte bound: {}", s.usage()[0].bytes);
+        s.sweep().await;
+        assert_eq!(s.usage()[0].segments, 101, "the default cap trimmed the adopted window");
+        assert_eq!(s.usage()[0].bytes, 1010);
+        assert!(s.get("big", "seg-00000.m4s").await.is_some());
+
+        // Past what was adopted plus the cap: the oldest goes, and only it.
+        put_seg(&s, "big", "seg-09001.m4s", 291).await;
+        assert_eq!(s.usage()[0].bytes, 1291);
+        assert_eq!(s.usage()[0].segments, 101);
         assert!(s.get("big", "seg-00000.m4s").await.is_none(), "oldest first");
-        assert!(s.get("big", "seg-09000.m4s").await.is_some());
+        assert!(s.get("big", "seg-00001.m4s").await.is_some());
+        assert!(s.adopt_hold_active(), "eviction under the hold ended it");
+
+        // The manager names no window for this stream: the default cap again.
+        s.take_manager_policy(&OriginPolicyUpdate { default: None, per_stream: Some(vec![]) });
+        put_seg(&s, "big", "seg-09002.m4s", 10).await;
+        assert!(s.usage()[0].bytes <= 300, "held past its byte bound: {}", s.usage()[0].bytes);
+        assert!(s.get("big", "seg-00001.m4s").await.is_none());
+        assert!(s.get("big", "seg-09002.m4s").await.is_some());
     }
 
-    /// A store that adopted nothing has nothing to hold: a first start, or a
-    /// stream that began after the restart, trims by age from the outset.
+    /// The session's own cap, larger than both the default and the window,
+    /// arrives after the restart: nothing adopted was lost on the way.
+    #[tokio::test]
+    async fn a_window_over_the_default_cap_survives_until_its_own_cap_arrives() {
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "show", 100, 7000);
+        let s = store(&tmp, 0);
+        s.set_default_policy(OriginPolicy { max_bytes_per_stream: 300, ..one_minute() });
+        put_seg(&s, "show", "seg-09000.m4s", 10).await;
+        s.take_manager_policy(&OriginPolicyUpdate {
+            default: None,
+            per_stream: Some(vec![(
+                "show".into(),
+                OriginPolicyPatch {
+                    retention_secs: Some(7200),
+                    max_bytes_per_stream: Some(5000),
+                    ..Default::default()
+                },
+            )]),
+        });
+        put_seg(&s, "show", "seg-09001.m4s", 10).await;
+        s.sweep().await;
+        assert_eq!(s.usage()[0].segments, 102, "nothing lost across the restart");
+        assert!(s.get("show", "seg-00000.m4s").await.is_some());
+    }
+
+    /// A store that adopted nothing has nothing to hold.
     #[tokio::test]
     async fn a_store_that_adopted_nothing_holds_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp, 0);
         assert!(!s.adopt_hold_active());
+    }
+
+    /// The hold is for windows a previous run left behind. A stream that began
+    /// after the restart has nothing to wait for the manager about, and its
+    /// segments age as normal from the outset — on a relay carrying no DVR
+    /// session the manager never names per-stream policies, and the hold runs
+    /// its full ten minutes.
+    #[tokio::test]
+    async fn a_stream_that_began_after_the_restart_is_not_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "show", 10, 7000);
+        let s = store(&tmp, 0);
+        s.set_default_policy(OriginPolicy {
+            retention: Duration::from_millis(40),
+            ..one_minute()
+        });
+        assert!(s.adopt_hold_active());
+
+        put_seg(&s, "fresh", "seg-00001.m4s", 10).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        put_seg(&s, "fresh", "seg-00002.m4s", 10).await;
+        put_seg(&s, "show", "seg-09000.m4s", 10).await;
+        assert!(
+            s.get("fresh", "seg-00001.m4s").await.is_none(),
+            "a stream that adopted nothing was held"
+        );
+        assert!(s.get("fresh", "seg-00002.m4s").await.is_some());
+        assert!(s.get("show", "seg-00000.m4s").await.is_some(), "the adopted window went");
+    }
+
+    /// A hold that runs out is ended by the first eviction to look, so the
+    /// manager's push arriving after it is not reported as saving windows the
+    /// default has already trimmed.
+    #[tokio::test]
+    async fn a_hold_that_runs_out_is_ended_by_the_next_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "show", 10, 7000);
+        let s = store(&tmp, 0);
+        s.set_default_policy(one_minute());
+        // As though the ten minutes had passed.
+        s.adopt_hold_until_ms.store(s.now_ms().max(1), Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        put_seg(&s, "show", "seg-09000.m4s", 10).await;
+        assert_eq!(s.adopt_hold_until_ms.load(Ordering::Relaxed), 0, "the lapse went unremarked");
+        assert!(!s.adopt_hold_active());
+        assert!(s.get("show", "seg-00000.m4s").await.is_none(), "trimmed to the default");
+    }
+
+    /// A push that lands while the store is still adopting is applied from the
+    /// retained value, before the subscription's first change — and it has to
+    /// end the hold there too, or the reconciler, having sent it, sends
+    /// nothing more and every stream skips age trimming for ten minutes.
+    #[tokio::test]
+    async fn a_policy_pushed_before_the_origin_subscribed_still_ends_the_hold() {
+        use crate::distribution_control::{DistributionControl, RuntimeDistConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        left_behind(&tmp, "show", 10, 7000);
+        let s = Arc::new(store(&tmp, 0));
+        assert!(s.adopt_hold_active());
+
+        let cfg = crate::config::DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+        control.set_origin_policy(OriginPolicyUpdate { default: None, per_stream: Some(vec![]) });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        super::super::follow_manager_storage(s.clone(), &control, cancel.clone());
+        for _ in 0..200 {
+            if !s.adopt_hold_active() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel.cancel();
+        assert!(!s.adopt_hold_active(), "the retained push did not end the hold");
     }
 
     /// Adoption puts the queue in age order, not directory order.
@@ -4568,6 +4769,9 @@ seg-1.m4s
             min_segments: 0,
             idle_grace: std::time::Duration::from_secs(60),
         });
+        // The manager has spoken, so that bound is the stream's: until it
+        // does, the restart hold keeps the adopted bytes from it.
+        s.manager_policy_received();
         s.put("s", "seg-00010.m4s", Bytes::from_static(b"zz")).await.unwrap();
         assert!(
             s.get("s", "seg-00009.m4s").await.is_none(),

@@ -928,6 +928,7 @@ fn build_health_message(
     // is running. Lets the manager render live viewer counts and build
     // shareable viewer links.
     if let Some(d) = dist_snapshot {
+        let viewers = relay_stats.viewer_metrics();
         payload["distribution"] = serde_json::json!({
             "streams": d.streams,
             "viewers": d.viewers,
@@ -942,11 +943,15 @@ fn build_health_message(
             // parses the object loosely and ignores it.
             "origin_streams": d.origin_streams,
             // What each viewer's player last reported about its playback —
-            // buffer ahead, stalls, reconnects, bandwidth estimate — freshest
-            // first, bounded (`origin::metrics::MAX_REPORTED`). The manager
-            // joins each to a portal login by `client` and shows it on the
-            // DVR Sessions page. Additive, as above.
-            "viewer_metrics": d.viewer_metrics,
+            // buffer ahead, stalls, reconnects, bandwidth estimate — bounded
+            // (`origin::metrics::MAX_REPORTED`) and shared fairly across
+            // streams. The manager joins each to a portal login by `client`
+            // and shows it on the DVR Sessions page. Additive, as above.
+            "viewer_metrics": viewers.reports,
+            // Per stream, how many clients hold a live report and how many of
+            // them made the list, so a cut reads as a cut on the manager and
+            // not as viewers who stopped reporting.
+            "viewer_metrics_streams": viewers.streams,
         });
     }
     // Advertised viewer base URL — the runtime (manager-pushed) value wins over

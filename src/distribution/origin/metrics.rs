@@ -17,10 +17,20 @@
 //! **The client id is the page's own, not the holder and not the token.** The
 //! holder is never presented to the relay by design (it is what the portal
 //! compares a renewal against), and a token cannot tell two devices apart. So
-//! the page mints an id per load, reports under it here, and sends the same id
-//! on its portal beat; the manager joins the two. A viewer on a one-off link
-//! never beats, so their report stays anonymous — which is still a row with a
-//! buffer reading, where before there was nothing.
+//! the page keeps one id per tab — in `sessionStorage`, per stream, minted
+//! afresh only when none is stored or when the page arrives with a new claim's
+//! token — reports under it here, and sends the same id on its portal beat;
+//! the manager joins the two. A reload therefore replaces the tab's report
+//! rather than leaving the last one behind under an id nobody holds. A viewer
+//! on a one-off link never beats, so their report stays anonymous — which is
+//! still a row with a buffer reading, where before there was nothing.
+//!
+//! **One credential is a few devices, not a stream's worth.** A token holder
+//! can name any client id it likes, and the peer is loopback for everyone, so
+//! the only thing that tells one viewer's reports from another's is the token
+//! presented with them: at most [`MAX_CLIENTS_PER_TOKEN`] clients per token
+//! per stream, counted on a hash of it. Past that a new client is refused,
+//! never swapped for one already held.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,9 +40,10 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use sha2::{Digest, Sha256};
 
 use crate::distribution::DistributionState;
-use crate::stats::{ViewerEvent, ViewerMetricReport};
+use crate::stats::{ViewerEvent, ViewerMetricReport, ViewerMetricStream, ViewerMetricsSnapshot};
 
 /// How often the page is asked to report. Carried in every reply, as the beat
 /// cadence is, so a change reaches tabs already open.
@@ -43,16 +54,35 @@ pub const REPORT_TTL: Duration = Duration::from_secs(90);
 
 /// Most clients remembered per stream. The route is token-gated, so this is
 /// a bound on good behaviour, not a defence — but it is a map that grows with
-/// every page load, and a page that reloads every second must not grow it
+/// every new tab, and a page that mints an id every second must not grow it
 /// without limit.
 pub const MAX_CLIENTS_PER_STREAM: usize = 500;
 
-/// Most streams with reports. Reports arrive only for streams the relay
-/// holds, so this is well above anything real.
+/// Most clients one presented viewer token holds a report for, per stream.
+///
+/// A tab keeps its id across reloads and a renewal brings a new token to the
+/// same id, so a token is one device, or a link opened on a laptop and a
+/// tablet. Eight is room for that and no room to fill a stream's table, or its
+/// share of [`MAX_REPORTED`], from one link that has been passed around. A
+/// client past it is refused, never swapped for one already held: the reports
+/// a stream keeps stay those of the viewers who came first.
+pub const MAX_CLIENTS_PER_TOKEN: usize = 8;
+
+/// Most streams with reports. A report is accepted only for a stream the
+/// origin is serving (`OriginStore::holds_stream`), so this is well above
+/// anything real.
 pub const MAX_STREAMS: usize = 64;
 
-/// Most reports carried in one health message, freshest first. The manager
-/// stores the whole health blob per tick, so this is a bound on that write.
+/// Most reports carried in one health message, shared fairly across streams
+/// (see [`ViewerMetrics::snapshot`]).
+///
+/// What it bounds is the health message. A tablet's report is about 0.9 KB of
+/// JSON and one with every field at its limit under 2 KB, so the list stays
+/// under 400 KB: well inside the manager's 5 MB frame cap, and small enough
+/// for a manager that predates the viewer roll, which keeps a relay's whole
+/// health and sends it on to every open dashboard. Each stream's entry in
+/// `viewer_metrics_streams` says how many reports it had and how many made
+/// the list, so a cut is never read as viewers who are not reporting.
 pub const MAX_REPORTED: usize = 200;
 
 /// The largest body the route will read. A report is a few hundred bytes.
@@ -153,9 +183,23 @@ pub enum MetricRefusal {
     /// The stream already holds [`MAX_CLIENTS_PER_STREAM`] clients and this
     /// is a new one.
     TooManyClients,
+    /// The token presented already holds reports for
+    /// [`MAX_CLIENTS_PER_TOKEN`] other clients on this stream.
+    TooManyForToken,
     /// The relay already holds reports for [`MAX_STREAMS`] streams and this is
     /// a new one.
     TooManyStreams,
+}
+
+/// What a client's reports are counted against: a hash of the token they
+/// were presented with, so the store never holds a credential.
+type TokenKey = [u8; 16];
+
+fn token_key(token: &str) -> TokenKey {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
 }
 
 fn clamp_u32(v: f64, max: u32) -> u32 {
@@ -260,6 +304,7 @@ impl ViewerReport {
 struct Entry {
     report: ViewerMetricReport,
     received: Instant,
+    token: TokenKey,
 }
 
 /// The freshest report per client per stream.
@@ -273,14 +318,21 @@ impl ViewerMetrics {
         Arc::new(Self::default())
     }
 
-    /// Keep this report, replacing the client's previous one.
-    pub fn record(&self, stream: &str, report: ViewerReport) -> Result<(), MetricRefusal> {
-        self.record_at(stream, report, Instant::now())
+    /// Keep this report, replacing the client's previous one. `token` is the
+    /// viewer token it was presented with, already verified.
+    pub fn record(
+        &self,
+        stream: &str,
+        token: &str,
+        report: ViewerReport,
+    ) -> Result<(), MetricRefusal> {
+        self.record_at(stream, token_key(token), report, Instant::now())
     }
 
     fn record_at(
         &self,
         stream: &str,
+        token: TokenKey,
         report: ViewerReport,
         now: Instant,
     ) -> Result<(), MetricRefusal> {
@@ -298,48 +350,97 @@ impl ViewerMetrics {
         if !clients.contains_key(&report.client) && clients.len() >= MAX_CLIENTS_PER_STREAM {
             return Err(MetricRefusal::TooManyClients);
         }
+        // Counted rather than indexed: a stream holds at most 500 clients,
+        // and this runs once per report, every twenty seconds per viewer.
+        let others = clients
+            .iter()
+            .filter(|(client, e)| e.token == token && **client != report.client)
+            .count();
+        if others >= MAX_CLIENTS_PER_TOKEN {
+            return Err(MetricRefusal::TooManyForToken);
+        }
         let report = report.sanitize(stream);
         clients.insert(
             report.client.clone(),
             Entry {
                 report,
                 received: now,
+                token,
             },
         );
         Ok(())
     }
 
-    /// Every live report, freshest first, at most [`MAX_REPORTED`], with
-    /// `age_secs` filled in. Prunes what has expired.
-    pub fn snapshot(&self) -> Vec<ViewerMetricReport> {
+    /// The live reports to carry on health, at most [`MAX_REPORTED`], with
+    /// `age_secs` filled in, and per stream how many there were. Prunes what
+    /// has expired.
+    ///
+    /// **Shared fairly across streams.** Each stream gets an equal share of
+    /// the cap, and whatever a stream with fewer reports leaves goes to the
+    /// busier ones, so one stream can never push another's out — a relay
+    /// carries several groups' sessions, and one feed's audience, or one
+    /// link's holder, must not blank the next feed's roll. Within a stream
+    /// the freshest reports are listed first, and its entry in `streams` says
+    /// how many were left out.
+    pub fn snapshot(&self) -> ViewerMetricsSnapshot {
         self.snapshot_at(Instant::now())
     }
 
-    fn snapshot_at(&self, now: Instant) -> Vec<ViewerMetricReport> {
+    fn snapshot_at(&self, now: Instant) -> ViewerMetricsSnapshot {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         prune(&mut map, now);
-        let mut all: Vec<(Duration, &Entry)> = map
-            .values()
-            .flat_map(|clients| clients.values())
-            .map(|e| (now.saturating_duration_since(e.received), e))
-            .collect();
-        all.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.report.client.cmp(&b.1.report.client)));
-        all.into_iter()
-            .take(MAX_REPORTED)
-            .map(|(age, e)| {
-                let mut r = e.report.clone();
-                r.age_secs = age.as_secs();
-                r
+        // In stream order, so the same reports make the cut from one tick to
+        // the next when nothing has changed.
+        let mut streams: Vec<(&String, Vec<(Duration, &Entry)>)> = map
+            .iter()
+            .map(|(stream, clients)| {
+                let mut live: Vec<(Duration, &Entry)> = clients
+                    .values()
+                    .map(|e| (now.saturating_duration_since(e.received), e))
+                    .collect();
+                live.sort_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then_with(|| a.1.report.client.cmp(&b.1.report.client))
+                });
+                (stream, live)
             })
-            .collect()
+            .collect();
+        streams.sort_by(|a, b| a.0.cmp(b.0));
+        let lens: Vec<usize> = streams.iter().map(|(_, live)| live.len()).collect();
+        let shares = fair_shares(&lens, MAX_REPORTED);
+        let mut out = ViewerMetricsSnapshot::default();
+        for ((stream, live), listed) in streams.into_iter().zip(shares) {
+            out.streams.push(ViewerMetricStream {
+                stream: stream.clone(),
+                reporting: live.len(),
+                listed,
+            });
+            out.reports
+                .extend(live.into_iter().take(listed).map(|(age, e)| {
+                    let mut r = e.report.clone();
+                    r.age_secs = age.as_secs();
+                    r
+                }));
+        }
+        out
     }
+}
 
-    /// How many clients have a live report for `stream`.
-    pub fn reporting(&self, stream: &str) -> usize {
-        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        prune(&mut map, Instant::now());
-        map.get(stream).map(|c| c.len()).unwrap_or(0)
+/// Split `cap` across lists of these lengths: an equal share each, and what a
+/// shorter list does not use passed on to the longer ones. The shares never
+/// add up to more than `cap`, nor to less than `cap` while any list is left
+/// with more than its share.
+fn fair_shares(lens: &[usize], cap: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..lens.len()).collect();
+    order.sort_by_key(|&i| lens[i]);
+    let mut shares = vec![0; lens.len()];
+    let mut left = cap;
+    for (k, &i) in order.iter().enumerate() {
+        let share = (left / (lens.len() - k)).min(lens[i]);
+        shares[i] = share;
+        left -= share;
     }
+    shares
 }
 
 fn prune(map: &mut HashMap<String, HashMap<String, Entry>>, now: Instant) {
@@ -364,6 +465,11 @@ pub(super) fn routes() -> Router<Arc<DistributionState>> {
 /// The viewer token only, as for marks: the edge has no business here. The
 /// reply carries the cadence, so it is the relay's to change. The peer
 /// address is not read: see `ViewerMetricReport::age_secs`.
+///
+/// `404` for a stream the origin is not serving, as marks answer for one with
+/// no directory: a viewer token outlives the session it was minted for by
+/// hours, and a tab left open on a session the manager has dropped must not
+/// hold one of [`MAX_STREAMS`] report slots for it.
 async fn metrics_post(
     State(st): State<Arc<DistributionState>>,
     Path(stream): Path<String>,
@@ -374,11 +480,25 @@ async fn metrics_post(
     let Some(stream) = crate::distribution::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
-    if let Err(resp) = crate::distribution::check_viewer_token(&st, &stream, &headers, query.as_deref()) {
-        return resp;
-    }
+    let token = match crate::distribution::accepted_viewer_token(
+        &st,
+        &stream,
+        &headers,
+        query.as_deref(),
+    ) {
+        Ok(token) => token,
+        Err(resp) => return resp,
+    };
     let no_store = [(header::CACHE_CONTROL, "no-store")];
-    match st.viewer_metrics.record(&stream, report) {
+    if !st.origin.holds_stream(&stream) {
+        return (
+            StatusCode::NOT_FOUND,
+            no_store,
+            "the relay is not serving this stream",
+        )
+            .into_response();
+    }
+    match st.viewer_metrics.record(&stream, &token, report) {
         Ok(()) => (
             StatusCode::OK,
             no_store,
@@ -389,6 +509,12 @@ async fn metrics_post(
             StatusCode::BAD_REQUEST,
             no_store,
             "a report needs a client id of up to 64 letters, digits, '-' or '_'",
+        )
+            .into_response(),
+        Err(MetricRefusal::TooManyForToken) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            no_store,
+            "this viewer token is already reporting for as many players as it may",
         )
             .into_response(),
         Err(MetricRefusal::TooManyClients) | Err(MetricRefusal::TooManyStreams) => (
@@ -418,17 +544,23 @@ mod tests {
         }
     }
 
+    /// A token of its own for every client, so the per-token bound stays out
+    /// of tests about something else.
+    fn own(client: &str) -> TokenKey {
+        token_key(client)
+    }
+
     #[test]
     fn the_freshest_report_per_client_is_what_is_published_with_its_age() {
         let m = ViewerMetrics::default();
         let t0 = Instant::now();
-        m.record_at("show", report("a"), t0).unwrap();
-        m.record_at("show", report("b"), t0 + Duration::from_secs(5)).unwrap();
+        m.record_at("show", own("a"), report("a"), t0).unwrap();
+        m.record_at("show", own("b"), report("b"), t0 + Duration::from_secs(5)).unwrap();
         let mut again = report("a");
         again.stalls = 3.0;
-        m.record_at("show", again, t0 + Duration::from_secs(20)).unwrap();
+        m.record_at("show", own("a"), again, t0 + Duration::from_secs(20)).unwrap();
 
-        let snap = m.snapshot_at(t0 + Duration::from_secs(30));
+        let snap = m.snapshot_at(t0 + Duration::from_secs(30)).reports;
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].client, "a", "freshest first");
         assert_eq!(snap[0].age_secs, 10);
@@ -443,9 +575,20 @@ mod tests {
     fn a_report_older_than_the_ttl_is_gone_from_the_snapshot_and_the_count() {
         let m = ViewerMetrics::default();
         let t0 = Instant::now();
-        m.record_at("show", report("a"), t0).unwrap();
-        assert_eq!(m.snapshot_at(t0 + REPORT_TTL - Duration::from_secs(1)).len(), 1);
-        assert_eq!(m.snapshot_at(t0 + REPORT_TTL).len(), 0);
+        m.record_at("show", own("a"), report("a"), t0).unwrap();
+        let held = m.snapshot_at(t0 + REPORT_TTL - Duration::from_secs(1));
+        assert_eq!(held.reports.len(), 1);
+        assert_eq!(
+            held.streams,
+            vec![ViewerMetricStream {
+                stream: "show".into(),
+                reporting: 1,
+                listed: 1
+            }]
+        );
+        let gone = m.snapshot_at(t0 + REPORT_TTL);
+        assert!(gone.reports.is_empty());
+        assert!(gone.streams.is_empty(), "a stream with no live report has no entry");
         assert_eq!(m.inner.lock().unwrap().len(), 0, "an empty stream is dropped too");
     }
 
@@ -490,32 +633,209 @@ mod tests {
     #[test]
     fn a_bad_client_id_is_refused_and_the_caps_hold() {
         let m = ViewerMetrics::default();
+        let t0 = Instant::now();
         for bad in ["", "a b", "x".repeat(65).as_str(), "é"] {
-            assert_eq!(m.record("show", report(bad)), Err(MetricRefusal::BadClient), "{bad:?}");
+            assert_eq!(
+                m.record_at("show", own(bad), report(bad), t0),
+                Err(MetricRefusal::BadClient),
+                "{bad:?}"
+            );
         }
         for i in 0..MAX_CLIENTS_PER_STREAM {
-            m.record("show", report(&format!("c{i}"))).unwrap();
+            let c = format!("c{i}");
+            m.record_at("show", own(&c), report(&c), t0).unwrap();
         }
-        assert_eq!(m.record("show", report("one-more")), Err(MetricRefusal::TooManyClients));
+        assert_eq!(
+            m.record_at("show", own("one-more"), report("one-more"), t0),
+            Err(MetricRefusal::TooManyClients)
+        );
         // A client already held may still report.
-        m.record("show", report("c0")).unwrap();
-        assert_eq!(m.reporting("show"), MAX_CLIENTS_PER_STREAM);
+        m.record_at("show", own("c0"), report("c0"), t0).unwrap();
+        let snap = m.snapshot_at(t0);
+        assert_eq!(snap.streams[0].reporting, MAX_CLIENTS_PER_STREAM);
 
         for i in 1..MAX_STREAMS {
-            m.record(&format!("s{i}"), report("c")).unwrap();
+            m.record_at(&format!("s{i}"), own("c"), report("c"), t0).unwrap();
         }
-        assert_eq!(m.record("another", report("c")), Err(MetricRefusal::TooManyStreams));
+        assert_eq!(
+            m.record_at("another", own("c"), report("c"), t0),
+            Err(MetricRefusal::TooManyStreams)
+        );
+    }
+
+    /// One credential is a few devices. A link passed round, or a script
+    /// holding one, could otherwise name a fresh client every report and fill
+    /// a stream's table — refusing every real viewer who came after — and
+    /// that stream's whole share of the health list.
+    #[test]
+    fn one_token_reports_for_a_few_clients_and_is_refused_past_them() {
+        let m = ViewerMetrics::default();
+        let t0 = Instant::now();
+        let link = token_key("1790000000.abc");
+        for i in 0..MAX_CLIENTS_PER_TOKEN {
+            m.record_at("show", link, report(&format!("tab{i}")), t0).unwrap();
+        }
+        assert_eq!(
+            m.record_at("show", link, report("tab-extra"), t0),
+            Err(MetricRefusal::TooManyForToken),
+            "a ninth client under one token"
+        );
+        // Refused, not swapped: every client already held keeps reporting.
+        m.record_at("show", link, report("tab0"), t0 + Duration::from_secs(20)).unwrap();
+        let snap = m.snapshot_at(t0 + Duration::from_secs(20));
+        assert_eq!(snap.streams[0].reporting, MAX_CLIENTS_PER_TOKEN);
+        // Another credential is another viewer, and the bound is per stream.
+        m.record_at("show", token_key("1790000000.def"), report("tab-extra"), t0).unwrap();
+        m.record_at("other", link, report("tab-extra"), t0).unwrap();
+        // A renewal brings a new token to the same tab: still that one client.
+        m.record_at("show", token_key("1790001800.abc"), report("tab1"), t0).unwrap();
+        m.record_at("show", link, report("tab-late"), t0).unwrap();
+        // A client that has gone frees its place.
+        let later = t0 + REPORT_TTL;
+        m.record_at("show", link, report("tab0"), later).unwrap();
+        m.record_at("show", link, report("tab-after"), later).unwrap();
     }
 
     #[test]
-    fn the_snapshot_is_bounded() {
+    fn the_cut_is_bounded_and_shared_between_streams() {
         let m = ViewerMetrics::default();
         let t0 = Instant::now();
         for i in 0..(MAX_REPORTED + 50) {
-            m.record_at(&format!("s{}", i % 8), report(&format!("c{i}")), t0 + Duration::from_millis(i as u64)).unwrap();
+            let c = format!("c{i}");
+            m.record_at(
+                &format!("s{}", i % 8),
+                own(&c),
+                report(&c),
+                t0 + Duration::from_millis(i as u64),
+            )
+            .unwrap();
         }
         let snap = m.snapshot_at(t0 + Duration::from_secs(1));
-        assert_eq!(snap.len(), MAX_REPORTED);
-        assert_eq!(snap[0].client, format!("c{}", MAX_REPORTED + 49), "the newest survive the cut");
+        assert_eq!(snap.reports.len(), MAX_REPORTED);
+        assert_eq!(snap.streams.len(), 8);
+        for s in &snap.streams {
+            assert_eq!(s.listed, MAX_REPORTED / 8, "{s:?}");
+            assert_eq!(s.reporting, if s.stream.as_str() < "s2" { 32 } else { 31 }, "{s:?}");
+            let listed: Vec<&ViewerMetricReport> =
+                snap.reports.iter().filter(|r| r.stream == s.stream).collect();
+            assert_eq!(listed.len(), s.listed);
+            assert!(
+                listed.windows(2).all(|w| w[0].age_secs <= w[1].age_secs),
+                "freshest first within a stream"
+            );
+        }
+    }
+
+    /// The production shape the relay-wide freshest-first cut got wrong: a
+    /// busy feed's reports, all fresher, pushed a small feed's out of the list
+    /// altogether, and its operator saw nobody reporting.
+    #[test]
+    fn a_busy_stream_does_not_push_a_quiet_one_out_of_the_cut() {
+        let m = ViewerMetrics::default();
+        let t0 = Instant::now();
+        for i in 0..5 {
+            let c = format!("quiet{i}");
+            m.record_at("quiet", own(&c), report(&c), t0).unwrap();
+        }
+        for i in 0..MAX_CLIENTS_PER_STREAM {
+            let c = format!("busy{i}");
+            m.record_at("busy", own(&c), report(&c), t0 + Duration::from_secs(10)).unwrap();
+        }
+        let snap = m.snapshot_at(t0 + Duration::from_secs(15));
+        assert_eq!(snap.reports.len(), MAX_REPORTED);
+        assert_eq!(
+            snap.streams,
+            vec![
+                ViewerMetricStream {
+                    stream: "busy".into(),
+                    reporting: MAX_CLIENTS_PER_STREAM,
+                    listed: MAX_REPORTED - 5,
+                },
+                ViewerMetricStream { stream: "quiet".into(), reporting: 5, listed: 5 },
+            ]
+        );
+        assert_eq!(snap.reports.iter().filter(|r| r.stream == "quiet").count(), 5);
+    }
+
+    #[test]
+    fn shares_are_equal_and_what_one_leaves_goes_to_the_rest() {
+        assert_eq!(fair_shares(&[], 200), Vec::<usize>::new());
+        assert_eq!(fair_shares(&[3, 4], 200), vec![3, 4], "under the cap, everything");
+        assert_eq!(fair_shares(&[1000, 5], 200), vec![195, 5]);
+        assert_eq!(fair_shares(&[100, 100, 100], 200), vec![66, 67, 67]);
+        assert_eq!(fair_shares(&[10, 500, 60, 500], 200), vec![10, 65, 60, 65]);
+    }
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn state(dir: &std::path::Path) -> Arc<DistributionState> {
+        use crate::distribution::origin::{OriginConfig, OriginStore};
+        use crate::distribution_control::{DistUpdate, DistributionControl, RuntimeDistConfig};
+
+        let cfg = crate::config::DistributionConfig::default();
+        let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+        control.apply(DistUpdate { token_secret: Some(SECRET.into()), ..Default::default() });
+        let origin = OriginStore::new(OriginConfig {
+            root: dir.join("origin"),
+            retention: Duration::from_secs(3600),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 0,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_secs(60),
+        })
+        .unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        DistributionState::new(
+            Arc::new(crate::distribution::hub::DistributionHub::new()),
+            Arc::new(origin),
+            cfg,
+            control,
+            tokio_util::sync::CancellationToken::new(),
+            events,
+        )
+    }
+
+    async fn post(
+        st: &Arc<DistributionState>,
+        stream: &str,
+        token: &str,
+        client: &str,
+    ) -> StatusCode {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        metrics_post(
+            State(st.clone()),
+            Path(stream.to_string()),
+            headers,
+            axum::extract::RawQuery(None),
+            axum::Json(report(client)),
+        )
+        .await
+        .status()
+    }
+
+    /// A viewer token outlives its session by hours, so a tab left open on a
+    /// session the manager has dropped would hold a report slot for a stream
+    /// the relay no longer serves — and enough of them, every slot, refusing
+    /// the next session's viewers. Marks refuse such a stream; so does this.
+    #[tokio::test]
+    async fn a_report_for_a_stream_the_origin_is_not_serving_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let exp = crate::stats::now_epoch_ms() / 1000 + 300;
+        let viewer = crate::distribution::token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+
+        assert_eq!(post(&st, "feed", &viewer, "tab").await, StatusCode::NOT_FOUND);
+        st.origin.put("feed", "seg-00001.m4s", bytes::Bytes::from_static(b"x")).await.unwrap();
+        assert_eq!(post(&st, "feed", &viewer, "tab").await, StatusCode::OK);
+
+        // The token the report came with is what it is counted against.
+        for i in 1..MAX_CLIENTS_PER_TOKEN {
+            assert_eq!(post(&st, "feed", &viewer, &format!("tab{i}")).await, StatusCode::OK);
+        }
+        assert_eq!(post(&st, "feed", &viewer, "tab-extra").await, StatusCode::TOO_MANY_REQUESTS);
+
+        st.origin.retire_stream("feed").await;
+        assert_eq!(post(&st, "feed", &viewer, "tab").await, StatusCode::NOT_FOUND);
     }
 }

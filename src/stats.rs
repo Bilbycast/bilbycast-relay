@@ -107,8 +107,11 @@ pub struct RelayStats {
     /// by the health builder — never on a media path.
     pub distribution_origin_streams: arc_swap::ArcSwap<Vec<OriginStreamUsage>>,
     /// What each viewer's player last reported about its playback. Published
-    /// on the same slow tick as the per-stream list, for the same reason.
-    pub distribution_viewer_metrics: arc_swap::ArcSwap<Vec<ViewerMetricReport>>,
+    /// on the same slow tick as the per-stream list, for the same reason, and
+    /// kept out of [`DistributionStatsSnapshot`]: only the health builder
+    /// reads it, and the 1 s stats tick and `/metrics` would otherwise copy
+    /// every report to read five counters.
+    pub distribution_viewer_metrics: arc_swap::ArcSwap<ViewerMetricsSnapshot>,
     /// Viewer sessions that had a datagram refused by the WebRTC ingress
     /// source pin (`webrtc::session::PeerPin`). One per session, not per
     /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
@@ -144,16 +147,18 @@ pub struct OriginStreamUsage {
 pub struct ViewerMetricReport {
     /// The origin stream the player is reporting against.
     pub stream: String,
-    /// The player's own id for this page load. Opaque; the manager joins it
-    /// to a portal login through the beat, which carries the same id.
+    /// The player's own id for its tab, kept across reloads. Opaque; the
+    /// manager joins it to a portal login through the beat, which carries the
+    /// same id.
     pub client: String,
     /// Seconds since the relay received this report.
     ///
     /// No address, deliberately. The relay sits behind a TLS terminator, so
-    /// the peer it sees is loopback for every viewer; and this list lands in
-    /// the manager's node health, which anyone with View on the relay can
-    /// read — an address here would walk past the Admin-only gate the
-    /// manager keeps on a viewer's address.
+    /// the peer it sees is loopback for every viewer; and this list rides the
+    /// relay's health message, which a manager that predates the viewer roll
+    /// keeps whole and shows to anyone with View on the relay — an address
+    /// here would walk past the Admin-only gate the manager keeps on a
+    /// viewer's address.
     pub age_secs: u64,
     /// `full`, `balanced` or `low`.
     pub quality: String,
@@ -227,6 +232,28 @@ pub struct ViewerEvent {
     pub ms: u32,
 }
 
+/// How one stream fared in the cut of playback reports carried on health.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ViewerMetricStream {
+    pub stream: String,
+    /// Clients holding a live report for this stream.
+    pub reporting: usize,
+    /// How many of those reports are in the list. Fewer than `reporting` when
+    /// the cut left some out, which the manager must read as "not listed",
+    /// never as "not reporting".
+    pub listed: usize,
+}
+
+/// The players' reports as the health message carries them: the list itself,
+/// shared fairly across streams, and per stream how much of it was cut.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ViewerMetricsSnapshot {
+    /// Grouped by stream, freshest first within each.
+    pub reports: Vec<ViewerMetricReport>,
+    /// One entry per stream with at least one live report.
+    pub streams: Vec<ViewerMetricStream>,
+}
+
 /// Snapshot of the distribution subsystem telemetry.
 #[derive(Debug, Clone, Serialize)]
 pub struct DistributionStatsSnapshot {
@@ -238,8 +265,6 @@ pub struct DistributionStatsSnapshot {
     pub offpath_sessions: u64,
     /// Per-stream breakdown of `origin_bytes`.
     pub origin_streams: Vec<OriginStreamUsage>,
-    /// What each viewer's player last reported, freshest first.
-    pub viewer_metrics: Vec<ViewerMetricReport>,
 }
 
 /// Current wall-clock epoch in milliseconds (saturating to 0 before 1970).
@@ -285,7 +310,9 @@ impl RelayStats {
             distribution_bytes_out: AtomicU64::new(0),
             distribution_origin_bytes: AtomicU64::new(0),
             distribution_origin_streams: arc_swap::ArcSwap::from_pointee(Vec::new()),
-            distribution_viewer_metrics: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            distribution_viewer_metrics: arc_swap::ArcSwap::from_pointee(
+                ViewerMetricsSnapshot::default(),
+            ),
             distribution_offpath_sessions: AtomicU64::new(0),
         }
     }
@@ -312,9 +339,14 @@ impl RelayStats {
 
     /// Publish what the viewers' players last reported (called by the
     /// subsystem on its telemetry tick).
-    pub fn set_viewer_metrics(&self, reports: Vec<ViewerMetricReport>) {
+    pub fn set_viewer_metrics(&self, snapshot: ViewerMetricsSnapshot) {
         self.distribution_viewer_metrics
-            .store(std::sync::Arc::new(reports));
+            .store(std::sync::Arc::new(snapshot));
+    }
+
+    /// The players' reports last published, shared rather than copied.
+    pub fn viewer_metrics(&self) -> std::sync::Arc<ViewerMetricsSnapshot> {
+        self.distribution_viewer_metrics.load_full()
     }
 
     /// Snapshot the distribution telemetry. Returns `None` when the subsystem
@@ -331,7 +363,6 @@ impl RelayStats {
             origin_bytes: self.distribution_origin_bytes.load(Ordering::Relaxed),
             offpath_sessions: self.distribution_offpath_sessions.load(Ordering::Relaxed),
             origin_streams: self.distribution_origin_streams.load().as_ref().clone(),
-            viewer_metrics: self.distribution_viewer_metrics.load().as_ref().clone(),
         })
     }
 

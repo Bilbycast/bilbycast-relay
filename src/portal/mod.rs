@@ -697,7 +697,7 @@ pub struct WatchQuery {
     #[serde(default)]
     pub held: Option<String>,
     /// On a beat, the id the player reports its playback metrics under at the
-    /// relay (`POST /origin/{stream}/metrics`). Minted by the page per load;
+    /// relay (`POST /origin/{stream}/metrics`). Kept by the page per tab;
     /// carried here so the manager can put a login's name beside the numbers
     /// the relay holds anonymously. Opaque, grants nothing, optional: an older
     /// player beats without one and is simply listed without metrics.
