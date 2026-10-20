@@ -107,7 +107,7 @@ The `flow_id` field contains the tunnel UUID for all tunnel events.
 | info | Connected to manager | WebSocket auth succeeded (auth_ok or register_ack) |
 | warning | Manager connection lost, rotating to next URL | WebSocket closed normally |
 | warning | Manager connection lost, rotating to next URL: {error} | WebSocket errored |
-| critical | Manager authentication failed: {reason} | Auth rejected by manager |
+| critical | Manager authentication failed: {reason} | Auth rejected by manager. After a `rotate_secret` the manager did not store (its acknowledgement lost or late, or its database write failed), the next reconnect raises this once, with the new secret, before the relay falls back to the previous one |
 
 **Source**: `src/manager/client.rs`
 
@@ -117,8 +117,8 @@ The `flow_id` field contains the tunnel UUID for all tunnel events.
 
 | Severity | Message | Trigger |
 |----------|---------|---------|
-| info | Secret rotated successfully | rotate_secret command completed |
-| warning | Credential persistence failed: {error} | Failed to write credentials to config file after rotation |
+| info | Secret rotated successfully | `rotate_secret` saved the new secret to the config file and its acknowledgement was sent. The next authentication presents the new secret |
+| warning | Credential persistence failed: {error} | The config file could not be written. On `rotate_secret` the rotation is **refused** (`success: false`), so the manager keeps the old secret and the relay goes on presenting it. After an authentication that settled which secret the manager holds after a rotation, the relay is connected but the file may still hold a secret the manager refused, which a restart would present |
 
 **Source**: `src/manager/client.rs`
 

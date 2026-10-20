@@ -159,7 +159,7 @@ pub fn start_manager_client(
 
 #[allow(clippy::too_many_arguments)]
 async fn manager_client_loop(
-    mut config: ManagerConfig,
+    config: ManagerConfig,
     ctx: Arc<SessionContext>,
     relay_stats: Arc<RelayStats>,
     relay_config: RelayConfig,
@@ -173,6 +173,7 @@ async fn manager_client_loop(
     // accumulates). 1-16 URLs in config.urls.
     let fixed_backoff = Duration::from_secs(5);
     let mut cursor: usize = 0;
+    let mut creds = LinkCredentials::new(config);
 
     // Surface manager-link state on the relay's OWN local REST/metrics
     // (purely local observability — no WS-protocol change). A configured
@@ -183,38 +184,26 @@ async fn manager_client_loop(
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
     loop {
-        if config.urls.is_empty() {
+        let urls = &creds.config.urls;
+        if urls.is_empty() {
             tracing::error!("Manager client started with no URLs — config.urls is empty");
             tokio::time::sleep(fixed_backoff).await;
             continue;
         }
-        let current_url = config.urls[cursor % config.urls.len()].clone();
+        let current_url = urls[cursor % urls.len()].clone();
         // For the log only: a manager URL may carry a credential for whatever
         // fronts the manager (a userinfo, a `?token=`).
         let shown_url = crate::config::redact_url(&current_url);
         tracing::info!(
             "Connecting to manager at {shown_url} (url {} of {})",
-            (cursor % config.urls.len()) + 1,
-            config.urls.len(),
+            (cursor % urls.len()) + 1,
+            urls.len(),
         );
 
-        match try_connect(&current_url, &config, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender, distribution_control.as_ref()).await {
-            Ok(ConnectResult::Closed) => {
+        match try_connect(&current_url, &mut creds, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender, distribution_control.as_ref()).await {
+            Ok(()) => {
                 tracing::info!("Manager connection to {shown_url} closed normally");
                 event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, "Manager connection lost, rotating to next URL");
-            }
-            Ok(ConnectResult::Registered {
-                node_id,
-                node_secret,
-            }) => {
-                tracing::info!(
-                    "Registered with manager as node_id={node_id}, persisting credentials"
-                );
-                config.registration_token = None;
-                config.node_id = Some(node_id.clone());
-                config.node_secret = Some(node_secret.clone());
-
-                persist_credentials(&relay_config, &config_path, &node_id, &node_secret);
             }
             Err(e) => {
                 tracing::warn!("Manager connection to {shown_url} failed: {e}");
@@ -235,18 +224,116 @@ async fn manager_client_loop(
     }
 }
 
-enum ConnectResult {
-    Closed,
-    Registered {
-        node_id: String,
-        node_secret: String,
-    },
+/// How many secrets the relay keeps besides the one it presents.
+///
+/// Each is one refused authentication at worst, and the manager locks a node
+/// out after five refusals in 60 s (`NodeAuthLimiter`). Four fallbacks means
+/// the right secret is reached on the fifth attempt at the latest, before the
+/// lockout would refuse it too.
+const MAX_FALLBACK_SECRETS: usize = 4;
+
+/// What the reconnect loop authenticates with, carried from one connection to
+/// the next.
+///
+/// The connection that learns of a change — a registration, a rotated secret,
+/// which of several candidate secrets the manager accepted — updates this in
+/// place, so the change survives however that connection ends. Registration
+/// used to hand its credentials back in `try_connect`'s `Ok` value, and a
+/// connection reset, the usual way a WebSocket ends, comes back as `Err`: the
+/// credentials were dropped, and the relay presented its consumed
+/// registration token at every reconnect until it was restarted.
+struct LinkCredentials {
+    /// The connection settings. `node_secret` is the secret presented at the
+    /// next authentication.
+    config: ManagerConfig,
+    /// Secrets the manager may hold instead of `config.node_secret`, the most
+    /// likely first. Empty except between a rotation and the first
+    /// authentication that shows which secret the manager stored.
+    fallback_secrets: Vec<String>,
+}
+
+impl LinkCredentials {
+    fn new(config: ManagerConfig) -> Self {
+        Self {
+            config,
+            fallback_secrets: Vec::new(),
+        }
+    }
+
+    /// The manager registered the relay and issued these credentials.
+    fn registered(&mut self, node_id: String, node_secret: String) {
+        self.config.registration_token = None;
+        self.config.node_id = Some(node_id);
+        self.config.node_secret = Some(node_secret);
+        self.fallback_secrets.clear();
+    }
+
+    /// The relay saved `new_secret` and answered the `rotate_secret` that
+    /// carried it. `ack_sent` is whether that answer was written to the
+    /// connection.
+    ///
+    /// The relay cannot know whether the manager stored the new secret. The
+    /// manager stores it only once it reads a successful acknowledgement, so it
+    /// keeps the old one when the acknowledgement is lost with the connection,
+    /// arrives after the manager's 10 s wait, or its database write fails. A
+    /// relay that simply switched to the new secret would be refused at its
+    /// next reconnect in each of those cases, and keep being refused. A relay
+    /// that kept the old one — as this one did, until a restart read the file
+    /// — is refused whenever the rotation did land. So it keeps both, presents
+    /// the likelier one first and falls back to the other ([`Self::rejected`])
+    /// until an authentication settles it ([`Self::accepted`]).
+    ///
+    /// The likelier one is the new secret when the acknowledgement left, and
+    /// the old one when it did not, since then the manager cannot have read it.
+    ///
+    /// The fallbacks live in memory only. A relay restarted before its next
+    /// authentication presents the secret in the file — always the newest
+    /// rotated one — with nothing to fall back to: right whenever the manager
+    /// stored that rotation, and locked out when it did not.
+    fn rotated(&mut self, new_secret: String, ack_sent: bool) {
+        if ack_sent {
+            if let Some(previous) = self.config.node_secret.replace(new_secret) {
+                self.fallback_secrets.insert(0, previous);
+            }
+        } else {
+            self.fallback_secrets.push(new_secret);
+        }
+        // Oldest last, and the least likely: it is the manager's only if every
+        // rotation since was lost.
+        self.fallback_secrets.truncate(MAX_FALLBACK_SECRETS);
+    }
+
+    /// The manager refused `config.node_secret`. Present the next candidate at
+    /// the next attempt.
+    ///
+    /// The refused secret goes to the back rather than away. A refusal is not
+    /// always a verdict on the secret: the manager also answers `auth_error`
+    /// while a node is locked out and when its database read fails.
+    fn rejected(&mut self) {
+        if self.fallback_secrets.is_empty() {
+            return;
+        }
+        let next = self.fallback_secrets.remove(0);
+        if let Some(refused) = self.config.node_secret.replace(next) {
+            self.fallback_secrets.push(refused);
+        }
+    }
+
+    /// The manager accepted `config.node_secret`. Returns whether this settled
+    /// which secret it holds, in which case the caller saves it: the config
+    /// file holds the newest rotated secret, and the manager may have accepted
+    /// an older one.
+    fn accepted(&mut self) -> bool {
+        let settled = !self.fallback_secrets.is_empty();
+        self.fallback_secrets.clear();
+        settled
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn try_connect(
     current_url: &str,
-    config: &ManagerConfig,
+    creds: &mut LinkCredentials,
     ctx: &Arc<SessionContext>,
     relay_stats: &Arc<RelayStats>,
     relay_config: &RelayConfig,
@@ -254,7 +341,8 @@ async fn try_connect(
     event_rx: &mut mpsc::Receiver<Event>,
     event_sender: &super::events::EventSender,
     distribution_control: Option<&Arc<DistributionControl>>,
-) -> Result<ConnectResult, String> {
+) -> Result<(), String> {
+    let config = &creds.config;
     // Enforce TLS — only wss:// connections are allowed
     if !current_url.starts_with("wss://") {
         return Err(
@@ -326,10 +414,33 @@ async fn try_connect(
 
     tracing::info!("WebSocket connected, sending auth...");
 
+    run_session(ws_stream, creds, ctx, relay_stats, relay_config, config_path, event_rx, event_sender, distribution_control).await
+}
+
+/// One manager session over an established WebSocket: authenticate, then pump
+/// stats, health, events and commands until the connection ends.
+///
+/// Separate from [`try_connect`] so the tests can drive it over an in-memory
+/// stream; `try_connect` only enforces `wss://` and builds the TLS connection.
+#[allow(clippy::too_many_arguments)]
+async fn run_session<T>(
+    ws_stream: tokio_tungstenite::WebSocketStream<T>,
+    creds: &mut LinkCredentials,
+    ctx: &Arc<SessionContext>,
+    relay_stats: &Arc<RelayStats>,
+    relay_config: &RelayConfig,
+    config_path: &PathBuf,
+    event_rx: &mut mpsc::Receiver<Event>,
+    event_sender: &super::events::EventSender,
+    distribution_control: Option<&Arc<DistributionControl>>,
+) -> Result<(), String>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     // Step 1: Send auth message
-    let auth_msg = build_auth_message(config);
+    let auth_msg = build_auth_message(&creds.config);
     if let Ok(json) = serde_json::to_string(&auth_msg) {
         ws_write
             .send(Message::Text(json.into()))
@@ -339,8 +450,6 @@ async fn try_connect(
 
     // Step 2: Wait for auth response (10s timeout)
     let auth_timeout = tokio::time::timeout(Duration::from_secs(10), ws_read.next()).await;
-
-    let mut registered_creds: Option<(String, String)> = None;
 
     match auth_timeout {
         Ok(Some(Ok(Message::Text(text)))) => {
@@ -352,6 +461,26 @@ async fn try_connect(
                     tracing::info!("Authenticated with manager");
                     relay_stats.mark_manager_connected();
                     event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Connected to manager");
+                    if creds.accepted()
+                        && let Some(secret) = &creds.config.node_secret
+                    {
+                        // The file holds the newest rotated secret, which the
+                        // manager may never have stored. Save the one it just
+                        // accepted, so a restart presents it too.
+                        match persist_node_secret(relay_config, config_path, secret) {
+                            Ok(()) => tracing::info!(
+                                "Manager accepted a node secret after a rotation; saved it to {}",
+                                config_path.display()
+                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to save the node secret the manager accepted: {e}; \
+                                     after a restart the relay may present one the manager does not hold"
+                                );
+                                event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
+                            }
+                        }
+                    }
                 }
                 "register_ack" => {
                     let payload = &response["payload"];
@@ -363,12 +492,13 @@ async fn try_connect(
 
                     if !node_id.is_empty() && !node_secret.is_empty() {
                         persist_credentials(relay_config, config_path, &node_id, &node_secret);
-                        registered_creds = Some((node_id, node_secret));
+                        creds.registered(node_id, node_secret);
                     }
                 }
                 "auth_error" => {
                     let msg = response["message"].as_str().unwrap_or("Unknown auth error");
                     event_sender.emit(super::events::EventSeverity::Critical, category::MANAGER, format!("Manager authentication failed: {}", msg));
+                    creds.rejected();
                     return Err(format!("Auth rejected: {msg}"));
                 }
                 other => {
@@ -420,7 +550,7 @@ async fn try_connect(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(&text, ctx, relay_config, config_path, &mut ws_write, distribution_control).await;
+                        handle_manager_message(&text, ctx, relay_config, config_path, &mut ws_write, distribution_control, creds).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
@@ -444,14 +574,7 @@ async fn try_connect(
         }
     }
 
-    if let Some((node_id, node_secret)) = registered_creds {
-        return Ok(ConnectResult::Registered {
-            node_id,
-            node_secret,
-        });
-    }
-
-    Ok(ConnectResult::Closed)
+    Ok(())
 }
 
 // ───────────────────────────────────────────────────────
@@ -1126,6 +1249,7 @@ async fn handle_manager_message<S>(
     config_path: &PathBuf,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
     distribution_control: Option<&Arc<DistributionControl>>,
+    creds: &mut LinkCredentials,
 ) where
     S: futures_util::Sink<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
@@ -1167,23 +1291,30 @@ async fn handle_manager_message<S>(
                 return;
             }
 
-            // rotate_secret is handled inline (needs config_path for persistence)
+            // rotate_secret is handled inline: it writes to config_path, and it
+            // changes the secret the next reconnect presents.
+            //
+            // The order is save, answer, adopt. A secret the relay could not
+            // save is refused: the manager is told so and keeps the old secret,
+            // which the relay goes on presenting. Answering success for it
+            // instead would have the manager store a secret the file does not
+            // hold, and the relay would be locked out at its next restart. The answer is sent before the
+            // secret is adopted because whether it left decides which secret
+            // the relay presents first — see `LinkCredentials::rotated`, which
+            // also keeps the old secret for an answer the manager never reads.
             if action_type == "rotate_secret" {
-                let result = rotated_secret(action).map(|new_secret| {
-                    tracing::info!("Manager command: rotate_secret — updating node authentication secret");
-                    // Persist new secret to config file. Through the
-                    // shared helper: rotating must not revert the
+                tracing::info!("Manager command: rotate_secret — updating node authentication secret");
+                let result = rotated_secret(action).and_then(|new_secret| {
+                    // Through the shared helper: rotating must not revert the
                     // distribution config the manager pushed since startup.
-                    if let Err(e) = update_config_file(config_path, relay_config, |config| {
-                        if let Some(ref mut mgr) = config.manager {
-                            mgr.node_secret = Some(new_secret.to_string());
+                    match persist_node_secret(relay_config, config_path, new_secret) {
+                        Ok(()) => Ok(new_secret.to_string()),
+                        Err(e) => {
+                            tracing::warn!("Failed to persist rotated secret: {e}");
+                            ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
+                            Err(format!("The relay could not save the new secret, so it keeps its current one: {e}"))
                         }
-                    }) {
-                        tracing::warn!("Failed to persist rotated secret: {e}");
-                        ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
                     }
-                    tracing::info!("Node secret rotated and persisted");
-                    ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
                 });
 
                 let ack = serde_json::json!({
@@ -1192,11 +1323,24 @@ async fn handle_manager_message<S>(
                     "payload": {
                         "command_id": command_id,
                         "success": result.is_ok(),
-                        "error": result.err()
+                        "error": result.as_ref().err()
                     }
                 });
-                if let Ok(json) = serde_json::to_string(&ack) {
-                    let _ = ws_write.send(Message::Text(json.into())).await;
+                let ack_sent = match serde_json::to_string(&ack) {
+                    Ok(json) => ws_write.send(Message::Text(json.into())).await.is_ok(),
+                    Err(_) => false,
+                };
+                if let Ok(new_secret) = result {
+                    creds.rotated(new_secret, ack_sent);
+                    if ack_sent {
+                        tracing::info!("Node secret rotated and persisted; the next authentication presents it");
+                        ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
+                    } else {
+                        tracing::warn!(
+                            "Node secret rotated and persisted, but the acknowledgement did not reach the \
+                             manager; the next authentication presents the previous secret first"
+                        );
+                    }
                 }
                 return;
             }
@@ -1414,6 +1558,20 @@ fn persist_credentials(
         Ok(()) => tracing::info!("Manager credentials saved to {}", config_path.display()),
         Err(e) => tracing::warn!("Failed to persist manager credentials: {e}"),
     }
+}
+
+/// Save `node_secret` as the relay's manager secret, leaving the rest of the
+/// file as it is.
+fn persist_node_secret(
+    relay_config: &RelayConfig,
+    config_path: &PathBuf,
+    node_secret: &str,
+) -> Result<(), String> {
+    update_config_file(config_path, relay_config, |config| {
+        if let Some(ref mut mgr) = config.manager {
+            mgr.node_secret = Some(node_secret.to_string());
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2164,5 +2322,376 @@ mod redaction_tests {
             serde_json::json!({ "type": "configure_distribution", "cascade_sources": twice }),
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    //! The credentials a session hands the next one, driven through the real
+    //! session loop and command handler against a fake manager on the other
+    //! end of an in-memory WebSocket. `try_connect` adds only the `wss://`
+    //! check and the TLS connection in front of `run_session`.
+    use super::*;
+    use crate::config::{ManagerConfig, RelayConfig};
+    use tokio::io::DuplexStream;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    type Ws = WebSocketStream<DuplexStream>;
+
+    const OLD: &str = "old-secret";
+    const NEW: &str = "new-secret";
+
+    fn manager_config(node_secret: Option<&str>, registration_token: Option<&str>) -> ManagerConfig {
+        ManagerConfig {
+            enabled: true,
+            urls: vec!["wss://m.example/ws/node".into()],
+            accept_self_signed_cert: false,
+            cert_fingerprint: None,
+            registration_token: registration_token.map(str::to_string),
+            node_id: node_secret.map(|_| "node-1".to_string()),
+            node_secret: node_secret.map(str::to_string),
+        }
+    }
+
+    /// The relay's end: its config file, and what `manager_client_loop` hands
+    /// every session.
+    struct Relay {
+        _dir: tempfile::TempDir,
+        config_path: PathBuf,
+        relay_config: RelayConfig,
+        ctx: Arc<SessionContext>,
+        relay_stats: Arc<RelayStats>,
+        event_sender: crate::manager::events::EventSender,
+        event_rx: mpsc::Receiver<Event>,
+    }
+
+    impl Relay {
+        /// A relay whose config file holds `manager`.
+        fn new(manager: ManagerConfig) -> Self {
+            Self::at("relay.json", manager)
+        }
+
+        /// A relay whose config file is at `file` inside a fresh directory —
+        /// a path under a directory that does not exist cannot be written.
+        fn at(file: &str, manager: ManagerConfig) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join(file);
+            let relay_config = RelayConfig { manager: Some(manager), ..Default::default() };
+            if config_path.parent().is_some_and(|p| p.exists()) {
+                std::fs::write(&config_path, serde_json::to_string_pretty(&relay_config).unwrap())
+                    .unwrap();
+            }
+            let relay_stats = Arc::new(RelayStats::new());
+            let (event_sender, event_rx) = crate::manager::event_channel();
+            let ctx = crate::server::create_session_context(
+                relay_stats.clone(),
+                event_sender.clone(),
+                false,
+                64,
+                100,
+            );
+            Self { _dir: dir, config_path, relay_config, ctx, relay_stats, event_sender, event_rx }
+        }
+
+        fn credentials(&self) -> LinkCredentials {
+            LinkCredentials::new(self.relay_config.manager.clone().unwrap())
+        }
+
+        fn secret_on_disk(&self) -> Option<String> {
+            let text = std::fs::read_to_string(&self.config_path).ok()?;
+            serde_json::from_str::<RelayConfig>(&text).ok()?.manager?.node_secret
+        }
+
+        /// One session with `manager` playing the other end. Returns how the
+        /// session ended and what `manager` returned.
+        async fn session<F, Fut, R>(&mut self, creds: &mut LinkCredentials, manager: F) -> (Result<(), String>, R)
+        where
+            F: FnOnce(Ws) -> Fut,
+            Fut: std::future::Future<Output = R>,
+        {
+            let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
+            let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await;
+            let manager_ws = WebSocketStream::from_raw_socket(manager_io, Role::Server, None).await;
+            let session = run_session(
+                relay_ws,
+                creds,
+                &self.ctx,
+                &self.relay_stats,
+                &self.relay_config,
+                &self.config_path,
+                &mut self.event_rx,
+                &self.event_sender,
+                None,
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(session, manager(manager_ws))
+            })
+            .await
+            .expect("the session did not end")
+        }
+    }
+
+    async fn recv(ws: &mut Ws) -> serde_json::Value {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
+                Some(Ok(_)) => continue,
+                other => panic!("the relay's connection ended: {other:?}"),
+            }
+        }
+    }
+
+    async fn send(ws: &mut Ws, value: serde_json::Value) {
+        ws.send(Message::Text(value.to_string().into())).await.unwrap();
+    }
+
+    fn auth_ok() -> serde_json::Value {
+        serde_json::json!({ "type": "auth_ok" })
+    }
+
+    /// What the manager answers a secret it does not hold.
+    fn auth_error() -> serde_json::Value {
+        serde_json::json!({ "type": "auth_error", "message": "Invalid node secret" })
+    }
+
+    /// The manager's half of an authentication: answer `reply`, and return
+    /// what the relay presented.
+    async fn authenticate(ws: &mut Ws, reply: serde_json::Value) -> serde_json::Value {
+        let auth = recv(ws).await;
+        assert_eq!(auth["type"], "auth", "{auth}");
+        send(ws, reply).await;
+        auth["payload"].clone()
+    }
+
+    fn rotate_command(new_secret: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "command",
+            "payload": {
+                "command_id": "rotate-1",
+                "action": { "type": "rotate_secret", "new_secret": new_secret }
+            }
+        })
+    }
+
+    /// Send `rotate_secret`, as `POST /api/v1/nodes/{id}/rotate-secret` does,
+    /// and return the relay's acknowledgement.
+    async fn rotate(ws: &mut Ws, new_secret: &str) -> serde_json::Value {
+        send(ws, rotate_command(new_secret)).await;
+        loop {
+            let msg = recv(ws).await;
+            if msg["type"] == "command_ack" && msg["payload"]["command_id"] == "rotate-1" {
+                return msg["payload"].clone();
+            }
+        }
+    }
+
+    /// End the connection the way a reset does: the relay's read fails, so
+    /// the session returns `Err`, not `Ok`. Then wait for the relay to hang up.
+    async fn break_connection(mut ws: Ws) {
+        use tokio::io::AsyncWriteExt;
+        // A frame with every reserved bit set, which no peer may send.
+        ws.get_mut().write_all(&[0xF1, 0x00]).await.unwrap();
+        while let Some(Ok(_)) = ws.next().await {}
+    }
+
+    /// The relay used to save the rotated secret and acknowledge it — so the
+    /// manager stored it — and go on presenting the old one, refused at every
+    /// reconnect until a restart read the file. The connection is broken
+    /// rather than closed, because a session that returns `Err` is the path on
+    /// which a credential handed back in the result would be lost.
+    #[tokio::test]
+    async fn a_rotated_secret_is_presented_at_the_next_reconnect() {
+        let mut relay = Relay::new(manager_config(Some(OLD), None));
+        let mut creds = relay.credentials();
+
+        let (ended, ack) = relay
+            .session(&mut creds, |mut ws| async move {
+                let shown = authenticate(&mut ws, auth_ok()).await;
+                assert_eq!(shown["node_secret"], OLD);
+                let ack = rotate(&mut ws, NEW).await;
+                break_connection(ws).await;
+                ack
+            })
+            .await;
+        assert_eq!(ack["success"], true, "{ack}");
+        assert!(ended.unwrap_err().contains("WebSocket error"));
+        assert_eq!(relay.secret_on_disk().as_deref(), Some(NEW));
+
+        let (_, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_id"], "node-1");
+        assert_eq!(
+            shown["node_secret"], NEW,
+            "the reconnect presented the secret the manager replaced"
+        );
+        assert_eq!(relay.secret_on_disk().as_deref(), Some(NEW));
+    }
+
+    /// An acknowledgement the manager never read — lost with the connection,
+    /// or later than its 10 s wait — leaves the manager on the old secret.
+    /// The relay is refused once with the new one, falls back to the old one,
+    /// and saves it, so a restart presents it too.
+    #[tokio::test]
+    async fn a_rotation_the_manager_did_not_store_falls_back_to_the_previous_secret() {
+        let mut relay = Relay::new(manager_config(Some(OLD), None));
+        let mut creds = relay.credentials();
+
+        let (_, ack) = relay
+            .session(&mut creds, |mut ws| async move {
+                authenticate(&mut ws, auth_ok()).await;
+                rotate(&mut ws, NEW).await
+            })
+            .await;
+        assert_eq!(ack["success"], true, "{ack}");
+
+        let (ended, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_error()).await })
+            .await;
+        assert_eq!(shown["node_secret"], NEW, "the likelier secret goes first");
+        assert!(ended.unwrap_err().contains("Auth rejected"));
+
+        let (_, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD, "the refused secret was presented again");
+        assert_eq!(
+            relay.secret_on_disk().as_deref(),
+            Some(OLD),
+            "a restart would present the secret the manager refused"
+        );
+
+        // Settled: nothing left to fall back to, and the next connection
+        // presents the accepted secret straight away.
+        assert!(creds.fallback_secrets.is_empty());
+        let (_, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD);
+    }
+
+    /// A secret the relay cannot save is refused. Acknowledging it would have
+    /// the manager store a secret the file does not hold, and the relay would
+    /// be locked out at its next restart.
+    #[tokio::test]
+    async fn a_secret_that_cannot_be_saved_is_refused_and_the_old_one_kept() {
+        let mut relay = Relay::at("missing/relay.json", manager_config(Some(OLD), None));
+        let mut creds = relay.credentials();
+
+        let (_, ack) = relay
+            .session(&mut creds, |mut ws| async move {
+                authenticate(&mut ws, auth_ok()).await;
+                rotate(&mut ws, NEW).await
+            })
+            .await;
+        assert_eq!(ack["success"], false, "{ack}");
+        let error = ack["error"].as_str().unwrap();
+        assert!(error.contains("could not save the new secret"), "{error}");
+
+        let (_, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD);
+        assert!(creds.fallback_secrets.is_empty(), "a refused secret is not a candidate");
+    }
+
+    /// When the acknowledgement could not even be written, the manager cannot
+    /// have read it: the old secret goes first, and is what the file is
+    /// brought back to once the manager accepts it.
+    #[tokio::test]
+    async fn an_acknowledgement_that_never_left_puts_the_previous_secret_first() {
+        let mut relay = Relay::new(manager_config(Some(OLD), None));
+        let mut creds = relay.credentials();
+
+        let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await;
+        drop(manager_io);
+        let (mut ws_write, _ws_read) = relay_ws.split();
+        handle_manager_message(
+            &rotate_command(NEW).to_string(),
+            &relay.ctx,
+            &relay.relay_config,
+            &relay.config_path,
+            &mut ws_write,
+            None,
+            &mut creds,
+        )
+        .await;
+        assert_eq!(relay.secret_on_disk().as_deref(), Some(NEW), "saved before it is answered");
+
+        let (_, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD);
+        assert_eq!(relay.secret_on_disk().as_deref(), Some(OLD));
+    }
+
+    /// Registration had the same flaw, handing its credentials back in the
+    /// session's `Ok` value: a reset after `register_ack` dropped them, and
+    /// the relay presented its consumed registration token until a restart.
+    #[tokio::test]
+    async fn a_registration_survives_a_reset_connection() {
+        let mut relay = Relay::new(manager_config(None, Some("one-time-token")));
+        let mut creds = relay.credentials();
+
+        let (ended, shown) = relay
+            .session(&mut creds, |mut ws| async move {
+                let register_ack = serde_json::json!({
+                    "type": "register_ack",
+                    "payload": { "node_id": "node-9", "node_secret": "issued-secret" }
+                });
+                let shown = authenticate(&mut ws, register_ack).await;
+                break_connection(ws).await;
+                shown
+            })
+            .await;
+        assert_eq!(shown["registration_token"], "one-time-token");
+        assert!(ended.unwrap_err().contains("WebSocket error"));
+
+        let (_, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_id"], "node-9");
+        assert_eq!(shown["node_secret"], "issued-secret");
+        assert!(shown.get("registration_token").is_none(), "{shown}");
+    }
+
+    /// Two rotations in one session, the second never stored: the manager holds
+    /// the first. Every secret issued since the last accepted one stays a
+    /// candidate, newest first, and a refusal moves one to the back rather
+    /// than dropping it.
+    #[test]
+    fn every_secret_since_the_last_accepted_one_is_tried_newest_first() {
+        let mut creds = LinkCredentials::new(manager_config(Some("s0"), None));
+        creds.rotated("s1".into(), true);
+        creds.rotated("s2".into(), true);
+
+        let mut presented = Vec::new();
+        for _ in 0..4 {
+            presented.push(creds.config.node_secret.clone().unwrap());
+            creds.rejected();
+        }
+        assert_eq!(presented, ["s2", "s1", "s0", "s2"]);
+
+        assert!(creds.accepted(), "accepting settles which secret the manager holds");
+        assert!(creds.fallback_secrets.is_empty());
+        assert!(!creds.accepted(), "nothing was open the second time");
+    }
+
+    /// The manager locks a node out after five refusals in 60 s. However many
+    /// rotations go unconfirmed, the relay reaches the last candidate on its
+    /// fifth attempt at the latest.
+    #[test]
+    fn the_candidates_stay_inside_the_managers_lockout() {
+        let mut creds = LinkCredentials::new(manager_config(Some("s0"), None));
+        for i in 1..=10 {
+            creds.rotated(format!("s{i}"), true);
+        }
+        assert_eq!(creds.config.node_secret.as_deref(), Some("s10"));
+        assert_eq!(creds.fallback_secrets, ["s9", "s8", "s7", "s6"]);
+        // The one presented plus its fallbacks, so at most four refusals.
+        let candidates = 1 + creds.fallback_secrets.len();
+        assert!(candidates <= 5, "{candidates} candidates would run into the lockout");
     }
 }
