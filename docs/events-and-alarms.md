@@ -107,7 +107,7 @@ The `flow_id` field contains the tunnel UUID for all tunnel events.
 | info | Connected to manager | WebSocket auth succeeded (auth_ok or register_ack) |
 | warning | Manager connection lost, rotating to next URL | WebSocket closed normally |
 | warning | Manager connection lost, rotating to next URL: {error} | WebSocket errored |
-| critical | Manager authentication failed: {reason} | Auth rejected by manager. After a `rotate_secret` the manager did not store (its acknowledgement lost or late, or its database write failed), the next reconnect raises this once, with the new secret, before the relay falls back to the previous one |
+| critical | Manager authentication failed: {reason} | Auth rejected by manager. After a `rotate_secret` whose acknowledgement was sent but which the manager did not store (the connection dropped before the manager read the acknowledgement, the manager read it after its 10 s wait, or its database write failed), the next reconnect raises this with the new secret before the relay falls back to the previous one: once for each such rotation since the relay last authenticated. A rotation whose acknowledgement could not be sent at all raises nothing, because the relay then presents the previous secret first |
 
 **Source**: `src/manager/client.rs`
 
@@ -118,7 +118,7 @@ The `flow_id` field contains the tunnel UUID for all tunnel events.
 | Severity | Message | Trigger |
 |----------|---------|---------|
 | info | Secret rotated successfully | `rotate_secret` saved the new secret to the config file and its acknowledgement was sent. The next authentication presents the new secret |
-| warning | Credential persistence failed: {error} | The config file could not be written. On `rotate_secret` the rotation is **refused** (`success: false`), so the manager keeps the old secret and the relay goes on presenting it. After an authentication that settled which secret the manager holds after a rotation, the relay is connected but the file may still hold a secret the manager refused, which a restart would present |
+| warning | Credential persistence failed: {error} | The config file could not be written. On `rotate_secret` the rotation is **refused** (`success: false`), so the manager keeps the old secret and the relay goes on presenting it. When a rotation's acknowledgement could not be sent, the relay puts the previous secret back in the file; if that write fails, the file keeps the new secret, which a restart before the next authentication would present. After an authentication that settled which secret the manager holds after a rotation, the relay is connected but the file may still hold a secret the manager refused, which a restart would present |
 
 **Source**: `src/manager/client.rs`
 

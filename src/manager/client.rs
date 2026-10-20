@@ -152,13 +152,17 @@ pub fn start_manager_client(
             event_rx,
             event_sender,
             distribution_control,
+            connect_to_manager,
         )
         .await;
     })
 }
 
+/// The reconnect loop. `connect` opens the WebSocket for one attempt —
+/// [`connect_to_manager`] in the relay, an in-memory stream in the tests —
+/// and [`run_session`] runs it.
 #[allow(clippy::too_many_arguments)]
-async fn manager_client_loop(
+async fn manager_client_loop<C, F, S>(
     config: ManagerConfig,
     ctx: Arc<SessionContext>,
     relay_stats: Arc<RelayStats>,
@@ -167,12 +171,21 @@ async fn manager_client_loop(
     mut event_rx: mpsc::Receiver<Event>,
     event_sender: super::events::EventSender,
     distribution_control: Option<Arc<DistributionControl>>,
-) {
+    mut connect: C,
+) where
+    C: FnMut(String, ManagerConfig) -> F,
+    F: std::future::Future<Output = Result<tokio_tungstenite::WebSocketStream<S>, String>>,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Multi-URL failover: rotate to the next manager URL on each close/error;
     // constant 5 s backoff between attempts (no delay while connected; never
     // accumulates). 1-16 URLs in config.urls.
     let fixed_backoff = Duration::from_secs(5);
     let mut cursor: usize = 0;
+    // Made once, before the loop, and handed to every session: a session
+    // records here what it learns about the credentials — a registration, a
+    // rotated secret, which candidate secret the manager accepted — and the
+    // next attempt must authenticate with that, not with the startup config.
     let mut creds = LinkCredentials::new(config);
 
     // Surface manager-link state on the relay's OWN local REST/metrics
@@ -200,7 +213,11 @@ async fn manager_client_loop(
             urls.len(),
         );
 
-        match try_connect(&current_url, &mut creds, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender, distribution_control.as_ref()).await {
+        let ended = match connect(current_url, creds.config.clone()).await {
+            Ok(ws_stream) => run_session(ws_stream, &mut creds, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender, distribution_control.as_ref()).await,
+            Err(e) => Err(e),
+        };
+        match ended {
             Ok(()) => {
                 tracing::info!("Manager connection to {shown_url} closed normally");
                 event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, "Manager connection lost, rotating to next URL");
@@ -211,7 +228,7 @@ async fn manager_client_loop(
             }
         }
 
-        // The link is down again (try_connect only returns on close/error).
+        // The link is down again (an attempt only ends on close/error).
         // Stamp the disconnect for the local manager-link surface.
         relay_stats.mark_manager_disconnected();
 
@@ -238,9 +255,9 @@ const MAX_FALLBACK_SECRETS: usize = 4;
 /// The connection that learns of a change — a registration, a rotated secret,
 /// which of several candidate secrets the manager accepted — updates this in
 /// place, so the change survives however that connection ends. Registration
-/// used to hand its credentials back in `try_connect`'s `Ok` value, and a
-/// connection reset, the usual way a WebSocket ends, comes back as `Err`: the
-/// credentials were dropped, and the relay presented its consumed
+/// used to hand its credentials back in the `Ok` value a session ended with,
+/// and a connection reset, the usual way a WebSocket ends, comes back as
+/// `Err`: the credentials were dropped, and the relay presented its consumed
 /// registration token at every reconnect until it was restarted.
 struct LinkCredentials {
     /// The connection settings. `node_secret` is the secret presented at the
@@ -287,9 +304,12 @@ impl LinkCredentials {
     /// the old one when it did not, since then the manager cannot have read it.
     ///
     /// The fallbacks live in memory only. A relay restarted before its next
-    /// authentication presents the secret in the file — always the newest
-    /// rotated one — with nothing to fall back to: right whenever the manager
-    /// stored that rotation, and locked out when it did not.
+    /// authentication presents the secret in the file, with nothing to fall
+    /// back to. When the acknowledgement did not leave, the handler has put
+    /// the secret presented first back in the file, since this rotation
+    /// cannot have reached the manager. When it did, the file holds the new
+    /// one: right whenever the manager stored that rotation, and locked out
+    /// when it did not.
     fn rotated(&mut self, new_secret: String, ack_sent: bool) {
         if ack_sent {
             if let Some(previous) = self.config.node_secret.replace(new_secret) {
@@ -321,8 +341,8 @@ impl LinkCredentials {
 
     /// The manager accepted `config.node_secret`. Returns whether this settled
     /// which secret it holds, in which case the caller saves it: the config
-    /// file holds the newest rotated secret, and the manager may have accepted
-    /// an older one.
+    /// file holds the secret presented first after the rotation, and the
+    /// manager may have accepted another.
     fn accepted(&mut self) -> bool {
         let settled = !self.fallback_secrets.is_empty();
         self.fallback_secrets.clear();
@@ -330,19 +350,17 @@ impl LinkCredentials {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn try_connect(
-    current_url: &str,
-    creds: &mut LinkCredentials,
-    ctx: &Arc<SessionContext>,
-    relay_stats: &Arc<RelayStats>,
-    relay_config: &RelayConfig,
-    config_path: &PathBuf,
-    event_rx: &mut mpsc::Receiver<Event>,
-    event_sender: &super::events::EventSender,
-    distribution_control: Option<&Arc<DistributionControl>>,
-) -> Result<(), String> {
-    let config = &creds.config;
+/// Open the WebSocket to the manager at `current_url`, over TLS as `config`
+/// asks. It takes its arguments by value so the reconnect loop can take it as
+/// a plain function; the loop hands it a copy of the credentials it holds.
+async fn connect_to_manager(
+    current_url: String,
+    config: ManagerConfig,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    let current_url = current_url.as_str();
     // Enforce TLS — only wss:// connections are allowed
     if !current_url.starts_with("wss://") {
         return Err(
@@ -414,14 +432,15 @@ async fn try_connect(
 
     tracing::info!("WebSocket connected, sending auth...");
 
-    run_session(ws_stream, creds, ctx, relay_stats, relay_config, config_path, event_rx, event_sender, distribution_control).await
+    Ok(ws_stream)
 }
 
 /// One manager session over an established WebSocket: authenticate, then pump
 /// stats, health, events and commands until the connection ends.
 ///
-/// Separate from [`try_connect`] so the tests can drive it over an in-memory
-/// stream; `try_connect` only enforces `wss://` and builds the TLS connection.
+/// Separate from [`connect_to_manager`] so the tests can drive it over an
+/// in-memory stream; `connect_to_manager` only enforces `wss://` and builds
+/// the TLS connection.
 #[allow(clippy::too_many_arguments)]
 async fn run_session<T>(
     ws_stream: tokio_tungstenite::WebSocketStream<T>,
@@ -464,10 +483,11 @@ where
                     if creds.accepted()
                         && let Some(secret) = &creds.config.node_secret
                     {
-                        // The file holds the newest rotated secret, which the
-                        // manager may never have stored. Save the one it just
-                        // accepted, so a restart presents it too.
-                        match persist_node_secret(relay_config, config_path, secret) {
+                        // The file holds the secret presented first after the
+                        // rotation, which the manager may never have stored.
+                        // Save the one it just accepted, so a restart presents
+                        // it too.
+                        match persist_node_secret(relay_config, config_path, &creds.config, secret) {
                             Ok(()) => tracing::info!(
                                 "Manager accepted a node secret after a rotation; saved it to {}",
                                 config_path.display()
@@ -1298,16 +1318,17 @@ async fn handle_manager_message<S>(
             // save is refused: the manager is told so and keeps the old secret,
             // which the relay goes on presenting. Answering success for it
             // instead would have the manager store a secret the file does not
-            // hold, and the relay would be locked out at its next restart. The answer is sent before the
-            // secret is adopted because whether it left decides which secret
-            // the relay presents first — see `LinkCredentials::rotated`, which
-            // also keeps the old secret for an answer the manager never reads.
+            // hold, and the relay would be locked out at its next restart. The
+            // answer is sent before the secret is adopted because whether it
+            // left decides which secret the relay presents first — see
+            // `LinkCredentials::rotated`, which also keeps the old secret for an
+            // answer the manager never reads.
             if action_type == "rotate_secret" {
-                tracing::info!("Manager command: rotate_secret — updating node authentication secret");
                 let result = rotated_secret(action).and_then(|new_secret| {
+                    tracing::info!("Manager command: rotate_secret — updating node authentication secret");
                     // Through the shared helper: rotating must not revert the
                     // distribution config the manager pushed since startup.
-                    match persist_node_secret(relay_config, config_path, new_secret) {
+                    match persist_node_secret(relay_config, config_path, &creds.config, new_secret) {
                         Ok(()) => Ok(new_secret.to_string()),
                         Err(e) => {
                             tracing::warn!("Failed to persist rotated secret: {e}");
@@ -1331,16 +1352,34 @@ async fn handle_manager_message<S>(
                     Err(_) => false,
                 };
                 if let Ok(new_secret) = result {
-                    creds.rotated(new_secret, ack_sent);
                     if ack_sent {
                         tracing::info!("Node secret rotated and persisted; the next authentication presents it");
                         ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
                     } else {
+                        // The manager cannot have read an answer that never
+                        // left, so this rotation changed nothing there, and the
+                        // file goes back to the secret the relay presents
+                        // first. The answer failed because the connection did,
+                        // so the relay may stay unconnected for a while —
+                        // through a manager outage, say — and a restart in that
+                        // time would otherwise present the new secret from the
+                        // file with nothing to fall back to.
                         tracing::warn!(
                             "Node secret rotated and persisted, but the acknowledgement did not reach the \
-                             manager; the next authentication presents the previous secret first"
+                             manager; the relay keeps presenting the previous secret first"
                         );
+                        if let Some(previous) = &creds.config.node_secret
+                            && let Err(e) = persist_node_secret(relay_config, config_path, &creds.config, previous)
+                        {
+                            tracing::warn!(
+                                "Failed to put the previous node secret back in the config file: {e}; \
+                                 a restart before the next authentication would present one the manager \
+                                 does not hold"
+                            );
+                            ctx.event_sender.emit(super::events::EventSeverity::Warning, category::MANAGER, format!("Credential persistence failed: {}", e));
+                        }
                     }
+                    creds.rotated(new_secret, ack_sent);
                 }
                 return;
             }
@@ -1560,15 +1599,26 @@ fn persist_credentials(
     }
 }
 
-/// Save `node_secret` as the relay's manager secret, leaving the rest of the
-/// file as it is.
+/// Save `node_secret` as the relay's manager secret, with the identity it is
+/// the secret of — `identity`'s node ID and registration token, which are the
+/// ones the relay authenticates with now — and leave the rest of the file as
+/// it is.
+///
+/// The identity is written too, not only the secret, because the file is not
+/// always what gets edited: when it cannot be re-read, `update_config_file`
+/// edits the startup config instead, and for a relay that registered since it
+/// started that still holds the consumed registration token and no node ID. A
+/// restart would then present the token, and be refused.
 fn persist_node_secret(
     relay_config: &RelayConfig,
     config_path: &PathBuf,
+    identity: &ManagerConfig,
     node_secret: &str,
 ) -> Result<(), String> {
     update_config_file(config_path, relay_config, |config| {
         if let Some(ref mut mgr) = config.manager {
+            mgr.registration_token = identity.registration_token.clone();
+            mgr.node_id = identity.node_id.clone();
             mgr.node_secret = Some(node_secret.to_string());
         }
     })
@@ -2329,8 +2379,8 @@ mod redaction_tests {
 mod rotation_tests {
     //! The credentials a session hands the next one, driven through the real
     //! session loop and command handler against a fake manager on the other
-    //! end of an in-memory WebSocket. `try_connect` adds only the `wss://`
-    //! check and the TLS connection in front of `run_session`.
+    //! end of an in-memory WebSocket. `connect_to_manager` adds only the
+    //! `wss://` check and the TLS connection in front of `run_session`.
     use super::*;
     use crate::config::{ManagerConfig, RelayConfig};
     use tokio::io::DuplexStream;
@@ -2412,7 +2462,7 @@ mod rotation_tests {
         {
             let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
             let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await;
-            let manager_ws = WebSocketStream::from_raw_socket(manager_io, Role::Server, None).await;
+            let manager_ws = answer(manager_io).await;
             let session = run_session(
                 relay_ws,
                 creds,
@@ -2430,6 +2480,11 @@ mod rotation_tests {
             .await
             .expect("the session did not end")
         }
+    }
+
+    /// The manager's end of a connection the relay opened.
+    async fn answer(io: DuplexStream) -> Ws {
+        WebSocketStream::from_raw_socket(io, Role::Server, None).await
     }
 
     async fn recv(ws: &mut Ws) -> serde_json::Value {
@@ -2597,8 +2652,9 @@ mod rotation_tests {
     }
 
     /// When the acknowledgement could not even be written, the manager cannot
-    /// have read it: the old secret goes first, and is what the file is
-    /// brought back to once the manager accepts it.
+    /// have read it: the old secret goes first, and the file goes straight
+    /// back to it. The connection that failed may stay down — a manager
+    /// outage, say — and a restart in that time must not present the new one.
     #[tokio::test]
     async fn an_acknowledgement_that_never_left_puts_the_previous_secret_first() {
         let mut relay = Relay::new(manager_config(Some(OLD), None));
@@ -2618,13 +2674,105 @@ mod rotation_tests {
             &mut creds,
         )
         .await;
-        assert_eq!(relay.secret_on_disk().as_deref(), Some(NEW), "saved before it is answered");
+        assert_eq!(
+            relay.secret_on_disk().as_deref(),
+            Some(OLD),
+            "a restart now would present a secret the manager never read"
+        );
 
         let (_, shown) = relay
             .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
             .await;
         assert_eq!(shown["node_secret"], OLD);
         assert_eq!(relay.secret_on_disk().as_deref(), Some(OLD));
+    }
+
+    /// The file holds what a restart presents, so a saved secret takes the
+    /// identity it belongs to with it. A file that cannot be re-read is
+    /// rewritten from the startup config, and for a relay that registered
+    /// since it started that config still holds the consumed registration
+    /// token and no node ID.
+    #[tokio::test]
+    async fn a_secret_saved_over_an_unreadable_file_keeps_the_identity_it_belongs_to() {
+        let mut relay = Relay::new(manager_config(None, Some("one-time-token")));
+        let mut creds = relay.credentials();
+
+        let (_, ()) = relay
+            .session(&mut creds, |mut ws| async move {
+                let register_ack = serde_json::json!({
+                    "type": "register_ack",
+                    "payload": { "node_id": "node-9", "node_secret": "issued-secret" }
+                });
+                authenticate(&mut ws, register_ack).await;
+            })
+            .await;
+        std::fs::write(&relay.config_path, "{ not json").unwrap();
+
+        let (_, ack) = relay
+            .session(&mut creds, |mut ws| async move {
+                authenticate(&mut ws, auth_ok()).await;
+                rotate(&mut ws, NEW).await
+            })
+            .await;
+        assert_eq!(ack["success"], true, "{ack}");
+
+        let text = std::fs::read_to_string(&relay.config_path).unwrap();
+        let on_disk = serde_json::from_str::<RelayConfig>(&text).unwrap().manager.unwrap();
+        let after_restart = build_auth_message(&on_disk)["payload"].clone();
+        assert_eq!(after_restart["node_id"], "node-9", "{after_restart}");
+        assert_eq!(after_restart["node_secret"], NEW, "{after_restart}");
+        assert!(on_disk.registration_token.is_none(), "the consumed token was written back");
+    }
+
+    /// The reconnect loop itself, not only one session, carries what a session
+    /// learned: the credentials outlive each attempt. This is where the relay
+    /// was locked out — the loop kept authenticating with the config it
+    /// started with, whatever the session before had been told.
+    #[tokio::test(start_paused = true)]
+    async fn the_reconnect_loop_presents_a_rotated_secret_at_its_next_attempt() {
+        let relay = Relay::new(manager_config(Some(OLD), None));
+        let manager = relay.relay_config.manager.clone().unwrap();
+
+        // Each attempt gets a fresh in-memory connection, whose manager end
+        // comes out here.
+        let (manager_end, mut accepted) = mpsc::unbounded_channel();
+        let connect = move |_url: String, _config: ManagerConfig| {
+            let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
+            let _ = manager_end.send(manager_io);
+            async move { Ok(WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await) }
+        };
+        let client = manager_client_loop(
+            manager,
+            relay.ctx.clone(),
+            relay.relay_stats.clone(),
+            relay.relay_config.clone(),
+            relay.config_path.clone(),
+            relay.event_rx,
+            relay.event_sender.clone(),
+            None,
+            connect,
+        );
+
+        let fake_manager = async {
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            let shown = authenticate(&mut ws, auth_ok()).await;
+            assert_eq!(shown["node_secret"], OLD);
+            let ack = rotate(&mut ws, NEW).await;
+            assert_eq!(ack["success"], true, "{ack}");
+            break_connection(ws).await;
+
+            // The loop waits out its backoff (on the paused clock) and dials again.
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            authenticate(&mut ws, auth_ok()).await
+        };
+        let shown = tokio::select! {
+            _ = client => panic!("the reconnect loop never returns"),
+            shown = fake_manager => shown,
+        };
+        assert_eq!(
+            shown["node_secret"], NEW,
+            "the reconnect presented the secret the manager replaced"
+        );
     }
 
     /// Registration had the same flaw, handing its credentials back in the
