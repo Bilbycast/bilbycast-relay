@@ -639,6 +639,9 @@ impl LinkCredentials {
     ///
     /// The likelier one is the new secret when the acknowledgement left, and
     /// the old one when it did not, since then the manager cannot have read it.
+    /// One whose write stalled until [`WRITE_STALL_LIMIT`] counts as one that
+    /// did not leave: whatever part of it got out, it cannot have arrived
+    /// within the manager's 10 s wait.
     ///
     /// The fallbacks live in memory only. A relay restarted before its next
     /// authentication presents the secret in the file, with nothing to fall
@@ -1834,10 +1837,12 @@ where
                         ctx.event_sender.emit(super::events::EventSeverity::Info, category::MANAGER, "Secret rotated successfully");
                     } else {
                         // The manager cannot have read an answer that never
-                        // left, so this rotation changed nothing there, and the
-                        // file goes back to the secret the relay presents
-                        // first. The answer failed because the connection did,
-                        // so the relay may stay unconnected for a while —
+                        // left, nor in time one whose write stalled until
+                        // WRITE_STALL_LIMIT, far past its 10 s wait for it, so
+                        // this rotation changed nothing there, and the file
+                        // goes back to the secret the relay presents first.
+                        // The answer failed because the connection did, so
+                        // the relay may stay unconnected for a while —
                         // through a manager outage, say — and a restart in that
                         // time would otherwise present the new secret from the
                         // file with nothing to fall back to.
