@@ -9,13 +9,18 @@
 //! Authentication uses the same protocol as bilbycast-edge: first WebSocket
 //! frame contains either registration_token or node_id + node_secret.
 
+use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{Bytes, Message, Utf8Bytes};
 use uuid::Uuid;
 
 use crate::config::{ManagerConfig, RelayConfig};
@@ -130,6 +135,328 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
+// ───────────────────────────────────────────────────────
+// Deadlines on the manager link
+// ───────────────────────────────────────────────────────
+//
+// The reconnect loop is a single task, so one await in it that never
+// completes ends all reconnection: the relay drops off the manager and stays
+// off, still forwarding media but out of reach of retention pushes,
+// distribution config and token secrets, with nothing logged after
+// "Connecting to manager" until it is restarted. Production edges did exactly
+// that against a manager front door that completed TLS and never returned the
+// 101 (bilbycast-edge#180), and this client was the same code. Every await on
+// the link is bounded below. The constants and rules are shared with the
+// edge's and the gateway SDK's manager clients, so an operator sees one model:
+// change them together.
+
+/// Deadline on the whole dial: DNS, TCP, TLS and the HTTP upgrade.
+///
+/// tokio-tungstenite has none of its own, and a peer that has taken the
+/// upgrade request and never answers it leaves nothing unacknowledged on the
+/// socket, so not even TCP's retransmission timer ends the wait.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one TCP attempt runs alone before the next address is tried
+/// beside it (RFC 8305's connection attempt delay).
+///
+/// The addresses are not tried one after another, which is what tokio's
+/// `TcpStream::connect(host)` does, with no deadline per address. A first
+/// address that silently drops SYNs — a broken IPv6 path to a dual-stack
+/// manager, a dead A record — holds that for the kernel's SYN timeout, about
+/// 127 s, and under the 30 s dial deadline the second address would never be
+/// tried: a relay that used to connect slowly would never connect. Neither a
+/// longer deadline nor sorting IPv4 first fixes that; the first brings the
+/// stall back and the second only moves it to the other family.
+const CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// A dial slower than this is logged even when it succeeds, so a path going
+/// bad shows before it becomes an outage.
+const SLOW_DIAL_WARN: Duration = Duration::from_secs(5);
+
+/// Deadline on writing the auth frame.
+const AUTH_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline on the manager's answer to the auth frame.
+const AUTH_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline on every write the live session makes, the first health frame
+/// after authentication included.
+///
+/// A write that cannot complete for five minutes means the manager stopped
+/// reading the connection — a wedged handler, a proxy that keeps the TCP
+/// connection but has stalled its upstream — and TCP never says so, because
+/// the manager's kernel goes on acknowledging zero-window probes. The session
+/// ends with an error naming the stall. This is also what covers a session
+/// before the manager's first ping, and one with a manager that never pings,
+/// which the silence check leaves alone ([`InboundCadence`]).
+///
+/// It is at least the manager's 10 s wait for a `rotate_secret`
+/// acknowledgement, which is what makes an acknowledgement that has not been
+/// written by the deadline one the manager cannot have stored (see
+/// [`LinkCredentials::rotated`]).
+const WRITE_STALL_LIMIT: Duration = Duration::from_secs(300);
+
+/// Inbound silence never ends a session sooner than this, however fast the
+/// manager pings. It is only a floor: the limit scales with the cadence the
+/// manager actually uses ([`InboundCadence::silence_limit`]).
+const SILENCE_FLOOR: Duration = Duration::from_secs(90);
+
+/// How many ping intervals of silence end a session. Four, so one lost ping
+/// cannot.
+const SILENCE_PINGS: u32 = 4;
+
+/// How often the silence is checked. Coarse on purpose: the limit is
+/// measured in minutes, and a check is a clock read.
+const SILENCE_CHECK: Duration = Duration::from_secs(5);
+
+/// How many of the latest gaps between pings the cadence is judged on.
+const CADENCE_GAPS: usize = 8;
+
+/// No gap between pings counts for more than this, the longest keepalive the
+/// manager can be set to (`ws_keepalive_interval_secs`, 1–300 s). A longer
+/// gap is the manager stalling, not its cadence.
+const MAX_PING_GAP: Duration = Duration::from_secs(300);
+
+/// Frames the reader holds for the session loop while it is busy writing.
+const INBOUND_QUEUE: usize = 256;
+
+/// What the live session has heard from the manager, and how often it pings.
+///
+/// The manager pings every node on its `ws_keepalive_interval_secs` setting,
+/// which an operator can set anywhere from 1 to 300 s and which holds for the
+/// life of one connection. So the cadence is learned from the pings rather
+/// than assumed. Until the first ping the check is **unarmed**: a manager from
+/// before the keepalive never pings, and its quiet must never end a healthy
+/// session ([`WRITE_STALL_LIMIT`] still covers that one).
+///
+/// It arms on the first ping, counting the time since the session started as
+/// the first gap — an over-estimate, which is the safe direction — and judges
+/// by the **median** of the latest [`CADENCE_GAPS`] gaps, each clamped to
+/// [`MAX_PING_GAP`]. Not the widest gap: a running maximum only ever grows, so
+/// one 85 s stall in the manager would turn a 90 s limit into 340 s for the
+/// rest of the session. Pings read back to back — late, say, after the reader
+/// waited for room — pull the median down, which the floor absorbs.
+struct InboundCadence {
+    /// The last frame of any kind.
+    last_frame: Instant,
+    /// The last ping, or the start of the session until the first one.
+    last_ping: Instant,
+    /// The latest gaps between pings, oldest first.
+    gaps: VecDeque<Duration>,
+}
+
+impl InboundCadence {
+    fn new(session_start: Instant) -> Self {
+        Self {
+            last_frame: session_start,
+            last_ping: session_start,
+            gaps: VecDeque::with_capacity(CADENCE_GAPS),
+        }
+    }
+
+    /// Any frame at all proves the manager is there.
+    fn on_frame(&mut self, now: Instant) {
+        self.last_frame = now;
+    }
+
+    /// A ping also teaches the cadence.
+    fn on_ping(&mut self, now: Instant) {
+        self.on_frame(now);
+        if self.gaps.len() == CADENCE_GAPS {
+            self.gaps.pop_front();
+        }
+        self.gaps
+            .push_back(now.saturating_duration_since(self.last_ping).min(MAX_PING_GAP));
+        self.last_ping = now;
+    }
+
+    /// The silence that ends the session, or `None` before the first ping.
+    fn silence_limit(&self) -> Option<Duration> {
+        let mut gaps: Vec<Duration> = self.gaps.iter().copied().collect();
+        gaps.sort_unstable();
+        // With an even count, the upper of the two middle gaps: the longer
+        // limit is the safe side.
+        let median = *gaps.get(gaps.len() / 2)?;
+        Some(SILENCE_FLOOR.max(median.saturating_mul(SILENCE_PINGS)))
+    }
+
+    /// How long the manager has been silent and the limit, once that is past
+    /// the limit.
+    fn dead_for(&self, now: Instant) -> Option<(Duration, Duration)> {
+        let limit = self.silence_limit()?;
+        let silent = now.saturating_duration_since(self.last_frame);
+        (silent > limit).then_some((silent, limit))
+    }
+}
+
+/// The stream every dial produces.
+type ManagerWsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Dial the manager at `url`, giving up at `deadline`, and name the stage
+/// that failed: the DNS lookup, the TCP connect, or the TLS handshake and
+/// HTTP upgrade.
+///
+/// The connected socket goes to `client_async_tls_with_config`, the function
+/// `connect_async*` calls once it has a socket of its own, so TLS, SNI,
+/// certificate pinning and the insecure verifier behave exactly as they did
+/// and so does the stream it returns. `None` as the connector is what
+/// `connect_async` passes. Nagle is left on, as those calls left it
+/// (`disable_nagle: false`).
+async fn dial_manager(
+    url: &str,
+    connector: Option<tokio_tungstenite::Connector>,
+    deadline: Instant,
+) -> Result<ManagerWsStream, String> {
+    let started = Instant::now();
+    let request = url
+        .into_client_request()
+        .map_err(|e| format!("WebSocket connect failed: {e}"))?;
+    let (host, port) = manager_host_port(&request)?;
+
+    // An IP literal resolves to itself, without a lookup.
+    let lookup = tokio::net::lookup_host((host.as_str(), port));
+    let addrs: Vec<SocketAddr> = match tokio::time::timeout_at(deadline, lookup).await {
+        Ok(Ok(found)) => found.collect(),
+        Ok(Err(e)) => return Err(format!("manager DNS lookup for {host} failed: {e}")),
+        Err(_) => return Err(format!("manager DNS lookup for {host} timed out")),
+    };
+
+    let connect = connect_first(&host, addrs, tokio::net::TcpStream::connect);
+    let tcp = match tokio::time::timeout_at(deadline, connect).await {
+        Ok(connected) => connected?,
+        Err(_) => return Err(format!("TCP connect to {host} timed out")),
+    };
+
+    let upgrading = Instant::now();
+    let upgrade = tokio_tungstenite::client_async_tls_with_config(request, tcp, None, connector);
+    let (ws_stream, _response) = match tokio::time::timeout_at(deadline, upgrade).await {
+        Ok(Ok(upgraded)) => upgraded,
+        Ok(Err(e)) => return Err(format!("TLS/WebSocket upgrade with {host} failed: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "TLS/WebSocket upgrade with {host} timed out after {}s",
+                upgrading.elapsed().as_secs()
+            ));
+        }
+    };
+
+    let took = started.elapsed();
+    if took >= SLOW_DIAL_WARN {
+        tracing::warn!(
+            "Manager dial to {host} took {:.1}s — a slow path; watch it for a stall",
+            took.as_secs_f64()
+        );
+    }
+    Ok(ws_stream)
+}
+
+/// The host and port a manager URL names, as the upgrade will use them: the
+/// port defaults by scheme, and an IPv6 literal loses its brackets.
+fn manager_host_port(
+    request: &tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> Result<(String, u16), String> {
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| "WebSocket connect failed: the manager URL has no host".to_string())?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string();
+    let port = uri
+        .port_u16()
+        .or(match uri.scheme_str() {
+            Some("wss") => Some(443),
+            Some("ws") => Some(80),
+            _ => None,
+        })
+        .ok_or_else(|| "WebSocket connect failed: the manager URL is not ws:// or wss://".to_string())?;
+    Ok((host, port))
+}
+
+/// Connect to whichever of `addrs` answers first, Happy-Eyeballs style
+/// (RFC 8305, without its DNS half).
+///
+/// The first attempt starts alone; the next starts beside it
+/// [`CONNECT_ATTEMPT_DELAY`] later if nothing has connected, or at once when
+/// an attempt fails. The first to connect wins and the rest are dropped,
+/// which closes them. No attempt has a deadline of its own: the dial's
+/// deadline bounds them all. `connect` is `TcpStream::connect`, or a stand-in
+/// in the tests.
+async fn connect_first<C, F, T>(host: &str, addrs: Vec<SocketAddr>, mut connect: C) -> Result<T, String>
+where
+    C: FnMut(SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    let count = addrs.len();
+    let mut waiting = interleave_families(addrs);
+    let mut attempts = FuturesUnordered::new();
+    let mut start = |order: usize, addr: SocketAddr| {
+        let attempt = connect(addr);
+        async move { (order, addr, attempt.await) }
+    };
+    let mut started = 0;
+    let mut last_error = None;
+    let next_attempt = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(next_attempt);
+
+    loop {
+        tokio::select! {
+            () = &mut next_attempt, if !waiting.is_empty() => {
+                if let Some(addr) = waiting.pop_front() {
+                    attempts.push(start(started, addr));
+                    started += 1;
+                }
+                next_attempt.as_mut().reset(Instant::now() + CONNECT_ATTEMPT_DELAY);
+            }
+            Some((order, addr, result)) = attempts.next() => match result {
+                Ok(stream) => {
+                    tracing::debug!("Manager {host}: TCP connected to {addr}");
+                    if order > 0 {
+                        tracing::warn!(
+                            "Manager {host}: connected to {addr} after {order} earlier address(es) failed \
+                             or did not answer; check the path to those"
+                        );
+                    }
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    tracing::debug!("Manager {host}: TCP connect to {addr} failed: {e}");
+                    last_error = Some(format!("{addr}: {e}"));
+                    // The next address now, not after the rest of the delay.
+                    next_attempt.as_mut().reset(Instant::now());
+                }
+            },
+            else => {
+                return Err(format!(
+                    "TCP connect to {host} ({count} addresses) failed: {}",
+                    last_error.unwrap_or_else(|| "the lookup found none".to_string())
+                ));
+            }
+        }
+    }
+}
+
+/// `addrs` with the address families alternating, led by the family of the
+/// first: the resolver's preference still goes first, and a family whose
+/// path is broken costs one [`CONNECT_ATTEMPT_DELAY`] before the other is
+/// tried rather than one per address.
+fn interleave_families(addrs: Vec<SocketAddr>) -> VecDeque<SocketAddr> {
+    let lead_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (lead, other): (Vec<_>, Vec<_>) = addrs.into_iter().partition(|a| a.is_ipv6() == lead_v6);
+    let (mut lead, mut other) = (lead.into_iter(), other.into_iter());
+    let mut ordered = VecDeque::new();
+    loop {
+        match (lead.next(), other.next()) {
+            (None, None) => return ordered,
+            (a, b) => ordered.extend(a.into_iter().chain(b)),
+        }
+    }
+}
+
 /// Start the manager client background task.
 #[allow(clippy::too_many_arguments)]
 pub fn start_manager_client(
@@ -158,9 +485,9 @@ pub fn start_manager_client(
     })
 }
 
-/// The reconnect loop. `connect` opens the WebSocket for one attempt —
-/// [`connect_to_manager`] in the relay, an in-memory stream in the tests —
-/// and [`run_session`] runs it.
+/// The reconnect loop. `connect` opens the WebSocket for one attempt, by the
+/// deadline it is given — [`connect_to_manager`] in the relay, an in-memory
+/// stream in the tests — and [`run_session`] runs it.
 #[allow(clippy::too_many_arguments)]
 async fn manager_client_loop<C, F, S>(
     config: ManagerConfig,
@@ -173,7 +500,7 @@ async fn manager_client_loop<C, F, S>(
     distribution_control: Option<Arc<DistributionControl>>,
     mut connect: C,
 ) where
-    C: FnMut(String, ManagerConfig) -> F,
+    C: FnMut(String, ManagerConfig, Instant) -> F,
     F: std::future::Future<Output = Result<tokio_tungstenite::WebSocketStream<S>, String>>,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -213,7 +540,17 @@ async fn manager_client_loop<C, F, S>(
             urls.len(),
         );
 
-        let ended = match connect(current_url, creds.config.clone()).await {
+        // Bounded here rather than only inside `connect_to_manager`, so the
+        // bound holds whatever `connect` is. `connect_to_manager` works to
+        // the same deadline and names the stage it was in when it passed;
+        // its timer is due at the same instant and is polled first, so its
+        // message is the one that surfaces.
+        let deadline = Instant::now() + DIAL_TIMEOUT;
+        let dialled = match tokio::time::timeout_at(deadline, connect(current_url, creds.config.clone(), deadline)).await {
+            Ok(dialled) => dialled,
+            Err(_) => Err(format!("Manager dial timed out after {}s", DIAL_TIMEOUT.as_secs())),
+        };
+        let ended = match dialled {
             Ok(ws_stream) => run_session(ws_stream, &mut creds, &ctx, &relay_stats, &relay_config, &config_path, &mut event_rx, &event_sender, distribution_control.as_ref()).await,
             Err(e) => Err(e),
         };
@@ -351,15 +688,14 @@ impl LinkCredentials {
 }
 
 /// Open the WebSocket to the manager at `current_url`, over TLS as `config`
-/// asks. It takes its arguments by value so the reconnect loop can take it as
-/// a plain function; the loop hands it a copy of the credentials it holds.
+/// asks, by `deadline`. It takes its arguments by value so the reconnect loop
+/// can take it as a plain function; the loop hands it a copy of the
+/// credentials it holds.
 async fn connect_to_manager(
     current_url: String,
     config: ManagerConfig,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    String,
-> {
+    deadline: Instant,
+) -> Result<ManagerWsStream, String> {
     let current_url = current_url.as_str();
     // Enforce TLS — only wss:// connections are allowed
     if !current_url.starts_with("wss://") {
@@ -369,7 +705,7 @@ async fn connect_to_manager(
         );
     }
 
-    let (ws_stream, _response) = if config.accept_self_signed_cert {
+    let connector = if config.accept_self_signed_cert {
         // SECURITY: Require explicit env var to allow insecure connections.
         if std::env::var("BILBYCAST_ALLOW_INSECURE").as_deref() != Ok("1") {
             return Err(
@@ -389,15 +725,7 @@ async fn connect_to_manager(
             .dangerous()
             .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
             .with_no_client_auth();
-        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
-        tokio_tungstenite::connect_async_tls_with_config(
-            current_url,
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        .map_err(|e| format!("WebSocket connect failed: {e}"))?
+        Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config)))
     } else if let Some(ref fingerprint) = config.cert_fingerprint {
         // Certificate pinning: validate CA chain AND check fingerprint
         tracing::info!("Certificate pinning enabled (fingerprint: {}...)", &fingerprint[..fingerprint.len().min(11)]);
@@ -415,20 +743,13 @@ async fn connect_to_manager(
             .dangerous()
             .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
             .with_no_client_auth();
-        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
-        tokio_tungstenite::connect_async_tls_with_config(
-            current_url,
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        .map_err(|e| format!("WebSocket connect failed: {e}"))?
+        Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config)))
     } else {
-        tokio_tungstenite::connect_async(current_url)
-            .await
-            .map_err(|e| format!("WebSocket connect failed: {e}"))?
+        // The webpki roots, as `connect_async` used.
+        None
     };
+
+    let ws_stream = dial_manager(current_url, connector, deadline).await?;
 
     tracing::info!("WebSocket connected, sending auth...");
 
@@ -461,14 +782,15 @@ where
     // Step 1: Send auth message
     let auth_msg = build_auth_message(&creds.config);
     if let Ok(json) = serde_json::to_string(&auth_msg) {
-        ws_write
-            .send(Message::Text(json.into()))
-            .await
-            .map_err(|e| format!("Failed to send auth: {e}"))?;
+        match tokio::time::timeout(AUTH_SEND_TIMEOUT, ws_write.send(Message::Text(json.into()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("Failed to send auth: {e}")),
+            Err(_) => return Err(format!("Auth send timed out after {}s", AUTH_SEND_TIMEOUT.as_secs())),
+        }
     }
 
-    // Step 2: Wait for auth response (10s timeout)
-    let auth_timeout = tokio::time::timeout(Duration::from_secs(10), ws_read.next()).await;
+    // Step 2: Wait for auth response
+    let auth_timeout = tokio::time::timeout(AUTH_REPLY_TIMEOUT, ws_read.next()).await;
 
     match auth_timeout {
         Ok(Some(Ok(Message::Text(text)))) => {
@@ -529,13 +851,141 @@ where
         Ok(Some(Ok(_))) => return Err("Unexpected non-text auth response".into()),
         Ok(Some(Err(e))) => return Err(format!("WebSocket error during auth: {e}")),
         Ok(None) => return Err("Connection closed during auth".into()),
-        Err(_) => return Err("Auth response timeout (10s)".into()),
+        Err(_) => return Err(format!("Auth response timeout ({}s)", AUTH_REPLY_TIMEOUT.as_secs())),
     }
 
+    // The reader runs beside the session loop for as long as the session
+    // does, and is dropped with it, which loses nothing but frames nobody is
+    // left to handle. It never resolves, so it never drops the loop: the
+    // loop ends the session itself, between operations.
+    let (inbound_tx, mut inbound) = mpsc::channel(INBOUND_QUEUE);
+    let reader = read_manager(ws_read, inbound_tx);
+    let session = live_session(
+        &mut ws_write,
+        &mut inbound,
+        creds,
+        ctx,
+        relay_stats,
+        relay_config,
+        config_path,
+        event_rx,
+        distribution_control,
+    );
+    tokio::select! {
+        ended = session => ended,
+        never = reader => match never {},
+    }
+}
+
+/// What the reader hands the session loop.
+enum Inbound {
+    /// A text frame: a command, or the manager's JSON ping.
+    Text(Utf8Bytes),
+    /// A WebSocket ping, for the loop to answer.
+    Ping(Bytes),
+    /// The manager closed the connection, or it ended.
+    Closed,
+    /// Reading failed.
+    Failed(String),
+    /// Nothing has come from the manager for `silent`, past its `limit`.
+    Silent { silent: Duration, limit: Duration },
+}
+
+/// Read the manager's side of a live session, beside the session loop's
+/// writes rather than between them.
+///
+/// Every frame is stamped on the cadence here, as it arrives. A loop that
+/// only read between its own writes would, when held up writing on a starved
+/// uplink, leave the manager's pings unread in the socket buffer and take a
+/// busy session for a dead one. The reader owns the cadence and checks it, and
+/// the loop learns of a silence as one more inbound item, ending the session
+/// between operations, never in the middle of one: `rotate_secret` saves the
+/// secret, answers and then adopts it, and a session dropped while answering
+/// would leave the new secret in the file, the old one in memory, and nothing
+/// to fall back to.
+///
+/// Only the loop writes, so a ping is passed on for it to answer — and
+/// dropped if [`INBOUND_QUEUE`] items are already waiting, since a pong is a
+/// courtesy and the reader must not stop reading for one. A command is never
+/// dropped: the reader waits for room.
+///
+/// It never returns. Once it has passed on how the connection ended, it waits
+/// to be dropped with the session.
+async fn read_manager<S>(mut ws_read: S, inbound: mpsc::Sender<Inbound>) -> std::convert::Infallible
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut cadence = InboundCadence::new(Instant::now());
+    let mut check = tokio::time::interval(SILENCE_CHECK);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let last = loop {
+        tokio::select! {
+            // A frame that is already waiting is stamped before the check
+            // runs, so one that arrives on the limit is not taken for silence.
+            biased;
+            frame = ws_read.next() => {
+                let now = Instant::now();
+                let item = match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        cadence.on_frame(now);
+                        Inbound::Text(text)
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        cadence.on_ping(now);
+                        let _ = inbound.try_send(Inbound::Ping(data));
+                        continue;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break Inbound::Closed,
+                    Some(Ok(_)) => {
+                        cadence.on_frame(now);
+                        continue;
+                    }
+                    Some(Err(e)) => break Inbound::Failed(e.to_string()),
+                };
+                if inbound.send(item).await.is_err() {
+                    // The session has ended; nothing is listening.
+                    break Inbound::Closed;
+                }
+            }
+            _ = check.tick() => {
+                if let Some((silent, limit)) = cadence.dead_for(Instant::now()) {
+                    break Inbound::Silent { silent, limit };
+                }
+            }
+        }
+    };
+    let _ = inbound.send(last).await;
+    std::future::pending().await
+}
+
+/// The authenticated session: stats every second, health every 15 s, events
+/// as they come, and the manager's commands, until the connection ends, a
+/// write stalls past [`WRITE_STALL_LIMIT`] or the manager falls silent.
+///
+/// Every await in it is bounded, so it always gets back to `inbound`, which
+/// is how it hears of a silence; `rotate_secret` relies on the session never
+/// being dropped part-way through a command (see [`read_manager`]).
+#[allow(clippy::too_many_arguments)]
+async fn live_session<W>(
+    ws_write: &mut W,
+    inbound: &mut mpsc::Receiver<Inbound>,
+    creds: &mut LinkCredentials,
+    ctx: &Arc<SessionContext>,
+    relay_stats: &Arc<RelayStats>,
+    relay_config: &RelayConfig,
+    config_path: &PathBuf,
+    event_rx: &mut mpsc::Receiver<Event>,
+    distribution_control: Option<&Arc<DistributionControl>>,
+) -> Result<(), String>
+where
+    W: futures_util::Sink<Message> + Unpin,
+    W::Error: std::fmt::Display,
+{
     // Send initial health
     let health = build_health_message(ctx, relay_stats, relay_config, distribution_control);
     if let Ok(json) = serde_json::to_string(&health) {
-        let _ = ws_write.send(Message::Text(json.into())).await;
+        send_bounded(ws_write, Message::Text(json.into())).await?;
     }
 
     // Main loop: stats every 1s, health every 15s, handle incoming commands
@@ -553,48 +1003,64 @@ where
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "payload": build_stats_payload(ctx, relay_stats)
                 });
-                if let Ok(json) = serde_json::to_string(&envelope)
-                    && ws_write.send(Message::Text(json.into())).await.is_err() {
-                        break;
-                    }
+                if let Ok(json) = serde_json::to_string(&envelope) {
+                    send_bounded(ws_write, Message::Text(json.into())).await?;
+                }
             }
 
             _ = health_interval.tick() => {
                 let envelope = build_health_message(ctx, relay_stats, relay_config, distribution_control);
-                if let Ok(json) = serde_json::to_string(&envelope)
-                    && ws_write.send(Message::Text(json.into())).await.is_err() {
-                        break;
-                    }
-            }
-
-            msg = ws_read.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(&text, ctx, relay_config, config_path, &mut ws_write, distribution_control, creds).await;
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        let _ = ws_write.send(Message::Pong(data)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(e)) => {
-                        return Err(format!("WebSocket error: {e}"));
-                    }
-                    _ => {}
+                if let Ok(json) = serde_json::to_string(&envelope) {
+                    send_bounded(ws_write, Message::Text(json.into())).await?;
                 }
             }
+
+            item = inbound.recv() => match item {
+                Some(Inbound::Text(text)) => {
+                    handle_manager_message(&text, ctx, relay_config, config_path, ws_write, distribution_control, creds).await?;
+                }
+                Some(Inbound::Ping(data)) => {
+                    send_bounded(ws_write, Message::Pong(data)).await?;
+                }
+                Some(Inbound::Closed) | None => return Ok(()),
+                Some(Inbound::Failed(e)) => return Err(format!("WebSocket error: {e}")),
+                Some(Inbound::Silent { silent, limit }) => {
+                    return Err(format!(
+                        "Nothing heard from the manager for {}s (limit {}s from its ping cadence) \
+                         — treating the session as dead and reconnecting",
+                        silent.as_secs(),
+                        limit.as_secs()
+                    ));
+                }
+            },
 
             // Forward queued events to the manager
             Some(event) = event_rx.recv() => {
                 let envelope = build_event_envelope(&event);
-                if let Ok(json) = serde_json::to_string(&envelope)
-                    && ws_write.send(Message::Text(json.into())).await.is_err() {
-                        break;
-                    }
+                if let Ok(json) = serde_json::to_string(&envelope) {
+                    send_bounded(ws_write, Message::Text(json.into())).await?;
+                }
             }
         }
     }
+}
 
-    Ok(())
+/// Write one frame to the manager, bounded by [`WRITE_STALL_LIMIT`]. A write
+/// that fails or stalls ends the session, so the error says which.
+async fn send_bounded<W>(ws_write: &mut W, msg: Message) -> Result<(), String>
+where
+    W: futures_util::Sink<Message> + Unpin,
+    W::Error: std::fmt::Display,
+{
+    match tokio::time::timeout(WRITE_STALL_LIMIT, ws_write.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("WebSocket write failed: {e}")),
+        Err(_) => Err(format!(
+            "A write to the manager made no progress for {}s — the manager stopped reading; \
+             ending the session",
+            WRITE_STALL_LIMIT.as_secs()
+        )),
+    }
 }
 
 // ───────────────────────────────────────────────────────
@@ -1261,24 +1727,28 @@ fn build_config_response(relay_config: &RelayConfig) -> serde_json::Value {
 // Command handling
 // ───────────────────────────────────────────────────────
 
+/// Handle one text frame from the manager. `Err` is a write that failed or
+/// stalled ([`send_bounded`]), which ends the session; a command that fails
+/// is answered, not an `Err`.
 #[allow(clippy::too_many_arguments)]
-async fn handle_manager_message<S>(
+async fn handle_manager_message<W>(
     text: &str,
     ctx: &Arc<SessionContext>,
     relay_config: &RelayConfig,
     config_path: &PathBuf,
-    ws_write: &mut futures_util::stream::SplitSink<S, Message>,
+    ws_write: &mut W,
     distribution_control: Option<&Arc<DistributionControl>>,
     creds: &mut LinkCredentials,
-) where
-    S: futures_util::Sink<Message> + Unpin,
-    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+) -> Result<(), String>
+where
+    W: futures_util::Sink<Message> + Unpin,
+    W::Error: std::fmt::Display,
 {
     let envelope: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("Invalid message from manager: {e}");
-            return;
+            return Ok(());
         }
     };
 
@@ -1293,7 +1763,7 @@ async fn handle_manager_message<S>(
                 "payload": null
             });
             if let Ok(json) = serde_json::to_string(&pong) {
-                let _ = ws_write.send(Message::Text(json.into())).await;
+                send_bounded(ws_write, Message::Text(json.into())).await?;
             }
         }
         "command" => {
@@ -1306,9 +1776,9 @@ async fn handle_manager_message<S>(
                 tracing::info!("Manager command: get_config");
                 let response = build_config_response(relay_config);
                 if let Ok(json) = serde_json::to_string(&response) {
-                    let _ = ws_write.send(Message::Text(json.into())).await;
+                    send_bounded(ws_write, Message::Text(json.into())).await?;
                 }
-                return;
+                return Ok(());
             }
 
             // rotate_secret is handled inline: it writes to config_path, and it
@@ -1323,6 +1793,10 @@ async fn handle_manager_message<S>(
             // left decides which secret the relay presents first — see
             // `LinkCredentials::rotated`, which also keeps the old secret for an
             // answer the manager never reads.
+            //
+            // A write that fails or stalls ends the session, but only after
+            // the bookkeeping below: the answer's outcome is held, not
+            // propagated, until the secret it decides has been adopted.
             if action_type == "rotate_secret" {
                 let result = rotated_secret(action).and_then(|new_secret| {
                     tracing::info!("Manager command: rotate_secret — updating node authentication secret");
@@ -1347,9 +1821,12 @@ async fn handle_manager_message<S>(
                         "error": result.as_ref().err()
                     }
                 });
-                let ack_sent = match serde_json::to_string(&ack) {
-                    Ok(json) => ws_write.send(Message::Text(json.into())).await.is_ok(),
-                    Err(_) => false,
+                let (ack_sent, written) = match serde_json::to_string(&ack) {
+                    Ok(json) => {
+                        let written = send_bounded(ws_write, Message::Text(json.into())).await;
+                        (written.is_ok(), written)
+                    }
+                    Err(_) => (false, Ok(())),
                 };
                 if let Ok(new_secret) = result {
                     if ack_sent {
@@ -1381,7 +1858,7 @@ async fn handle_manager_message<S>(
                     }
                     creds.rotated(new_secret, ack_sent);
                 }
-                return;
+                return written;
             }
 
             // configure_distribution updates the runtime distribution config
@@ -1401,9 +1878,9 @@ async fn handle_manager_message<S>(
                     }
                 });
                 if let Ok(json) = serde_json::to_string(&ack) {
-                    let _ = ws_write.send(Message::Text(json.into())).await;
+                    send_bounded(ws_write, Message::Text(json.into())).await?;
                 }
-                return;
+                return Ok(());
             }
 
             let result = execute_command(action_type, action, ctx).await;
@@ -1438,7 +1915,7 @@ async fn handle_manager_message<S>(
                 }),
             };
             if let Ok(json) = serde_json::to_string(&ack) {
-                let _ = ws_write.send(Message::Text(json.into())).await;
+                send_bounded(ws_write, Message::Text(json.into())).await?;
             }
         }
         "register_ack" => {
@@ -1448,6 +1925,7 @@ async fn handle_manager_message<S>(
             tracing::debug!("Unknown message type from manager: {msg_type}");
         }
     }
+    Ok(())
 }
 
 async fn execute_command(
@@ -2387,12 +2865,12 @@ mod rotation_tests {
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
-    type Ws = WebSocketStream<DuplexStream>;
+    pub(super) type Ws = WebSocketStream<DuplexStream>;
 
-    const OLD: &str = "old-secret";
-    const NEW: &str = "new-secret";
+    pub(super) const OLD: &str = "old-secret";
+    pub(super) const NEW: &str = "new-secret";
 
-    fn manager_config(node_secret: Option<&str>, registration_token: Option<&str>) -> ManagerConfig {
+    pub(super) fn manager_config(node_secret: Option<&str>, registration_token: Option<&str>) -> ManagerConfig {
         ManagerConfig {
             enabled: true,
             urls: vec!["wss://m.example/ws/node".into()],
@@ -2406,19 +2884,19 @@ mod rotation_tests {
 
     /// The relay's end: its config file, and what `manager_client_loop` hands
     /// every session.
-    struct Relay {
+    pub(super) struct Relay {
         _dir: tempfile::TempDir,
-        config_path: PathBuf,
-        relay_config: RelayConfig,
-        ctx: Arc<SessionContext>,
-        relay_stats: Arc<RelayStats>,
-        event_sender: crate::manager::events::EventSender,
-        event_rx: mpsc::Receiver<Event>,
+        pub(super) config_path: PathBuf,
+        pub(super) relay_config: RelayConfig,
+        pub(super) ctx: Arc<SessionContext>,
+        pub(super) relay_stats: Arc<RelayStats>,
+        pub(super) event_sender: crate::manager::events::EventSender,
+        pub(super) event_rx: mpsc::Receiver<Event>,
     }
 
     impl Relay {
         /// A relay whose config file holds `manager`.
-        fn new(manager: ManagerConfig) -> Self {
+        pub(super) fn new(manager: ManagerConfig) -> Self {
             Self::at("relay.json", manager)
         }
 
@@ -2444,23 +2922,39 @@ mod rotation_tests {
             Self { _dir: dir, config_path, relay_config, ctx, relay_stats, event_sender, event_rx }
         }
 
-        fn credentials(&self) -> LinkCredentials {
+        pub(super) fn credentials(&self) -> LinkCredentials {
             LinkCredentials::new(self.relay_config.manager.clone().unwrap())
         }
 
-        fn secret_on_disk(&self) -> Option<String> {
+        pub(super) fn secret_on_disk(&self) -> Option<String> {
             let text = std::fs::read_to_string(&self.config_path).ok()?;
             serde_json::from_str::<RelayConfig>(&text).ok()?.manager?.node_secret
         }
 
         /// One session with `manager` playing the other end. Returns how the
         /// session ended and what `manager` returned.
-        async fn session<F, Fut, R>(&mut self, creds: &mut LinkCredentials, manager: F) -> (Result<(), String>, R)
+        pub(super) async fn session<F, Fut, R>(&mut self, creds: &mut LinkCredentials, manager: F) -> (Result<(), String>, R)
         where
             F: FnOnce(Ws) -> Fut,
             Fut: std::future::Future<Output = R>,
         {
-            let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
+            self.session_over(1 << 20, Duration::from_secs(10), creds, manager).await
+        }
+
+        /// [`Self::session`] over a connection that holds `buffer` bytes each
+        /// way, which must end within `within`.
+        pub(super) async fn session_over<F, Fut, R>(
+            &mut self,
+            buffer: usize,
+            within: Duration,
+            creds: &mut LinkCredentials,
+            manager: F,
+        ) -> (Result<(), String>, R)
+        where
+            F: FnOnce(Ws) -> Fut,
+            Fut: std::future::Future<Output = R>,
+        {
+            let (relay_io, manager_io) = tokio::io::duplex(buffer);
             let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await;
             let manager_ws = answer(manager_io).await;
             let session = run_session(
@@ -2474,7 +2968,7 @@ mod rotation_tests {
                 &self.event_sender,
                 None,
             );
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(within, async {
                 tokio::join!(session, manager(manager_ws))
             })
             .await
@@ -2483,11 +2977,11 @@ mod rotation_tests {
     }
 
     /// The manager's end of a connection the relay opened.
-    async fn answer(io: DuplexStream) -> Ws {
+    pub(super) async fn answer(io: DuplexStream) -> Ws {
         WebSocketStream::from_raw_socket(io, Role::Server, None).await
     }
 
-    async fn recv(ws: &mut Ws) -> serde_json::Value {
+    pub(super) async fn recv(ws: &mut Ws) -> serde_json::Value {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
@@ -2497,11 +2991,11 @@ mod rotation_tests {
         }
     }
 
-    async fn send(ws: &mut Ws, value: serde_json::Value) {
+    pub(super) async fn send(ws: &mut Ws, value: serde_json::Value) {
         ws.send(Message::Text(value.to_string().into())).await.unwrap();
     }
 
-    fn auth_ok() -> serde_json::Value {
+    pub(super) fn auth_ok() -> serde_json::Value {
         serde_json::json!({ "type": "auth_ok" })
     }
 
@@ -2512,14 +3006,14 @@ mod rotation_tests {
 
     /// The manager's half of an authentication: answer `reply`, and return
     /// what the relay presented.
-    async fn authenticate(ws: &mut Ws, reply: serde_json::Value) -> serde_json::Value {
+    pub(super) async fn authenticate(ws: &mut Ws, reply: serde_json::Value) -> serde_json::Value {
         let auth = recv(ws).await;
         assert_eq!(auth["type"], "auth", "{auth}");
         send(ws, reply).await;
         auth["payload"].clone()
     }
 
-    fn rotate_command(new_secret: &str) -> serde_json::Value {
+    pub(super) fn rotate_command(new_secret: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "command",
             "payload": {
@@ -2664,7 +3158,7 @@ mod rotation_tests {
         let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await;
         drop(manager_io);
         let (mut ws_write, _ws_read) = relay_ws.split();
-        handle_manager_message(
+        let written = handle_manager_message(
             &rotate_command(NEW).to_string(),
             &relay.ctx,
             &relay.relay_config,
@@ -2674,6 +3168,7 @@ mod rotation_tests {
             &mut creds,
         )
         .await;
+        assert!(written.is_err(), "a write that failed must end the session");
         assert_eq!(
             relay.secret_on_disk().as_deref(),
             Some(OLD),
@@ -2736,7 +3231,7 @@ mod rotation_tests {
         // Each attempt gets a fresh in-memory connection, whose manager end
         // comes out here.
         let (manager_end, mut accepted) = mpsc::unbounded_channel();
-        let connect = move |_url: String, _config: ManagerConfig| {
+        let connect = move |_url: String, _config: ManagerConfig, _deadline: Instant| {
             let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
             let _ = manager_end.send(manager_io);
             async move { Ok(WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await) }
@@ -2841,5 +3336,466 @@ mod rotation_tests {
         // The one presented plus its fallbacks, so at most four refusals.
         let candidates = 1 + creds.fallback_secrets.len();
         assert!(candidates <= 5, "{candidates} candidates would run into the lockout");
+    }
+}
+
+#[cfg(test)]
+mod link_deadline_tests {
+    //! The deadlines on the manager link: a dial that never completes, a
+    //! write the manager never reads, a manager that falls silent — each must
+    //! end in a reconnect, never in a relay stranded until it is restarted —
+    //! and none of them may cut short a session that is merely busy.
+    use super::rotation_tests::{
+        NEW, OLD, Relay, Ws, answer, auth_ok, authenticate, manager_config, recv, rotate_command, send,
+    };
+    use super::*;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    // ── the cadence ──────────────────────────────────────────────────────
+
+    /// A manager that has not pinged has said nothing about its cadence, and
+    /// one from before the keepalive never will: its quiet ends nothing.
+    #[test]
+    fn the_silence_check_is_unarmed_until_the_first_ping() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_frame(t0 + secs(10));
+        assert_eq!(c.dead_for(t0 + secs(3600)), None);
+        c.on_ping(t0 + secs(15));
+        assert_eq!(c.silence_limit(), Some(SILENCE_FLOOR));
+        assert!(c.dead_for(t0 + secs(15) + secs(91)).is_some());
+    }
+
+    /// The first ping arms it with the time since the session started as its
+    /// first gap, and that gap is taken at its word.
+    #[test]
+    fn the_first_ping_counts_the_session_so_far_as_a_gap() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0 + secs(120));
+        assert_eq!(c.silence_limit(), Some(secs(480)));
+    }
+
+    /// The keepalive can be set to 300 s; a fixed limit would drop every
+    /// healthy session on such a manager.
+    #[test]
+    fn a_slow_cadence_scales_the_limit() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        for n in 1..=3 {
+            c.on_ping(t0 + secs(300 * n));
+        }
+        assert_eq!(c.silence_limit(), Some(secs(1200)));
+        assert_eq!(c.dead_for(t0 + secs(900) + secs(1199)), None);
+        assert!(c.dead_for(t0 + secs(900) + secs(1201)).is_some());
+    }
+
+    /// One stall in the manager is not its cadence. Judged by the widest gap,
+    /// an 85 s stall would have the next silence wait 340 s.
+    #[test]
+    fn one_long_gap_does_not_set_the_limit() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        let mut at = 0;
+        for gap in [15, 15, 15, 85, 15, 15] {
+            at += gap;
+            c.on_ping(t0 + secs(at));
+        }
+        assert_eq!(c.silence_limit(), Some(SILENCE_FLOOR));
+    }
+
+    /// Pings read late, back to back, after the session was held up, measure
+    /// nothing; the floor stands.
+    #[test]
+    fn back_to_back_pings_do_not_take_the_limit_under_the_floor() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        for _ in 0..CADENCE_GAPS {
+            c.on_ping(t0);
+        }
+        assert_eq!(c.silence_limit(), Some(SILENCE_FLOOR));
+    }
+
+    /// A gap longer than any keepalive the manager can be set to is a stall,
+    /// and counts as 300 s.
+    #[test]
+    fn a_gap_counts_for_at_most_300_s() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0 + secs(3600));
+        assert_eq!(c.silence_limit(), Some(MAX_PING_GAP * SILENCE_PINGS));
+    }
+
+    /// Only the latest gaps count: the earliest fall out.
+    #[test]
+    fn the_cadence_is_the_latest_gaps() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        let mut at = 0;
+        for _ in 0..CADENCE_GAPS {
+            at += 60;
+            c.on_ping(t0 + secs(at));
+        }
+        assert_eq!(c.silence_limit(), Some(secs(240)));
+        for _ in 0..CADENCE_GAPS {
+            at += 15;
+            c.on_ping(t0 + secs(at));
+        }
+        assert_eq!(c.silence_limit(), Some(SILENCE_FLOOR));
+    }
+
+    /// Any frame proves the manager is there, not only a ping.
+    #[test]
+    fn any_frame_resets_the_silence() {
+        let t0 = Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0 + secs(15));
+        c.on_frame(t0 + secs(80));
+        assert_eq!(c.dead_for(t0 + secs(170)), None);
+        assert!(c.dead_for(t0 + secs(171)).is_some());
+    }
+
+    // ── the dial ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_families_alternate_led_by_the_resolvers_first() {
+        let v4 = |n: u8| SocketAddr::from(([192, 0, 2, n], 443));
+        let v6 = |n: u16| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, n], 443));
+        assert_eq!(interleave_families(vec![v6(1), v6(2), v4(1), v4(2), v4(3)]), [v6(1), v4(1), v6(2), v4(2), v4(3)]);
+        assert_eq!(interleave_families(vec![v4(1), v4(2), v6(1)]), [v4(1), v6(1), v4(2)]);
+        assert_eq!(interleave_families(vec![v4(1), v4(2)]), [v4(1), v4(2)]);
+        assert!(interleave_families(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn the_host_and_port_are_the_ones_the_upgrade_uses() {
+        let parse = |url: &str| manager_host_port(&url.into_client_request().unwrap());
+        assert_eq!(parse("wss://m.example/ws/node"), Ok(("m.example".to_string(), 443)));
+        assert_eq!(parse("ws://m.example/ws/node"), Ok(("m.example".to_string(), 80)));
+        assert_eq!(parse("wss://[2001:db8::1]:8443/ws/node"), Ok(("2001:db8::1".to_string(), 8443)));
+    }
+
+    /// The next address starts a connection attempt delay after the last one,
+    /// or at once when an attempt fails, and the first to connect wins.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_address_starts_after_the_attempt_delay_or_at_once_after_a_failure() {
+        let v4 = |n: u8| SocketAddr::from(([192, 0, 2, n], 443));
+        let v6 = |n: u16| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, n], 443));
+        let (refused, winner) = (v4(1), v4(2));
+        let t0 = Instant::now();
+        let mut started = Vec::new();
+        let connected = connect_first("m.example", vec![v6(1), v6(2), v4(1), v4(2)], |addr| {
+            started.push((addr, t0.elapsed()));
+            async move {
+                if addr == refused {
+                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+                }
+                if addr != winner {
+                    std::future::pending::<()>().await;
+                }
+                Ok(addr)
+            }
+        })
+        .await;
+        assert_eq!(connected, Ok(winner));
+        let ms = Duration::from_millis;
+        assert_eq!(started, [(v6(1), ms(0)), (v4(1), ms(250)), (v6(2), ms(250)), (v4(2), ms(500))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn when_every_address_fails_the_last_error_is_named() {
+        let addrs = vec![SocketAddr::from(([192, 0, 2, 1], 443)), SocketAddr::from(([192, 0, 2, 2], 443))];
+        let failed = connect_first("m.example", addrs, |_| async {
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+        })
+        .await
+        .unwrap_err();
+        assert!(failed.starts_with("TCP connect to m.example (2 addresses) failed: 192.0.2.2:443: "), "{failed}");
+    }
+
+    /// An address that silently drops SYNs — a broken IPv6 path to a
+    /// dual-stack manager — must not hold up the one after it. tokio's own
+    /// connect would wait out the kernel's SYN timeout (~127 s) on it, past
+    /// the whole dial deadline.
+    #[tokio::test]
+    async fn an_address_that_never_answers_does_not_hold_up_the_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        // TEST-NET-1. Stood in for rather than dialled, so the test does not
+        // depend on how this host routes it.
+        let black_hole = SocketAddr::from(([192, 0, 2, 1], 443));
+        let started = std::time::Instant::now();
+        let connect = |addr: SocketAddr| async move {
+            if addr == black_hole {
+                std::future::pending::<()>().await;
+            }
+            tokio::net::TcpStream::connect(addr).await
+        };
+        let stream = tokio::time::timeout(secs(5), connect_first("m.example", vec![black_hole, live], connect))
+            .await
+            .expect("the second address was never tried")
+            .expect("the second address is live");
+        assert_eq!(stream.peer_addr().unwrap(), live);
+        let took = started.elapsed();
+        assert!(took >= CONNECT_ATTEMPT_DELAY && took < secs(2), "{took:?}");
+    }
+
+    /// The stall behind bilbycast-edge#180: the peer takes the upgrade request
+    /// and never answers it. `ws://`, so the stall is exactly at the upgrade.
+    #[tokio::test]
+    async fn a_dial_to_a_peer_that_never_answers_the_upgrade_gives_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (asked_tx, asked) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            let _ = asked_tx.send(String::from_utf8_lossy(&request[..n]).into_owned());
+            // Hold the connection open and never answer.
+            std::future::pending::<()>().await;
+        });
+
+        let started = std::time::Instant::now();
+        let url = format!("ws://{addr}/ws/node");
+        let failed = tokio::time::timeout(secs(10), dial_manager(&url, None, Instant::now() + secs(1)))
+            .await
+            .expect("a peer that never answers held the dial past its deadline")
+            .expect_err("a peer that never answers cannot complete the upgrade");
+        assert!(asked.await.unwrap().starts_with("GET /ws/node"), "the upgrade request was never sent");
+        assert!(failed.starts_with("TLS/WebSocket upgrade with 127.0.0.1 timed out"), "{failed}");
+        assert!(started.elapsed() < secs(5), "the deadline did not apply: {:?}", started.elapsed());
+    }
+
+    /// A refused connection is an error of its own stage, not a timeout.
+    #[tokio::test]
+    async fn a_refused_dial_names_the_tcp_stage() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let failed = dial_manager(&format!("ws://{addr}/ws/node"), None, Instant::now() + secs(10))
+            .await
+            .expect_err("a closed port cannot connect");
+        assert!(failed.starts_with("TCP connect to 127.0.0.1 (1 addresses) failed: "), "{failed}");
+    }
+
+    // ── the reconnect loop and the session ───────────────────────────────
+
+    /// The reconnect loop over in-memory connections: the first `stalled`
+    /// dials never complete, and the manager end of each later one is sent
+    /// to `accepted`.
+    async fn reconnect_loop(relay: Relay, stalled: usize, accepted: mpsc::UnboundedSender<DuplexStream>) {
+        let manager = relay.relay_config.manager.clone().unwrap();
+        let mut dials = 0;
+        let connect = move |_url: String, _config: ManagerConfig, _deadline: Instant| {
+            dials += 1;
+            let stall = dials <= stalled;
+            let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
+            if !stall {
+                let _ = accepted.send(manager_io);
+            }
+            async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await)
+            }
+        };
+        manager_client_loop(
+            manager,
+            relay.ctx.clone(),
+            relay.relay_stats.clone(),
+            relay.relay_config.clone(),
+            relay.config_path.clone(),
+            relay.event_rx,
+            relay.event_sender.clone(),
+            None,
+            connect,
+        )
+        .await;
+    }
+
+    /// The message of the first event the relay sends that starts with
+    /// `prefix`. The relay queues its events while it is disconnected and
+    /// sends them on the next connection.
+    async fn event_starting(ws: &mut Ws, prefix: &str) -> String {
+        loop {
+            let msg = recv(ws).await;
+            if msg["type"] == "event"
+                && let Some(text) = msg["payload"]["message"].as_str()
+                && text.starts_with(prefix)
+            {
+                return text.to_string();
+            }
+        }
+    }
+
+    /// Read what the relay has written until it has been quiet for half a
+    /// second — of the paused clock, so less than its 1 s stats tick.
+    async fn drain(ws: &mut Ws) {
+        while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_millis(500), ws.next()).await {}
+    }
+
+    /// The loop bounds the dial whatever `connect` is, and dials again after
+    /// its usual backoff. Before the deadline, this was the relay stranded.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_that_never_completes_is_abandoned_and_dialled_again() {
+        let relay = Relay::new(manager_config(Some(OLD), None));
+        let (accepted_tx, mut accepted) = mpsc::unbounded_channel();
+        let t0 = Instant::now();
+        let fake_manager = async {
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            let dialled_again_after = t0.elapsed();
+            authenticate(&mut ws, auth_ok()).await;
+            (dialled_again_after, event_starting(&mut ws, "Manager connection lost").await)
+        };
+        let (dialled_again_after, lost) = tokio::time::timeout(secs(3600), async {
+            tokio::select! {
+                () = reconnect_loop(relay, 1, accepted_tx) => unreachable!("the reconnect loop never returns"),
+                seen = fake_manager => seen,
+            }
+        })
+        .await
+        .expect("the relay never dialled again");
+        assert!(
+            dialled_again_after >= DIAL_TIMEOUT + secs(5) && dialled_again_after < DIAL_TIMEOUT + secs(6),
+            "the 30 s dial deadline and the 5 s backoff: {dialled_again_after:?}"
+        );
+        assert!(lost.ends_with("Manager dial timed out after 30s"), "{lost}");
+    }
+
+    /// The manager pings, then falls silent but still reads, so no write
+    /// stalls: only the silence can end the session, and it does, on the
+    /// 90 s floor, after which the loop dials again.
+    #[tokio::test(start_paused = true)]
+    async fn a_manager_that_pings_twice_and_falls_silent_is_dropped_and_dialled_again() {
+        let relay = Relay::new(manager_config(Some(OLD), None));
+        let (accepted_tx, mut accepted) = mpsc::unbounded_channel();
+        let fake_manager = async {
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            authenticate(&mut ws, auth_ok()).await;
+            ws.send(Message::Ping(Bytes::new())).await.unwrap();
+            tokio::time::sleep(secs(15)).await;
+            ws.send(Message::Ping(Bytes::new())).await.unwrap();
+            let last_ping = Instant::now();
+            while let Some(Ok(_)) = ws.next().await {}
+            let dropped_after = last_ping.elapsed();
+
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            authenticate(&mut ws, auth_ok()).await;
+            (dropped_after, event_starting(&mut ws, "Manager connection lost").await)
+        };
+        let (dropped_after, lost) = tokio::time::timeout(secs(3600), async {
+            tokio::select! {
+                () = reconnect_loop(relay, 0, accepted_tx) => unreachable!("the reconnect loop never returns"),
+                seen = fake_manager => seen,
+            }
+        })
+        .await
+        .expect("a silent manager held the session for an hour");
+        assert!(
+            dropped_after > SILENCE_FLOOR && dropped_after <= SILENCE_FLOOR + 2 * SILENCE_CHECK,
+            "{dropped_after:?}"
+        );
+        assert!(lost.contains("Nothing heard from the manager for"), "{lost}");
+    }
+
+    /// The other half of the silence check: a manager that is plainly there
+    /// is never taken for a silent one because the relay's own writes are
+    /// held up. Here the manager reads nothing for 150 s — past the 90 s
+    /// floor — while pinging on the default 15 s keepalive, and the relay's
+    /// session loop sits in a write the whole time. Pings read only between
+    /// those writes would have gone unseen.
+    #[tokio::test(start_paused = true)]
+    async fn a_manager_that_keeps_pinging_keeps_a_session_whose_writes_are_held_up() {
+        let mut relay = Relay::new(manager_config(Some(OLD), None));
+        let mut creds = relay.credentials();
+        let (ended, ack) = relay
+            .session_over(4096, secs(3600), &mut creds, |mut ws| async move {
+                authenticate(&mut ws, auth_ok()).await;
+                for _ in 0..10 {
+                    ws.send(Message::Ping(Bytes::new())).await.unwrap();
+                    tokio::time::sleep(secs(15)).await;
+                }
+                let list = serde_json::json!({
+                    "type": "command",
+                    "payload": { "command_id": "list-1", "action": { "type": "list_tunnels" } }
+                });
+                send(&mut ws, list).await;
+                loop {
+                    let msg = recv(&mut ws).await;
+                    if msg["type"] == "command_ack" {
+                        return msg["payload"].clone();
+                    }
+                }
+            })
+            .await;
+        assert_eq!(ack["command_id"], "list-1", "{ack}");
+        assert_eq!(ack["success"], true, "{ack}");
+        // The manager hung up without a close handshake when it was done.
+        let ended = ended.unwrap_err();
+        assert!(ended.starts_with("WebSocket error"), "{ended}");
+    }
+
+    /// The auth frame has a deadline of its own.
+    #[tokio::test(start_paused = true)]
+    async fn an_auth_frame_the_manager_never_reads_ends_the_attempt() {
+        let mut relay = Relay::new(manager_config(Some(OLD), None));
+        let mut creds = relay.credentials();
+        // 64 bytes each way, and the auth frame is longer.
+        let (ended, _held) = relay
+            .session_over(64, secs(3600), &mut creds, |ws| async move {
+                tokio::time::sleep(secs(60)).await;
+                ws
+            })
+            .await;
+        assert_eq!(ended, Err("Auth send timed out after 10s".to_string()));
+    }
+
+    /// A manager that stops reading while the relay answers `rotate_secret`.
+    /// The acknowledgement cannot leave, so the manager cannot have stored the
+    /// new secret, and the session must end with the old one back in the file
+    /// and presented first. The manager has pinged, so the silence check is
+    /// armed and falls due while the acknowledgement is stuck; a session
+    /// dropped there, part-way through the command, would have left the new
+    /// secret in the file and the old one in memory with nothing to fall back
+    /// to — a relay locked out at its next restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_manager_that_stops_reading_at_a_rotation_leaves_the_old_secret_on_disk() {
+        let mut relay = Relay::new(manager_config(Some(OLD), None));
+        let mut creds = relay.credentials();
+        // 64 bytes each way: the acknowledgement does not fit.
+        let (ended, _held) = relay
+            .session_over(64, secs(3600), &mut creds, |mut ws| async move {
+                authenticate(&mut ws, auth_ok()).await;
+                ws.send(Message::Ping(Bytes::new())).await.unwrap();
+                ws.send(Message::Ping(Bytes::new())).await.unwrap();
+                drain(&mut ws).await;
+                send(&mut ws, rotate_command(NEW)).await;
+                // Never read again, and never hang up.
+                ws
+            })
+            .await;
+        let ended = ended.unwrap_err();
+        assert!(ended.contains("made no progress for 300s"), "{ended}");
+        assert_eq!(
+            relay.secret_on_disk().as_deref(),
+            Some(OLD),
+            "a restart would present a secret the manager never stored"
+        );
+        assert_eq!(creds.config.node_secret.as_deref(), Some(OLD));
+        assert_eq!(creds.fallback_secrets, [NEW]);
+
+        let (_, shown) = relay
+            .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD);
     }
 }
