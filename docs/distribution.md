@@ -624,7 +624,7 @@ is the viewer's: it stays what they chose, and the page no longer moves the
 thumb or the label. On a window that is still growing the scale then moves
 under a thumb that does not, so the thumb stops marking the span the bar shows,
 and the next nudge jumps to whatever its position has come to mean — a known
-issue, not yet fixed.
+issue, not yet fixed (bilbycast-relay#22).
 
 Two properties that decide whether it feels right:
 
