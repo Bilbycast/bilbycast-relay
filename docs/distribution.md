@@ -674,7 +674,7 @@ things an operator reaches for without looking are in the four corners:
 | top right | **MARK**. Tap marks; **hold** opens the marks list |
 | bottom left | **play** — green while running, grey with a white glyph when stopped |
 | bottom right | **LIVE** |
-| right edge | the zoom slider: top is the whole window, drag down to zoom in |
+| right edge | the zoom slider: opens at one minute across the bar; top is the whole window, drag down to zoom in |
 | bottom | timeline, then speed / frame-step / shuttle |
 
 **The picture stops above the transport** rather than running underneath it, so

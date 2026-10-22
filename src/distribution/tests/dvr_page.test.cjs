@@ -2508,3 +2508,57 @@ test("thumbnail sheets the relay does not have stop the prefetch instead of bein
   assert.equal(asked.length, 3, "three misses and it stops: " + asked.length + " were asked for");
   assert.equal(new Set(asked).size, 3, "and no sheet is asked for twice");
 });
+
+// ── the zoom slider's default ────────────────────────────────────────────
+// The bar opens at one minute across, not the whole window. The slider's scale
+// is relative to the window, so the thumb has to be kept on a minute as the
+// window grows — until the viewer moves it, after which it is theirs.
+
+/// Give main's playlist a window of `secs`, as a live feed's grows.
+const setWindow = (w, secs) => {
+  instanceOn(w, "main").levels = [{ details: { fragments: [{ start: 0, duration: secs }], totalduration: secs } }];
+};
+/// Past the page's 200 ms render tick.
+const tick = () => new Promise((r) => setTimeout(r, 260));
+const zoomOf = (w) => ({
+  label: w.document.getElementById("zoomLabel").textContent,
+  pos: parseInt(w.document.getElementById("zoom").value, 10),
+});
+
+test("the timeline opens at one minute across the bar", async (t) => {
+  const w = loadPage();
+  t.after(() => closePage(w));
+  setWindow(w, 3600);
+  await tick();
+  // span 3600: pos = 1000 * ln(60/3600) / ln(15/3600) = 747
+  assert.deepEqual(zoomOf(w), { label: "1m", pos: 747 });
+});
+
+test("the default follows the window as it grows, showing all of one under a minute", async (t) => {
+  const w = loadPage();
+  t.after(() => closePage(w));
+  setWindow(w, 40);
+  await tick();
+  assert.deepEqual(zoomOf(w), { label: "ALL", pos: 0 }, "a 40 s window is shown whole");
+  setWindow(w, 600);
+  await tick();
+  // span 600: 1000 * ln(60/600) / ln(15/600) = 624 — a different thumb, still a minute
+  assert.deepEqual(zoomOf(w), { label: "1m", pos: 624 });
+  setWindow(w, 9000);
+  await tick();
+  assert.deepEqual(zoomOf(w), { label: "1m", pos: 747 }, "the scale tops out at an hour");
+});
+
+test("once the viewer moves the slider it stays where they put it", async (t) => {
+  const w = loadPage();
+  t.after(() => closePage(w));
+  setWindow(w, 3600);
+  await tick();
+  const zoom = w.document.getElementById("zoom");
+  zoom.value = "0";
+  zoom.dispatchEvent(new w.Event("input", { bubbles: true }));
+  assert.equal(zoomOf(w).label, "ALL");
+  setWindow(w, 4000);
+  await tick();
+  assert.deepEqual(zoomOf(w), { label: "ALL", pos: 0 }, "the default took the slider back");
+});

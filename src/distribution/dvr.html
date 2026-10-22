@@ -576,7 +576,7 @@
 
   <!-- right edge: how much of the window the bar shows -->
   <div id="zoomWrap">
-    <span id="zoomLabel">ALL</span>
+    <span id="zoomLabel">1m</span>
     <div id="zoomRail">
       <input id="zoom" type="range" min="0" max="1000" value="0" step="1"
              aria-label="Timeline zoom" title="Drag down to zoom in">
@@ -2039,9 +2039,18 @@
   // step and a cue point cannot be found by dragging. Zooming trades reach for
   // granularity: at 30 s across the bar a step is ~30 ms, under a frame.
   //
-  // `0` means the whole window, which is where this started and stays the
-  // default — an operator who has not asked to zoom should see everything.
-  var zoomSecs = 0;
+  // `0` means the whole window. The bar opens at one minute instead: the
+  // operator is almost always working the last minute of an event hours long,
+  // and the whole window is one drag away at the top of the slider.
+  var ZOOM_DEFAULT_SECS = 60;
+  var zoomSecs = ZOOM_DEFAULT_SECS;
+
+  /// Whether the operator has moved the zoom slider yet.
+  ///
+  /// Until they have, the thumb is kept on the default span. The slider's
+  /// scale is relative to the window, which grows for the whole event, so a
+  /// thumb left where it was first put would drift away from a minute.
+  var zoomTouched = false;
 
   /// Centre of the view while it is pinned, or null to follow the playhead.
   ///
@@ -2934,6 +2943,31 @@
     return Math.max(ZOOM_MIN_SECS, span * Math.pow(ZOOM_MIN_SECS / span, frac));
   }
 
+  /// The inverse of `zoomFromSlider`: where the thumb sits for `secs`.
+  ///
+  /// A span at least as long as the scale's top is the top position — the
+  /// whole window, which is what `viewRange` shows for it anyway.
+  function sliderFromZoom(secs, whole) {
+    if (!secs) return 0;
+    var span = Math.max(ZOOM_MIN_SECS, Math.min(whole, 3600));
+    if (secs >= span) return 0;
+    var pos = 1000 * Math.log(secs / span) / Math.log(ZOOM_MIN_SECS / span);
+    return Math.max(0, Math.min(1000, Math.round(pos)));
+  }
+
+  /// Keep the thumb and label on the default span until the operator takes
+  /// over. Setting `value` from script fires no `input` event, so this never
+  /// counts as the operator having touched it.
+  function syncDefaultZoom() {
+    if (zoomTouched) return;
+    var full = range(main);
+    var whole = full ? full.end - full.start : 0;
+    var pos = String(sliderFromZoom(zoomSecs, whole || 3600));
+    if (zoomInput.value !== pos) zoomInput.value = pos;
+    var text = zoomText(zoomSecs, whole || Infinity);
+    if (zoomLabel.textContent !== text) zoomLabel.textContent = text;
+  }
+
   /// A span as something to read at a glance, not a duration to the second.
   function zoomText(secs, whole) {
     if (!secs || secs >= whole) return "ALL";
@@ -2943,6 +2977,7 @@
   }
 
   function applyZoom() {
+    zoomTouched = true;
     var full = range(main);
     var whole = full ? full.end - full.start : 0;
     zoomSecs = zoomFromSlider(parseInt(zoomInput.value, 10), whole || 3600);
@@ -5232,6 +5267,7 @@
   }
 
   function render(remeasure) {
+    syncDefaultZoom();
     var v = activeVideo();
     // Two independent conditions, and the offset needs both.
     //
