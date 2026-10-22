@@ -590,13 +590,41 @@ picture with no fetch. It is capped by `backBufferLength`, so on a long window
 it is a small fraction of the bar and *shrinks* as a proportion the longer a
 session runs. Everything outside it is served by the thumbnail preview.
 
-### How much of the window the bar shows (`VIEW`)
+### How much of the window the bar shows (the zoom slider)
 
 A whole-event window is hours long, so a 1000-step bar is seconds per step and a
-cue point cannot be found by dragging at all. `VIEW` sets the span the bar
-covers — `ALL`, 30m, 10m, 2m, 30s — trading reach for granularity. Measured on
-the live feed: **30 s across the bar is 0.028 s per step**, comfortably under a
-frame, against 0.33 s per step on a 5-minute window and ~9 s on a 2h30m one.
+cue point cannot be found by dragging at all. The **zoom slider** on the right
+edge sets the span the bar covers, trading reach for granularity. It is
+continuous rather than a row of presets: the top is the whole window (`ALL`),
+and dragging down narrows the span smoothly to 15 s (`ZOOM_MIN_SECS`). The
+scale is logarithmic and relative to the window (`zoomFromSlider`): just below
+the top is the whole window, or an hour when the window is longer — the scale
+tops out there — and every step down divides the span by the same factor, so
+the narrow end, where a cue point is found, gets as much of the slider as the
+wide end. The label above it reads the span at a glance — `ALL`, then whole
+hours, minutes or seconds, rounded. Measured on the live feed: **30 s across
+the bar is 0.028 s per step**, comfortably under a frame, against 0.33 s per
+step on a 5-minute window and ~9 s on a 2h30m one.
+
+**It opens at one minute** (`ZOOM_DEFAULT_SECS`): the operator is almost
+always working the last minute of an event hours long, and the whole window is
+one drag away at the top. A span wider than the window collapses to the
+window, so a window still **under a minute opens whole** — the label reads
+`ALL` and the thumb sits at the top — and the bar narrows to a minute once the
+window grows past one.
+
+**The thumb follows the growing window until the viewer first touches it.**
+The scale is relative to the window, which grows for the whole event, so a
+thumb left where the page first put it would come to mean more than a minute.
+Until the slider is first moved, every render tick puts the thumb and the label
+back on the default span (`syncDefaultZoom`, through `sliderFromZoom`, the
+inverse of the scale). Setting the slider from script fires no `input` event,
+so this never counts as the viewer touching it. From the first touch the span
+is the viewer's: it stays what they chose, and the page no longer moves the
+thumb or the label. On a window that is still growing the scale then moves
+under a thumb that does not, so the thumb stops marking the span the bar shows,
+and the next nudge jumps to whatever its position has come to mean — a known
+issue, not yet fixed.
 
 Two properties that decide whether it feels right:
 
@@ -611,9 +639,6 @@ Two properties that decide whether it feels right:
   whole window. Measured against the view instead, zooming in would report the
   viewer as closer to live than they are, which is a number an operator acts on.
 
-A preset wider than the window collapses to the window, so `30m` on a
-five-minute window is simply `ALL`.
-
 **Reaching past the visible span.** Held in the outer eighth of the bar, the
 view scrolls that way — the thumb stays put and the window moves under it. Its
 own frame loop drives this rather than the `input` event, because a thumb held
@@ -622,7 +647,7 @@ movement scrolls one step and stalls. The pan is clamped to the window so the
 far ends stay reachable.
 
 **The ruler.** Marks along the bar sit at round clock times, which does two
-jobs: their spacing says how far the bar is zoomed without reading the buttons,
+jobs: their spacing says how far the bar is zoomed without reading the label,
 and because each is pinned to an absolute moment they drift left on their own as
 the view follows the playhead. That motion is the passage of time, not an
 animation over it — and it stops when the transport stops, which is also true.
@@ -659,7 +684,7 @@ its left edge also steps by a segment, which is invisible on a whole-event
 window (0.02 % of the bar) and noticeable on a very short one.
 
 Zooming in near the playhead also tends to fill the bar with buffered media, so
-at the narrow presets the whole visible span is usually instant *and*
+at a narrow zoom the whole visible span is usually instant *and*
 frame-exact. That is a consequence of the back buffer's size rather than a
 designed property, and it does not hold for a viewer who has just joined.
 
