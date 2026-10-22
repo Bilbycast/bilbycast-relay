@@ -10,6 +10,7 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -554,37 +555,163 @@ async fn handle_udp_datagrams(
     }
 }
 
-/// Send a TunnelReady notification to an edge via its control stream.
-async fn notify_tunnel_ready(ctx: &Arc<SessionContext>, edge_id: &str, tunnel_id: Uuid) {
-    if let Some(conn) = ctx.edge_connections.get(edge_id) {
-        // We need to send on the existing control stream, but we don't have
-        // access to it here. Instead, open a new uni stream for notifications.
+/// How long a notification to an edge may take to leave. Best effort, like
+/// the notification itself.
+///
+/// Opening the stream waits for the edge to allow another one, and writing it
+/// waits on the edge's flow control: an edge that has stopped taking streams
+/// but still answers keep-alives holds both for ever. The callers await this
+/// inline — another edge's control loop and its cleanup, the REST tunnel
+/// delete, and the manager's `close_tunnel`, whose session writes nothing to
+/// the manager meanwhile — so one such edge must not hold them for longer
+/// than this.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Send `msg` to an edge on a stream of its own (the edge's control stream
+/// belongs to its session task). Best effort: a missing or closed connection,
+/// or one that takes longer than [`NOTIFY_TIMEOUT`], is ignored.
+async fn notify_edge(ctx: &Arc<SessionContext>, edge_id: &str, msg: &RelayMessage) {
+    // A clone of the handle, not the map's `Ref`: a `Ref` held across the
+    // awaits below holds its shard's lock with it, and an edge connecting or
+    // disconnecting meanwhile — an insert or remove in that shard — would
+    // block a runtime thread until the notification ended.
+    let Some(conn) = ctx.edge_connections.get(edge_id).map(|c| c.clone()) else {
+        return;
+    };
+    let notify = async {
         if let Ok(mut send) = conn.open_uni().await {
-            let msg = RelayMessage::TunnelReady { tunnel_id };
-            let _ = write_message(&mut send, &msg).await;
+            let _ = write_message(&mut send, msg).await;
             let _ = send.finish();
         }
+    };
+    if tokio::time::timeout(NOTIFY_TIMEOUT, notify).await.is_err() {
+        tracing::debug!(
+            "Notification to edge '{edge_id}' did not leave within {}s; dropped",
+            NOTIFY_TIMEOUT.as_secs()
+        );
     }
+}
+
+/// Send a TunnelReady notification to an edge.
+async fn notify_tunnel_ready(ctx: &Arc<SessionContext>, edge_id: &str, tunnel_id: Uuid) {
+    notify_edge(ctx, edge_id, &RelayMessage::TunnelReady { tunnel_id }).await;
 }
 
 /// Send a TunnelDown notification to an edge.
 ///
 /// `edge_id` here is the `edge_connections` key, i.e. the endpoint's
 /// `connection_id` (the value returned by `TunnelRouter::force_remove_tunnel`
-/// and `remove_edge`). Best-effort: a missing/closed connection is ignored.
+/// and `remove_edge`). Best effort, as [`notify_edge`] says.
 pub(crate) async fn notify_tunnel_down(
     ctx: &Arc<SessionContext>,
     edge_id: &str,
     tunnel_id: Uuid,
     reason: &str,
 ) {
-    if let Some(conn) = ctx.edge_connections.get(edge_id)
-        && let Ok(mut send) = conn.open_uni().await {
-            let msg = RelayMessage::TunnelDown {
-                tunnel_id,
-                reason: reason.to_string(),
-            };
-            let _ = write_message(&mut send, &msg).await;
-            let _ = send.finish();
-        }
+    let msg = RelayMessage::TunnelDown {
+        tunnel_id,
+        reason: reason.to_string(),
+    };
+    notify_edge(ctx, edge_id, &msg).await;
+}
+
+#[cfg(test)]
+mod notify_tests {
+    //! Notifications from one edge's session to another, through the real
+    //! session code over QUIC on loopback.
+    use super::*;
+    use rustls::pki_types::CertificateDer;
+    use std::net::SocketAddr;
+
+    /// A relay running the real session code, and the certificate an edge
+    /// must trust to reach it.
+    fn start_relay() -> (SocketAddr, CertificateDer<'static>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key.into())
+            .unwrap();
+        tls.alpn_protocols = vec![ALPN_RELAY.to_vec()];
+        let server = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (event_sender, _events) = crate::manager::event_channel();
+        let ctx = crate::server::create_session_context(Arc::new(RelayStats::new()), event_sender, false, 64, 100);
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    if let Ok(connection) = incoming.await {
+                        handle_edge_connection(ctx, connection).await;
+                    }
+                });
+            }
+        });
+        (addr, cert_der)
+    }
+
+    /// An edge's endpoint, connection and control stream. It allows the relay
+    /// `uni_streams` streams of the relay's own, which is what notifications
+    /// arrive on.
+    async fn edge(
+        relay: SocketAddr,
+        cert: &CertificateDer<'static>,
+        uni_streams: u32,
+    ) -> (quinn::Endpoint, Connection, quinn::SendStream, quinn::RecvStream) {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let mut crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![ALPN_RELAY.to_vec()];
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_uni_streams(uni_streams.into());
+        let mut config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+        ));
+        config.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(config);
+        let connection = endpoint.connect(relay, "localhost").unwrap().await.unwrap();
+        let (send, recv) = connection.open_bi().await.unwrap();
+        (endpoint, connection, send, recv)
+    }
+
+    /// An edge that has stopped taking streams but still answers keep-alives
+    /// held the relay's notification to it for ever — and with it the control
+    /// loop of the edge whose bind set it off, which answered nothing more.
+    #[tokio::test]
+    async fn an_edge_that_takes_no_streams_does_not_hold_up_its_peer() {
+        let (relay, cert) = start_relay();
+        let tunnel_id = Uuid::new_v4();
+        let bind = |direction| EdgeMessage::TunnelBind {
+            tunnel_id,
+            direction,
+            protocol: TunnelProtocol::Tcp,
+            bind_token: None,
+        };
+
+        // It allows the relay no streams, so a notification to it never opens.
+        let (_deaf_endpoint, _deaf, mut deaf_send, mut deaf_recv) = edge(relay, &cert, 0).await;
+        write_message(&mut deaf_send, &bind(TunnelDirection::Ingress)).await.unwrap();
+        let waiting: RelayMessage = read_message(&mut deaf_recv).await.unwrap();
+        assert!(matches!(waiting, RelayMessage::TunnelWaiting { .. }), "{waiting:?}");
+
+        let (_endpoint, _peer, mut send, mut recv) = edge(relay, &cert, 100).await;
+        write_message(&mut send, &bind(TunnelDirection::Egress)).await.unwrap();
+        let ready: RelayMessage = read_message(&mut recv).await.unwrap();
+        assert!(matches!(ready, RelayMessage::TunnelReady { .. }), "{ready:?}");
+
+        // This edge's control loop is now notifying the deaf one.
+        write_message(&mut send, &EdgeMessage::Ping).await.unwrap();
+        let pong = tokio::time::timeout(NOTIFY_TIMEOUT * 3, read_message::<RelayMessage>(&mut recv))
+            .await
+            .expect("the control loop is still held by the notification")
+            .unwrap();
+        assert!(matches!(pong, RelayMessage::Pong), "{pong:?}");
+    }
 }
