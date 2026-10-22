@@ -115,9 +115,24 @@ The relay carries three logically distinct path types, all forwarded the same op
 |  |   Commands: get_config,       |                                       |
 |  |     disconnect_edge,          |                                       |
 |  |     close_tunnel, list_*      |                                       |
+|  |   Every await bounded: dial   |                                       |
+|  |     30s, auth 10s+10s, write  |                                       |
+|  |     300s, silence 90s+        |                                       |
 |  +-------------------------------+                                       |
 +===========================================================================+
 ```
+
+The manager client's reconnect loop is a single task, so an await on the
+manager link that never completed used to keep the relay off the manager until
+it was restarted (the edge's #180 was the same code). Every await on it is now
+bounded: the dial (DNS, TCP to each resolved address Happy-Eyeballs style, TLS
+and the HTTP upgrade) in 30 s, the auth frame and its answer in 10 s each,
+every session write in 300 s, and once the manager has pinged, 90 s with
+nothing from it — or four of its ping intervals, if those are longer — ends
+the session. A reader beside the session loop does the listening, so a session
+busy writing is never taken for a dead one, and the session only ever ends
+between commands, never part-way through `rotate_secret`. Detail and the
+reasons: CLAUDE.md, "Manager Connection", Deadlines.
 
 The `distribution` task is `#[cfg(feature = "viewer-distribution")]` and is
 only spawned when `distribution.enabled` is true — which it is by default, so
