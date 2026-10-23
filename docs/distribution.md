@@ -632,12 +632,19 @@ set on a ten-minute window (623) became 119 s on one arrow key once the window
 had grown to an hour, where 60.2 s sits at 746.
 
 **The thumb is never moved while the viewer has hold of it** (`zoomHeld`): from
-a press on the slider until the pointer is let go or cancelled anywhere on the
-page — a drag that ends off the track still ends, as on the scrub bar — and
-from a key down on it until its keyup, or until focus leaves the slider with
-the key still down. Moving it then would move it under the finger. The label
-is under no finger, so it keeps up throughout, and the thumb is put back on the
-span at the first render tick after it is let go.
+a press of the primary button on the slider (a touch or a pen is one) until the
+pointer is let go or cancelled anywhere on the page — a drag that ends off the
+track still ends, as on the scrub bar — or a context menu opens, and from a key
+down on it until its keyup, or until focus leaves the slider with the key still
+down. Moving it then would move it under the finger. The label is under no
+finger, so it keeps up throughout, and the thumb is put back on the span at the
+first render tick after it is let go.
+
+Only the primary button takes hold, because only it drags the thumb, and a
+context menu lets go, because off Windows the menu opens on the press and takes
+the release: no pointerup reaches the page, and a hold taken then lasted until
+some later click, the thumb off the span as before #22. A macOS ctrl-click is a
+primary press that opens a menu just the same.
 
 Two properties that decide whether it feels right:
 

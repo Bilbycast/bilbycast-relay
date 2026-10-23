@@ -2046,7 +2046,7 @@
   var zoomSecs = ZOOM_DEFAULT_SECS;
 
   /// Whether the viewer has hold of the zoom slider: a pointer pressed on it
-  /// and not yet let go, or a key down on it.
+  /// with the primary button and not yet let go, or a key down on it.
   ///
   /// Every render tick puts the thumb back on the span (`syncZoom`), but not
   /// while it is held. Moving it then would move it under the finger, and a
@@ -5836,11 +5836,14 @@
     b.addEventListener("click", function () { setRate(parseFloat(b.dataset.rate)); });
   });
   zoomInput.addEventListener("input", applyZoom);
-  // Hold the thumb still while the viewer has it (see `zoomHeld`). A press is
+  // Hold the thumb still while the viewer has it (see `zoomHeld`). Only the
+  // primary button takes hold, because only it drags the thumb. A press is
   // let go on the window, not the input, as the scrub bar's is: a drag that
   // ends off the track still ends. A key is let go on its keyup, or on blur
   // when focus leaves with the key still down and its keyup goes elsewhere.
-  zoomInput.addEventListener("pointerdown", function () { zoomHeld = true; });
+  zoomInput.addEventListener("pointerdown", function (e) {
+    if (e.button === 0) zoomHeld = true;
+  });
   zoomInput.addEventListener("keydown", function () { zoomHeld = true; });
   ["keyup", "blur"].forEach(function (type) {
     zoomInput.addEventListener(type, function () { zoomHeld = false; });
@@ -5848,6 +5851,13 @@
   ["pointerup", "pointercancel"].forEach(function (type) {
     window.addEventListener(type, function () { zoomHeld = false; });
   });
+  // A context menu lets go as well. Off Windows the menu opens on the press
+  // and takes the release, so no pointerup ever reaches the page, and a
+  // macOS ctrl-click is a primary press that opens one just the same: held
+  // until some later click, the thumb would stop following the span, which is
+  // bilbycast-relay#22 again. Letting go early costs nothing: the thumb is put
+  // on the span a tick sooner.
+  window.addEventListener("contextmenu", function () { zoomHeld = false; });
   btnRew.addEventListener("click", function () { cycleShuttle(-1); });
   btnFf.addEventListener("click", function () { cycleShuttle(1); });
 

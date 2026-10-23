@@ -2524,6 +2524,11 @@ const zoomOf = (w) => ({
   label: w.document.getElementById("zoomLabel").textContent,
   pos: parseInt(w.document.getElementById("zoom").value, 10),
 });
+/// A pointer press or release as a browser sends one, from pointer 1 with the
+/// primary button unless said otherwise. The zoom slider's hold reads the
+/// button, which a bare `Event` does not carry.
+const pointer = (w, type, { id = 1, button = 0 } = {}) =>
+  new w.PointerEvent(type, { bubbles: true, pointerId: id, button });
 
 test("the timeline opens at one minute across the bar", async (t) => {
   const w = loadPage();
@@ -2594,10 +2599,10 @@ test("the thumb keeps the viewer's span as the window grows, so a nudge is one s
   setWindow(w, 600);
   await tick();
   // One step in from a minute: 600 * (15/600)^0.623 = 60.27 s.
-  zoom.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  zoom.dispatchEvent(pointer(w, "pointerdown"));
   zoom.value = "623";
   zoom.dispatchEvent(new w.Event("input", { bubbles: true }));
-  w.dispatchEvent(new w.Event("pointerup"));
+  w.dispatchEvent(pointer(w, "pointerup"));
   const chosen = spanOf(w);
   assert.ok(Math.abs(chosen - 60.27) < 0.1, "fixture: the span chosen is " + chosen + " s");
 
@@ -2632,22 +2637,22 @@ test("the thumb is never moved while the viewer has hold of it", async (t) => {
   // A finger on the thumb while the window grows: left where it is, and put
   // on the span (60.27 s) once the finger lifts, wherever on the page it
   // lifts — or once the browser takes the touch over for a scroll.
-  zoom.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  zoom.dispatchEvent(pointer(w, "pointerdown"));
   zoom.value = "623";
   zoom.dispatchEvent(new w.Event("input", { bubbles: true }));
   setWindow(w, 900);
   await tick();
   assert.equal(zoomOf(w).pos, 623, "the thumb moved under the finger");
-  w.dispatchEvent(new w.Event("pointerup"));
+  w.dispatchEvent(pointer(w, "pointerup"));
   await tick();
   // span 900: 1000 * ln(60.27/900) / ln(15/900) = 660
   assert.equal(zoomOf(w).pos, 660, "let go, the thumb was not put on the span");
 
-  zoom.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  zoom.dispatchEvent(pointer(w, "pointerdown"));
   setWindow(w, 1200);
   await tick();
   assert.equal(zoomOf(w).pos, 660, "the thumb moved under the finger");
-  w.dispatchEvent(new w.Event("pointercancel"));
+  w.dispatchEvent(pointer(w, "pointercancel"));
   await tick();
   // span 1200: 1000 * ln(60.27/1200) / ln(15/1200) = 683
   assert.equal(zoomOf(w).pos, 683, "a cancelled touch left the thumb held");
@@ -2672,4 +2677,35 @@ test("the thumb is never moved while the viewer has hold of it", async (t) => {
   zoom.blur();
   await tick();
   assert.equal(zoomOf(w).pos, 746, "focus left, and the thumb stayed held");
+});
+
+// A press whose release never reaches the page must not take hold, or the
+// thumb stops following the span until some later click: #22 again. Off
+// Windows a context menu opens on the press and takes the release.
+test("a press that opens a context menu never leaves the thumb held", async (t) => {
+  const w = loadPage();
+  t.after(() => closePage(w));
+  const zoom = w.document.getElementById("zoom");
+  setWindow(w, 600);
+  await tick();
+  assert.equal(zoomOf(w).pos, 624, "fixture: a minute on a ten-minute window");
+
+  // Only the primary button drags the thumb, so only it takes hold. A
+  // right-click's press with no release after it; the menu it opens is left
+  // out, so this checks the button on its own.
+  zoom.dispatchEvent(pointer(w, "pointerdown", { button: 2 }));
+  setWindow(w, 900);
+  await tick();
+  // span 900: 1000 * ln(60/900) / ln(15/900) = 661
+  assert.equal(zoomOf(w).pos, 661, "a right-click left the thumb held");
+
+  // A macOS ctrl-click is a primary press, so it takes hold, and its menu
+  // takes the release. The menu is what lets go. Sent as Safari and Firefox
+  // send it, a MouseEvent with no pointerId.
+  zoom.dispatchEvent(pointer(w, "pointerdown"));
+  zoom.dispatchEvent(new w.MouseEvent("contextmenu", { bubbles: true, ctrlKey: true }));
+  setWindow(w, 1200);
+  await tick();
+  // span 1200: 1000 * ln(60/1200) / ln(15/1200) = 684
+  assert.equal(zoomOf(w).pos, 684, "a ctrl-click's menu left the thumb held");
 });
