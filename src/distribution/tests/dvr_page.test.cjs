@@ -2554,10 +2554,11 @@ test("the default follows the window as it grows, showing all of one under a min
   assert.deepEqual(zoomOf(w), { label: "1m", pos: 747 }, "the scale tops out at an hour");
 });
 
-// ALL sits at the top of the slider whatever the window, so it is the one
-// choice a growing window leaves where the viewer put it. A span chosen below
-// the top follows the window down the slider instead (bilbycast-relay#22,
-// below).
+// ALL is the top of the slider whatever the window, so picking it keeps the
+// whole window as the window grows, and the one-minute default never takes it
+// back. Any other span keeps its length, and its thumb moves down the slider
+// as the window grows up to an hour (bilbycast-relay#22, below); the 15 s
+// floor stays at the bottom.
 test("once the viewer picks ALL the bar stays the whole window, and the default never takes it back", async (t) => {
   const w = loadPage();
   t.after(() => closePage(w));
