@@ -2525,8 +2525,8 @@ const zoomOf = (w) => ({
   pos: parseInt(w.document.getElementById("zoom").value, 10),
 });
 /// A pointer press or release as a browser sends one, from pointer 1 with the
-/// primary button unless said otherwise. The zoom slider's hold reads the
-/// button, which a bare `Event` does not carry.
+/// primary button unless said otherwise. The zoom slider's hold reads both,
+/// and a bare `Event` carries neither.
 const pointer = (w, type, { id = 1, button = 0 } = {}) =>
   new w.PointerEvent(type, { bubbles: true, pointerId: id, button });
 
@@ -2700,12 +2700,78 @@ test("a press that opens a context menu never leaves the thumb held", async (t) 
   assert.equal(zoomOf(w).pos, 661, "a right-click left the thumb held");
 
   // A macOS ctrl-click is a primary press, so it takes hold, and its menu
-  // takes the release. The menu is what lets go. Sent as Safari and Firefox
-  // send it, a MouseEvent with no pointerId.
+  // takes the release. The menu is what lets go. Sent as a MouseEvent with no
+  // pointerId, since not every browser sends it as a PointerEvent.
   zoom.dispatchEvent(pointer(w, "pointerdown"));
   zoom.dispatchEvent(new w.MouseEvent("contextmenu", { bubbles: true, ctrlKey: true }));
   setWindow(w, 1200);
   await tick();
   // span 1200: 1000 * ln(60/1200) / ln(15/1200) = 684
   assert.equal(zoomOf(w).pos, 684, "a ctrl-click's menu left the thumb held");
+
+  // A menu opened from the keyboard can take the key's keyup the same way.
+  zoom.focus();
+  zoom.dispatchEvent(new w.KeyboardEvent("keydown", { key: "ContextMenu", bubbles: true }));
+  zoom.dispatchEvent(new w.MouseEvent("contextmenu", { bubbles: true }));
+  setWindow(w, 1800);
+  await tick();
+  // span 1800: 1000 * ln(60/1800) / ln(15/1800) = 710
+  assert.equal(zoomOf(w).pos, 710, "a menu opened from the keyboard left the thumb held");
+});
+
+// The window hears every pointer's release, so the hold is kept by the pointer
+// that pressed, and the key apart from it.
+test("only the pointer that pressed the thumb lets go of it", async (t) => {
+  const w = loadPage();
+  t.after(() => closePage(w));
+  const zoom = w.document.getElementById("zoom");
+  const body = w.document.body;
+  setWindow(w, 600);
+  await tick();
+  assert.equal(zoomOf(w).pos, 624, "fixture: a minute on a ten-minute window");
+
+  // One finger on the thumb while others tap elsewhere on the page, one of
+  // them taken over by the browser for a scroll.
+  zoom.focus();
+  zoom.dispatchEvent(pointer(w, "pointerdown", { id: 1 }));
+  body.dispatchEvent(pointer(w, "pointerdown", { id: 2 }));
+  body.dispatchEvent(pointer(w, "pointerup", { id: 2 }));
+  body.dispatchEvent(pointer(w, "pointerdown", { id: 3 }));
+  body.dispatchEvent(pointer(w, "pointercancel", { id: 3 }));
+  setWindow(w, 900);
+  await tick();
+  assert.equal(zoomOf(w).pos, 624, "another finger's release let go of the thumb");
+
+  // A key pressed and let go on the slider mid-drag.
+  zoom.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Shift", bubbles: true }));
+  zoom.dispatchEvent(new w.KeyboardEvent("keyup", { key: "Shift", bubbles: true }));
+  setWindow(w, 1200);
+  await tick();
+  assert.equal(zoomOf(w).pos, 624, "a keyup let go of the finger's hold");
+
+  // The finger that pressed lifts.
+  body.dispatchEvent(pointer(w, "pointerup", { id: 1 }));
+  await tick();
+  // span 1200: 1000 * ln(60/1200) / ln(15/1200) = 684
+  assert.equal(zoomOf(w).pos, 684, "the pressing finger's release did not let go");
+
+  // Focus leaving the slider lets go of a press as well as a key.
+  zoom.dispatchEvent(pointer(w, "pointerdown", { id: 4 }));
+  setWindow(w, 1800);
+  await tick();
+  assert.equal(zoomOf(w).pos, 684, "the thumb moved under the finger");
+  zoom.blur();
+  await tick();
+  // span 1800: 1000 * ln(60/1800) / ln(15/1800) = 710
+  assert.equal(zoomOf(w).pos, 710, "focus left, and the press stayed held");
+
+  // A later press takes the hold over, so one whose release never came
+  // cannot keep it.
+  zoom.dispatchEvent(pointer(w, "pointerdown", { id: 5 }));
+  zoom.dispatchEvent(pointer(w, "pointerdown", { id: 6 }));
+  body.dispatchEvent(pointer(w, "pointerup", { id: 6 }));
+  setWindow(w, 2400);
+  await tick();
+  // span 2400: 1000 * ln(60/2400) / ln(15/2400) = 727
+  assert.equal(zoomOf(w).pos, 727, "a press whose release never came kept the thumb");
 });

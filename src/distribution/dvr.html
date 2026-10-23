@@ -2045,13 +2045,20 @@
   var ZOOM_DEFAULT_SECS = 60;
   var zoomSecs = ZOOM_DEFAULT_SECS;
 
-  /// Whether the viewer has hold of the zoom slider: a pointer pressed on it
-  /// with the primary button and not yet let go, or a key down on it.
+  /// Who has hold of the zoom slider: the pointer pressed on it with the
+  /// primary button and not yet let go (its `pointerId`, or null), and
+  /// whether a key is down on it.
   ///
   /// Every render tick puts the thumb back on the span (`syncZoom`), but not
   /// while it is held. Moving it then would move it under the finger, and a
   /// drag on a growing window would fight the page for the thumb.
-  var zoomHeld = false;
+  ///
+  /// The press is kept by its pointer, and the key apart from it, because the
+  /// window hears every pointer's release: a second finger lifted off MARK,
+  /// or a key let go on the slider mid-drag, is not the viewer letting go of
+  /// the thumb.
+  var zoomPointer = null;
+  var zoomKeyHeld = false;
 
   /// Centre of the view while it is pinned, or null to follow the playhead.
   ///
@@ -2970,12 +2977,12 @@
   /// choice, and reading it back off a position whose meaning has moved is the
   /// drift itself. Setting `value` from script fires no `input` event, so it
   /// never comes back through `applyZoom` as a choice of theirs. A held thumb
-  /// is left where the viewer has it (`zoomHeld`); the label is under no
-  /// finger, so it keeps up throughout.
+  /// is left where the viewer has it (`zoomPointer`, `zoomKeyHeld`); the label
+  /// is under no finger, so it keeps up throughout.
   function syncZoom() {
     var full = range(main);
     var whole = full ? full.end - full.start : 0;
-    if (!zoomHeld) {
+    if (zoomPointer === null && !zoomKeyHeld) {
       var pos = String(sliderFromZoom(zoomSecs, whole || 3600));
       if (zoomInput.value !== pos) zoomInput.value = pos;
     }
@@ -5836,28 +5843,40 @@
     b.addEventListener("click", function () { setRate(parseFloat(b.dataset.rate)); });
   });
   zoomInput.addEventListener("input", applyZoom);
-  // Hold the thumb still while the viewer has it (see `zoomHeld`). Only the
-  // primary button takes hold, because only it drags the thumb. A press is
-  // let go on the window, not the input, as the scrub bar's is: a drag that
-  // ends off the track still ends. A key is let go on its keyup, or on blur
-  // when focus leaves with the key still down and its keyup goes elsewhere.
+  // Hold the thumb still while the viewer has it (see `zoomPointer`). Only
+  // the primary button takes hold, because only it drags the thumb, and a
+  // later press takes it over, so a pointer whose release never came cannot
+  // keep it. A press is let go on the window, not the input, as the scrub
+  // bar's is: a drag that ends off the track still ends. A key is let go on a
+  // keyup. Focus leaving the slider lets go of both: a key's keyup then goes
+  // wherever focus went. Letting go early costs nothing, the thumb being put
+  // on the span a tick sooner, so every release errs that way.
   zoomInput.addEventListener("pointerdown", function (e) {
-    if (e.button === 0) zoomHeld = true;
+    if (e.button === 0) zoomPointer = e.pointerId;
   });
-  zoomInput.addEventListener("keydown", function () { zoomHeld = true; });
-  ["keyup", "blur"].forEach(function (type) {
-    zoomInput.addEventListener(type, function () { zoomHeld = false; });
+  zoomInput.addEventListener("keydown", function () { zoomKeyHeld = true; });
+  zoomInput.addEventListener("keyup", function () { zoomKeyHeld = false; });
+  zoomInput.addEventListener("blur", function () {
+    zoomPointer = null;
+    zoomKeyHeld = false;
   });
   ["pointerup", "pointercancel"].forEach(function (type) {
-    window.addEventListener(type, function () { zoomHeld = false; });
+    window.addEventListener(type, function (e) {
+      if (e.pointerId === zoomPointer) zoomPointer = null;
+    });
   });
   // A context menu lets go as well. Off Windows the menu opens on the press
   // and takes the release, so no pointerup ever reaches the page, and a
-  // macOS ctrl-click is a primary press that opens one just the same: held
-  // until some later click, the thumb would stop following the span, which is
-  // bilbycast-relay#22 again. Letting go early costs nothing: the thumb is put
-  // on the span a tick sooner.
-  window.addEventListener("contextmenu", function () { zoomHeld = false; });
+  // macOS ctrl-click is a primary press that opens one just the same: still
+  // held, the thumb would stop following the span until that pointer was
+  // next let go, which is bilbycast-relay#22 again. A menu opened from the
+  // keyboard can take the key's keyup the same way. Which pointer opened it
+  // is not asked: not every browser sends `contextmenu` as a PointerEvent,
+  // and one opened from the keyboard has no pointer at all.
+  window.addEventListener("contextmenu", function () {
+    zoomPointer = null;
+    zoomKeyHeld = false;
+  });
   btnRew.addEventListener("click", function () { cycleShuttle(-1); });
   btnFf.addEventListener("click", function () { cycleShuttle(1); });
 
