@@ -2549,7 +2549,11 @@ test("the default follows the window as it grows, showing all of one under a min
   assert.deepEqual(zoomOf(w), { label: "1m", pos: 747 }, "the scale tops out at an hour");
 });
 
-test("once the viewer moves the slider it stays where they put it", async (t) => {
+// ALL sits at the top of the slider whatever the window, so it is the one
+// choice a growing window leaves where the viewer put it. A span chosen below
+// the top follows the window down the slider instead (bilbycast-relay#22,
+// below).
+test("once the viewer picks ALL the bar stays the whole window, and the default never takes it back", async (t) => {
   const w = loadPage();
   t.after(() => closePage(w));
   setWindow(w, 3600);
