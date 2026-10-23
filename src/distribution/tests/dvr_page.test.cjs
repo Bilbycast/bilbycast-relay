@@ -2511,8 +2511,8 @@ test("thumbnail sheets the relay does not have stop the prefetch instead of bein
 
 // ── the zoom slider's default ────────────────────────────────────────────
 // The bar opens at one minute across, not the whole window. The slider's scale
-// is relative to the window, so the thumb has to be kept on a minute as the
-// window grows — until the viewer moves it, after which it is theirs.
+// is relative to the window, so the thumb has to be kept on the span as the
+// window grows — a minute until the viewer moves it, and theirs after that.
 
 /// Give main's playlist a window of `secs`, as a live feed's grows.
 const setWindow = (w, secs) => {
@@ -2561,4 +2561,111 @@ test("once the viewer moves the slider it stays where they put it", async (t) =>
   setWindow(w, 4000);
   await tick();
   assert.deepEqual(zoomOf(w), { label: "ALL", pos: 0 }, "the default took the slider back");
+});
+
+/// The span the bar covers, read off the page the way a viewer finds it: hold
+/// the bar, take the thumb to its right-hand end and read the position
+/// readout, which counts from the start of the view. A window with no clock
+/// on its fragments reads as a duration, to the frame at the default 25 fps.
+const spanOf = (w) => {
+  const scrub = w.document.getElementById("scrub");
+  scrub.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  scrub.value = "1000";
+  scrub.dispatchEvent(new w.Event("input", { bubbles: true }));
+  const text = w.document.getElementById("tPos").textContent;
+  w.dispatchEvent(new w.Event("pointerup"));
+  const m = /^(\d+):(\d+)\.(\d+)$/.exec(text);
+  assert.ok(m, "the readout is not a duration: " + text);
+  return +m[1] * 60 + +m[2] + +m[3] / 25;
+};
+
+// bilbycast-relay#22. From the viewer's first touch the page stopped moving
+// the thumb, while the window went on growing under its scale: the thumb
+// stopped marking the span, and the next nudge applied the new scale to the
+// old position.
+test("the thumb keeps the viewer's span as the window grows, so a nudge is one step", async (t) => {
+  const w = loadPage();
+  t.after(() => closePage(w));
+  const zoom = w.document.getElementById("zoom");
+  setWindow(w, 600);
+  await tick();
+  // One step in from a minute: 600 * (15/600)^0.623 = 60.27 s.
+  zoom.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  zoom.value = "623";
+  zoom.dispatchEvent(new w.Event("input", { bubbles: true }));
+  w.dispatchEvent(new w.Event("pointerup"));
+  const chosen = spanOf(w);
+  assert.ok(Math.abs(chosen - 60.27) < 0.1, "fixture: the span chosen is " + chosen + " s");
+
+  setWindow(w, 3600);
+  await tick();
+  // span 3600: 1000 * ln(60.27/3600) / ln(15/3600) = 746
+  assert.deepEqual(zoomOf(w), { label: "1m", pos: 746 }, "the thumb was left where the viewer put it");
+  assert.ok(Math.abs(spanOf(w) - chosen) < 0.1, "the span was read back off the thumb");
+
+  // One arrow key out, from wherever the thumb now is. A step on this scale
+  // is half a percent of the span, a third of a second at a minute; from the
+  // thumb left at 623 it was 119 s.
+  zoom.focus();
+  zoom.dispatchEvent(new w.KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+  zoom.value = String(zoomOf(w).pos - 1);
+  zoom.dispatchEvent(new w.Event("input", { bubbles: true }));
+  zoom.dispatchEvent(new w.KeyboardEvent("keyup", { key: "ArrowLeft", bubbles: true }));
+  const nudged = spanOf(w);
+  assert.ok(
+    nudged > chosen && nudged - chosen < 1,
+    "one step took the span from " + chosen + " s to " + nudged + " s"
+  );
+});
+
+test("the thumb is never moved while the viewer has hold of it", async (t) => {
+  const w = loadPage();
+  t.after(() => closePage(w));
+  const zoom = w.document.getElementById("zoom");
+  setWindow(w, 600);
+  await tick();
+
+  // A finger on the thumb while the window grows: left where it is, and put
+  // on the span (60.27 s) once the finger lifts, wherever on the page it
+  // lifts — or once the browser takes the touch over for a scroll.
+  zoom.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  zoom.value = "623";
+  zoom.dispatchEvent(new w.Event("input", { bubbles: true }));
+  setWindow(w, 900);
+  await tick();
+  assert.equal(zoomOf(w).pos, 623, "the thumb moved under the finger");
+  w.dispatchEvent(new w.Event("pointerup"));
+  await tick();
+  // span 900: 1000 * ln(60.27/900) / ln(15/900) = 660
+  assert.equal(zoomOf(w).pos, 660, "let go, the thumb was not put on the span");
+
+  zoom.dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+  setWindow(w, 1200);
+  await tick();
+  assert.equal(zoomOf(w).pos, 660, "the thumb moved under the finger");
+  w.dispatchEvent(new w.Event("pointercancel"));
+  await tick();
+  // span 1200: 1000 * ln(60.27/1200) / ln(15/1200) = 683
+  assert.equal(zoomOf(w).pos, 683, "a cancelled touch left the thumb held");
+
+  // A key down on it, likewise, until its keyup...
+  zoom.focus();
+  zoom.dispatchEvent(new w.KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+  setWindow(w, 2400);
+  await tick();
+  assert.equal(zoomOf(w).pos, 683, "the thumb moved under a held key");
+  zoom.dispatchEvent(new w.KeyboardEvent("keyup", { key: "ArrowLeft", bubbles: true }));
+  await tick();
+  // span 2400: 1000 * ln(60.27/2400) / ln(15/2400) = 726
+  assert.equal(zoomOf(w).pos, 726, "the keyup did not let go of the thumb");
+
+  // ...or until focus leaves with the key still down, when its keyup goes
+  // wherever focus went.
+  zoom.dispatchEvent(new w.KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+  setWindow(w, 3600);
+  await tick();
+  assert.equal(zoomOf(w).pos, 726, "the thumb moved under a held key");
+  zoom.blur();
+  await tick();
+  assert.equal(zoomOf(w).pos, 746, "focus left, and the thumb stayed held");
 });

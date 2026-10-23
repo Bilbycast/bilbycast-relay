@@ -2045,12 +2045,13 @@
   var ZOOM_DEFAULT_SECS = 60;
   var zoomSecs = ZOOM_DEFAULT_SECS;
 
-  /// Whether the operator has moved the zoom slider yet.
+  /// Whether the viewer has hold of the zoom slider: a pointer pressed on it
+  /// and not yet let go, or a key down on it.
   ///
-  /// Until they have, the thumb is kept on the default span. The slider's
-  /// scale is relative to the window, which grows for the whole event, so a
-  /// thumb left where it was first put would drift away from a minute.
-  var zoomTouched = false;
+  /// Every render tick puts the thumb back on the span (`syncZoom`), but not
+  /// while it is held. Moving it then would move it under the finger, and a
+  /// drag on a growing window would fight the page for the thumb.
+  var zoomHeld = false;
 
   /// Centre of the view while it is pinned, or null to follow the playhead.
   ///
@@ -2955,15 +2956,29 @@
     return Math.max(0, Math.min(1000, Math.round(pos)));
   }
 
-  /// Keep the thumb and label on the default span until the operator takes
-  /// over. Setting `value` from script fires no `input` event, so this never
-  /// counts as the operator having touched it.
-  function syncDefaultZoom() {
-    if (zoomTouched) return;
+  /// Keep the thumb and label on the span the bar shows.
+  ///
+  /// The span is `zoomSecs`: a minute until the viewer moves the slider, and
+  /// whatever they chose after that. The slider's scale is relative to the
+  /// window, which grows for the whole event, so one span sits at a different
+  /// position as it grows — a minute is 624 on a ten-minute window and 747 on
+  /// an hour. A thumb left where it was put stops marking the span the bar
+  /// shows, and the next nudge applies the new scale to the old position: one
+  /// arrow key on an hour's window doubled a minute (bilbycast-relay#22).
+  ///
+  /// This writes the thumb and never `zoomSecs`. The span is the viewer's
+  /// choice, and reading it back off a position whose meaning has moved is the
+  /// drift itself. Setting `value` from script fires no `input` event, so it
+  /// never comes back through `applyZoom` as a choice of theirs. A held thumb
+  /// is left where the viewer has it (`zoomHeld`); the label is under no
+  /// finger, so it keeps up throughout.
+  function syncZoom() {
     var full = range(main);
     var whole = full ? full.end - full.start : 0;
-    var pos = String(sliderFromZoom(zoomSecs, whole || 3600));
-    if (zoomInput.value !== pos) zoomInput.value = pos;
+    if (!zoomHeld) {
+      var pos = String(sliderFromZoom(zoomSecs, whole || 3600));
+      if (zoomInput.value !== pos) zoomInput.value = pos;
+    }
     var text = zoomText(zoomSecs, whole || Infinity);
     if (zoomLabel.textContent !== text) zoomLabel.textContent = text;
   }
@@ -2977,7 +2992,6 @@
   }
 
   function applyZoom() {
-    zoomTouched = true;
     var full = range(main);
     var whole = full ? full.end - full.start : 0;
     zoomSecs = zoomFromSlider(parseInt(zoomInput.value, 10), whole || 3600);
@@ -5267,7 +5281,7 @@
   }
 
   function render(remeasure) {
-    syncDefaultZoom();
+    syncZoom();
     var v = activeVideo();
     // Two independent conditions, and the offset needs both.
     //
@@ -5822,6 +5836,18 @@
     b.addEventListener("click", function () { setRate(parseFloat(b.dataset.rate)); });
   });
   zoomInput.addEventListener("input", applyZoom);
+  // Hold the thumb still while the viewer has it (see `zoomHeld`). A press is
+  // let go on the window, not the input, as the scrub bar's is: a drag that
+  // ends off the track still ends. A key is let go on its keyup, or on blur
+  // when focus leaves with the key still down and its keyup goes elsewhere.
+  zoomInput.addEventListener("pointerdown", function () { zoomHeld = true; });
+  zoomInput.addEventListener("keydown", function () { zoomHeld = true; });
+  ["keyup", "blur"].forEach(function (type) {
+    zoomInput.addEventListener(type, function () { zoomHeld = false; });
+  });
+  ["pointerup", "pointercancel"].forEach(function (type) {
+    window.addEventListener(type, function () { zoomHeld = false; });
+  });
   btnRew.addEventListener("click", function () { cycleShuttle(-1); });
   btnFf.addEventListener("click", function () { cycleShuttle(1); });
 

@@ -613,18 +613,31 @@ window, so a window still **under a minute opens whole** — the label reads
 `ALL` and the thumb sits at the top — and the bar narrows to a minute once the
 window grows past one.
 
-**The thumb follows the growing window until the viewer first touches it.**
-The scale is relative to the window, which grows for the whole event, so a
-thumb left where the page first put it would come to mean more than a minute.
-Until the slider is first moved, every render tick puts the thumb and the label
-back on the default span (`syncDefaultZoom`, through `sliderFromZoom`, the
-inverse of the scale). Setting the slider from script fires no `input` event,
-so this never counts as the viewer touching it. From the first touch the span
-is the viewer's: it stays what they chose, and the page no longer moves the
-thumb or the label. On a window that is still growing the scale then moves
-under a thumb that does not, so the thumb stops marking the span the bar shows,
-and the next nudge jumps to whatever its position has come to mean — a known
-issue, not yet fixed (bilbycast-relay#22).
+**The thumb follows the growing window, and the span stays the one chosen.**
+The span is a minute until the slider is first moved and whatever the viewer
+chose after that. The scale is relative to the window, which grows for the
+whole event, so one span sits further down the slider as the window grows — a
+minute is 624 on a ten-minute window and 747 on an hour. Every render tick puts
+the thumb and the label back on the span (`syncZoom`, through `sliderFromZoom`,
+the inverse of the scale). It writes the thumb and never the span: the span is
+the viewer's, and reading it back off a position whose meaning has moved is
+exactly the drift this prevents. Setting the slider from script fires no
+`input` event, so the page moving the thumb never counts as the viewer choosing
+a span.
+
+Until bilbycast-relay#22 the page stopped moving the thumb at the viewer's
+first touch, so on a growing window the thumb stopped marking the span the bar
+showed, and the next nudge applied the new scale to the old position: 60.2 s
+set on a ten-minute window (623) became 119 s on one arrow key once the window
+had grown to an hour, where 60.2 s sits at 746.
+
+**The thumb is never moved while the viewer has hold of it** (`zoomHeld`): from
+a press on the slider until the pointer is let go or cancelled anywhere on the
+page — a drag that ends off the track still ends, as on the scrub bar — and
+from a key down on it until its keyup, or until focus leaves the slider with
+the key still down. Moving it then would move it under the finger. The label
+is under no finger, so it keeps up throughout, and the thumb is put back on the
+span at the first render tick after it is let go.
 
 Two properties that decide whether it feels right:
 
