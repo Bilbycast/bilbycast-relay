@@ -43,6 +43,8 @@ type Recorder = Arc<Mutex<Seen>>;
 #[derive(Deserialize)]
 struct StreamsQuery {
     username: String,
+    #[serde(rename = "for")]
+    purpose: Option<String>,
 }
 
 async fn stub_streams(
@@ -55,11 +57,36 @@ async fn stub_streams(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    rec.lock().unwrap().calls.push((
-        "/api/v1/dvr/portal/streams".into(),
-        auth,
-        q.username.clone(),
-    ));
+    // The purpose is part of the recorded path, so a test can tell the
+    // watch list from the upcoming list.
+    let path = match &q.purpose {
+        Some(p) => format!("/api/v1/dvr/portal/streams?for={p}"),
+        None => "/api/v1/dvr/portal/streams".into(),
+    };
+    rec.lock().unwrap().calls.push((path, auth, q.username.clone()));
+
+    // As `dump_portal_contract` prints it: under its own key, a name and a
+    // start, nothing that would open the feed.
+    if q.purpose.as_deref() == Some("upcoming") {
+        let upcoming = if q.username == "a.smith" {
+            serde_json::json!([
+                { "session_id": "s2", "name": "Next match",
+                  "starts_at": "2026-10-25T08:35:00Z" }
+            ])
+        } else if q.username == "old.manager" {
+            // A manager too old to know the question answers it as the
+            // default: live feeds, under `streams`.
+            return Json(serde_json::json!({ "streams": [
+                { "session_id": "s1", "name": "Match feed",
+                  "stream_id": "match-feed", "state": "active", "relay_node_id": "n1" }
+            ]}));
+        } else if q.username == "broken.upcoming" {
+            return Json(serde_json::json!({ "upcoming": "not a list" }));
+        } else {
+            serde_json::json!([])
+        };
+        return Json(serde_json::json!({ "upcoming": upcoming }));
+    }
 
     // The field set here is not invented: it is what
     // `manager-core`'s `dump_portal_contract` test prints, which is the
@@ -488,14 +515,77 @@ async fn a_signed_in_user_sees_their_feeds_and_the_manager_is_asked_correctly() 
     assert!(body["feeds"][0].get("relay_node_id").is_none());
     assert!(body["feeds"][0].get("stream_id").is_none());
 
-    let calls = &rec.lock().unwrap().calls;
-    assert_eq!(calls.len(), 1);
+    // Two questions, asked concurrently, so in either order: what may they
+    // watch, and what is coming up.
+    let mut calls = rec.lock().unwrap().calls.clone();
+    calls.sort();
+    assert_eq!(calls.len(), 2, "{calls:?}");
     assert_eq!(calls[0].0, "/api/v1/dvr/portal/streams");
-    assert_eq!(calls[0].1, format!("Bearer {SERVICE_TOKEN}"));
-    assert_eq!(
-        calls[0].2, "a.smith",
-        "the manager was asked about the wrong user"
-    );
+    assert_eq!(calls[1].0, "/api/v1/dvr/portal/streams?for=upcoming");
+    for call in &calls {
+        assert_eq!(call.1, format!("Bearer {SERVICE_TOKEN}"));
+        assert_eq!(call.2, "a.smith", "the manager was asked about the wrong user");
+    }
+}
+
+/// What is coming up reaches the page as a name and a start, and nothing a
+/// viewer could open it with.
+#[tokio::test]
+async fn upcoming_feeds_are_listed_with_their_start_and_nothing_else() {
+    let (base, _rec) = harness().await;
+    let body: serde_json::Value = client()
+        .get(format!("{base}/api/feeds"))
+        .header("Remote-User", "a.smith")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let upcoming = body["upcoming"].as_array().expect("upcoming array");
+    assert_eq!(upcoming.len(), 1, "{body}");
+    assert_eq!(upcoming[0]["name"], "Next match");
+    assert_eq!(upcoming[0]["starts_at"], "2026-10-25T08:35:00Z");
+    assert!(upcoming[0].get("session_id").is_none(), "{body}");
+    assert!(upcoming[0].get("stream_id").is_none(), "{body}");
+    // And it is not offered as something to watch.
+    let feeds = body["feeds"].as_array().unwrap();
+    assert!(feeds.iter().all(|f| f["name"] != "Next match"), "{body}");
+}
+
+/// A manager that predates the question answers it with live feeds under
+/// `streams`. Those must not appear as upcoming.
+#[tokio::test]
+async fn an_older_manager_yields_nothing_upcoming() {
+    let (base, _rec) = harness().await;
+    let body: serde_json::Value = client()
+        .get(format!("{base}/api/feeds"))
+        .header("Remote-User", "old.manager")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["upcoming"], serde_json::json!([]), "{body}");
+}
+
+/// An upcoming list the portal cannot read costs the viewer that list, not
+/// the page: the feeds they can watch still load.
+#[tokio::test]
+async fn an_unreadable_upcoming_list_does_not_cost_the_feeds() {
+    let (base, _rec) = harness().await;
+    let r = client()
+        .get(format!("{base}/api/feeds"))
+        .header("Remote-User", "broken.upcoming")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["feeds"], serde_json::json!([]), "{body}");
+    assert_eq!(body["upcoming"], serde_json::json!([]), "{body}");
 }
 
 /// The header is a claim, and from an untrusted peer it is the client
