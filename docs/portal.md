@@ -567,6 +567,19 @@ none has been refused. So the portal sends the reason with its next poll as
 …` or `not replacing …`), and the manager shows it in the Portal logins panel
 until a poll arrives without it.
 
+**Whether each person has set a password.** Every sync, the portal reads each
+managed account's hash in Authelia's file and tells the manager
+(`POST /api/v1/dvr/portal/accounts/password-state`) whether it is still the
+placeholder the portal wrote — argon2id at argon2's minimum cost — or one
+Authelia wrote when the person used their link, at its own cost. No password is
+read or sent; the cost is in the hash text. The list goes only when it changes,
+and once an hour regardless. The manager marks each row *password set* or
+*invite not used*. Hand-made accounts, and logins the portal has not created
+yet, are not reported, and show neither. An Authelia whose argon2 settings are
+lowered to the minimum would make every password read as not set. A manager
+older than the route answers 404, which the portal logs once and otherwise
+ignores.
+
 ### `authelia_url` and its path
 
 The portal appends Authelia's API paths to `authelia_url`, so **its path must be
