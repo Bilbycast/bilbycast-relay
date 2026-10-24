@@ -853,6 +853,71 @@ fn unusable_password_hash() -> anyhow::Result<String> {
     Ok(hash.to_string())
 }
 
+/// Is this the hash [`unusable_password_hash`] writes — an account nobody has
+/// set a password on yet?
+///
+/// Told by its cost, which the PHC string carries in the clear: the
+/// placeholder is argon2id at argon2's minimum, and nothing else writes that.
+/// Authelia hashes a password its owner sets at its own configured cost — 64
+/// MiB and three passes by default, nowhere near the minimum — so the hash
+/// itself says which wrote it, and the password is never involved. An
+/// Authelia configured down to argon2's minimum would read as "not set".
+fn is_placeholder_hash(hash: &str) -> bool {
+    use argon2::Params;
+    let mut parts = hash.split('$');
+    if parts.next() != Some("") || parts.next() != Some("argon2id") {
+        return false;
+    }
+    let Some(mut params) = parts.next() else {
+        return false;
+    };
+    // The version segment is optional in a PHC string.
+    if params.starts_with("v=") {
+        let Some(next) = parts.next() else {
+            return false;
+        };
+        params = next;
+    }
+    let mut cost = (None, None, None);
+    for kv in params.split(',') {
+        match kv.split_once('=') {
+            Some(("m", v)) => cost.0 = v.parse::<u32>().ok(),
+            Some(("t", v)) => cost.1 = v.parse::<u32>().ok(),
+            Some(("p", v)) => cost.2 = v.parse::<u32>().ok(),
+            _ => {}
+        }
+    }
+    cost == (
+        Some(Params::MIN_M_COST),
+        Some(Params::MIN_T_COST),
+        Some(Params::MIN_P_COST),
+    )
+}
+
+/// Whether each listed login's owner has set a password: `true` once the
+/// account's hash is no longer the portal's placeholder.
+///
+/// Only accounts this portal manages, and only logins the manager listed. A
+/// hand-made account's hash says nothing about an invite, and a login not yet
+/// in the file has no state to report — the manager shows both as unknown,
+/// never as "not set".
+fn password_states(users: &Mapping, accounts: &[ManagerAccount], group: &str) -> Vec<(String, bool)> {
+    let mut states: Vec<(String, bool)> = accounts
+        .iter()
+        .filter_map(|a| {
+            let entry = users.get(Value::String(a.username.clone()))?;
+            if !is_managed(entry, group) {
+                return None;
+            }
+            let hash = str_field(entry, "password")?;
+            Some((a.username.clone(), !is_placeholder_hash(hash)))
+        })
+        .collect();
+    states.sort();
+    states.dedup_by(|a, b| a.0 == b.0);
+    states
+}
+
 /// Why rewriting the file would change an entry this loop does not own, if it
 /// would.
 ///
@@ -1245,6 +1310,12 @@ struct Memory {
     limited: bool,
     /// Plan notes already logged.
     noted: HashSet<String>,
+    /// The password states the manager last accepted, and when. Sent again
+    /// only when they change, or an hour on as a backstop for a manager whose
+    /// database was restored.
+    reported: Option<(Vec<(String, bool)>, Instant)>,
+    /// A password-state report has failed, and the log has said so.
+    password_report_failing: bool,
     /// Why the last cycle could not read or write Authelia's file, bounded
     /// like a link error. Sent with the next poll, so the manager can say why
     /// its logins are not reaching Authelia; `None` once nothing stood in the
@@ -1341,6 +1412,9 @@ async fn sync_once(
     };
     let empty = Mapping::new();
     let users = snap.users().unwrap_or(&empty);
+    // From this read, before any write: an account created this cycle is
+    // reported on the next, once Authelia's file holds it.
+    let passwords = password_states(users, &accounts, &cfg.managed_group);
 
     // Last cycle's removals and replacements, checked against a read taken
     // since. Still there, they are applied, and the manager is told below;
@@ -1553,7 +1627,78 @@ async fn sync_once(
         serve(state, memory, key, || None).await;
     }
     memory.served.retain(|k, _| planned.contains(k));
+    report_password_states(state, memory, passwords).await;
     Ok(out)
+}
+
+/// How long the manager goes without hearing the password states when none
+/// has changed. A backstop only: what it has is in its database.
+const PASSWORD_REPORT_EVERY: Duration = Duration::from_secs(3600);
+
+/// Tell the manager which logins' owners have set a password, when that has
+/// changed since it last accepted the list (or an hour has passed).
+///
+/// Never fails the cycle: this is information for an operator, and the sync
+/// it rides on has work that matters more. A failure is logged once and
+/// retried next cycle; a manager too old for the route is told nothing more
+/// until the states change.
+async fn report_password_states(
+    state: &PortalState,
+    memory: &mut Memory,
+    passwords: Vec<(String, bool)>,
+) {
+    if let Some((last, at)) = &memory.reported
+        && *last == passwords
+        && at.elapsed() < PASSWORD_REPORT_EVERY
+    {
+        return;
+    }
+    let accounts: Vec<serde_json::Value> = passwords
+        .iter()
+        .map(|(u, set)| serde_json::json!({ "username": u, "password_set": set }))
+        .collect();
+    let sent = state
+        .http
+        .post(format!(
+            "{}/api/v1/dvr/portal/accounts/password-state",
+            state.cfg.manager_url
+        ))
+        .bearer_auth(&state.cfg.manager_token)
+        .json(&serde_json::json!({ "accounts": accounts }))
+        .send()
+        .await;
+    let failed = match sent {
+        Ok(r) if r.status().is_success() => None,
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            if !memory.password_report_failing {
+                tracing::info!(
+                    "the manager has no route for password states, so it is older than this \
+                     portal; its Portal logins list will not say who has set a password until it \
+                     is upgraded"
+                );
+            }
+            memory.password_report_failing = true;
+            memory.reported = Some((passwords, Instant::now()));
+            return;
+        }
+        Ok(r) => Some(format!("manager answered {}", r.status())),
+        Err(e) => Some(format!("{e:#}")),
+    };
+    match failed {
+        None => {
+            if memory.password_report_failing {
+                tracing::info!("password states reaching the manager again");
+            }
+            memory.password_report_failing = false;
+            memory.reported = Some((passwords, Instant::now()));
+        }
+        Some(e) => {
+            if !memory.password_report_failing {
+                tracing::warn!(error = %e, "could not tell the manager which logins have set a password; retrying next sync");
+            }
+            memory.password_report_failing = true;
+        }
+    }
 }
 
 impl Served {
@@ -3007,8 +3152,21 @@ users:
         /// turn, the last answer repeating.
         health: Vec<(u16, &'static str)>,
         health_asked: usize,
+        /// Password-state reports received; the status to answer them with,
+        /// when not 200.
+        password_reports: Vec<serde_json::Value>,
+        password_status: Option<u16>,
     }
     type Shared = Arc<Mutex<Stub>>;
+
+    async fn stub_password_state(
+        State(s): State<Shared>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> StatusCode {
+        let mut s = s.lock().unwrap();
+        s.password_reports.push(body);
+        StatusCode::from_u16(s.password_status.unwrap_or(200)).unwrap()
+    }
 
     async fn stub_removal_ack(
         State(s): State<Shared>,
@@ -3089,6 +3247,10 @@ users:
             .route(
                 "/api/v1/dvr/portal/accounts/removed-applied",
                 post(stub_removal_ack),
+            )
+            .route(
+                "/api/v1/dvr/portal/accounts/password-state",
+                post(stub_password_state),
             )
             .route("/api/health", get(stub_health))
             .route(
@@ -3221,6 +3383,146 @@ users:
         let s = r.stub.lock().unwrap();
         let error = s.acks[0]["error"].as_str().expect("reported as sent");
         assert!(error.contains("Operation failed"), "{error}");
+    }
+
+    // ── Who has set a password ──────────────────────────────────────────────
+
+    /// What Authelia writes for a password its owner set, at its default cost.
+    /// The salt and digest are made up; only the cost is read.
+    const AUTHELIA_HASH: &str =
+        "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaGhhc2g";
+
+    #[test]
+    fn the_placeholder_is_told_from_a_password_by_its_cost() {
+        let ours = unusable_password_hash().unwrap();
+        assert!(is_placeholder_hash(&ours), "{ours}");
+        assert!(!is_placeholder_hash(AUTHELIA_HASH));
+        // The same cost spelled without the optional version is still ours.
+        let unversioned = ours.replacen("$v=19", "", 1);
+        assert!(is_placeholder_hash(&unversioned), "{unversioned}");
+        for other in [
+            "",
+            "x",
+            "$argon2i$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=8,t=2,p=1$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=16,t=1,p=1$c2FsdA$aGFzaA",
+            "$6$rounds=50000$salt$hash",
+            "$2y$10$abcdefghijklmnopqrstuuabcdefghijklmnopqrstuvwxyz01234",
+            "argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA",
+        ] {
+            assert!(!is_placeholder_hash(other), "{other:?} read as the placeholder");
+        }
+    }
+
+    #[test]
+    fn password_states_cover_managed_listed_accounts_only() {
+        let ours = unusable_password_hash().unwrap();
+        let doc = file(&format!(
+            r#"
+users:
+  invited:
+    password: "{ours}"
+    groups: [bilbycast-portal]
+  signed.up:
+    password: "{AUTHELIA_HASH}"
+    groups: [bilbycast-portal]
+  by.hand:
+    password: "{ours}"
+    groups: []
+  unlisted:
+    password: "{ours}"
+    groups: [bilbycast-portal]
+"#
+        ));
+        let accounts = [
+            acct("signed.up", Some("s@example.com")),
+            acct("invited", Some("i@example.com")),
+            acct("by.hand", Some("h@example.com")),
+            acct("not.yet.created", Some("n@example.com")),
+        ];
+        assert_eq!(
+            password_states(&users(&doc), &accounts, G),
+            vec![("invited".to_string(), false), ("signed.up".to_string(), true)],
+            "a hand-made account, an account not yet in the file and one the manager \
+             does not list say nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_states_reach_the_manager_when_they_change() {
+        let ours = unusable_password_hash().unwrap();
+        let yaml = |a_hash: &str| {
+            format!(
+                "users:\n  a.smith:\n    password: \"{a_hash}\"\n    email: alex@example.com\n    \
+                 groups: [bilbycast-portal]\n  b.jones:\n    password: \"{AUTHELIA_HASH}\"\n    \
+                 email: bea@example.com\n    groups: [bilbycast-portal]\n"
+            )
+        };
+        let answer = serde_json::json!({
+            "accounts": [
+                { "username": "a.smith", "email": "alex@example.com" },
+                { "username": "b.jones", "email": "bea@example.com" },
+            ],
+            "removed": [],
+        });
+        let r = rig(&yaml(&ours), answer, None).await;
+        let mut memory = Memory::default();
+
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        {
+            let s = r.stub.lock().unwrap();
+            assert_eq!(s.password_reports.len(), 1);
+            assert_eq!(
+                s.password_reports[0],
+                serde_json::json!({ "accounts": [
+                    { "username": "a.smith", "password_set": false },
+                    { "username": "b.jones", "password_set": true },
+                ]})
+            );
+        }
+
+        // Nothing changed: nothing sent.
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(r.stub.lock().unwrap().password_reports.len(), 1);
+
+        // a.smith uses the link: Authelia rewrites the hash, and the next
+        // cycle says so.
+        std::fs::write(&r.cfg.users_file, yaml(AUTHELIA_HASH)).unwrap();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        {
+            let s = r.stub.lock().unwrap();
+            assert_eq!(s.password_reports.len(), 2);
+            assert_eq!(s.password_reports[1]["accounts"][0]["password_set"], true);
+        }
+
+        // A refused report is retried next cycle, and never fails the sync.
+        std::fs::write(&r.cfg.users_file, yaml(&ours)).unwrap();
+        r.stub.lock().unwrap().password_status = Some(500);
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        r.stub.lock().unwrap().password_status = None;
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        {
+            let s = r.stub.lock().unwrap();
+            assert_eq!(s.password_reports.len(), 4, "the refused report was not retried");
+            assert_eq!(s.password_reports[3]["accounts"][0]["password_set"], false);
+        }
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(r.stub.lock().unwrap().password_reports.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_manager_without_the_route_is_not_asked_again_until_something_changes() {
+        let r = rig(TWO_MANAGED, requesting(&[]), None).await;
+        let mut memory = Memory::default();
+        r.stub.lock().unwrap().password_status = Some(404);
+        // `requesting(&[])` lists nobody, so make the manager list both.
+        r.stub.lock().unwrap().answer = serde_json::json!({
+            "accounts": [{ "username": "a.smith", "email": "alex@example.com" }],
+            "removed": [],
+        });
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(r.stub.lock().unwrap().password_reports.len(), 1);
     }
 
     #[tokio::test]
