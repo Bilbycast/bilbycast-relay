@@ -87,6 +87,25 @@ struct ManagerStream {
     stream_id: String,
 }
 
+/// What the portal sends the browser for one feed that is scheduled but not
+/// yet on air. Shown, never opened: there is nothing to mint until it starts,
+/// and the manager refuses a mint for it anyway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpcomingFeed {
+    pub name: String,
+    pub starts_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The manager's answer to "what is coming up for this username". Under its
+/// own key, so a manager too old to know the question — which answers it as
+/// "what may I watch" — yields an empty list here rather than live feeds
+/// listed as upcoming.
+#[derive(Debug, Deserialize)]
+struct UpcomingResponse {
+    #[serde(default)]
+    upcoming: Vec<UpcomingFeed>,
+}
+
 /// The manager's answer to "mint a token for this feed".
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -295,6 +314,40 @@ async fn fetch_streams(st: &PortalState, username: &str) -> Result<Vec<ManagerSt
     fetch_streams_for(st, username, None).await
 }
 
+/// The scheduled feeds this viewer will be able to watch within the week.
+///
+/// Best-effort: a failure here is logged and answered as nothing coming up,
+/// because the page exists to get someone watching, and an upcoming list it
+/// could not fetch must not keep them from the feeds that are on air.
+async fn fetch_upcoming(st: &PortalState, username: &str) -> Vec<UpcomingFeed> {
+    let url = format!("{}/api/v1/dvr/portal/streams", st.cfg.manager_url);
+    let resp = match st
+        .http
+        .get(&url)
+        .query(&[("username", username), ("for", "upcoming")])
+        .bearer_auth(&st.cfg.manager_token)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!(status = %r.status(), "portal: manager refused the upcoming list");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "portal: manager upcoming list failed");
+            return Vec::new();
+        }
+    };
+    match resp.json::<UpcomingResponse>().await {
+        Ok(body) => body.upcoming,
+        Err(e) => {
+            tracing::warn!(error = %e, "portal: unreadable upcoming list");
+            Vec::new()
+        }
+    }
+}
+
 /// The feeds this viewer may act on, for a given purpose.
 ///
 /// `for=clips` asks the wider question: a finished game cannot be watched, and
@@ -429,7 +482,8 @@ async fn mint_inner(
     })
 }
 
-/// `GET /api/feeds` — what the signed-in user may watch.
+/// `GET /api/feeds` — what the signed-in user may watch, and what is scheduled
+/// for them in the week ahead.
 async fn feeds(
     State(st): State<PortalState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -438,7 +492,9 @@ async fn feeds(
     let Some(username) = identify(&st.cfg, peer.ip(), &headers) else {
         return unauthenticated();
     };
-    let streams = match fetch_streams(&st, &username).await {
+    let (streams, upcoming) =
+        tokio::join!(fetch_streams(&st, &username), fetch_upcoming(&st, &username));
+    let streams = match streams {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -449,6 +505,7 @@ async fn feeds(
     Json(serde_json::json!({
         "username": username,
         "feeds": feeds,
+        "upcoming": upcoming,
         // Rendered as a "Sign out" link when configured. The portal cannot end
         // the session itself — Authelia holds the cookie — so an absent value
         // means no button, rather than one that appears to work.

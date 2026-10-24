@@ -42,13 +42,21 @@
       out.hidden = false;
     }
 
+    var upcoming = data.upcoming || [];
     if (!data.feeds || !data.feeds.length) {
       /* Distinguishing "you have none" from "none are on air" would need the
        * manager to report entitlements for feeds it has decided not to show,
        * which is the oracle the API deliberately does not provide. So this
        * says what the viewer can act on. */
-      msg('Nothing is available to you right now. Feeds appear here once they '
-        + 'are on air. If you are expecting one, check with whoever set it up.');
+      note.hidden = true;
+      if (!upcoming.length) {
+        msg('Nothing is available to you right now. Feeds appear here once they '
+          + 'are on air. If you are expecting one, check with whoever set it up.');
+        return;
+      }
+      msg('Nothing is on air right now. The feeds below can be opened here '
+        + 'once they start.');
+      body.appendChild(renderUpcoming(upcoming));
       return;
     }
     note.hidden = false;
@@ -74,12 +82,63 @@
     });
     body.textContent = '';
     body.appendChild(list);
+    if (upcoming.length) body.appendChild(renderUpcoming(upcoming));
+  }
+
+  /* Scheduled feeds starting within the week. A name and a time, and nothing
+   * to press: there is nothing to watch until it starts, and the manager
+   * would refuse the link if asked. */
+  function renderUpcoming(upcoming) {
+    var section = document.createDocumentFragment();
+    var h = document.createElement('h2');
+    h.textContent = 'Coming up';
+    section.appendChild(h);
+
+    var list = document.createElement('div');
+    list.className = 'feeds';
+    upcoming.forEach(function (f) {
+      var row = document.createElement('div');
+      row.className = 'feed upcoming';
+
+      var name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = f.name;
+      row.appendChild(name);
+
+      var when = document.createElement('div');
+      when.className = 'when';
+      when.textContent = startsText(f.starts_at);
+      row.appendChild(when);
+
+      list.appendChild(row);
+    });
+    section.appendChild(list);
+    return section;
+  }
+
+  /* In the viewer's own time zone, which is the browser's. A start that has
+   * passed is one the system is still bringing up, so it says so rather than
+   * showing a time in the past. */
+  function startsText(iso) {
+    var t = new Date(iso);
+    if (isNaN(t.getTime())) return '';
+    var now = new Date();
+    if (t <= now) return 'Starting shortly';
+    var time = t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    var day = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var days = Math.round(
+      (new Date(t.getFullYear(), t.getMonth(), t.getDate()) - day) / 86400000);
+    if (days === 0) return 'Today, ' + time;
+    if (days === 1) return 'Tomorrow, ' + time;
+    return t.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' })
+      + ', ' + time;
   }
 
   /* The link is followed in THIS tab, not opened in a new one. A token in a
    * URL that window.open() produced gets blocked as a popup often enough that
    * the failure would read as the feed being broken. */
   function open(feed, btn) {
+    opening = true;
     btn.disabled = true;
     btn.textContent = 'Opening…';
     fetch('/api/watch', {
@@ -90,6 +149,7 @@
       return r.json().then(function (d) { return { ok: r.ok, data: d }; });
     }).then(function (res) {
       if (!res.ok || !res.data.watch_url) {
+        opening = false;
         btn.disabled = false;
         btn.textContent = 'Watch';
         msg(res.data && res.data.error
@@ -108,6 +168,7 @@
            + "from=" + encodeURIComponent(window.location.origin);
       window.location.href = url;
     }).catch(function () {
+      opening = false;
       btn.disabled = false;
       btn.textContent = 'Watch';
       msg('Could not open that feed. Try again in a moment.', true);
@@ -339,27 +400,72 @@
     return pair;
   }
 
-  fetch('/api/feeds', { headers: { 'Accept': 'application/json' } })
-    .then(function (r) {
-      if (r.status === 401) {
-        /* The proxy in front of us handles sign-in, so the fix is to land on
-         * it again rather than anything this page can do. */
-        window.location.reload();
-        throw new Error('unauthenticated');
-      }
-      return r.json().then(function (d) { return { ok: r.ok, data: d }; });
-    })
-    .then(function (res) {
-      if (!res.ok) {
-        msg(res.data && res.data.error ? res.data.error
-                                       : 'Could not load your feeds.', true);
-        return;
-      }
-      render(res.data);
-      loadClips(false);
-    })
-    .catch(function (e) {
-      if (e && e.message === 'unauthenticated') return;
-      msg('Could not load your feeds. Try again in a moment.', true);
+  /* While something is coming up, look again, so a feed turns into a Watch
+   * button when it starts without the viewer having to know to reload.
+   *
+   * Paced by the soonest start rather than a fixed tick: a game three days
+   * out is re-checked every quarter hour, which also picks up anything newly
+   * scheduled, and one whose start has passed every half minute until it is
+   * on air. With nothing coming up the page does not poll at all. */
+  var feedTimer = null;
+  var opening = false;
+  var FEED_POLL_MIN_MS = 30 * 1000;
+  var FEED_POLL_MAX_MS = 15 * 60 * 1000;
+
+  function scheduleFeeds(upcoming) {
+    clearTimeout(feedTimer);
+    feedTimer = null;
+    if (!upcoming || !upcoming.length) return;
+    var soonest = Infinity;
+    upcoming.forEach(function (f) {
+      var t = new Date(f.starts_at).getTime();
+      if (!isNaN(t) && t < soonest) soonest = t;
     });
+    var wait = Math.min(Math.max(soonest - Date.now(), FEED_POLL_MIN_MS), FEED_POLL_MAX_MS);
+    feedTimer = setTimeout(function () { loadFeeds(false); }, wait);
+  }
+
+  /* A refresh that fails keeps what is on screen and tries again later; only
+   * the first load reports, since that is the one with nothing to show. A
+   * refresh never redraws under a viewer who has just pressed Watch. */
+  function loadFeeds(first) {
+    fetch('/api/feeds', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) {
+        if (r.status === 401) {
+          /* The proxy in front of us handles sign-in, so the fix is to land on
+           * it again rather than anything this page can do. */
+          window.location.reload();
+          throw new Error('unauthenticated');
+        }
+        return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+      })
+      .then(function (res) {
+        if (!res.ok) {
+          if (first) {
+            msg(res.data && res.data.error ? res.data.error
+                                           : 'Could not load your feeds.', true);
+          } else {
+            feedTimer = setTimeout(function () { loadFeeds(false); }, FEED_POLL_MIN_MS);
+          }
+          return;
+        }
+        if (opening) {
+          scheduleFeeds(res.data.upcoming);
+          return;
+        }
+        render(res.data);
+        scheduleFeeds(res.data.upcoming);
+        if (first) loadClips(false);
+      })
+      .catch(function (e) {
+        if (e && e.message === 'unauthenticated') return;
+        if (first) {
+          msg('Could not load your feeds. Try again in a moment.', true);
+        } else {
+          feedTimer = setTimeout(function () { loadFeeds(false); }, FEED_POLL_MIN_MS);
+        }
+      });
+  }
+
+  loadFeeds(true);
 })();

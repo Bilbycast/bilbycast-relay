@@ -61,6 +61,8 @@
   }
   .feed button:active { filter: brightness(.92); }
   .feed button:disabled { opacity: .5; cursor: default; }
+  /* Not on air yet, so no button: the start time stands where it would be. */
+  .feed.upcoming .when { color: var(--dim); font-size: 14px; white-space: nowrap; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   .note { color: var(--dim); font-size: 13px; margin: 0 0 16px; }
