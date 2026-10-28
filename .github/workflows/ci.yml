@@ -210,3 +210,39 @@ jobs:
         run: |
           npm i --no-save --no-audit --no-fund jsdom@30
           DVR_PAGE_REQUIRE_JSDOM=1 node --test tests/dvr_page.test.cjs
+
+  # ---------------------------------------------------------------
+  # The portal page's jsdom suite.
+  #
+  # The same gap as the DVR page's, on the other public page this repo
+  # serves: `portal.js` holds the whole of the portal's browser behaviour —
+  # the "Coming up" refresh and its pacing, the back-off, the pause while
+  # hidden, the guarded sign-in reload, a Watch press and its give-up — and
+  # no cargo command executes it. `tests/portal_page.test.cjs` drives the
+  # real `portal.html` + `portal.js` against a fake network and a virtual
+  # clock. Three review rounds of that logic were checked by throwaway
+  # harnesses that were then deleted; this is the one that stays.
+  #
+  # A sibling of `dvr-page` rather than a step in it, so each check reports
+  # on its own page and the existing check's name is unchanged.
+  # `PORTAL_PAGE_REQUIRE_JSDOM=1` turns the suite's skip-without-jsdom into a
+  # failure, as `DVR_PAGE_REQUIRE_JSDOM=1` does there.
+  # ---------------------------------------------------------------
+  portal-page:
+    name: Portal page (jsdom)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: jsdom suite
+        working-directory: src/portal
+        run: |
+          npm i --no-save --no-audit --no-fund jsdom@30
+          PORTAL_PAGE_REQUIRE_JSDOM=1 node --test tests/portal_page.test.cjs

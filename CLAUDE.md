@@ -594,6 +594,21 @@ running the two together would stop proving that. The job then `bash -n`s the th
 `packaging/test-portal-install.sh` against staged tarballs — shell that is
 otherwise only ever run for real, against a signed release, on somebody's server.
 
+Two more jobs run the hand-written browser pages, which no cargo command
+executes (`mod.rs` only serves them, or reads them as text): **`dvr-page`**
+drives `dvr.html` through `src/distribution/tests/dvr_page.test.cjs`, and
+**`portal-page`** drives the real `portal.html` + `portal.js` through
+`src/portal/tests/portal_page.test.cjs` — a fake network, a virtual clock the
+test advances, a settable `document.hidden` and a `location` whose reloads and
+navigations are counted — covering the refresh pacing, back-off, the pause
+while hidden, the guarded sign-in reload, and Watch presses (give-up,
+back-forward-cache restore, a superseded press, a sign-in held back behind
+one). Each installs jsdom `--no-save` (so no `package.json` or lockfile enters
+the repo; `.gitignore` keeps out the `node_modules/`) and sets
+`DVR_PAGE_REQUIRE_JSDOM=1` / `PORTAL_PAGE_REQUIRE_JSDOM=1`, which turns the
+suite's skip-without-jsdom into a failure; locally both still skip without
+jsdom.
+
 The accepted-lint set lives in `[lints.clippy]` in `Cargo.toml`, one documented
 reason per entry, so CI runs `-D warnings` with no inline `-A` flags to drift out
 of sync with the manifest.

@@ -31,6 +31,8 @@ certs/
 # Logs
 *.log
 
-# Opt-in jsdom harness for the DVR page (see src/distribution/tests/).
+# Opt-in jsdom harnesses for the DVR page (src/distribution/tests/) and the
+# portal page (src/portal/tests/). Unanchored, so either directory's install is
+# kept out.
 node_modules/
 package-lock.json
