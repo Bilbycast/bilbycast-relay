@@ -27,6 +27,35 @@
     body.appendChild(d);
   }
 
+  /* The proxy in front of us handles sign-in, so the fix for a session that
+   * has ended is to land on it again: reload. At most once in half a minute,
+   * though — a proxy that refuses `/api/*` while still serving this page would
+   * otherwise have it reload for ever — and past that, a link to do it by
+   * hand. The time is kept in sessionStorage, which outlives the reload;
+   * where that cannot be read or written the link is offered at once, since a
+   * reload that cannot be counted cannot be bounded either. */
+  var RELOAD_GUARD_MS = 30 * 1000;
+  var RELOAD_KEY = 'bilbycast-portal-reloaded-at';
+
+  function signInAgain() {
+    var now = Date.now();
+    try {
+      var since = now - (Number(window.sessionStorage.getItem(RELOAD_KEY)) || 0);
+      if (since < 0 || since >= RELOAD_GUARD_MS) {
+        window.sessionStorage.setItem(RELOAD_KEY, String(now));
+        window.location.reload();
+        return;
+      }
+    } catch (e) { /* the link, below */ }
+    stopFeeds();
+    msg('Your sign-in has ended.', true);
+    var a = document.createElement('a');
+    a.href = '/';
+    a.textContent = 'Sign in again';
+    body.firstChild.appendChild(document.createTextNode(' '));
+    body.firstChild.appendChild(a);
+  }
+
   /* Built with createElement + textContent rather than innerHTML. Feed names
    * come from an operator, not a viewer, but that is an assumption about
    * today's product rather than a property of this code. */
@@ -145,11 +174,22 @@
     opening = btn;
     btn.disabled = true;
     btn.textContent = 'Opening…';
+    /* Redirects are not followed, as for the feed list: a session that has
+     * ended answered with the proxy's sign-in redirect is refused by
+     * `connect-src 'self'` once followed, and read as the feed failing. */
     fetch('/api/watch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: feed.session_id })
+      body: JSON.stringify({ session_id: feed.session_id }),
+      redirect: 'manual'
     }).then(function (r) {
+      if (r.status === 401 || r.type === 'opaqueredirect') {
+        opening = false;
+        btn.disabled = false;
+        btn.textContent = 'Watch';
+        signInAgain();
+        throw new Error('unauthenticated');
+      }
       return r.json().then(function (d) { return { ok: r.ok, data: d }; });
     }).then(function (res) {
       if (!res.ok || !res.data.watch_url) {
@@ -171,8 +211,9 @@
       url += (url.indexOf("?") === -1 ? "?" : "&")
            + "from=" + encodeURIComponent(window.location.origin);
       window.location.href = url;
-      navTimer = setTimeout(reopen, NAV_GIVE_UP_MS);
-    }).catch(function () {
+      navTimer = setTimeout(function () { reopen(false); }, NAV_GIVE_UP_MS);
+    }).catch(function (e) {
+      if (e && e.message === 'unauthenticated') return;
       opening = false;
       btn.disabled = false;
       btn.textContent = 'Watch';
@@ -447,11 +488,15 @@
     }, wait);
   }
 
+  function stopFeeds() {
+    clearTimeout(feedTimer);
+    feedTimer = null;
+    feedWanted = false;
+  }
+
   function scheduleFeeds(upcoming) {
     if (!upcoming || !upcoming.length) {
-      clearTimeout(feedTimer);
-      feedTimer = null;
-      feedWanted = false;
+      stopFeeds();
       return;
     }
     var now = Date.now();
@@ -507,9 +552,10 @@
     fetch('/api/feeds', { headers: { 'Accept': 'application/json' }, redirect: 'manual' })
       .then(function (r) {
         if (r.status === 401 || r.type === 'opaqueredirect') {
-          /* The proxy in front of us handles sign-in, so the fix is to land on
-           * it again rather than anything this page can do. */
-          window.location.reload();
+          /* Not while a Watch press is navigating away: a reload would cancel
+           * it, and the player's own load passes the proxy, which signs the
+           * viewer in. */
+          if (!opening) signInAgain();
           throw new Error('unauthenticated');
         }
         return r.json().then(function (d) { return { ok: r.ok, data: d }; });
@@ -564,12 +610,17 @@
    * with something that is not a page — leaves this page as it was: the
    * button saying "Opening…" and every refresh held off for good. So does
    * coming Back to it from the browser's back-forward cache, which restores
-   * the page exactly as it was left. Either way the button is given back and
-   * the list fetched afresh. */
-  var NAV_GIVE_UP_MS = 20 * 1000;
+   * the page exactly as it was left.
+   *
+   * Back from the cache, the button is given back and the list fetched
+   * afresh. When the navigation has simply not arrived after a while, only
+   * the button is given back: it may yet arrive, and a refresh now could
+   * reload the page on a 401 and cancel it. The next scheduled refresh redraws
+   * if anything has changed. */
+  var NAV_GIVE_UP_MS = 45 * 1000;
   var navTimer = null;
 
-  function reopen() {
+  function reopen(refresh) {
     clearTimeout(navTimer);
     navTimer = null;
     if (opening) {
@@ -577,11 +628,12 @@
       opening.textContent = 'Watch';
     }
     opening = false;
+    if (!refresh) return;
     shown = null;
     loadFeeds(false);
   }
 
-  window.addEventListener('pageshow', function (e) { if (e.persisted) reopen(); });
+  window.addEventListener('pageshow', function (e) { if (e.persisted) reopen(true); });
   /* The navigation went ahead: nothing to give back. */
   window.addEventListener('pagehide', function () {
     clearTimeout(navTimer);

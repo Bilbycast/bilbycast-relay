@@ -375,13 +375,18 @@ systemd unit runs as its own user. The `portal` feature is independent of
 
 `GET /api/feeds` also carries `upcoming`: the scheduled feeds starting within
 the week, `{name, starts_at}` only, asked of the manager with `for=upcoming`
-beside the watch list and best-effort (a refusal, an unreadable answer or an
-older manager's `streams` all yield `[]` and leave the live feeds alone). The
-page shows them under "Coming up" with nothing to press, and while any are
-listed re-fetches on a timer paced by the soonest start (30 s–15 min; 30 s for
-ten minutes past a start, then 5 min; failures back off doubling to 15 min),
-never while the tab is hidden, with `redirect: 'manual'` so a proxy's sign-in
-redirect reloads the page, and redraws only an answer that changed.
+beside the watch list and best-effort: a refusal or an unreadable answer
+yields `null`, which the page treats as a failed refresh (list kept, retried
+with back-off), and an older manager's `streams` yields `[]`; the live feeds
+come either way. The page shows them under "Coming up" with nothing to press,
+and while any are listed re-fetches on a timer paced by the soonest start
+(30 s–15 min; 30 s for ten minutes past a start, then 5 min; failures back
+off doubling to 15 min), never while the tab is hidden, and redraws only an
+answer that changed. Both `/api/feeds` and the Watch `POST /api/watch` use
+`redirect: 'manual'`, so a proxy's sign-in redirect (or a 401) reloads the
+page — at most once per 30 s (`sessionStorage`), then a "Sign in again" link
+— and never over a Watch navigation in progress (a 45 s give-up timer hands
+the button back without refreshing).
 
 What it deliberately does not hold: **the token secret** (it asks the manager
 to mint, and the manager re-checks the entitlement first) and **the
