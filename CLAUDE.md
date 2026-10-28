@@ -377,13 +377,15 @@ systemd unit runs as its own user. The `portal` feature is independent of
 the week, `{name, starts_at}` only, asked of the manager with `for=upcoming`
 beside the watch list and best-effort: a refusal or an unreadable answer
 yields `null`, on which the page draws the live feeds beside its last
-upcoming list and keeps asking at that list's pace (only with no list yet does
-it back off and say the list could not be loaded) — an entry whose name is
+upcoming list and keeps asking at that list's pace, every 15 min once nothing
+is left in it (only with no list yet does it back off as a failure does and,
+with nothing on air, say the list could not be loaded) — an entry whose name is
 seen on air from 10 min before its start is dropped from that list for good,
 so it does not come back as "Starting shortly" when it ends, while a later
 same-named session stays — and an older manager's `streams` yields `[]`; the
 live feeds come either way. The page shows them under "Coming up" with nothing to press,
-and while any are listed re-fetches on a timer paced by the soonest start
+and while any are listed (or, while the upcoming question keeps failing, even
+with none) re-fetches on a timer paced by the soonest start
 (30 s–15 min; 30 s for ten minutes past a start, then 5 min; failures back
 off doubling to 15 min), never while the tab is hidden, and redraws only an
 answer that changed. Both `/api/feeds` and the Watch `POST /api/watch` use
