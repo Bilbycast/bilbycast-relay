@@ -749,7 +749,8 @@ test("a feed seen on air does not come back as coming up once it ends", async (t
 test("a later session of the same name is not the one that went on air", async (t) => {
   // A name is all an upcoming entry carries, so "seen on air" is by name; a
   // session whose start is still more than ten minutes off when a feed of
-  // its name is on air is a different one, and stays listed.
+  // its name is on air is a different one, and stays listed. Here it is a
+  // day off; the two cases below pin the ten minutes from either side.
   const page = await loadPortal({
     answer: { feeds: [], upcoming: [soon("Training", 10 * MIN), soon("Training", DAY)] },
   });
@@ -766,4 +767,48 @@ test("a later session of the same name is not the one that went on air", async (
   assert.equal(rows.length, 1, "expected tomorrow's Training only: " + rows);
   assert.ok(rows[0].startsWith("Training | Tomorrow"), rows[0]);
   assert.deepEqual(page.feedWaits(), [15 * MIN]);
+});
+
+test("a feed on air five minutes before its start does not come back as coming up", async (t) => {
+  // An operator may start a feed ahead of its slot: seen on air up to ten
+  // minutes early, it is the entry of its name, and has run.
+  const page = await loadPortal({ answer: { feeds: [], upcoming: [soon("X", 10 * MIN)] } });
+  t.after(page.close);
+  await page.advance(5 * MIN);
+  page.answer = { feeds: [feed("X")], upcoming: null };
+  await page.setHidden(true);
+  await page.setHidden(false);
+  assert.equal(page.asked("/api/feeds").length, 2, "no refresh five minutes before the start");
+  assert.deepEqual(page.live(), ["X"]);
+
+  // X ends after its start, with the upcoming question still failing.
+  page.answer = { feeds: [], upcoming: null };
+  await page.advance(page.feedDue());
+  assert.deepEqual(page.upcoming(), [], "a feed started early came back as coming up");
+  assert.ok(!page.text().includes("Starting shortly"), page.text());
+  assert.deepEqual(page.feedWaits(), [15 * MIN]);
+});
+
+test("a same-named session twelve minutes off is not the one on air", async (t) => {
+  const later = soon("Training", 22 * MIN);
+  const page = await loadPortal({
+    answer: { feeds: [], upcoming: [soon("Training", 10 * MIN), later] },
+  });
+  t.after(page.close);
+  page.answer = { feeds: [feed("Training")], upcoming: null };
+  await page.advance(10 * MIN);
+  assert.deepEqual(page.live(), ["Training"]);
+
+  // It ends two minutes in, before the later one is due.
+  page.answer = { feeds: [], upcoming: null };
+  await page.advance(2 * MIN);
+  await page.setHidden(true);
+  await page.setHidden(false);
+  const rows = page.upcoming();
+  assert.equal(rows.length, 1, "expected the later Training only: " + rows);
+  assert.ok(rows[0].startsWith("Training | Today"), rows[0]);
+  assert.equal(
+    page.document.querySelector("#body .feed.upcoming .when").getAttribute("data-starts"),
+    later.starts_at
+  );
 });
