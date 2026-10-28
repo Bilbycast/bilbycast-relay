@@ -81,6 +81,11 @@
        * which is the oracle the API deliberately does not provide. So this
        * says what the viewer can act on. */
       note.hidden = true;
+      if (!upcoming.length && data.upcomingUnknown) {
+        msg('Nothing is on air right now, and the list of feeds coming up could '
+          + 'not be loaded. This page tries again shortly.');
+        return;
+      }
       if (!upcoming.length) {
         msg('Nothing is available to you right now. Feeds appear here once they '
           + 'are on air. If you are expecting one, check with whoever set it up.');
@@ -171,6 +176,13 @@
    * URL that window.open() produced gets blocked as a popup often enough that
    * the failure would read as the feed being broken. */
   function open(feed, btn) {
+    /* One press at a time. A second Watch press supersedes the first: its
+     * button is given back, its give-up timer cleared, and whatever its
+     * request answers is ignored — the press the viewer made last is the one
+     * that is followed. */
+    clearTimeout(navTimer);
+    navTimer = null;
+    if (opening && opening !== btn) giveBack(opening);
     opening = btn;
     btn.disabled = true;
     btn.textContent = 'Opening…';
@@ -183,19 +195,17 @@
       body: JSON.stringify({ session_id: feed.session_id }),
       redirect: 'manual'
     }).then(function (r) {
+      if (opening !== btn) throw new Error('superseded');
       if (r.status === 401 || r.type === 'opaqueredirect') {
-        opening = false;
-        btn.disabled = false;
-        btn.textContent = 'Watch';
+        giveBack(btn);
         signInAgain();
         throw new Error('unauthenticated');
       }
       return r.json().then(function (d) { return { ok: r.ok, data: d }; });
     }).then(function (res) {
+      if (opening !== btn) return;
       if (!res.ok || !res.data.watch_url) {
-        opening = false;
-        btn.disabled = false;
-        btn.textContent = 'Watch';
+        giveBack(btn);
         msg(res.data && res.data.error
             ? res.data.error
             : 'Could not open that feed. Try again in a moment.', true);
@@ -213,12 +223,18 @@
       window.location.href = url;
       navTimer = setTimeout(function () { reopen(false); }, NAV_GIVE_UP_MS);
     }).catch(function (e) {
-      if (e && e.message === 'unauthenticated') return;
-      opening = false;
-      btn.disabled = false;
-      btn.textContent = 'Watch';
+      if (e && (e.message === 'unauthenticated' || e.message === 'superseded')) return;
+      if (opening !== btn) return;
+      giveBack(btn);
       msg('Could not open that feed. Try again in a moment.', true);
     });
+  }
+
+  /* A pressed Watch button back as it was, and no longer the one opening. */
+  function giveBack(btn) {
+    btn.disabled = false;
+    btn.textContent = 'Watch';
+    if (opening === btn) opening = false;
   }
 
   /* Clips are fetched after the feeds, and their failure is silent.
@@ -472,6 +488,13 @@
   var opening = false;
   /* What the list on screen was drawn from, or null when it was not. */
   var shown = null;
+  /* The upcoming list of the last answer that had one, or null before any
+   * did: what a refresh whose upcoming half failed shows meanwhile. */
+  var lastUpcoming = null;
+  /* A refresh found the session ended while a Watch press was navigating, and
+   * left it so as not to reload over the navigation. Acted on if the
+   * navigation is given up. */
+  var signInDeferred = false;
   var FEED_POLL_MIN_MS = 30 * 1000;
   var FEED_POLL_MAX_MS = 15 * 60 * 1000;
   var FEED_OVERDUE_FAST_MS = 10 * 60 * 1000;
@@ -499,6 +522,10 @@
       stopFeeds();
       return;
     }
+    pollIn(nextPoll(upcoming));
+  }
+
+  function nextPoll(upcoming) {
     var now = Date.now();
     var wait = FEED_POLL_MAX_MS;
     upcoming.forEach(function (f) {
@@ -509,7 +536,7 @@
         : FEED_POLL_OVERDUE_MS;
       if (w < wait) wait = w;
     });
-    pollIn(Math.max(wait, FEED_POLL_MIN_MS));
+    return Math.max(wait, FEED_POLL_MIN_MS);
   }
 
   /* A refresh that fails keeps what is on screen and tries again, half a
@@ -527,7 +554,7 @@
    * since they are told relative to now. */
   function draw(data) {
     var key = JSON.stringify([data.username, data.logout_url || null,
-      data.feeds || [], data.upcoming || []]);
+      data.feeds || [], data.upcoming || [], !!data.upcomingUnknown]);
     if (key === shown) {
       var whens = body.querySelectorAll('.feed.upcoming .when');
       for (var i = 0; i < whens.length; i++) {
@@ -554,8 +581,9 @@
         if (r.status === 401 || r.type === 'opaqueredirect') {
           /* Not while a Watch press is navigating away: a reload would cancel
            * it, and the player's own load passes the proxy, which signs the
-           * viewer in. */
-          if (!opening) signInAgain();
+           * viewer in. If that navigation is given up, it is done then. */
+          if (opening) signInDeferred = true;
+          else signInAgain();
           throw new Error('unauthenticated');
         }
         return r.json().then(function (d) { return { ok: r.ok, data: d }; });
@@ -567,20 +595,33 @@
         }
         if (seq !== feedSeq) return;
         if (res.data.upcoming === null) {
-          /* The portal could not get the upcoming list from the manager. A
-           * failed refresh, then: what is on screen stays, and it is asked
-           * again. Taken for nothing coming up, it would stop the refresh for
-           * good, and a feed due to start would never become a Watch button.
-           * With nothing drawn yet, the live feeds are drawn meanwhile. */
-          if (!opening && shown === null) {
+          /* The portal could not get the upcoming list from the manager; the
+           * live half came through. So the live feeds are drawn, beside the
+           * last upcoming list there was (less any of it now on air, by name,
+           * which is all an upcoming entry carries), and the refresh goes on
+           * at that list's own pace: a feed that starts while the upcoming
+           * question keeps failing still becomes a Watch button. Taken for
+           * nothing coming up, it would have stopped the refresh for good.
+           * With no list yet to go on, it backs off as a failure does. */
+          var live = res.data.feeds || [];
+          var kept = (lastUpcoming || []).filter(function (u) {
+            return !live.some(function (f) { return f.name === u.name; });
+          });
+          if (!opening) {
             draw({ username: res.data.username, logout_url: res.data.logout_url,
-              feeds: res.data.feeds, upcoming: [] });
+              feeds: live, upcoming: kept, upcomingUnknown: lastUpcoming === null });
           }
-          retryFeeds();
+          if (lastUpcoming === null) {
+            retryFeeds();
+          } else {
+            feedFailures = 0;
+            pollIn(kept.length ? nextPoll(kept) : FEED_POLL_MAX_MS);
+          }
           if (first) loadClips(false);
           return;
         }
         feedFailures = 0;
+        lastUpcoming = res.data.upcoming || [];
         if (!opening) draw(res.data);
         scheduleFeeds(res.data.upcoming);
         if (first) loadClips(false);
@@ -623,14 +664,18 @@
   function reopen(refresh) {
     clearTimeout(navTimer);
     navTimer = null;
-    if (opening) {
-      opening.disabled = false;
-      opening.textContent = 'Watch';
-    }
+    if (opening) giveBack(opening);
     opening = false;
-    if (!refresh) return;
-    shown = null;
-    loadFeeds(false);
+    if (refresh) {
+      signInDeferred = false;
+      shown = null;
+      loadFeeds(false);
+    } else if (signInDeferred) {
+      /* A refresh found the session ended meanwhile; with the navigation
+       * given up there is nothing left to cancel. */
+      signInDeferred = false;
+      signInAgain();
+    }
   }
 
   window.addEventListener('pageshow', function (e) { if (e.persisted) reopen(true); });

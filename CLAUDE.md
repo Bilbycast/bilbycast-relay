@@ -376,8 +376,9 @@ systemd unit runs as its own user. The `portal` feature is independent of
 `GET /api/feeds` also carries `upcoming`: the scheduled feeds starting within
 the week, `{name, starts_at}` only, asked of the manager with `for=upcoming`
 beside the watch list and best-effort: a refusal or an unreadable answer
-yields `null`, which the page treats as a failed refresh (list kept, retried
-with back-off), and an older manager's `streams` yields `[]`; the live feeds
+yields `null`, on which the page draws the live feeds beside its last
+upcoming list and keeps asking at that list's pace (backing off with none),
+and an older manager's `streams` yields `[]`; the live feeds
 come either way. The page shows them under "Coming up" with nothing to press,
 and while any are listed re-fetches on a timer paced by the soonest start
 (30 s–15 min; 30 s for ten minutes past a start, then 5 min; failures back
@@ -386,7 +387,8 @@ answer that changed. Both `/api/feeds` and the Watch `POST /api/watch` use
 `redirect: 'manual'`, so a proxy's sign-in redirect (or a 401) reloads the
 page — at most once per 30 s (`sessionStorage`), then a "Sign in again" link
 — and never over a Watch navigation in progress (a 45 s give-up timer hands
-the button back without refreshing).
+the button back without refreshing, then does any sign-in held back; a second
+press supersedes the first).
 
 What it deliberately does not hold: **the token secret** (it asks the manager
 to mint, and the manager re-checks the entitlement first) and **the
