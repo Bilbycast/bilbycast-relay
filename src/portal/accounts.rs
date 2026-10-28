@@ -894,28 +894,51 @@ fn is_placeholder_hash(hash: &str) -> bool {
     )
 }
 
-/// Whether each listed login's owner has set a password: `true` once the
-/// account's hash is no longer the portal's placeholder.
+/// What one cycle tells the manager about passwords, for the logins it listed.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct PasswordReport {
+    /// `(username, set)` for each login with an account this portal manages:
+    /// `true` once its hash is no longer the portal's placeholder.
+    states: Vec<(String, bool)>,
+    /// Logins with no managed account in the file read, or none whose hash
+    /// can be read: a hand-made account, one the managed group was taken off,
+    /// or one not created yet. The manager forgets what it last knew of them,
+    /// so a login that stops being reported does not keep that state for good.
+    unknown: Vec<String>,
+}
+
+/// Whether each listed login's owner has set a password, from one read of the
+/// file.
 ///
-/// Only accounts this portal manages, and only logins the manager listed. A
-/// hand-made account's hash says nothing about an invite, and a login not yet
-/// in the file has no state to report — the manager shows both as unknown,
-/// never as "not set".
-fn password_states(users: &Mapping, accounts: &[ManagerAccount], group: &str) -> Vec<(String, bool)> {
-    let mut states: Vec<(String, bool)> = accounts
-        .iter()
-        .filter_map(|a| {
-            let entry = users.get(Value::String(a.username.clone()))?;
-            if !is_managed(entry, group) {
-                return None;
-            }
-            let hash = str_field(entry, "password")?;
-            Some((a.username.clone(), !is_placeholder_hash(hash)))
-        })
-        .collect();
-    states.sort();
-    states.dedup_by(|a, b| a.0 == b.0);
-    states
+/// A hand-made account's hash says nothing about an invite, and a login not
+/// yet in the file has no state — both are `unknown`, which the manager shows
+/// as nothing, never as "not set". `settling` are usernames this cycle
+/// removes or replaces, or whose removal is not yet applied: the entry this
+/// read holds for one is the last holder's, and its state would be stamped on
+/// the login that has the name now, so they are in neither list until a read
+/// after the change says.
+fn password_report(
+    users: &Mapping,
+    accounts: &[ManagerAccount],
+    group: &str,
+    settling: &HashSet<&str>,
+) -> PasswordReport {
+    let mut r = PasswordReport::default();
+    for a in accounts.iter().filter(|a| !settling.contains(a.username.as_str())) {
+        let hash = users
+            .get(a.username.as_str())
+            .filter(|e| is_managed(e, group))
+            .and_then(|e| str_field(e, "password"));
+        match hash {
+            Some(h) => r.states.push((a.username.clone(), !is_placeholder_hash(h))),
+            None => r.unknown.push(a.username.clone()),
+        }
+    }
+    r.states.sort();
+    r.states.dedup_by(|a, b| a.0 == b.0);
+    r.unknown.sort();
+    r.unknown.dedup();
+    r
 }
 
 /// Why rewriting the file would change an entry this loop does not own, if it
@@ -1310,11 +1333,11 @@ struct Memory {
     limited: bool,
     /// Plan notes already logged.
     noted: HashSet<String>,
-    /// The password states the manager last accepted, and when. Sent again
-    /// only when they change, or an hour on as a backstop for a manager whose
+    /// The password report the manager last accepted, and when. Sent again
+    /// only when it changes, or an hour on as a backstop for a manager whose
     /// database was restored.
-    reported: Option<(Vec<(String, bool)>, Instant)>,
-    /// A password-state report has failed, and the log has said so.
+    reported: Option<(PasswordReport, Instant)>,
+    /// A password report has failed, and the log has said so.
     password_report_failing: bool,
     /// Why the last cycle could not read or write Authelia's file, bounded
     /// like a link error. Sent with the next poll, so the manager can say why
@@ -1412,9 +1435,7 @@ async fn sync_once(
     };
     let empty = Mapping::new();
     let users = snap.users().unwrap_or(&empty);
-    // From this read, before any write: an account created this cycle is
-    // reported on the next, once Authelia's file holds it.
-    let passwords = password_states(users, &accounts, &cfg.managed_group);
+    let read_as = (snap.ino, snap.modified, snap.len);
 
     // Last cycle's removals and replacements, checked against a read taken
     // since. Still there, they are applied, and the manager is told below;
@@ -1443,11 +1464,26 @@ async fn sync_once(
     });
     let p = plan(users, &accounts, unapplied.as_deref(), &cfg.managed_group);
     memory.note(&p);
+    // From this read, before any write: an account created this cycle is
+    // reported on the next, once Authelia's file holds it, and so is one
+    // removed or replaced — or whose removal waits — once a read shows the
+    // name's new holder.
+    let settling: HashSet<&str> = p
+        .remove
+        .iter()
+        .chain(&p.replace)
+        .map(String::as_str)
+        .chain(unapplied.iter().flatten().map(|r| r.username.as_str()))
+        .collect();
+    let passwords = password_report(users, &accounts, &cfg.managed_group, &settling);
 
     let mut out = Outcome::default();
     // Whether this cycle's changes are in the file — trivially so when there
     // were none.
     let mut landed = true;
+    // Whether a write landed, which checked the file was still this read
+    // just before it renamed over it.
+    let mut wrote = false;
     if p.changes_file() {
         let (path, group, changes) = (cfg.users_file.clone(), cfg.managed_group.clone(), p.clone());
         // Hashing included: it is CPU, and this runtime also serves viewers.
@@ -1462,6 +1498,7 @@ async fn sync_once(
         .await?;
         match written {
             Ok(true) => {
+                wrote = true;
                 out.added = p.add.len();
                 out.updated = p.update.len();
                 out.removed = p.remove.len();
@@ -1627,7 +1664,22 @@ async fn sync_once(
         serve(state, memory, key, || None).await;
     }
     memory.served.retain(|k, _| planned.contains(k));
-    report_password_states(state, memory, passwords).await;
+    // Only from a read of the whole file. Authelia rewrites it in place when a
+    // password is set, so a read taken mid-write can be missing accounts, and
+    // `unknown` would make the manager forget them. A write that landed
+    // checked the file was still this read; otherwise it must still be now.
+    // Not, and nothing is reported: the next cycle's read will be.
+    let whole = wrote || {
+        let path = cfg.users_file.clone();
+        tokio::task::spawn_blocking(move || std::fs::metadata(path))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|m| (m.ino(), m.modified().ok(), m.len()) == read_as)
+    };
+    if whole {
+        report_password_states(state, memory, passwords).await;
+    }
     Ok(out)
 }
 
@@ -1636,24 +1688,25 @@ async fn sync_once(
 const PASSWORD_REPORT_EVERY: Duration = Duration::from_secs(3600);
 
 /// Tell the manager which logins' owners have set a password, when that has
-/// changed since it last accepted the list (or an hour has passed).
+/// changed since it last accepted the report (or an hour has passed).
+///
+/// The body is `{"accounts": [{"username", "password_set"}, …], "unknown":
+/// [username, …]}`. A manager older than `unknown` ignores it; one older than
+/// the route answers 404.
 ///
 /// Never fails the cycle: this is information for an operator, and the sync
 /// it rides on has work that matters more. A failure is logged once and
 /// retried next cycle; a manager too old for the route is told nothing more
-/// until the states change.
-async fn report_password_states(
-    state: &PortalState,
-    memory: &mut Memory,
-    passwords: Vec<(String, bool)>,
-) {
+/// until the report changes.
+async fn report_password_states(state: &PortalState, memory: &mut Memory, report: PasswordReport) {
     if let Some((last, at)) = &memory.reported
-        && *last == passwords
+        && *last == report
         && at.elapsed() < PASSWORD_REPORT_EVERY
     {
         return;
     }
-    let accounts: Vec<serde_json::Value> = passwords
+    let accounts: Vec<serde_json::Value> = report
+        .states
         .iter()
         .map(|(u, set)| serde_json::json!({ "username": u, "password_set": set }))
         .collect();
@@ -1664,7 +1717,7 @@ async fn report_password_states(
             state.cfg.manager_url
         ))
         .bearer_auth(&state.cfg.manager_token)
-        .json(&serde_json::json!({ "accounts": accounts }))
+        .json(&serde_json::json!({ "accounts": accounts, "unknown": report.unknown }))
         .send()
         .await;
     let failed = match sent {
@@ -1678,7 +1731,7 @@ async fn report_password_states(
                 );
             }
             memory.password_report_failing = true;
-            memory.reported = Some((passwords, Instant::now()));
+            memory.reported = Some((report, Instant::now()));
             return;
         }
         Ok(r) => Some(format!("manager answered {}", r.status())),
@@ -1690,7 +1743,7 @@ async fn report_password_states(
                 tracing::info!("password states reaching the manager again");
             }
             memory.password_report_failing = false;
-            memory.reported = Some((passwords, Instant::now()));
+            memory.reported = Some((report, Instant::now()));
         }
         Some(e) => {
             if !memory.password_report_failing {
@@ -3156,6 +3209,9 @@ users:
         /// when not 200.
         password_reports: Vec<serde_json::Value>,
         password_status: Option<u16>,
+        /// A file to write, with what, when Authelia is next asked for a
+        /// link — Authelia rewriting its file mid-cycle.
+        rewrite_on_link: Option<(PathBuf, String)>,
     }
     type Shared = Arc<Mutex<Stub>>;
 
@@ -3214,6 +3270,9 @@ users:
         let mut s = s.lock().unwrap();
         s.asked
             .push(body["username"].as_str().unwrap_or("").to_string());
+        if let Some((path, text)) = s.rewrite_on_link.take() {
+            std::fs::write(path, text).unwrap();
+        }
         let (code, body) = s.authelia.clone();
         let mut r = (StatusCode::from_u16(code).unwrap(), body).into_response();
         if let Some(after) = s.retry_after {
@@ -3415,7 +3474,7 @@ users:
     }
 
     #[test]
-    fn password_states_cover_managed_listed_accounts_only() {
+    fn password_reports_cover_the_listed_logins() {
         let ours = unusable_password_hash().unwrap();
         let doc = file(&format!(
             r#"
@@ -3427,8 +3486,13 @@ users:
     password: "{AUTHELIA_HASH}"
     groups: [bilbycast-portal]
   by.hand:
-    password: "{ours}"
+    password: "{AUTHELIA_HASH}"
     groups: []
+  no.hash:
+    groups: [bilbycast-portal]
+  changing.hands:
+    password: "{AUTHELIA_HASH}"
+    groups: [bilbycast-portal]
   unlisted:
     password: "{ours}"
     groups: [bilbycast-portal]
@@ -3438,13 +3502,20 @@ users:
             acct("signed.up", Some("s@example.com")),
             acct("invited", Some("i@example.com")),
             acct("by.hand", Some("h@example.com")),
+            acct("no.hash", Some("x@example.com")),
             acct("not.yet.created", Some("n@example.com")),
+            acct("changing.hands", None),
         ];
+        let settling = HashSet::from(["changing.hands"]);
         assert_eq!(
-            password_states(&users(&doc), &accounts, G),
-            vec![("invited".to_string(), false), ("signed.up".to_string(), true)],
-            "a hand-made account, an account not yet in the file and one the manager \
-             does not list say nothing"
+            password_report(&users(&doc), &accounts, G, &settling),
+            PasswordReport {
+                states: vec![("invited".to_string(), false), ("signed.up".to_string(), true)],
+                unknown: vec!["by.hand".into(), "no.hash".into(), "not.yet.created".into()],
+            },
+            "a hand-made account, one with no hash and one not yet in the file are unknown; \
+             a name changing hands is neither, and one the manager does not list is not \
+             mentioned"
         );
     }
 
@@ -3474,10 +3545,13 @@ users:
             assert_eq!(s.password_reports.len(), 1);
             assert_eq!(
                 s.password_reports[0],
-                serde_json::json!({ "accounts": [
-                    { "username": "a.smith", "password_set": false },
-                    { "username": "b.jones", "password_set": true },
-                ]})
+                serde_json::json!({
+                    "accounts": [
+                        { "username": "a.smith", "password_set": false },
+                        { "username": "b.jones", "password_set": true },
+                    ],
+                    "unknown": [],
+                })
             );
         }
 
@@ -3522,6 +3596,74 @@ users:
         });
         sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
         sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(r.stub.lock().unwrap().password_reports.len(), 1);
+    }
+
+    /// A username given out again is the last holder's account in the read
+    /// taken before the write that replaces it. Reported from that read, the
+    /// new login would be stamped "password set" — and, given no account, it
+    /// is never reported again to put that right.
+    #[tokio::test]
+    async fn a_name_changing_hands_is_reported_once_a_read_shows_its_new_holder() {
+        let yaml = format!(
+            "users:\n  a.smith:\n    password: \"{AUTHELIA_HASH}\"\n    \
+             email: alex@example.com\n    groups: [bilbycast-portal]\n"
+        );
+        // Deleted and given out again, to someone with no email: the account
+        // goes, and none is made.
+        let answer = serde_json::json!({
+            "accounts": [{ "username": "a.smith" }],
+            "removed": [{ "username": "a.smith", "removed_at": "2026-10-28T08:00:00.123456Z" }],
+        });
+        let r = rig(&yaml, answer, None).await;
+        let mut memory = Memory::default();
+
+        let out = sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(out.replaced, 1);
+        {
+            let s = r.stub.lock().unwrap();
+            assert_eq!(
+                s.password_reports.last(),
+                Some(&serde_json::json!({ "accounts": [], "unknown": [] })),
+                "the last holder's password was reported for the name's new holder"
+            );
+        }
+
+        // The next read shows the account gone: the new login has none.
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        let s = r.stub.lock().unwrap();
+        assert_eq!(
+            s.password_reports.last(),
+            Some(&serde_json::json!({ "accounts": [], "unknown": ["a.smith"] }))
+        );
+    }
+
+    /// Nothing is reported from a read that is not the whole file: one that
+    /// failed, or one Authelia rewrote the file under.
+    #[tokio::test]
+    async fn no_report_comes_from_a_read_that_is_not_the_whole_file() {
+        let r = rig(TWO_MANAGED, requesting(&["a.smith"]), None).await;
+        let mut memory = Memory::default();
+        // Authelia writes the file mid-cycle — while the link is being asked
+        // for — leaving the read this cycle took missing nobody, but no
+        // longer the file.
+        let rewritten = format!("{TWO_MANAGED}  c.brown:\n    password: x\n    groups: []\n");
+        r.stub.lock().unwrap().rewrite_on_link = Some((r.cfg.users_file.clone(), rewritten));
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        {
+            let s = r.stub.lock().unwrap();
+            assert_eq!(s.asked, ["a.smith"]);
+            assert!(s.password_reports.is_empty(), "{:?}", s.password_reports);
+        }
+        // The next read is whole.
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(r.stub.lock().unwrap().password_reports.len(), 1);
+
+        // No file at all: the cycle fails, and nobody is reported unknown.
+        std::fs::remove_file(&r.cfg.users_file).unwrap();
+        r.stub.lock().unwrap().password_status = None;
+        memory.reported = None;
+        assert!(sync_once(&r.state, &r.cfg, &mut memory).await.is_err());
         assert_eq!(r.stub.lock().unwrap().password_reports.len(), 1);
     }
 

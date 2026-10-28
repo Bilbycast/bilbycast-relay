@@ -572,13 +572,23 @@ managed account's hash in Authelia's file and tells the manager
 (`POST /api/v1/dvr/portal/accounts/password-state`) whether it is still the
 placeholder the portal wrote — argon2id at argon2's minimum cost — or one
 Authelia wrote when the person used their link, at its own cost. No password is
-read or sent; the cost is in the hash text. The list goes only when it changes,
-and once an hour regardless. The manager marks each row *password set* or
-*invite not used*. Hand-made accounts, and logins the portal has not created
-yet, are not reported, and show neither. An Authelia whose argon2 settings are
-lowered to the minimum would make every password read as not set. A manager
-older than the route answers 404, which the portal logs once and otherwise
-ignores.
+read or sent; the cost is in the hash text. The body is
+`{"accounts": [{"username", "password_set"}, …], "unknown": [username, …]}`:
+`accounts` for each login the manager listed that has a managed account, and
+`unknown` for each one that has none in the file — a hand-made account, one
+taken out of `managed_group`, one not created yet — so the manager forgets what
+it knew rather than keeping a state nobody reports any more. A username this
+cycle removes or replaces, or whose removal is not yet applied, is in neither
+list: the file still holds the last holder's account, and its state is not the
+new holder's. The report goes only when it changes, and once an hour regardless,
+and only from a read of the whole file — none when the read failed, and none
+when Authelia rewrote the file during the cycle (it does so in place when a
+password is set, so the read may be missing accounts); the next cycle reports
+instead. The manager marks each row *password set* or *invite not used*, and an
+`unknown` row as neither. An Authelia whose argon2 settings are lowered to the
+minimum would make every password read as not set. A manager older than the
+route answers 404, which the portal logs once and does not ask again until the
+report changes. A manager that has the route but predates `unknown` ignores it.
 
 ### `authelia_url` and its path
 

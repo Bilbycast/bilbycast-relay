@@ -453,7 +453,14 @@ by the end of the pause. Each `(username, requested_at)` is served at most once
 per process, then acknowledged on `…/accounts/link-sent` with the reason (one
 line, ≤ 300 bytes) when it failed. A cycle whose file read or write failed (or
 was refused) sends the reason, bounded the same way, as `&sync_error=` on the
-next poll. Collisions that would make Authelia refuse the file under
+next poll. Each cycle also reports who has set a password on
+`POST …/accounts/password-state` — `{"accounts": [{username, password_set}],
+"unknown": [username]}`, `password_set` meaning the managed account's hash is no
+longer the placeholder (told by its argon2 cost, `is_placeholder_hash`), `unknown`
+the listed logins with no managed account — leaving out any username this cycle
+removes or replaces (or whose removal waits), sent only on change or hourly,
+and only from a read the file still matched afterwards (or a write that landed
+from it); a 404 is logged once and not retried until the report changes. Collisions that would make Authelia refuse the file under
 `search.email` (an email or username another account holds,
 case-insensitively) are never written, judged against the file *as the write
 leaves it* by a fixed point (`resolve` in `accounts.rs`), so a freed address
