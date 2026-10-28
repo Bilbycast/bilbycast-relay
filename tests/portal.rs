@@ -614,12 +614,14 @@ async fn an_older_manager_yields_nothing_upcoming() {
 }
 
 /// An upcoming list the portal cannot read costs the viewer that list, not
-/// the page: the feeds they can watch still load.
+/// the page: the feeds they can watch still load. And it is `null`, not `[]`:
+/// the page polls only while something is coming up, so an empty list here
+/// would stop it for good on one bad answer.
 #[tokio::test]
 async fn an_unreadable_upcoming_list_does_not_cost_the_feeds() {
     let (body, _) = feeds_as("broken.upcoming").await;
     assert!(the_live_feed(&body), "the live feeds went with the upcoming list: {body}");
-    assert_eq!(body["upcoming"], serde_json::json!([]), "{body}");
+    assert!(body["upcoming"].is_null(), "a failure read as nothing coming up: {body}");
 }
 
 /// Nor does a manager that refuses the upcoming question outright.
@@ -627,7 +629,7 @@ async fn an_unreadable_upcoming_list_does_not_cost_the_feeds() {
 async fn a_refused_upcoming_list_does_not_cost_the_feeds() {
     let (body, _) = feeds_as("failing.upcoming").await;
     assert!(the_live_feed(&body), "the live feeds went with the upcoming list: {body}");
-    assert_eq!(body["upcoming"], serde_json::json!([]), "{body}");
+    assert!(body["upcoming"].is_null(), "a failure read as nothing coming up: {body}");
 }
 
 /// The header is a claim, and from an untrusted peer it is the client

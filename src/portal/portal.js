@@ -520,6 +520,20 @@
           return;
         }
         if (seq !== feedSeq) return;
+        if (res.data.upcoming === null) {
+          /* The portal could not get the upcoming list from the manager. A
+           * failed refresh, then: what is on screen stays, and it is asked
+           * again. Taken for nothing coming up, it would stop the refresh for
+           * good, and a feed due to start would never become a Watch button.
+           * With nothing drawn yet, the live feeds are drawn meanwhile. */
+          if (!opening && shown === null) {
+            draw({ username: res.data.username, logout_url: res.data.logout_url,
+              feeds: res.data.feeds, upcoming: [] });
+          }
+          retryFeeds();
+          if (first) loadClips(false);
+          return;
+        }
         feedFailures = 0;
         if (!opening) draw(res.data);
         scheduleFeeds(res.data.upcoming);

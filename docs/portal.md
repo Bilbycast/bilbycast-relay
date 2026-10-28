@@ -1414,7 +1414,7 @@ three hours for a link grant, which cannot renew.
 |---|---|
 | `GET /` | The page. |
 | `GET /portal.js` | Its script — a separate route so the page can carry `script-src 'self'`. |
-| `GET /api/feeds` | What the signed-in user may watch (`feeds`), and under `upcoming` the scheduled feeds starting within the week, each only `{name, starts_at}` (RFC 3339) — nothing that opens one. Asked of the manager beside the watch list, with `for=upcoming`, and best-effort: a manager that refuses that question, answers it unreadably, or is too old to know it (it answers with `streams`, which is ignored) yields `upcoming: []` and the live feeds as usual. |
+| `GET /api/feeds` | What the signed-in user may watch (`feeds`), and under `upcoming` the scheduled feeds starting within the week, each only `{name, starts_at}` (RFC 3339) — nothing that opens one. Asked of the manager beside the watch list, with `for=upcoming`, and best-effort: a manager that refuses that question or answers it unreadably yields `upcoming: null` — a failure, which the page retries with the list it has on screen — and one too old to know it (it answers with `streams`, which is ignored) yields `upcoming: []`; the live feeds come as usual either way. |
 | `POST /api/watch` | Mint a link for one feed. The body names the *session*; the username comes from the header and can never be supplied by the browser. |
 | `GET /watch?stream=…` | One tap back to a feed whose credential ran out — re-mints and redirects. This is where the player's expired-access link points, not the front page. |
 | `GET /api/renew?stream=…` | Background renewal before the thirty minutes are up. Cross-origin, so it answers only origins named in `player_origins`; an empty list means no renewal at all. |

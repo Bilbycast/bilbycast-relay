@@ -314,12 +314,18 @@ async fn fetch_streams(st: &PortalState, username: &str) -> Result<Vec<ManagerSt
     fetch_streams_for(st, username, None).await
 }
 
-/// The scheduled feeds this viewer will be able to watch within the week.
+/// The scheduled feeds this viewer will be able to watch within the week, or
+/// `None` when the manager could not say.
 ///
-/// Best-effort: a failure here is logged and answered as nothing coming up,
+/// Best-effort: a failure here is logged and costs the page this list only,
 /// because the page exists to get someone watching, and an upcoming list it
-/// could not fetch must not keep them from the feeds that are on air.
-async fn fetch_upcoming(st: &PortalState, username: &str) -> Vec<UpcomingFeed> {
+/// could not fetch must not keep them from the feeds that are on air. But it
+/// is a failure, not an empty list: the page refreshes only while something
+/// is coming up, so "nothing" from a manager that hiccupped would stop it for
+/// good, and a feed about to start would never become a Watch button. An
+/// older manager's answer without the key is a real `[]` — it has nothing to
+/// say, and asking again will not change that.
+async fn fetch_upcoming(st: &PortalState, username: &str) -> Option<Vec<UpcomingFeed>> {
     let url = format!("{}/api/v1/dvr/portal/streams", st.cfg.manager_url);
     let resp = match st
         .http
@@ -332,18 +338,18 @@ async fn fetch_upcoming(st: &PortalState, username: &str) -> Vec<UpcomingFeed> {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::warn!(status = %r.status(), "portal: manager refused the upcoming list");
-            return Vec::new();
+            return None;
         }
         Err(e) => {
             tracing::warn!(error = %e, "portal: manager upcoming list failed");
-            return Vec::new();
+            return None;
         }
     };
     match resp.json::<UpcomingResponse>().await {
-        Ok(body) => body.upcoming,
+        Ok(body) => Some(body.upcoming),
         Err(e) => {
             tracing::warn!(error = %e, "portal: unreadable upcoming list");
-            Vec::new()
+            None
         }
     }
 }
@@ -505,6 +511,8 @@ async fn feeds(
     Json(serde_json::json!({
         "username": username,
         "feeds": feeds,
+        // `null` when the manager could not say, which the page retries;
+        // `[]` when nothing is coming up.
         "upcoming": upcoming,
         // Rendered as a "Sign out" link when configured. The portal cannot end
         // the session itself — Authelia holds the cookie — so an absent value
