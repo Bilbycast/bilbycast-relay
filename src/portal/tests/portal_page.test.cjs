@@ -505,14 +505,54 @@ test("back from the cache, the button is given back and the list asked afresh", 
 });
 
 test("a press answered after a cache restore gave it back does nothing", async (t) => {
-  const page = await loadPortal({ answer: { feeds: [feed("Live")], upcoming: [] } });
-  t.after(page.close);
-  await page.press("Live");
-  const req = page.pendingWatch();
-  await page.pageshow(true);
-  await page.answerWatch(req, { status: 502, body: { error: "Cannot reach the manager right now." } });
-  assert.deepEqual(page.live(), ["Live"], "a stale press's failure wiped the reloaded list");
-  assert.ok(!page.text().includes("Cannot reach"), page.text());
+  for (const [what, spec] of [
+    ["a 502", { status: 502, body: { error: "Cannot reach the manager right now." } }],
+    ["a 401", { status: 401, body: {} }],
+    ["a redirect", { redirect: true }],
+    ["a network error", { error: true }],
+    ["a link", minted("stale")],
+  ]) {
+    const page = await loadPortal({ answer: { feeds: [feed("Live")], upcoming: [] } });
+    t.after(page.close);
+    await page.press("Live");
+    const req = page.pendingWatch();
+    await page.pageshow(true);
+    await page.answerWatch(req, spec);
+    assert.deepEqual(page.live(), ["Live"], what + ": a stale press's answer wiped the reloaded list");
+    assert.ok(!page.text().includes("Cannot reach"), what + ": " + page.text());
+    assert.ok(!page.text().includes(COULD_NOT_OPEN), what + ": " + page.text());
+    assert.equal(page.loc.reloads, 0, what + ": a stale press signed in again");
+    assert.deepEqual(page.loc.navigations, [], what + ": a stale press navigated");
+  }
+});
+
+test("a superseded press answered 401, redirected or failing does nothing", async (t) => {
+  for (const [what, spec] of [
+    ["a 401", { status: 401, body: {} }],
+    ["a redirect", { redirect: true }],
+    ["a network error", { error: true }],
+  ]) {
+    // Superseded by a press on another button, and by one on its own button
+    // again, which only the press's number tells apart from it.
+    for (const last of ["B", "A"]) {
+      const how = what + ", then Watch " + (last === "A" ? "B, A" : "B");
+      const page = await loadPortal({ answer: { feeds: [feed("A"), feed("B")], upcoming: [] } });
+      t.after(page.close);
+      await page.press("A");
+      const stale = page.pendingWatch();
+      await page.press("B");
+      if (last === "A") await page.press("A");
+      const latest = page.pendingWatch();
+      await page.answerWatch(stale, spec);
+      assert.equal(page.loc.reloads, 0, how + ": a superseded press signed in again");
+      assert.ok(!page.text().includes(COULD_NOT_OPEN), how + ": " + page.text());
+      assert.deepEqual(page.live(), ["A", "B"], how + ": the list was taken away");
+      assert.equal(page.button(last).textContent, "Opening…", how + ": the latest press was given back");
+      await page.answerWatch(latest, minted("latest"));
+      assert.equal(page.loc.navigations.length, 1, how + ": the latest press did not navigate");
+      assert.ok(page.loc.navigations[0].includes("token=latest"), page.loc.navigations[0]);
+    }
+  }
 });
 
 test("Watch A, then B, then A again: only the last press is followed", async (t) => {
