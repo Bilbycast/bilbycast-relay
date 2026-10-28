@@ -365,6 +365,30 @@ test("nothing is asked while the tab is hidden, and showing it asks at once", as
   assert.equal(page.asked("/api/feeds").length, before + 1, "a backing-off refresh did not resume on show");
 });
 
+test("a refresh answered after the tab is hidden sets no timer there", async (t) => {
+  const page = await loadPortal({
+    answer: { feeds: [feed("Live")], upcoming: [soon("Final", 10 * MIN)] },
+  });
+  t.after(page.close);
+  // The refresh goes out while the tab is shown, and its answer is held...
+  page.net.queued["/api/feeds"].push(null);
+  await page.advance(page.feedDue());
+  const held = page.net.requests.filter((r) => r.path === "/api/feeds" && !r.done).pop();
+  assert.ok(held, "the refresh did not go out");
+  // ...until the viewer has switched tabs.
+  await page.setHidden(true);
+  page.net.settle(held, {
+    body: { username: "a.smith", feeds: [feed("Live")], upcoming: [soon("Final", 10 * MIN)], logout_url: null },
+  });
+  await flush();
+  assert.deepEqual(page.feedWaits(), [], "an answer landing in a hidden tab set a refresh timer");
+  const asked = page.asked("/api/feeds").length;
+  await page.advance(2 * HOUR);
+  assert.equal(page.asked("/api/feeds").length, asked, "a hidden tab asked");
+  await page.setHidden(false);
+  assert.equal(page.asked("/api/feeds").length, asked + 1, "showing the tab did not ask at once");
+});
+
 test("an unchanged answer keeps the very same Watch button", async (t) => {
   const page = await loadPortal({
     answer: { feeds: [feed("Live")], upcoming: [soon("Final", 3 * DAY)] },
@@ -386,6 +410,12 @@ test("an unchanged answer keeps the very same Watch button", async (t) => {
   page.answer = { feeds: [feed("Live")], upcoming: [soon("Final", 3 * DAY)] };
   await page.advance(page.feedDue());
   assert.strictEqual(page.button("Live"), pressed, "a refresh redrew under a Watch press");
+  assert.equal(pressed.textContent, "Opening…");
+
+  // Nor one whose upcoming half failed, with a live list that changed.
+  page.answer = { feeds: [feed("Live"), feed("Third")], upcoming: null };
+  await page.advance(page.feedDue());
+  assert.strictEqual(page.button("Live"), pressed, "a refresh with no upcoming list redrew under a Watch press");
   assert.equal(pressed.textContent, "Opening…");
 });
 
@@ -741,6 +771,26 @@ test("with no upcoming list yet, nothing on air says so and backs off", async (t
   assert.deepEqual(page.feedWaits(), [30 * SEC]);
   await page.advance(30 * SEC);
   assert.deepEqual(page.feedWaits(), [1 * MIN], "an unknown list was not backed off");
+});
+
+test("an answer missing only its upcoming list ends a back-off", async (t) => {
+  const page = await loadPortal({
+    answer: { feeds: [feed("Live")], upcoming: [soon("Final", 3 * DAY)] },
+  });
+  t.after(page.close);
+  for (const wait of [30 * SEC, 1 * MIN]) {
+    page.net.queued["/api/feeds"].push({ status: 502, body: {} });
+    await page.advance(page.feedDue());
+    assert.deepEqual(page.feedWaits(), [wait]);
+  }
+  // The portal answers again; only the manager's upcoming half is missing.
+  page.answer = { feeds: [feed("Live")], upcoming: null };
+  await page.advance(page.feedDue());
+  assert.deepEqual(page.feedWaits(), [15 * MIN], "the remembered list's pace was not taken up");
+  // So the next failure is the first of a new back-off.
+  page.net.queued["/api/feeds"].push({ status: 502, body: {} });
+  await page.advance(page.feedDue());
+  assert.deepEqual(page.feedWaits(), [30 * SEC], "the back-off was not reset by an answer missing its upcoming list");
 });
 
 test("an upcoming list that stops coming keeps the refresh going and draws a feed that starts", async (t) => {
