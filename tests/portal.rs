@@ -51,7 +51,8 @@ async fn stub_streams(
     State(rec): State<Recorder>,
     headers: HeaderMap,
     Query(q): Query<StreamsQuery>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -68,24 +69,42 @@ async fn stub_streams(
     // As `dump_portal_contract` prints it: under its own key, a name and a
     // start, nothing that would open the feed.
     if q.purpose.as_deref() == Some("upcoming") {
-        let upcoming = if q.username == "a.smith" {
-            serde_json::json!([
+        let upcoming = match q.username.as_str() {
+            "a.smith" => serde_json::json!([
                 { "session_id": "s2", "name": "Next match",
                   "starts_at": "2026-10-25T08:35:00Z" }
-            ])
-        } else if q.username == "old.manager" {
+            ]),
             // A manager too old to know the question answers it as the
-            // default: live feeds, under `streams`.
-            return Json(serde_json::json!({ "streams": [
-                { "session_id": "s1", "name": "Match feed",
-                  "stream_id": "match-feed", "state": "active", "relay_node_id": "n1" }
-            ]}));
-        } else if q.username == "broken.upcoming" {
-            return Json(serde_json::json!({ "upcoming": "not a list" }));
-        } else {
-            serde_json::json!([])
+            // default: live feeds, under `streams`. Each carries a start
+            // time, so a portal that read `streams` as upcoming would list
+            // it rather than fail to parse it — the test can tell the keys
+            // being kept apart from the answer being misread.
+            "old.manager" => {
+                return Json(serde_json::json!({ "streams": [
+                    { "session_id": "s1", "name": "Match feed",
+                      "stream_id": "match-feed", "state": "active", "relay_node_id": "n1",
+                      "starts_at": "2026-10-25T08:35:00Z" }
+                ]}))
+                .into_response();
+            }
+            "broken.upcoming" => {
+                return Json(serde_json::json!({ "upcoming": "not a list" })).into_response();
+            }
+            // Refused, with a list in the body all the same, so a portal that
+            // read past the status would show it.
+            "failing.upcoming" => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "database error", "upcoming": [
+                        { "session_id": "s2", "name": "Next match",
+                          "starts_at": "2026-10-25T08:35:00Z" }
+                    ]})),
+                )
+                    .into_response();
+            }
+            _ => serde_json::json!([]),
         };
-        return Json(serde_json::json!({ "upcoming": upcoming }));
+        return Json(serde_json::json!({ "upcoming": upcoming })).into_response();
     }
 
     // The field set here is not invented: it is what
@@ -94,9 +113,14 @@ async fn stub_streams(
     // lives in a different repo and cannot import that type, so this is the
     // seam where a fixture would otherwise drift in silence.
     //
-    // Only `a.smith` has anything; anyone else gets an empty list, which is
-    // what the real manager does for an unknown username.
-    let streams = if q.username == "a.smith" {
+    // Only `a.smith` and the users whose upcoming list goes wrong have
+    // anything; anyone else gets an empty list, which is what the real
+    // manager does for an unknown username.
+    let live = matches!(
+        q.username.as_str(),
+        "a.smith" | "old.manager" | "broken.upcoming" | "failing.upcoming"
+    );
+    let streams = if live {
         serde_json::json!([
             { "session_id": "s1", "name": "Match feed",
               "stream_id": "match-feed", "state": "active", "relay_node_id": "n1" }
@@ -104,7 +128,7 @@ async fn stub_streams(
     } else {
         serde_json::json!([])
     };
-    Json(serde_json::json!({ "streams": streams }))
+    Json(serde_json::json!({ "streams": streams })).into_response()
 }
 
 async fn stub_token(
@@ -554,37 +578,55 @@ async fn upcoming_feeds_are_listed_with_their_start_and_nothing_else() {
     assert!(feeds.iter().all(|f| f["name"] != "Next match"), "{body}");
 }
 
-/// A manager that predates the question answers it with live feeds under
-/// `streams`. Those must not appear as upcoming.
-#[tokio::test]
-async fn an_older_manager_yields_nothing_upcoming() {
-    let (base, _rec) = harness().await;
-    let body: serde_json::Value = client()
+/// `/api/feeds` as `user` sees it, and the paths the manager was asked on.
+async fn feeds_as(user: &str) -> (serde_json::Value, Vec<String>) {
+    let (base, rec) = harness().await;
+    let r = client()
         .get(format!("{base}/api/feeds"))
-        .header("Remote-User", "old.manager")
+        .header("Remote-User", user)
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.json().await.unwrap();
+    let mut asked: Vec<String> = rec.lock().unwrap().calls.iter().map(|c| c.0.clone()).collect();
+    asked.sort();
+    (body, asked)
+}
+
+/// The live feed every one of the users below has, as the page gets it.
+fn the_live_feed(body: &serde_json::Value) -> bool {
+    body["feeds"].as_array().is_some_and(|f| f.len() == 1 && f[0]["name"] == "Match feed")
+}
+
+/// A manager that predates the question answers it with live feeds under
+/// `streams`. Those must not appear as upcoming — and are not merely unread:
+/// they carry a start time, so reading them as upcoming would list them.
+#[tokio::test]
+async fn an_older_manager_yields_nothing_upcoming() {
+    let (body, asked) = feeds_as("old.manager").await;
+    assert!(
+        asked.iter().any(|p| p.ends_with("?for=upcoming")),
+        "the upcoming list was never asked for: {asked:?}"
+    );
     assert_eq!(body["upcoming"], serde_json::json!([]), "{body}");
+    assert!(the_live_feed(&body), "{body}");
 }
 
 /// An upcoming list the portal cannot read costs the viewer that list, not
 /// the page: the feeds they can watch still load.
 #[tokio::test]
 async fn an_unreadable_upcoming_list_does_not_cost_the_feeds() {
-    let (base, _rec) = harness().await;
-    let r = client()
-        .get(format!("{base}/api/feeds"))
-        .header("Remote-User", "broken.upcoming")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let body: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(body["feeds"], serde_json::json!([]), "{body}");
+    let (body, _) = feeds_as("broken.upcoming").await;
+    assert!(the_live_feed(&body), "the live feeds went with the upcoming list: {body}");
+    assert_eq!(body["upcoming"], serde_json::json!([]), "{body}");
+}
+
+/// Nor does a manager that refuses the upcoming question outright.
+#[tokio::test]
+async fn a_refused_upcoming_list_does_not_cost_the_feeds() {
+    let (body, _) = feeds_as("failing.upcoming").await;
+    assert!(the_live_feed(&body), "the live feeds went with the upcoming list: {body}");
     assert_eq!(body["upcoming"], serde_json::json!([]), "{body}");
 }
 
