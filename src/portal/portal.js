@@ -534,6 +534,10 @@
   var FEED_POLL_MAX_MS = 15 * 60 * 1000;
   var FEED_OVERDUE_FAST_MS = 10 * 60 * 1000;
   var FEED_POLL_OVERDUE_MS = 5 * 60 * 1000;
+  /* How early a feed may go on air and still be taken for the upcoming entry
+   * of its name: an operator can start one ahead of its slot, and this
+   * browser's clock need not agree with the manager's. */
+  var ON_AIR_EARLY_MS = 10 * 60 * 1000;
 
   function pollIn(wait) {
     clearTimeout(feedTimer);
@@ -648,11 +652,28 @@
            * at that list's own pace: a feed that starts while the upcoming
            * question keeps failing still becomes a Watch button. Taken for
            * nothing coming up, it would have stopped the refresh for good.
-           * With no list yet to go on, it backs off as a failure does. */
+           * With no list yet to go on, it backs off as a failure does.
+           *
+           * An entry seen on air is also dropped from that list for good:
+           * it has started, so it is not coming up again when it leaves the
+           * live list, and kept, it came back as "Starting shortly" once it
+           * ended, polled every five minutes for as long as the failure
+           * lasted. Only one whose start had come, or was at most ten minutes
+           * off: a session of the same name later in the week is a different
+           * one, and stays. */
           var live = res.data.feeds || [];
-          var kept = (lastUpcoming || []).filter(function (u) {
-            return !live.some(function (f) { return f.name === u.name; });
-          });
+          var now = Date.now();
+          var onAir = function (u) {
+            return live.some(function (f) { return f.name === u.name; });
+          };
+          /* A start that cannot be read counts as come. */
+          var due = function (u) {
+            return !(new Date(u.starts_at).getTime() > now + ON_AIR_EARLY_MS);
+          };
+          var kept = (lastUpcoming || []).filter(function (u) { return !onAir(u); });
+          if (lastUpcoming !== null) {
+            lastUpcoming = lastUpcoming.filter(function (u) { return !(onAir(u) && due(u)); });
+          }
           if (!opening) {
             draw({ username: res.data.username, logout_url: res.data.logout_url,
               feeds: live, upcoming: kept, upcomingUnknown: lastUpcoming === null });
