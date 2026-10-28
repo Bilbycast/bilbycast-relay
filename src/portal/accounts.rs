@@ -1337,7 +1337,12 @@ struct Memory {
     /// only when it changes, or an hour on as a backstop for a manager whose
     /// database was restored.
     reported: Option<(PasswordReport, Instant)>,
-    /// A password report has failed, and the log has said so.
+    /// The manager answered the last report 404: it is older than the route.
+    /// Not asked again until the report changes, and said in the log once.
+    password_route_missing: bool,
+    /// A password report has failed some other way, and the log has said so.
+    /// Kept apart from the 404, so a manager that has the route and then
+    /// fails is still warned about.
     password_report_failing: bool,
     /// Why the last cycle could not read or write Authelia's file, bounded
     /// like a link error. Sent with the next poll, so the manager can say why
@@ -1723,18 +1728,24 @@ async fn report_password_states(state: &PortalState, memory: &mut Memory, report
     let failed = match sent {
         Ok(r) if r.status().is_success() => None,
         Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-            if !memory.password_report_failing {
+            if !memory.password_route_missing {
                 tracing::info!(
                     "the manager has no route for password states, so it is older than this \
                      portal; its Portal logins list will not say who has set a password until it \
                      is upgraded"
                 );
             }
-            memory.password_report_failing = true;
+            memory.password_route_missing = true;
+            // A different answer: whatever failed before is over, so the next
+            // failure is said.
+            memory.password_report_failing = false;
             memory.reported = Some((report, Instant::now()));
             return;
         }
-        Ok(r) => Some(format!("manager answered {}", r.status())),
+        Ok(r) => {
+            memory.password_route_missing = false;
+            Some(format!("manager answered {}", r.status()))
+        }
         Err(e) => Some(format!("{e:#}")),
     };
     match failed {
@@ -1742,6 +1753,7 @@ async fn report_password_states(state: &PortalState, memory: &mut Memory, report
             if memory.password_report_failing {
                 tracing::info!("password states reaching the manager again");
             }
+            memory.password_route_missing = false;
             memory.password_report_failing = false;
             memory.reported = Some((report, Instant::now()));
         }
@@ -3586,17 +3598,44 @@ users:
 
     #[tokio::test]
     async fn a_manager_without_the_route_is_not_asked_again_until_something_changes() {
-        let r = rig(TWO_MANAGED, requesting(&[]), None).await;
-        let mut memory = Memory::default();
-        r.stub.lock().unwrap().password_status = Some(404);
-        // `requesting(&[])` lists nobody, so make the manager list both.
-        r.stub.lock().unwrap().answer = serde_json::json!({
-            "accounts": [{ "username": "a.smith", "email": "alex@example.com" }],
+        // Both listed, neither asking for a link.
+        let answer = serde_json::json!({
+            "accounts": [
+                { "username": "a.smith", "email": "alex@example.com" },
+                { "username": "b.jones", "email": "bea@example.com" },
+            ],
             "removed": [],
         });
+        let r = rig(TWO_MANAGED, answer, None).await;
+        let mut memory = Memory::default();
+        r.stub.lock().unwrap().password_status = Some(404);
         sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
         sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
         assert_eq!(r.stub.lock().unwrap().password_reports.len(), 1);
+        assert!(memory.password_route_missing && !memory.password_report_failing);
+
+        // Something changes — a.smith's account goes back to the placeholder
+        // — and the manager is asked again.
+        let ours = unusable_password_hash().unwrap();
+        let changed = TWO_MANAGED.replacen("password: x", &format!("password: \"{ours}\""), 1);
+        std::fs::write(&r.cfg.users_file, &changed).unwrap();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        {
+            let s = r.stub.lock().unwrap();
+            assert_eq!(s.password_reports.len(), 2, "not asked again after a change");
+            assert_eq!(s.password_reports[1]["accounts"][0]["password_set"], false);
+        }
+
+        // That manager is upgraded and then fails: a failure of its own, so
+        // it is warned about rather than taken for the missing route.
+        r.stub.lock().unwrap().password_status = Some(500);
+        std::fs::write(&r.cfg.users_file, TWO_MANAGED).unwrap();
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(r.stub.lock().unwrap().password_reports.len(), 3);
+        assert!(memory.password_report_failing && !memory.password_route_missing);
+        // … and retried next cycle, unlike the 404.
+        sync_once(&r.state, &r.cfg, &mut memory).await.unwrap();
+        assert_eq!(r.stub.lock().unwrap().password_reports.len(), 4);
     }
 
     /// A username given out again is the last holder's account in the read

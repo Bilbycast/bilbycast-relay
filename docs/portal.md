@@ -588,7 +588,9 @@ instead. The manager marks each row *password set* or *invite not used*, and an
 `unknown` row as neither. An Authelia whose argon2 settings are lowered to the
 minimum would make every password read as not set. A manager older than the
 route answers 404, which the portal logs once and does not ask again until the
-report changes. A manager that has the route but predates `unknown` ignores it.
+report changes; any other failure — a 500 after that 404 included — is warned
+about once and retried every cycle. A manager that has the route but predates
+`unknown` ignores it.
 
 ### `authelia_url` and its path
 
