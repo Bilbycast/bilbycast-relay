@@ -377,18 +377,24 @@ systemd unit runs as its own user. The `portal` feature is independent of
 the week, `{name, starts_at}` only, asked of the manager with `for=upcoming`
 beside the watch list and best-effort: a refusal or an unreadable answer
 yields `null`, on which the page draws the live feeds beside its last
-upcoming list and keeps asking at that list's pace (backing off with none),
-and an older manager's `streams` yields `[]`; the live feeds
-come either way. The page shows them under "Coming up" with nothing to press,
+upcoming list and keeps asking at that list's pace (only with no list yet does
+it back off and say the list could not be loaded) — an entry whose name is
+seen on air from 10 min before its start is dropped from that list for good,
+so it does not come back as "Starting shortly" when it ends, while a later
+same-named session stays — and an older manager's `streams` yields `[]`; the
+live feeds come either way. The page shows them under "Coming up" with nothing to press,
 and while any are listed re-fetches on a timer paced by the soonest start
 (30 s–15 min; 30 s for ten minutes past a start, then 5 min; failures back
 off doubling to 15 min), never while the tab is hidden, and redraws only an
 answer that changed. Both `/api/feeds` and the Watch `POST /api/watch` use
 `redirect: 'manual'`, so a proxy's sign-in redirect (or a 401) reloads the
 page — at most once per 30 s (`sessionStorage`), then a "Sign in again" link
-— and never over a Watch navigation in progress (a 45 s give-up timer hands
-the button back without refreshing, then does any sign-in held back; a second
-press supersedes the first).
+— and never over a Watch press in progress: a sign-in a refresh held back is
+done when the press ends without navigating (it fails, or a 45 s give-up timer
+hands the button back without refreshing), dropped by a later refresh that gets
+through, and the refresh asks every 30 s meanwhile. A later press supersedes
+every earlier one, told apart by a per-press number rather than by its button
+(Watch A, B, A is three presses), and only its answer navigates.
 
 What it deliberately does not hold: **the token secret** (it asks the manager
 to mint, and the manager re-checks the entitlement first) and **the

@@ -267,9 +267,17 @@ manager's own UI:
   refresh backs off from half a minute, doubling, to the quarter hour. One
   whose upcoming list the manager could not give is not taken for nothing
   coming up: the live feeds it did bring are drawn beside the last upcoming
-  list (less anything now on air), and the page keeps asking at that list's
-  pace — or, with no list yet, backing off — saying on a page with nothing on
-  air that the list could not be loaded. An answer that has not
+  list the page had (less anything of the same name now on air), and the page
+  keeps asking at that list's pace — every quarter hour once nothing is left
+  in it. An entry whose name has been seen on air, at or after its start or up
+  to ten minutes before it, is dropped from that list for good, so a feed that
+  has run does not come back under **Coming up** as "Starting shortly" when it
+  ends; a session of the same name further off (tomorrow's, say) is not taken
+  for it and stays, since a name is all an upcoming entry carries. Only before
+  any upcoming list has loaded does the page back off as a failure does and,
+  with nothing on air, say the list could not be loaded; once one has, a page
+  with nothing on air and nothing left in that list says what the list said —
+  nothing is available. An answer that has not
   changed is not redrawn, so a Watch button is never swapped out from under a
   press. A refresh or a Watch press the proxy answers with a redirect to its
   sign-in host (neither fetch follows redirects) or a `401` reloads the page,
@@ -277,10 +285,14 @@ manager's own UI:
   a proxy that refuses `/api/*` while serving the page cannot make it reload
   for ever; past that, or where `sessionStorage` is unavailable, the page
   offers a **Sign in again** link instead. A refresh is never reloaded over a
-  Watch press that is navigating to the player. If that navigation has not
-  happened after 45 s, the button is given back without a refresh, and a
-  sign-in such a refresh held back is done then; a second Watch press gives
-  the first one's button back and is the one followed; coming
+  Watch press that is out or navigating to the player. A sign-in such a
+  refresh holds back is done when the press ends without navigating — it
+  fails, or the navigation has not happened after 45 s and the button is given
+  back without a refresh — and meanwhile the refresh asks again every half
+  minute; one that the proxy lets through drops it, since the session is good
+  after all. A later Watch press gives the earlier one's button back and is the
+  one followed, whatever order the answers arrive in — Watch A, then B, then A
+  again is three presses, and only the third navigates; coming
   Back to the page from the browser's cache gives it back and refreshes.
 
 ## Accounts and password links
