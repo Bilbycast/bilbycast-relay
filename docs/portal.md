@@ -251,8 +251,24 @@ manager's own UI:
   [account sync](#accounts-and-password-links) on, the opposite direction does
   work: removing a username's last portal login in the manager removes the
   Authelia account the portal created for it, at the portal's next sync.)
-* Only sessions that are **on air** appear in the portal. A feed that is not
-  running is simply absent, rather than offering a link to a black screen.
+* Only sessions that are **on air** can be opened in the portal. A feed that is
+  not running offers no link to a black screen. A **scheduled** session the
+  viewer is entitled to that starts within the week is listed under **Coming
+  up** with its name and start time and nothing to press, until its stop time
+  (or a day past its start, with none) if it never goes live; the manager
+  leaves out drafts, and a session whose edge or relay has been deleted, which
+  the scheduler can never start. While anything is listed there the page asks
+  again on a timer set by the soonest start — at that start, but never more
+  than a quarter hour away; every half minute for the ten minutes after a
+  start has passed, then every five — so a feed turns into a Watch button when
+  it starts. It does not ask
+  while the tab is hidden, which would keep the viewer's Authelia session alive
+  on an unattended tab, and asks at once when it is shown again; a failed
+  refresh backs off from half a minute, doubling, to the quarter hour. An
+  answer that has not changed is not redrawn, so a Watch button is never
+  swapped out from under a press. A refresh the proxy answers with a redirect
+  to its sign-in host (its fetch does not follow redirects) or a `401` reloads
+  the page, which lands on sign-in.
 
 ## Accounts and password links
 
@@ -1398,7 +1414,7 @@ three hours for a link grant, which cannot renew.
 |---|---|
 | `GET /` | The page. |
 | `GET /portal.js` | Its script — a separate route so the page can carry `script-src 'self'`. |
-| `GET /api/feeds` | What the signed-in user may watch. |
+| `GET /api/feeds` | What the signed-in user may watch (`feeds`), and under `upcoming` the scheduled feeds starting within the week, each only `{name, starts_at}` (RFC 3339) — nothing that opens one. Asked of the manager beside the watch list, with `for=upcoming`, and best-effort: a manager that refuses that question, answers it unreadably, or is too old to know it (it answers with `streams`, which is ignored) yields `upcoming: []` and the live feeds as usual. |
 | `POST /api/watch` | Mint a link for one feed. The body names the *session*; the username comes from the header and can never be supplied by the browser. |
 | `GET /watch?stream=…` | One tap back to a feed whose credential ran out — re-mints and redirects. This is where the player's expired-access link points, not the front page. |
 | `GET /api/renew?stream=…` | Background renewal before the thirty minutes are up. Cross-origin, so it answers only origins named in `player_origins`; an empty list means no renewal at all. |

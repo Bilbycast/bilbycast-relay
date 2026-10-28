@@ -373,6 +373,16 @@ a web page must not be able to take the box's media termination with it. Its
 systemd unit runs as its own user. The `portal` feature is independent of
 `viewer-distribution` — it links neither str0m nor OpenSSL.
 
+`GET /api/feeds` also carries `upcoming`: the scheduled feeds starting within
+the week, `{name, starts_at}` only, asked of the manager with `for=upcoming`
+beside the watch list and best-effort (a refusal, an unreadable answer or an
+older manager's `streams` all yield `[]` and leave the live feeds alone). The
+page shows them under "Coming up" with nothing to press, and while any are
+listed re-fetches on a timer paced by the soonest start (30 s–15 min; 30 s for
+ten minutes past a start, then 5 min; failures back off doubling to 15 min),
+never while the tab is hidden, with `redirect: 'manual'` so a proxy's sign-in
+redirect reloads the page, and redraws only an answer that changed.
+
 What it deliberately does not hold: **the token secret** (it asks the manager
 to mint, and the manager re-checks the entitlement first) and **the
 entitlements** (read from the manager per page load, so a withdrawal takes

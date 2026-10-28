@@ -17,6 +17,9 @@
   var note = document.getElementById('note');
 
   function msg(text, bad) {
+    /* Whatever was drawn is gone, so the next answer is drawn whatever it
+     * says. */
+    shown = null;
     body.textContent = '';
     var d = document.createElement('div');
     d.className = bad ? 'msg bad' : 'msg';
@@ -107,6 +110,7 @@
 
       var when = document.createElement('div');
       when.className = 'when';
+      when.setAttribute('data-starts', f.starts_at);
       when.textContent = startsText(f.starts_at);
       row.appendChild(when);
 
@@ -138,7 +142,7 @@
    * URL that window.open() produced gets blocked as a popup often enough that
    * the failure would read as the feed being broken. */
   function open(feed, btn) {
-    opening = true;
+    opening = btn;
     btn.disabled = true;
     btn.textContent = 'Opening…';
     fetch('/api/watch', {
@@ -167,6 +171,7 @@
       url += (url.indexOf("?") === -1 ? "?" : "&")
            + "from=" + encodeURIComponent(window.location.origin);
       window.location.href = url;
+      navTimer = setTimeout(reopen, NAV_GIVE_UP_MS);
     }).catch(function () {
       opening = false;
       btn.disabled = false;
@@ -405,33 +410,103 @@
    *
    * Paced by the soonest start rather than a fixed tick: a game three days
    * out is re-checked every quarter hour, which also picks up anything newly
-   * scheduled, and one whose start has passed every half minute until it is
-   * on air. With nothing coming up the page does not poll at all. */
+   * scheduled. One whose start has passed is checked every half minute for
+   * ten minutes, then every five: it stays listed until its slot ends, which
+   * can be hours, and a start that late is as likely never to come. With
+   * nothing coming up the page does not poll at all.
+   *
+   * Never while the tab is hidden. Each refresh passes the sign-in proxy, so
+   * a tab left open and unwatched would keep its session alive for as long
+   * as anything was scheduled. Shown again, it refreshes at once. */
   var feedTimer = null;
+  /* A refresh is due: the timer is running, or would be if the tab were shown. */
+  var feedWanted = false;
+  var feedFailures = 0;
+  /* Numbered when sent: only the latest answer is acted on, so a refresh the
+   * tab being shown or restored sends while another is out does not have the
+   * older one schedule over it. */
+  var feedSeq = 0;
+  /* The Watch button whose feed is being opened, or false. While set, no
+   * refresh redraws under it. */
   var opening = false;
+  /* What the list on screen was drawn from, or null when it was not. */
+  var shown = null;
   var FEED_POLL_MIN_MS = 30 * 1000;
   var FEED_POLL_MAX_MS = 15 * 60 * 1000;
+  var FEED_OVERDUE_FAST_MS = 10 * 60 * 1000;
+  var FEED_POLL_OVERDUE_MS = 5 * 60 * 1000;
 
-  function scheduleFeeds(upcoming) {
+  function pollIn(wait) {
     clearTimeout(feedTimer);
     feedTimer = null;
-    if (!upcoming || !upcoming.length) return;
-    var soonest = Infinity;
-    upcoming.forEach(function (f) {
-      var t = new Date(f.starts_at).getTime();
-      if (!isNaN(t) && t < soonest) soonest = t;
-    });
-    var wait = Math.min(Math.max(soonest - Date.now(), FEED_POLL_MIN_MS), FEED_POLL_MAX_MS);
-    feedTimer = setTimeout(function () { loadFeeds(false); }, wait);
+    feedWanted = true;
+    if (document.hidden) return;
+    feedTimer = setTimeout(function () {
+      feedTimer = null;
+      if (!document.hidden) loadFeeds(false);
+    }, wait);
   }
 
-  /* A refresh that fails keeps what is on screen and tries again later; only
-   * the first load reports, since that is the one with nothing to show. A
-   * refresh never redraws under a viewer who has just pressed Watch. */
+  function scheduleFeeds(upcoming) {
+    if (!upcoming || !upcoming.length) {
+      clearTimeout(feedTimer);
+      feedTimer = null;
+      feedWanted = false;
+      return;
+    }
+    var now = Date.now();
+    var wait = FEED_POLL_MAX_MS;
+    upcoming.forEach(function (f) {
+      var t = new Date(f.starts_at).getTime();
+      if (isNaN(t)) return;
+      var w = t > now ? t - now
+        : now - t < FEED_OVERDUE_FAST_MS ? FEED_POLL_MIN_MS
+        : FEED_POLL_OVERDUE_MS;
+      if (w < wait) wait = w;
+    });
+    pollIn(Math.max(wait, FEED_POLL_MIN_MS));
+  }
+
+  /* A refresh that fails keeps what is on screen and tries again, half a
+   * minute later and twice as long each time after, up to the quarter hour:
+   * a relay or manager that is down is not asked every half minute until it
+   * comes back. */
+  function retryFeeds() {
+    feedFailures++;
+    pollIn(Math.min(FEED_POLL_MIN_MS * Math.pow(2, feedFailures - 1), FEED_POLL_MAX_MS));
+  }
+
+  /* Redrawn only when the answer changed. Rebuilt on every refresh, the Watch
+   * buttons lost focus, and a press that landed before the swap and was let
+   * go after it was no click at all. Unchanged, only the start times move,
+   * since they are told relative to now. */
+  function draw(data) {
+    var key = JSON.stringify([data.username, data.logout_url || null,
+      data.feeds || [], data.upcoming || []]);
+    if (key === shown) {
+      var whens = body.querySelectorAll('.feed.upcoming .when');
+      for (var i = 0; i < whens.length; i++) {
+        whens[i].textContent = startsText(whens[i].getAttribute('data-starts'));
+      }
+      return;
+    }
+    render(data);
+    shown = key;
+  }
+
+  /* Only the first load reports a failure, since that is the one with nothing
+   * to show. A refresh never redraws under a viewer who has just pressed
+   * Watch. */
   function loadFeeds(first) {
-    fetch('/api/feeds', { headers: { 'Accept': 'application/json' } })
+    var seq = ++feedSeq;
+    /* Redirects are not followed. A proxy that answers an expired session
+     * with a redirect to its sign-in host, rather than a 401, would have the
+     * fetch follow it to another origin, which `connect-src 'self'` refuses
+     * — a network failure, retried for good, while the page never signed
+     * the viewer back in. Not followed, it arrives as an opaque redirect. */
+    fetch('/api/feeds', { headers: { 'Accept': 'application/json' }, redirect: 'manual' })
       .then(function (r) {
-        if (r.status === 401) {
+        if (r.status === 401 || r.type === 'opaqueredirect') {
           /* The proxy in front of us handles sign-in, so the fix is to land on
            * it again rather than anything this page can do. */
           window.location.reload();
@@ -441,31 +516,63 @@
       })
       .then(function (res) {
         if (!res.ok) {
-          if (first) {
-            msg(res.data && res.data.error ? res.data.error
-                                           : 'Could not load your feeds.', true);
-          } else {
-            feedTimer = setTimeout(function () { loadFeeds(false); }, FEED_POLL_MIN_MS);
-          }
+          failed(res.data && res.data.error ? res.data.error : 'Could not load your feeds.');
           return;
         }
-        if (opening) {
-          scheduleFeeds(res.data.upcoming);
-          return;
-        }
-        render(res.data);
+        if (seq !== feedSeq) return;
+        feedFailures = 0;
+        if (!opening) draw(res.data);
         scheduleFeeds(res.data.upcoming);
         if (first) loadClips(false);
       })
       .catch(function (e) {
         if (e && e.message === 'unauthenticated') return;
-        if (first) {
-          msg('Could not load your feeds. Try again in a moment.', true);
-        } else {
-          feedTimer = setTimeout(function () { loadFeeds(false); }, FEED_POLL_MIN_MS);
-        }
+        failed('Could not load your feeds. Try again in a moment.');
       });
+
+    function failed(text) {
+      if (seq !== feedSeq) return;
+      if (first) msg(text, true);
+      else retryFeeds();
+    }
   }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      clearTimeout(feedTimer);
+      feedTimer = null;
+    } else if (feedWanted && !feedTimer) {
+      loadFeeds(false);
+    }
+  });
+
+  /* A press of Watch whose navigation never happens — stopped, or answered
+   * with something that is not a page — leaves this page as it was: the
+   * button saying "Opening…" and every refresh held off for good. So does
+   * coming Back to it from the browser's back-forward cache, which restores
+   * the page exactly as it was left. Either way the button is given back and
+   * the list fetched afresh. */
+  var NAV_GIVE_UP_MS = 20 * 1000;
+  var navTimer = null;
+
+  function reopen() {
+    clearTimeout(navTimer);
+    navTimer = null;
+    if (opening) {
+      opening.disabled = false;
+      opening.textContent = 'Watch';
+    }
+    opening = false;
+    shown = null;
+    loadFeeds(false);
+  }
+
+  window.addEventListener('pageshow', function (e) { if (e.persisted) reopen(); });
+  /* The navigation went ahead: nothing to give back. */
+  window.addEventListener('pagehide', function () {
+    clearTimeout(navTimer);
+    navTimer = null;
+  });
 
   loadFeeds(true);
 })();
