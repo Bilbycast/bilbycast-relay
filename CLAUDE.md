@@ -483,7 +483,8 @@ longer the placeholder (told by its argon2 cost, `is_placeholder_hash`), `unknow
 the listed logins with no managed account — leaving out any username this cycle
 removes or replaces (or whose removal waits), sent only on change or hourly,
 and only from a read the file still matched afterwards (or a write that landed
-from it); a 404 is logged once and not retried until the report changes. Collisions that would make Authelia refuse the file under
+from it); a 404 is logged once and treated as an accepted report — sent again
+only when the report changes or an hour has passed. Collisions that would make Authelia refuse the file under
 `search.email` (an email or username another account holds,
 case-insensitively) are never written, judged against the file *as the write
 leaves it* by a fixed point (`resolve` in `accounts.rs`), so a freed address

@@ -1701,8 +1701,9 @@ const PASSWORD_REPORT_EVERY: Duration = Duration::from_secs(3600);
 ///
 /// Never fails the cycle: this is information for an operator, and the sync
 /// it rides on has work that matters more. A failure is logged once and
-/// retried next cycle; a manager too old for the route is told nothing more
-/// until the report changes.
+/// retried next cycle; a manager too old for the route is treated as having
+/// accepted the report, so it is told again only on a change or after
+/// `PASSWORD_REPORT_EVERY`.
 async fn report_password_states(state: &PortalState, memory: &mut Memory, report: PasswordReport) {
     if let Some((last, at)) = &memory.reported
         && *last == report
