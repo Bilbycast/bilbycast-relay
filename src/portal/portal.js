@@ -179,10 +179,21 @@
     /* One press at a time. A second Watch press supersedes the first: its
      * button is given back, its give-up timer cleared, and whatever its
      * request answers is ignored — the press the viewer made last is the one
-     * that is followed. */
+     * that is followed.
+     *
+     * A press is told apart by its number, not by its button: Watch A, then
+     * B, then A again is three presses on two buttons, and the first A's
+     * answer is as stale as B's. Keyed on the button, it navigated and armed
+     * a second give-up timer, which later gave back whatever press was out
+     * when it fired, so that one did nothing at all. The button still has to
+     * be the one opening as well: a give-up or a return from the
+     * back-forward cache hands a press back without a newer one, and its
+     * answer, landing after that, must not act either. */
     clearTimeout(navTimer);
     navTimer = null;
     if (opening && opening !== btn) giveBack(opening);
+    var press = ++pressSeq;
+    function current() { return opening === btn && pressSeq === press; }
     opening = btn;
     btn.disabled = true;
     btn.textContent = 'Opening…';
@@ -195,7 +206,7 @@
       body: JSON.stringify({ session_id: feed.session_id }),
       redirect: 'manual'
     }).then(function (r) {
-      if (opening !== btn) throw new Error('superseded');
+      if (!current()) throw new Error('superseded');
       if (r.status === 401 || r.type === 'opaqueredirect') {
         giveBack(btn);
         signInAgain();
@@ -203,7 +214,7 @@
       }
       return r.json().then(function (d) { return { ok: r.ok, data: d }; });
     }).then(function (res) {
-      if (opening !== btn) return;
+      if (!current()) return;
       if (!res.ok || !res.data.watch_url) {
         giveBack(btn);
         msg(res.data && res.data.error
@@ -221,10 +232,16 @@
       url += (url.indexOf("?") === -1 ? "?" : "&")
            + "from=" + encodeURIComponent(window.location.origin);
       window.location.href = url;
-      navTimer = setTimeout(function () { reopen(false); }, NAV_GIVE_UP_MS);
+      /* Cleared first, and owned by this press: no give-up timer is ever left
+       * running for a press that is no longer the latest. */
+      clearTimeout(navTimer);
+      navTimer = setTimeout(function () {
+        navTimer = null;
+        if (pressSeq === press) reopen(false);
+      }, NAV_GIVE_UP_MS);
     }).catch(function (e) {
       if (e && (e.message === 'unauthenticated' || e.message === 'superseded')) return;
-      if (opening !== btn) return;
+      if (!current()) return;
       giveBack(btn);
       msg('Could not open that feed. Try again in a moment.', true);
     });
@@ -486,6 +503,8 @@
   /* The Watch button whose feed is being opened, or false. While set, no
    * refresh redraws under it. */
   var opening = false;
+  /* The number of the latest Watch press: only its answer is acted on. */
+  var pressSeq = 0;
   /* What the list on screen was drawn from, or null when it was not. */
   var shown = null;
   /* The upcoming list of the last answer that had one, or null before any
