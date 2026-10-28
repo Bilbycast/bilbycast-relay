@@ -38,6 +38,8 @@
   var RELOAD_KEY = 'bilbycast-portal-reloaded-at';
 
   function signInAgain() {
+    /* Whatever sign-in a refresh held back is this one. */
+    signInDeferred = false;
     var now = Date.now();
     try {
       var since = now - (Number(window.sessionStorage.getItem(RELOAD_KEY)) || 0);
@@ -217,6 +219,7 @@
       if (!current()) return;
       if (!res.ok || !res.data.watch_url) {
         giveBack(btn);
+        if (takeDeferredSignIn()) return;
         msg(res.data && res.data.error
             ? res.data.error
             : 'Could not open that feed. Try again in a moment.', true);
@@ -243,8 +246,20 @@
       if (e && (e.message === 'unauthenticated' || e.message === 'superseded')) return;
       if (!current()) return;
       giveBack(btn);
+      if (takeDeferredSignIn()) return;
       msg('Could not open that feed. Try again in a moment.', true);
     });
+  }
+
+  /* A sign-in that a refresh held back while a press was opening, done now
+   * that the press has ended without navigating — given up, or failed. A
+   * failed press used to drop it: the page was left with an error, no button
+   * and nothing scheduled, for good. True when there was one to do, which
+   * then speaks for the page in place of the press's own error. */
+  function takeDeferredSignIn() {
+    if (!signInDeferred) return false;
+    signInAgain();
+    return true;
   }
 
   /* A pressed Watch button back as it was, and no longer the one opening. */
@@ -510,9 +525,10 @@
   /* The upcoming list of the last answer that had one, or null before any
    * did: what a refresh whose upcoming half failed shows meanwhile. */
   var lastUpcoming = null;
-  /* A refresh found the session ended while a Watch press was navigating, and
-   * left it so as not to reload over the navigation. Acted on if the
-   * navigation is given up. */
+  /* A refresh found the session ended while a Watch press was opening, and
+   * left it so as not to reload over the navigation. Acted on when the press
+   * ends without navigating (it fails, or is given up); dropped when a later
+   * refresh gets past the proxy, which shows the session is good after all. */
   var signInDeferred = false;
   var FEED_POLL_MIN_MS = 30 * 1000;
   var FEED_POLL_MAX_MS = 15 * 60 * 1000;
@@ -600,11 +616,22 @@
         if (r.status === 401 || r.type === 'opaqueredirect') {
           /* Not while a Watch press is navigating away: a reload would cancel
            * it, and the player's own load passes the proxy, which signs the
-           * viewer in. If that navigation is given up, it is done then. */
-          if (opening) signInDeferred = true;
-          else signInAgain();
+           * viewer in. If the press ends without navigating, it is done then.
+           * The refresh keeps going meanwhile, at its shortest step and not
+           * counted as a failure, so a press that ends some way nothing here
+           * foresaw still meets a refresh that signs the viewer in. */
+          if (opening) {
+            signInDeferred = true;
+            pollIn(FEED_POLL_MIN_MS);
+          } else {
+            signInAgain();
+          }
           throw new Error('unauthenticated');
         }
+        /* Past the proxy, so the session is good: a sign-in an earlier
+         * refresh held back is not wanted any more. Any answer counts, a
+         * portal's own 502 included — it identified the viewer first. */
+        if (seq === feedSeq) signInDeferred = false;
         return r.json().then(function (d) { return { ok: r.ok, data: d }; });
       })
       .then(function (res) {
@@ -689,11 +716,10 @@
       signInDeferred = false;
       shown = null;
       loadFeeds(false);
-    } else if (signInDeferred) {
+    } else {
       /* A refresh found the session ended meanwhile; with the navigation
        * given up there is nothing left to cancel. */
-      signInDeferred = false;
-      signInAgain();
+      takeDeferredSignIn();
     }
   }
 
