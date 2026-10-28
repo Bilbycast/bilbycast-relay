@@ -409,7 +409,10 @@ test("a 401 reloads once, then offers a link within 30 s, then reloads again", a
   assert.ok(again.text().includes(SIGNED_OUT), again.text());
   const a = again.document.querySelector("#body a");
   assert.ok(a && a.textContent === "Sign in again" && a.getAttribute("href") === "/", "no Sign in again link");
-  assert.deepEqual(again.feedWaits(), [], "the page kept refreshing behind the link");
+  // A first load refused has never set a refresh, so this is no test of the
+  // link stopping one (the redirect case below and the held-back one past the
+  // guard are); it is that the 401 itself does not set one.
+  assert.deepEqual(again.feedWaits(), [], "a first load refused set a refresh");
 
   // Past the 30 s, another 401 reloads again.
   const later = await loadPortal({
@@ -439,6 +442,15 @@ test("a refresh redirected to the sign-in host is a sign-in, not a failure", asy
   await page.setHidden(false);
   assert.equal(page.loc.reloads, 1, "reloaded twice within 30 s");
   assert.ok(page.text().includes(SIGNED_OUT), page.text());
+
+  // Behind the link nothing is wanted any more: the tab put away and brought
+  // back again does not ask.
+  page.signedOut = true;
+  const asked = page.asked("/api/feeds").length;
+  await page.setHidden(true);
+  await page.setHidden(false);
+  assert.equal(page.asked("/api/feeds").length, asked, "showing the tab asked again behind the link");
+  assert.equal(page.loc.reloads, 1);
 });
 
 // ── a Watch press ────────────────────────────────────────────────────────────
@@ -626,12 +638,25 @@ test("a sign-in held back by a press, past the reload guard, is the link", async
   await page.advance(page.feedDue() - 2 * SEC);
   await page.press("A");
   const req = page.pendingWatch();
-  page.net.queued["/api/feeds"].push({ status: 401, body: {} });
+  page.signedOut = true;
   await page.advance(2 * SEC);
+  // Held back, the refresh goes on every half minute behind the press.
+  assert.deepEqual(page.feedWaits(), [30 * SEC]);
   await page.answerWatch(req, { status: 502, body: { error: "Cannot reach the manager right now." } });
   assert.equal(page.loc.reloads, 0);
   assert.ok(page.text().includes(SIGNED_OUT), page.text());
   assert.ok(!page.text().includes("Cannot reach"), "the press's own error stood over the sign-in");
+
+  // The link ends that refresh. Left running, it was refused past the guard
+  // and reloaded the page out from under the link.
+  assert.deepEqual(page.feedWaits(), [], "the held-back refresh was left running behind the link");
+  const asked = page.asked("/api/feeds").length;
+  await page.advance(2 * MIN);
+  await page.setHidden(true);
+  await page.setHidden(false);
+  assert.equal(page.asked("/api/feeds").length, asked, "refreshed behind the link");
+  assert.equal(page.loc.reloads, 0, "reloaded under the link");
+  assert.ok(page.document.querySelector("#body a"), "the Sign in again link went");
 });
 
 test("a sign-in held back by a press is done when the press is given up", async (t) => {
