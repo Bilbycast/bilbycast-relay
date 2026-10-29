@@ -99,6 +99,12 @@ async fn run_quic_endpoint(
 /// v6 sockets get `IPV6_V6ONLY=1` so they don't claim the v4 address
 /// space, both families get `SO_REUSEADDR`, and the socket is set to
 /// non-blocking for quinn.
+///
+/// Sized like the native-UDP plane's sockets (`udp_relay::SOCK_BUF_BYTES`,
+/// best-effort — the kernel clamps to `net.core.{r,w}mem_max`). It used to be
+/// left at the kernel default (~208 KB) and was seen dropping datagrams under
+/// the same 8.5 Mbit/s feed the 32 MiB native-UDP listener beside it carried
+/// clean (bilbycast-edge#165).
 fn build_udp_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = match addr.ip() {
@@ -110,6 +116,8 @@ fn build_udp_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net::Udp
         socket.set_only_v6(true)?;
     }
     socket.set_reuse_address(true)?;
+    let _ = socket.set_recv_buffer_size(crate::udp_relay::SOCK_BUF_BYTES);
+    let _ = socket.set_send_buffer_size(crate::udp_relay::SOCK_BUF_BYTES);
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())
@@ -206,4 +214,21 @@ fn build_server_config(config: &RelayConfig) -> Result<ServerConfig> {
     server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod quic_socket_buffer_tests {
+    /// bilbycast-edge#165: the QUIC listener asks for the native-UDP plane's
+    /// buffers; the kernel keeps the request or `net.core.rmem_max`.
+    #[test]
+    fn the_quic_listener_asks_for_the_native_plane_buffers() {
+        let rmem_max: usize = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(crate::udp_relay::SOCK_BUF_BYTES);
+        let sock = super::build_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Linux reports twice what it stored.
+        let stored = socket2::SockRef::from(&sock).recv_buffer_size().unwrap() / 2;
+        assert_eq!(stored, crate::udp_relay::SOCK_BUF_BYTES.min(rmem_max));
+    }
 }

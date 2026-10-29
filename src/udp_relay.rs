@@ -55,7 +55,7 @@ const RECV_BUF: usize = 2048;
 
 /// 32 MB socket buffers — broadcast contribution at tens of Mbps overruns the
 /// default ~200 KB kernel buffer (testbed quality gate #11).
-const SOCK_BUF_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const SOCK_BUF_BYTES: usize = 32 * 1024 * 1024;
 
 // ── Lock-free atomic SocketAddr (mirrors the edge udp_forwarder pattern) ──
 
