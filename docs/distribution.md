@@ -1013,7 +1013,12 @@ on the portal so the space can be reclaimed without ending the session. The
 byte ceiling charges clips that have been asked for but not yet cut at an
 estimate for their requested length — otherwise a batch in flight is invisible
 to the check that decides whether the next batch may be admitted — and is
-enforced again on upload, where the real size is known.
+enforced again on upload, where the real size is known. An upload is measured
+against what the feed's *other* clips hold or have reserved: it takes the place
+of whatever its own clip was counted at (the estimate, or the file an earlier
+attempt landed), so a clip inside its own reservation is never refused `507`.
+An upload, and any retry of it, charges nothing to the export allowance below —
+the clip was charged when it was asked for.
 
 **An export allowance bounds what a feed commissions, not only what it
 holds.** The count and the byte ceiling read what is on disk, and a delete

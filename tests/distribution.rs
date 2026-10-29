@@ -1747,6 +1747,135 @@ async fn a_clip_export_past_the_feed_allowance_is_429_and_a_delete_does_not_rese
     );
 }
 
+/// A clip that fits the room admitted for it is stored, on its first upload
+/// and on a retry — and neither upload spends any export allowance.
+///
+/// The upload's byte check counted the clip being uploaded twice: once as the
+/// estimate its pending record reserved, and again as the bytes arriving. On a
+/// feed whose budget the admitted clips had all but reserved, a clip inside
+/// its own reservation was refused `507`, and the edge re-encoded it from
+/// scratch up to three times before giving up on it.
+#[tokio::test]
+async fn a_clip_inside_its_own_reservation_is_stored_and_its_uploads_cost_no_allowance() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::{build_router, DistributionState};
+    use bilbycast_relay::distribution_control::DistUpdate;
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    /// The relay's per-stream clip ceiling, and what it charges a clip still
+    /// to be cut: 35 Mbit/s of its requested length.
+    const MAX_CLIP_BYTES_PER_STREAM: u64 = 4 * 1024 * 1024 * 1024;
+    const ESTIMATE_PER_SEC: u64 = 35_000_000 / 8;
+
+    let cancel = CancellationToken::new();
+    let (events, _rx) = event_channel();
+    let cfg = DistributionConfig::default();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let origin_cfg = test_origin_config(8, 1 << 30);
+    let root = origin_cfg.root.clone();
+    let origin = Arc::new(OriginStore::new(origin_cfg).unwrap());
+    let hub = Arc::new(Hub::new());
+    let state = DistributionState::new(hub, origin, cfg, control.clone(), cancel.clone(), events);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ =
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+    control.apply(DistUpdate { token_secret: Some(SECRET.into()), ..Default::default() });
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let viewer = token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+    let ingest = token::mint_ingest_token(SECRET, "feed", exp).unwrap();
+
+    /// (status, body). The write is allowed to fail: a relay that refuses an
+    /// upload answers before it has read the whole body.
+    async fn send(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        bearer: &str,
+    ) -> (u16, String) {
+        // JSON for the clip requests, which `axum::Json` insists on; the
+        // media routes take whatever they are sent.
+        let content_type = if method == "POST" { "application/json" } else { "video/mp4" };
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+             Authorization: Bearer {bearer}\r\nContent-Type: {content_type}\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(head.as_bytes()).await.unwrap();
+        let _ = s.write_all(body).await;
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        (status, body.to_string())
+    }
+    /// `n` clips of `pre + post` seconds at distinct marks named from `from`.
+    fn ask(n: usize, from: usize, pre: u32, post: u32) -> String {
+        let clips: Vec<String> = (from..from + n)
+            .map(|i| format!(r#"{{"at":"2026-10-29T10:{i:02}:00Z","name":"mark {i}"}}"#))
+            .collect();
+        format!(r#"{{"pre_secs":{pre},"post_secs":{post},"clips":[{}]}}"#, clips.join(","))
+    }
+
+    // The feed is ingested, which gives it the directory clips are filed in.
+    let (st, _) = send(addr, "PUT", "/origin/feed/seg-00001.m4s", b"x", &ingest).await;
+    assert_eq!(st, 201);
+
+    // 1. Sixteen one-minute clips and one of 21 s reserve all but ~3 MB of the
+    //    feed's 4 GiB — and 981 of the token's 1,020 clip-seconds.
+    let (st, body) =
+        send(addr, "POST", "/origin/feed/clips", ask(16, 0, 30, 30).as_bytes(), &viewer).await;
+    assert_eq!(st, 202, "fixture: the first batch was refused: {body}");
+    let (st, body) =
+        send(addr, "POST", "/origin/feed/clips", ask(1, 16, 10, 11).as_bytes(), &viewer).await;
+    assert_eq!(st, 202, "fixture: the short clip was refused: {body}");
+    let reserved = (16 * 60 + 21) * ESTIMATE_PER_SEC;
+    let unreserved = MAX_CLIP_BYTES_PER_STREAM - reserved;
+
+    // 2. A clip bigger than the feed's unreserved room, and well inside the
+    //    one-minute reservation that is its own.
+    let media = vec![0u8; 4 << 20];
+    assert!(
+        (media.len() as u64) > unreserved && (media.len() as u64) < 60 * ESTIMATE_PER_SEC,
+        "fixture: the upload must need its own reservation and fit it"
+    );
+    let (st, body) = send(addr, "PUT", "/origin/feed/clips/mark%200.mp4", &media, &ingest).await;
+    assert_eq!(st, 201, "a clip inside its own reservation was refused: {body}");
+
+    // 3. The edge uploads it again — its answer was lost, say — and the file it
+    //    replaces is not charged against it either.
+    let (st, body) = send(addr, "PUT", "/origin/feed/clips/mark%200.mp4", &media, &ingest).await;
+    assert_eq!(st, 201, "a retried upload was refused: {body}");
+    let (_, listed) = send(addr, "GET", "/origin/feed/clips", b"", &viewer).await;
+    assert!(
+        listed.contains(&format!("\"bytes\":{}", media.len())),
+        "the clip did not land whole: {listed}"
+    );
+
+    // 4. Neither upload spent any of the export allowance: 30 more seconds fit
+    //    the 39 the token has left, which one charged minute would not.
+    let (st, body) =
+        send(addr, "POST", "/origin/feed/clips", ask(1, 20, 15, 15).as_bytes(), &viewer).await;
+    assert_eq!(st, 202, "uploading a clip charged the export allowance: {body}");
+
+    cancel.cancel();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The 256 MiB ceiling belongs to the media PUT, not to the JSON routes.
 ///
 /// `clips_request` and `clip_failed` take `axum::Json`, which collects the

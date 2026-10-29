@@ -2184,18 +2184,25 @@ impl OriginStore {
     /// A record that has not been cut yet is charged
     /// [`estimated_clip_bytes`] for its requested length instead.
     pub fn clip_budget_used(&self, stream: &str) -> u64 {
+        self.list_clips(stream).iter().map(clip_budget_charge).sum()
+    }
+
+    /// [`clip_budget_used`](Self::clip_budget_used) less whatever the clip
+    /// `name` holds or is going to hold: what an upload of `name` has to fit
+    /// beside.
+    ///
+    /// The upload takes that clip's place in the budget — its media replaces
+    /// the estimate a pending record was charged, or the file a ready one
+    /// already has — so it is measured against the stream's *other* clips.
+    /// Measured against all of them, the clip being uploaded was counted
+    /// twice, once as its own reservation and once as the bytes arriving: a
+    /// clip that fitted the room admitted for it was refused `507`, and the
+    /// edge re-encoded it from scratch up to three times before giving up.
+    pub fn clip_budget_used_besides(&self, stream: &str, name: &str) -> u64 {
         self.list_clips(stream)
             .iter()
-            .map(|c| {
-                if c.ready {
-                    c.bytes
-                } else if c.failed {
-                    // Nothing is coming for this one, and it holds no media.
-                    0
-                } else {
-                    estimated_clip_bytes(c.pre_secs, c.post_secs)
-                }
-            })
+            .filter(|c| c.name != name)
+            .map(clip_budget_charge)
             .sum()
     }
 
@@ -3093,6 +3100,20 @@ fn estimated_clip_bytes(pre_secs: u32, post_secs: u32) -> u64 {
     secs * 35_000_000 / 8
 }
 
+/// What one clip counts against its stream's byte budget: its media once it
+/// has landed, nothing once the edge has given up on it, and
+/// [`estimated_clip_bytes`] while it is still to be cut.
+fn clip_budget_charge(c: &ClipRecord) -> u64 {
+    if c.ready {
+        c.bytes
+    } else if c.failed {
+        // Nothing is coming for this one, and it holds no media.
+        0
+    } else {
+        estimated_clip_bytes(c.pre_secs, c.post_secs)
+    }
+}
+
 /// The longest clip anyone may export, pre-roll and post-roll together.
 ///
 /// A review clip is a moment, not a passage of play, and the length has to be
@@ -3762,7 +3783,7 @@ async fn clip_put(
     let checked = tokio::task::spawn_blocking(move || {
         (
             origin.clip_record_exists(&for_stream, &for_name),
-            origin.clip_budget_used(&for_stream),
+            origin.clip_budget_used_besides(&for_stream, &for_name),
         )
     })
     .await;
@@ -3779,6 +3800,15 @@ async fn clip_put(
     // The per-stream ceiling, enforced where the bytes arrive rather than only
     // where they are asked for. The request-time check works from an estimate;
     // this one works from the scale.
+    //
+    // `used` is what the stream's *other* clips hold or have been admitted to
+    // hold: this upload replaces whatever this clip was counted at — the
+    // estimate its pending record reserved, or the file a retried upload
+    // already landed — so counting that as well charged the clip twice, and
+    // a clip that fitted was refused `507` and re-encoded by the edge up to
+    // three times. Nothing here touches the export allowance: that was
+    // charged when the clip was asked for, so an upload and its retries cost
+    // none of it.
     let room = MAX_CLIP_BYTES_PER_STREAM.saturating_sub(used);
     if room == 0 {
         tracing::warn!(stream = %stream, clip = %name, used, "origin: stream is over its clip budget");
@@ -6056,6 +6086,52 @@ seg-1.m4s
             Err(other) => panic!("refused for the wrong reason: {other:?}"),
             Ok(_) => panic!("a stream already at its clip budget admitted another full-length clip"),
         }
+    }
+
+    /// What an upload of one clip is measured beside: every *other* clip,
+    /// whatever this one is counted at — its pending estimate, the file a
+    /// retried upload already landed, or nothing once it has failed.
+    #[tokio::test]
+    async fn an_upload_is_measured_beside_the_other_clips_not_its_own_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        let ask = |name: &str, minute: u32| ClipAsk {
+            at: format!("2026-10-29T10:{minute:02}:00Z"),
+            name: name.into(),
+        };
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest {
+                pre_secs: 30,
+                post_secs: 30,
+                clips: vec![ask("pending", 0), ask("landed", 1), ask("failed", 2)],
+            },
+        )
+        .unwrap();
+        s.record_clip_requests(
+            "feed",
+            &ClipRequest { pre_secs: 5, post_secs: 5, clips: vec![ask("short", 3)] },
+        )
+        .unwrap();
+        s.put_clip("feed", "landed", &[0u8; 1000]).await.unwrap();
+        assert!(s.fail_clip("feed", "failed", "gone").unwrap());
+
+        let all = s.clip_budget_used("feed");
+        let (minute, ten_secs) = (estimated_clip_bytes(30, 30), estimated_clip_bytes(5, 5));
+        assert_eq!(all, minute + 1000 + ten_secs, "fixture: what the stream is counted at");
+        assert_eq!(
+            s.clip_budget_used_besides("feed", "pending"),
+            all - minute,
+            "a pending clip's upload was charged its own reservation as well"
+        );
+        assert_eq!(
+            s.clip_budget_used_besides("feed", "landed"),
+            all - 1000,
+            "a retried upload was charged the file it replaces"
+        );
+        assert_eq!(s.clip_budget_used_besides("feed", "failed"), all);
+        assert_eq!(s.clip_budget_used_besides("feed", "no such clip"), all);
     }
 
     /// A name collision is refused, not resolved by overwriting.
