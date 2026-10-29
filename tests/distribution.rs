@@ -1739,6 +1739,12 @@ async fn a_clip_export_past_the_feed_allowance_is_429_and_a_delete_does_not_rese
         fingerprint(&viewer_a),
         "the event does not name the token that looped"
     );
+    // And how much of its share the loop has spent: fifteen minutes, less what
+    // refilled while the test ran (one clip-second every 6 s).
+    assert!(
+        d["top_spender_outstanding_secs"].as_u64().is_some_and(|s| (890..=900).contains(&s)),
+        "the event does not say how much the looping token spent: {d}"
+    );
 }
 
 /// The 256 MiB ceiling belongs to the media PUT, not to the JSON routes.

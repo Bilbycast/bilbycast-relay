@@ -510,19 +510,41 @@ pub enum ClipRefusal {
     /// `retry_after` from now, provided nobody else spends the allowance
     /// first. `first` is set on the refusal that starts an episode — the one
     /// that raises the operator's event. `top_spender` is set only when the
-    /// feed's allowance refused: the [fingerprint](ClipCredential::fingerprint)
-    /// of the token on the feed with the most of its own share still spent,
-    /// which is who spent the feed — the refused request is usually somebody
-    /// else's. `None` when no token on the feed has any of its share
-    /// outstanding: the feed was spent by many tokens, each whole again.
+    /// feed's allowance refused — the refused request is then usually somebody
+    /// else's — and names the heaviest single token still outstanding on the
+    /// feed, with how much of its share it has spent; see [`TopSpender`] for
+    /// why that is not always who spent the feed. `None` on a credential
+    /// refusal, and when no token on the feed has any of its share outstanding.
     RateLimited {
         limit: ExportLimit,
         asked_secs: u64,
         retry_after: Duration,
         first: bool,
-        top_spender: Option<String>,
+        top_spender: Option<TopSpender>,
     },
     Io(std::io::Error),
+}
+
+/// The token on a feed with the most of its own export share still spent, as
+/// a feed refusal reports it.
+///
+/// The heaviest single token outstanding, which is not always who spent the
+/// feed. A feed spent by many tokens — a fresh one minted per export, say —
+/// leaves each with a small share outstanding, and whichever token holds the
+/// most is named however light it is: a viewer who exported one minute of clips
+/// is named over a script's hundred ten-second mints. So `outstanding_secs` is
+/// reported beside the name, to be read against the feed's allowance: a token
+/// holding a few dozen of the feed's 1,200 clip-seconds is a light spender, not
+/// the culprit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopSpender {
+    /// The token's [fingerprint](ClipCredential::fingerprint).
+    pub fingerprint: String,
+    /// Clip-seconds of its own share (`CREDENTIAL_EXPORT_ALLOWANCE`) it still
+    /// has spent, rounded up. The share refills at half the feed's rate, so a
+    /// heavy spend long past reads higher here than it still weighs on the
+    /// feed.
+    pub outstanding_secs: u64,
 }
 
 /// Which export allowance refused a clip request.
@@ -767,6 +789,14 @@ impl ExportAllowance {
         Duration::from_millis(self.cost_ms() * self.burst_secs)
     }
 
+    /// Clip-seconds of this allowance still spent at `now`, rounded up: `0`
+    /// once it is whole again.
+    fn outstanding_secs(&self, spent: &Spent, now: Instant) -> u64 {
+        let ahead = spent.full_at.saturating_duration_since(now).as_nanos();
+        let cost = u128::from(self.cost_ms()) * 1_000_000;
+        u64::try_from(ahead.div_ceil(cost)).unwrap_or(u64::MAX)
+    }
+
     /// Charge `secs` to an allowance in the state `spent`, at `now`.
     ///
     /// GCRA (ITU-T I.371's virtual scheduling): `full_at` is when the allowance
@@ -872,8 +902,8 @@ struct RateRefusal {
     retry_after: Duration,
     first: bool,
     /// On a feed refusal, the token on that stream with the most of its own
-    /// share still spent — see [`ClipRefusal::RateLimited`].
-    top_spender: Option<CredentialKey>,
+    /// share still spent, and how many clip-seconds of it — see [`TopSpender`].
+    top_spender: Option<(CredentialKey, u64)>,
 }
 
 /// What every stream, and every credential on every stream, has spent of its
@@ -924,16 +954,20 @@ impl ClipExportRate {
             }
             (Err(feed_wait), Err(_)) => (ExportLimit::Feed, feed_wait),
         };
-        // Who spent the feed. Every credential pays the same refill time per
-        // clip-second, so the latest `full_at` is the most outstanding spend;
-        // the key breaks a tie so the answer does not hang on map order.
+        // The heaviest token still outstanding on the feed, and how heavy:
+        // not always who spent it (see `TopSpender`). Every credential pays
+        // the same refill time per clip-second, so the latest `full_at` is the
+        // most outstanding spend; the key breaks a tie so the answer does not
+        // hang on map order.
         let top_spender = match limit {
             ExportLimit::Feed => self
                 .credentials
                 .iter()
                 .filter(|((s, _), _)| s == stream)
                 .max_by_key(|((_, k), spent)| (spent.full_at, *k))
-                .map(|((_, k), _)| *k),
+                .map(|((_, k), spent)| {
+                    (*k, CREDENTIAL_EXPORT_ALLOWANCE.outstanding_secs(spent, now))
+                }),
             ExportLimit::Credential => None,
         };
         let spent = match limit {
@@ -1881,7 +1915,10 @@ impl OriginStore {
                 asked_secs,
                 retry_after: r.retry_after,
                 first: r.first,
-                top_spender: r.top_spender.as_ref().map(fingerprint_of),
+                top_spender: r.top_spender.map(|(key, outstanding_secs)| TopSpender {
+                    fingerprint: fingerprint_of(&key),
+                    outstanding_secs,
+                }),
             }
         })?;
         // Charged before the write: a disk failure part-way through the commit
@@ -3326,7 +3363,10 @@ async fn clips_request(
 /// refusal that is the token that spent its share; on a feed refusal it is
 /// whoever asked next — in the export/delete loop, the viewer the loop locked
 /// out — so a feed refusal also names `top_spender_fingerprint`, the token on
-/// the feed with the most of its own share still spent.
+/// the feed with the most of its own share still spent, and beside it
+/// `top_spender_outstanding_secs`, how much: the heaviest token is not always
+/// who spent the feed (see [`TopSpender`]), and the number is what tells a
+/// light one from the culprit.
 fn admit_and_report(
     origin: &OriginStore,
     events: &EventSender,
@@ -3340,11 +3380,13 @@ fn admit_and_report(
     {
         let wait = whole_secs_up(*retry_after);
         let token = credential.fingerprint();
-        let top = top_spender.as_deref().unwrap_or("-");
+        let top = top_spender.as_ref().map_or("-", |t| t.fingerprint.as_str());
+        let top_secs = top_spender.as_ref().map(|t| t.outstanding_secs);
         if *first {
             tracing::warn!(
                 stream = %stream, limit = limit.as_str(), asked_secs, wait,
-                credential = credential.kind.as_str(), token = %token, top_spender = %top,
+                credential = credential.kind.as_str(), token = %token,
+                top_spender = %top, top_spender_secs = ?top_secs,
                 "origin: clip export allowance spent"
             );
             let allowance = limit.allowance();
@@ -3375,13 +3417,15 @@ fn admit_and_report(
                     "refill_secs_per_hour": allowance.refill_secs_per_hour,
                     "credential": credential.kind.as_str(),
                     "token_fingerprint": token,
-                    "top_spender_fingerprint": top_spender,
+                    "top_spender_fingerprint": top_spender.as_ref().map(|t| &t.fingerprint),
+                    "top_spender_outstanding_secs": top_secs,
                 }),
             );
         } else {
             tracing::debug!(
                 stream = %stream, limit = limit.as_str(), asked_secs, wait,
-                credential = credential.kind.as_str(), token = %token, top_spender = %top,
+                credential = credential.kind.as_str(), token = %token,
+                top_spender = %top, top_spender_secs = ?top_secs,
                 "origin: clip export refused, allowance still spent"
             );
         }
@@ -6449,8 +6493,8 @@ seg-1.m4s
                 assert_eq!(retry_after, secs(180), "60 clip-seconds over, at 3 s each");
                 assert_eq!(
                     top_spender,
-                    Some(cred(1).fingerprint()),
-                    "the refusal does not name the token that looped"
+                    Some(TopSpender { fingerprint: cred(1).fingerprint(), outstanding_secs: 900 }),
+                    "the refusal does not name the token that looped, and how much it spent"
                 );
             }
             other => panic!("the export/delete loop was not bounded: {other:?}"),
@@ -6730,10 +6774,11 @@ seg-1.m4s
         assert_eq!((e.limit, e.retry_after), (ExportLimit::Credential, secs(12)));
     }
 
-    /// A feed refusal names who spent the feed, not who asked next: the token
-    /// on that feed with the most of its own share outstanding. A credential
-    /// refusal needs no such name — the refused token is the spender — and a
-    /// feed spent by many tokens, each whole again, names none.
+    /// A feed refusal names the heaviest token still outstanding on the feed,
+    /// not who asked next, and says how heavy: the token on that feed with the
+    /// most of its own share outstanding, and how many clip-seconds of it. A
+    /// credential refusal needs no such name — the refused token is the
+    /// spender — and a feed spent by many tokens, each whole again, names none.
     #[test]
     fn a_feed_refusal_names_the_heaviest_spender_not_the_refused_token() {
         let t0 = Instant::now();
@@ -6744,7 +6789,10 @@ seg-1.m4s
         r.take("other", &cred(3), 1020, t0).unwrap();
         let e = r.take("feed", &cred(4), 100, t0).unwrap_err();
         assert_eq!(e.limit, ExportLimit::Feed);
-        assert_eq!(e.top_spender, Some(cred(2).key), "named the wrong token");
+        assert_eq!(e.top_spender, Some((cred(2).key, 1000)), "named the wrong token");
+        // Its share refills at ten clip-seconds a minute, rounded up.
+        let e = r.take("feed", &cred(4), 100, t0 + secs(61)).unwrap_err();
+        assert_eq!(e.top_spender, Some((cred(2).key, 990)));
 
         let e = r.take("other", &cred(3), 1, t0).unwrap_err();
         assert_eq!((e.limit, e.top_spender), (ExportLimit::Credential, None));
@@ -6757,6 +6805,21 @@ seg-1.m4s
         }
         let e = r.take("feed", &cred(200), 30, t0 + secs(61)).unwrap_err();
         assert_eq!((e.limit, e.top_spender), (ExportLimit::Feed, None));
+
+        // The same minting beside one ordinary viewer: the name lands on the
+        // viewer, who spent a twentieth of the feed, so it is the number that
+        // says this is a light spender rather than who spent the feed.
+        let mut r = ClipExportRate::default();
+        r.take("feed", &cred(200), 60, t0).unwrap();
+        for n in 0..114u8 {
+            r.take("feed", &cred(n), 10, t0).unwrap();
+        }
+        let e = r.take("feed", &cred(201), 30, t0).unwrap_err();
+        assert_eq!(e.limit, ExportLimit::Feed);
+        assert_eq!(e.top_spender, Some((cred(200).key, 60)));
+        // Still the viewer once every mint is whole again, and lighter.
+        let e = r.take("feed", &cred(201), 30, t0 + secs(61)).unwrap_err();
+        assert_eq!((e.limit, e.top_spender), (ExportLimit::Feed, Some((cred(200).key, 50))));
     }
 
     /// An episode is one event: the flag is set by the first refusal and
@@ -6864,6 +6927,12 @@ seg-1.m4s
             d["top_spender_fingerprint"],
             cred(8).fingerprint(),
             "a feed refusal does not name who spent the feed"
+        );
+        // 1000 clip-seconds of its share, less what refilled while the test ran
+        // (one every 6 s).
+        assert!(
+            d["top_spender_outstanding_secs"].as_u64().is_some_and(|s| (990..=1000).contains(&s)),
+            "a feed refusal does not say how much its top spender spent: {d}"
         );
         assert!(rx.try_recv().is_err(), "a second refusal in one episode raised another event");
         assert!(s.list_clips("feed").is_empty());

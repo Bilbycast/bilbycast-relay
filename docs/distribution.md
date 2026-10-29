@@ -1051,10 +1051,19 @@ refill from everyone else. The rules:
   request's token (`token_fingerprint`). When a token's own share refused, that
   is the token that spent it. When the feed's allowance refused, the refused
   request is usually somebody else's — the viewer an export/delete loop locked
-  out — so the event also names `top_spender_fingerprint`: the token on the
-  feed with the most of its own share still spent. It is `null` when no token
-  has any of its share outstanding, which is what a feed spent by a fresh token
-  per export looks like.
+  out — so the event also names `top_spender_fingerprint`, the heaviest single
+  token still outstanding on the feed, and beside it
+  `top_spender_outstanding_secs`, how many clip-seconds of its own share (1,020)
+  it still has spent, rounded up. Read the two together, against
+  `allowance_secs`. The heaviest token is not always who spent the feed: a feed
+  spent by many tokens — a fresh one minted per export — names whichever token
+  holds the most, however light, so a viewer who exported one minute of clips is
+  named over a hundred ten-second mints, at 60. Only a number that is a real
+  part of the feed's 1,200 points at a culprit. Both are `null` when a token's
+  own share refused, and when no token on the feed has any of its share
+  outstanding — mints alone, each whole again.
+  A token's share refills at half the feed's rate, so a heavy spend long past
+  reads higher here than it still weighs on the feed.
 - In memory only: a relay restart hands every allowance back whole, and so does
   the manager dropping the stream, so a new session given the same feed name
   starts whole. Retiring a stream after an ingest gap does not.
