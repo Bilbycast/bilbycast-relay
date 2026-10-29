@@ -1731,7 +1731,14 @@ async fn a_clip_export_past_the_feed_allowance_is_429_and_a_delete_does_not_rese
     assert_eq!(d["stream"], "feed");
     assert_eq!(d["limit"], "feed");
     assert_eq!(d["asked_secs"], 360);
+    // The refused request's token is the viewer the loop locked out; the one
+    // that spent the feed is named beside it.
     assert_eq!(d["token_fingerprint"], fingerprint(&viewer_b));
+    assert_eq!(
+        d["top_spender_fingerprint"],
+        fingerprint(&viewer_a),
+        "the event does not name the token that looped"
+    );
 }
 
 /// The 256 MiB ceiling belongs to the media PUT, not to the JSON routes.

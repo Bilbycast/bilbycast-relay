@@ -1046,8 +1046,15 @@ refill from everyone else. The rules:
   check — so a feed's first export is never refused, and the wait is always one
   that works, unless somebody else spends the feed's allowance meanwhile.
 - The first refusal of each episode — until that allowance is whole again —
-  raises a Warning `clip_export_rate_limited` event naming the feed and the
-  token, so a headless relay tells its operator somebody is hammering exports.
+  raises a Warning `clip_export_rate_limited` event, so a headless relay tells
+  its operator somebody is hammering exports. It names the feed and the refused
+  request's token (`token_fingerprint`). When a token's own share refused, that
+  is the token that spent it. When the feed's allowance refused, the refused
+  request is usually somebody else's — the viewer an export/delete loop locked
+  out — so the event also names `top_spender_fingerprint`: the token on the
+  feed with the most of its own share still spent. It is `null` when no token
+  has any of its share outstanding, which is what a feed spent by a fresh token
+  per export looks like.
 - In memory only: a relay restart hands every allowance back whole, and so does
   the manager dropping the stream, so a new session given the same feed name
   starts whole. Retiring a stream after an ingest gap does not.
@@ -1070,10 +1077,11 @@ records the choice). Every delete is **attributed** instead: an Info
 `ingest`) and the token's fingerprint — the first 12 hex digits of the SHA-256
 of its 32 signature bytes, the hex after the token's last `.`
 (`printf %s <hex> | xxd -r -p | sha256sum | cut -c1-12`). The same fingerprint
-is on the `clip_export_rate_limited` event and the relay's `clip export
-requested` log line, so an export and a delete by one token can be put
-together. It names a token, not a person: the manager records no mint, and the
-portal mints a fresh token for each delete it makes on a viewer's behalf.
+is on the `clip_export_rate_limited` event (as `token_fingerprint` or
+`top_spender_fingerprint`) and the relay's `clip export requested` log line,
+so an export and a delete by one token can be put together. It names a token,
+not a person: the manager records no mint, and the portal mints a fresh token
+for each delete it makes on a viewer's behalf.
 
 **What the relay reclaims on its own.** Clip retention is the manager's: it
 holds the expiry and sends `drop_origin_streams` when it lapses. The relay's
