@@ -1755,6 +1755,17 @@ async fn a_clip_export_past_the_feed_allowance_is_429_and_a_delete_does_not_rese
 /// feed whose budget the admitted clips had all but reserved, a clip inside
 /// its own reservation was refused `507`, and the edge re-encoded it from
 /// scratch up to three times before giving up on it.
+///
+/// The allowance half only proves anything if the allowance an upload could
+/// be charged to is the one about to run out. That is the feed's, shared by
+/// every token — a charge on the upload path would be keyed on the *ingest*
+/// token, so the viewer that asked for the clips would never see it. So the
+/// feed is brought to exactly a minute short of its twenty minutes before the
+/// uploads, partly through clips asked for and deleted (a delete refunds
+/// nothing), and the closing request comes on the ingest token the uploads
+/// arrived on. A minute, not less: an allowance refuses a charge it cannot
+/// take whole and charges nothing, so a feed with less than a clip's length
+/// left would swallow a charge on the upload path without a trace.
 #[tokio::test]
 async fn a_clip_inside_its_own_reservation_is_stored_and_its_uploads_cost_no_allowance() {
     use std::net::SocketAddr;
@@ -1793,6 +1804,8 @@ async fn a_clip_inside_its_own_reservation_is_stored_and_its_uploads_cost_no_all
         .as_secs()
         + 300;
     let viewer = token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+    // A different expiry is a different signature, so another credential.
+    let other_viewer = token::mint_viewer_token(SECRET, "feed", exp + 1).unwrap();
     let ingest = token::mint_ingest_token(SECRET, "feed", exp).unwrap();
 
     /// (status, body). The write is allowed to fail: a relay that refuses an
@@ -1835,8 +1848,22 @@ async fn a_clip_inside_its_own_reservation_is_stored_and_its_uploads_cost_no_all
     let (st, _) = send(addr, "PUT", "/origin/feed/seg-00001.m4s", b"x", &ingest).await;
     assert_eq!(st, 201);
 
-    // 1. Sixteen one-minute clips and one of 21 s reserve all but ~3 MB of the
-    //    feed's 4 GiB — and 981 of the token's 1,020 clip-seconds.
+    // 1. Another viewer asks for three 53 s clips and deletes them: the feed
+    //    has spent 159 of its 1,200 clip-seconds and holds nothing.
+    let (st, body) =
+        send(addr, "POST", "/origin/feed/clips", ask(3, 30, 26, 27).as_bytes(), &other_viewer)
+            .await;
+    assert_eq!(st, 202, "fixture: the clips to delete were refused: {body}");
+    for i in 30..33 {
+        let path = format!("/origin/feed/clips/mark%20{i}.mp4");
+        let (st, _) = send(addr, "DELETE", &path, b"", &other_viewer).await;
+        assert_eq!(st, 204, "fixture: mark {i} could not be deleted");
+    }
+
+    // 2. Sixteen one-minute clips and one of 21 s reserve all but ~3 MB of the
+    //    feed's 4 GiB, and take the feed to 1,140 of its 1,200 clip-seconds:
+    //    a minute left, so a minute charged to an upload would land, not be
+    //    refused and swallowed.
     let (st, body) =
         send(addr, "POST", "/origin/feed/clips", ask(16, 0, 30, 30).as_bytes(), &viewer).await;
     assert_eq!(st, 202, "fixture: the first batch was refused: {body}");
@@ -1846,7 +1873,7 @@ async fn a_clip_inside_its_own_reservation_is_stored_and_its_uploads_cost_no_all
     let reserved = (16 * 60 + 21) * ESTIMATE_PER_SEC;
     let unreserved = MAX_CLIP_BYTES_PER_STREAM - reserved;
 
-    // 2. A clip bigger than the feed's unreserved room, and well inside the
+    // 3. A clip bigger than the feed's unreserved room, and well inside the
     //    one-minute reservation that is its own.
     let media = vec![0u8; 4 << 20];
     assert!(
@@ -1856,7 +1883,7 @@ async fn a_clip_inside_its_own_reservation_is_stored_and_its_uploads_cost_no_all
     let (st, body) = send(addr, "PUT", "/origin/feed/clips/mark%200.mp4", &media, &ingest).await;
     assert_eq!(st, 201, "a clip inside its own reservation was refused: {body}");
 
-    // 3. The edge uploads it again — its answer was lost, say — and the file it
+    // 4. The edge uploads it again — its answer was lost, say — and the file it
     //    replaces is not charged against it either.
     let (st, body) = send(addr, "PUT", "/origin/feed/clips/mark%200.mp4", &media, &ingest).await;
     assert_eq!(st, 201, "a retried upload was refused: {body}");
@@ -1866,10 +1893,13 @@ async fn a_clip_inside_its_own_reservation_is_stored_and_its_uploads_cost_no_all
         "the clip did not land whole: {listed}"
     );
 
-    // 4. Neither upload spent any of the export allowance: 30 more seconds fit
-    //    the 39 the token has left, which one charged minute would not.
+    // 5. Neither upload spent any of the export allowance. 55 more seconds,
+    //    asked for on the ingest token the uploads came on, take the feed to
+    //    1,195 of its 1,200 — so a minute charged to an upload, which is what
+    //    the clip it carried cost, would refuse this `429`. (The token's own
+    //    share, 1,020, could absorb that; the feed's is what binds here.)
     let (st, body) =
-        send(addr, "POST", "/origin/feed/clips", ask(1, 20, 15, 15).as_bytes(), &viewer).await;
+        send(addr, "POST", "/origin/feed/clips", ask(1, 20, 27, 28).as_bytes(), &ingest).await;
     assert_eq!(st, 202, "uploading a clip charged the export allowance: {body}");
 
     cancel.cancel();

@@ -2198,6 +2198,13 @@ impl OriginStore {
     /// twice, once as its own reservation and once as the bytes arriving: a
     /// clip that fitted the room admitted for it was refused `507`, and the
     /// edge re-encoded it from scratch up to three times before giving up.
+    ///
+    /// The ceiling this keeps is the one after the upload commits. While an
+    /// upload replaces a clip that has already landed, the old `.mp4` stays on
+    /// disk beside the new `.part` until the rename, so for that moment the
+    /// stream can hold up to the old file's size past
+    /// `MAX_CLIP_BYTES_PER_STREAM`. The edge only cuts a clip that is not yet
+    /// ready, so that needs a second exporter or a stale listing.
     pub fn clip_budget_used_besides(&self, stream: &str, name: &str) -> u64 {
         self.list_clips(stream)
             .iter()
