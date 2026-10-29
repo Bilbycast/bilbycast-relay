@@ -429,6 +429,60 @@ if [[ "${DETECTED}" == "distribution" ]] || \
     echo "  until it lands players cannot start or seek."
     echo "  No edge restart needed. See relay issues #6 and #8."
     echo
+
+    # The service user must be able to write the origin root, or the
+    # distribution subsystem stops at startup. Since relay#15 that no longer
+    # takes the forwarder down with it, but viewers, the origin and DVR stay
+    # down until it is fixed — and a distribution binary runs the subsystem
+    # even with no `distribution` block in relay.json. On 2026-09-22 a
+    # root-owned origin directory did exactly this on a host that used no
+    # distribution at all. Report, never block (see above).
+    #
+    # Only when the subsystem will run: the new binary is a distribution
+    # build (an `unknown` read still probes) and relay.json has not opted out.
+    # Not `.distribution.enabled // true` — jq's `//` treats `false` as absent;
+    # an unreadable relay.json makes jq fail, so the probe runs.
+    DIST_WILL_RUN=1
+    if [[ "$(detect_installed_variant "${NEW_STAGED}")" == "default" ]]; then
+        DIST_WILL_RUN=0
+    fi
+    if jq -e '.distribution.enabled == false' /etc/bilbycast/relay.json > /dev/null 2>&1; then
+        DIST_WILL_RUN=0
+    fi
+    SERVICE_USER="$(systemctl show --property=User --value "${SERVICE_NAME}" 2>/dev/null || true)"
+    if [[ "${DIST_WILL_RUN}" -eq 1 && -n "${SERVICE_USER}" && "${SERVICE_USER}" != "root" ]] \
+       && command -v runuser > /dev/null 2>&1; then
+        # The directory itself when it exists, else the nearest ancestor that
+        # does — the relay creates the root, so that is where it must write. A
+        # relative origin_storage_dir is relative to the unit's working
+        # directory, not to wherever this script was started.
+        PROBE_DIR="${ORIGIN_ROOT}"
+        if [[ "${PROBE_DIR}" != /* ]]; then
+            PROBE_DIR="$(systemctl show --property=WorkingDirectory --value "${SERVICE_NAME}" 2>/dev/null || true)/${PROBE_DIR}"
+            [[ "${PROBE_DIR}" == /* ]] || PROBE_DIR="/${PROBE_DIR}"
+        fi
+        ORIGIN_ABS="${PROBE_DIR}"
+        while [[ ! -e "${PROBE_DIR}" && "${PROBE_DIR}" != "/" ]]; do
+            PROBE_DIR="$(dirname "${PROBE_DIR}")"
+        done
+        # The relay reads the root and rewrites its `.bilbycast-origin` marker
+        # on every start, so an origin a root-run relay once filled stays
+        # unusable after a non-recursive chown of the directory alone.
+        ORIGIN_MARKER="${ORIGIN_ABS}/.bilbycast-origin"
+        if ! runuser -u "${SERVICE_USER}" -- test -r "${PROBE_DIR}" -a -w "${PROBE_DIR}" -a -x "${PROBE_DIR}" 2>/dev/null \
+           || { [[ -e "${ORIGIN_MARKER}" ]] \
+                && ! runuser -u "${SERVICE_USER}" -- test -w "${ORIGIN_MARKER}" 2>/dev/null; }; then
+            echo "WARNING: ${PROBE_DIR} (or its .bilbycast-origin marker) is not writable by" >&2
+            echo "         ${SERVICE_USER}, so the viewer-distribution subsystem will stop at startup." >&2
+            echo "         The relay keeps forwarding tunnels; viewers, the origin and DVR stay down. Fix with:" >&2
+            if [[ "${PROBE_DIR}" == "${ORIGIN_ABS}" ]]; then
+                echo "           chown -R ${SERVICE_USER}: ${ORIGIN_ABS}" >&2
+            else
+                echo "           install -d -o ${SERVICE_USER} -g ${SERVICE_USER} ${ORIGIN_ABS}" >&2
+            fi
+            echo >&2
+        fi
+    fi
 fi
 
 echo "Stopping ${SERVICE_NAME}…"
@@ -582,6 +636,9 @@ if systemctl list-unit-files "${PORTAL_UNIT_NAME}.service" >/dev/null 2>&1 \
 fi
 
 echo "Starting ${SERVICE_NAME}…"
+# A unit that crash-looped before this upgrade may already be at its start
+# limit (StartLimitBurst), and then refuses the start below outright.
+systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
 systemctl start "${SERVICE_NAME}"
 
 # ── Health check + auto-rollback ──────────────────────────────────────
@@ -619,6 +676,43 @@ if [[ "${HEALTHY}" -eq 1 ]]; then
     fi
 
     NEW_RUNNING="$("${BINARY_PATH}" --version 2>/dev/null | awk '{ print $NF }' || echo unknown)"
+
+    # /health answers as soon as the REST API is up, which can be well
+    # before the optional subsystems have failed to start: `distribution`
+    # appears only once the origin has adopted the previous run's DVR window,
+    # and its listeners bind after that. So wait for its first report (up to
+    # the health timeout), then give the binds a moment and read again. A
+    # stopped subsystem does not fail the upgrade — the forwarder is healthy,
+    # and putting the old binary back would not fix a directory or a port —
+    # but it is said loudly (relay#15).
+    EXPECT_DIST=0
+    if [[ "$(detect_installed_variant "${BINARY_PATH}")" != "default" ]] \
+       && ! jq -e '.distribution.enabled == false' /etc/bilbycast/relay.json > /dev/null 2>&1; then
+        EXPECT_DIST=1
+    fi
+    sleep 2
+    HEALTH_BODY="$(curl -fsS --max-time 3 "${HEALTH_URL}" 2>/dev/null || true)"
+    if [[ "${EXPECT_DIST}" -eq 1 ]]; then
+        for _ in $(seq 1 "${HEALTH_TIMEOUT}"); do
+            if [[ -n "$(jq -r '.distribution // empty' <<< "${HEALTH_BODY}" 2>/dev/null || true)" ]]; then
+                sleep 2
+                HEALTH_BODY="$(curl -fsS --max-time 3 "${HEALTH_URL}" 2>/dev/null || true)"
+                break
+            fi
+            sleep 1
+            HEALTH_BODY="$(curl -fsS --max-time 3 "${HEALTH_URL}" 2>/dev/null || true)"
+        done
+    fi
+    if [[ "$(jq -r '.distribution // empty' <<< "${HEALTH_BODY}" 2>/dev/null || true)" == "stopped" ]]; then
+        echo "WARNING: the relay is forwarding, but its viewer-distribution subsystem stopped." >&2
+        echo "         The reason is in: journalctl -u ${SERVICE_NAME} -e | grep 'stopped:'" >&2
+        echo "         Fix the cause and restart: systemctl restart ${SERVICE_NAME}" >&2
+    fi
+    if [[ "$(jq -r '.udp_relay // empty' <<< "${HEALTH_BODY}" 2>/dev/null || true)" == "stopped" ]]; then
+        echo "WARNING: the relay is forwarding QUIC tunnels, but its native-UDP plane is not" >&2
+        echo "         running; the relay keeps retrying the bind. The reason is in:" >&2
+        echo "         journalctl -u ${SERVICE_NAME} -e | grep 'plane stopped:'" >&2
+    fi
     echo
     echo "── Upgrade complete ──"
     echo "  ${CURRENT_VERSION}  →  ${NEW_RUNNING}"
@@ -639,6 +733,11 @@ fi
 echo "Rolling back to previous binary…" >&2
 systemctl stop "${SERVICE_NAME}" || true
 mv -Tf "${PREV_BACKUP}" "${BINARY_PATH}"
+# A new binary that crash-looped through the health window has used up the
+# unit's start limit (RestartSec=3, StartLimitBurst=10), and systemd then
+# refuses this start with "start of the service was attempted too often" —
+# which on 2026-09-22 left the relay down until a manual reset-failed.
+systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
 systemctl start "${SERVICE_NAME}"
 # Roll the portal back with it, so the pair never straddles a version, and
 # leave it running only if it was.

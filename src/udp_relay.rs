@@ -596,13 +596,20 @@ fn socket_for(sockets: &[Arc<UdpSocket>], dest: SocketAddr) -> &Arc<UdpSocket> {
         .unwrap_or(&sockets[0])
 }
 
-/// Run the plain-UDP relay data plane. Binds one socket per
-/// [`RelayConfig::effective_udp_relay_addrs`] entry and forwards forever.
+/// Run the plain-UDP relay data plane: [`bind_udp_relay`] then
+/// [`serve_udp_relay`]. `main` goes through `supervise::supervise_udp_relay`
+/// instead, which retries the bind.
+pub async fn run_udp_relay(config: &RelayConfig, ctx: Arc<SessionContext>) -> Result<()> {
+    serve_udp_relay(bind_udp_relay(config)?, ctx).await
+}
+
+/// Bind one socket per [`RelayConfig::effective_udp_relay_addrs`] entry.
 ///
 /// Bind failures are **non-fatal**: a socket that can't bind is logged and
 /// skipped (so an upgrade never bricks a relay over a busy `:4434`). If *no*
-/// socket binds the task exits and the relay continues QUIC-only.
-pub async fn run_udp_relay(config: &RelayConfig, ctx: Arc<SessionContext>) -> Result<()> {
+/// socket binds this returns an error, the relay continues QUIC-only, and the
+/// supervisor tries the bind again later (relay#15).
+pub fn bind_udp_relay(config: &RelayConfig) -> Result<Vec<Arc<UdpSocket>>> {
     let entries = config.effective_udp_relay_addrs();
     let mut sockets: Vec<Arc<UdpSocket>> = Vec::with_capacity(entries.len());
     for raw in &entries {
@@ -627,7 +634,12 @@ pub async fn run_udp_relay(config: &RelayConfig, ctx: Arc<SessionContext>) -> Re
     if sockets.is_empty() {
         anyhow::bail!("native-UDP relay: no listener could be bound");
     }
+    Ok(sockets)
+}
 
+/// Forward on the bound sockets forever. Returns only if a receive loop
+/// ends, which none does short of a panic.
+pub async fn serve_udp_relay(sockets: Vec<Arc<UdpSocket>>, ctx: Arc<SessionContext>) -> Result<()> {
     let sockets: Arc<Vec<Arc<UdpSocket>>> = Arc::new(sockets);
 
     // Idle-session reaper (UDP has no connection-close signal).
@@ -657,8 +669,10 @@ pub async fn run_udp_relay(config: &RelayConfig, ctx: Arc<SessionContext>) -> Re
         });
     }
     // First loop to exit collapses the task; dropping the JoinSet aborts the rest.
-    let _ = set.join_next().await;
-    Ok(())
+    match set.join_next().await {
+        Some(Err(join)) => Err(anyhow::anyhow!("native-UDP receive loop failed: {join}")),
+        _ => Err(anyhow::anyhow!("native-UDP receive loop stopped")),
+    }
 }
 
 async fn recv_loop(

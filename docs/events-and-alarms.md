@@ -92,11 +92,13 @@ configured — discards events silently and counts nothing.
 | warning | Native-UDP register rejected: per-IP session cap exceeded | `Register` on the native plain-UDP plane dropped — per-IP session cap reached. DoS mitigation | `{ error_code: "relay_dos_suspect", remote_addr, remote_ip, transport: "udp" }` |
 | warning | Native-UDP register rejected: implausible source address | `Register` on the native plain-UDP plane arrived from an address that can never be a legitimate slot occupant. `reason: "unroutable_source"` — an address no host can own (unspecified / multicast / broadcast / port 0); `reason: "both_slots_same_address"` — the tunnel's *opposite* slot already holds exactly this address, which would make the session forward to its own source (an unbounded loop if that address routes back to the relay). Not latchable — a slot is a send target | `{ error_code: "relay_invalid_source_addr", reason, remote_addr, remote_ip, transport: "udp" }` |
 | warning | Native-UDP register refused: slot held by a live peer | `Register` tried to move a slot that is currently carrying media from a *different* source IP. Refused for `SLOT_TAKEOVER_GRACE_MS` (12 s) after the last media datagram, so a flowing contribution feed cannot be redirected by one unauthenticated datagram. A same-IP port rebind is always allowed; a genuine WAN-IP change recovers once the incumbent goes quiet | `{ error_code: "relay_slot_takeover_refused", remote_addr, remote_ip, transport: "udp" }` |
+| critical | Native-UDP relay plane stopped: {error} | The native plain-UDP plane (`:4434`) is not running: no listener could be bound at startup, or a receive loop ended. The relay **keeps forwarding QUIC tunnels** — before relay#15 this exited the whole process — withdraws the `udp-relay` capability, and reports `udp_relay_error` on health (`"udp_relay": "stopped"` on the public `/health`). Native SRT/RIST tunnels and relayed bond legs on this relay are down meanwhile. A failed bind is retried (5 s, doubling to 60 s) and raised once per outage; a plane that stops after binding is not retried and needs a restart (`src/supervise.rs`) | `{ error_code: "relay_udp_plane_stopped", transport: "udp", error }` |
+| info | Native-UDP relay plane started after a failed bind | A retried bind of the native plain-UDP plane succeeded after `relay_udp_plane_stopped`. The `udp-relay` capability and the `/health` field return to normal | `{ error_code: "relay_udp_plane_recovered", transport: "udp", attempts }` |
 | warning | Native-UDP plane accepts unauthenticated registers | Emitted **once at startup** when `require_bind_auth: false` *and* `udp_relay_enabled: true`. For any tunnel the manager has not pre-authorized, a `Register` on the native plane can *move* a slot (media hijack), not merely join a tunnel as on QUIC. See `require_bind_auth` in the README | `{ error_code: "relay_native_plane_unauthenticated", require_bind_auth: false, udp_relay_enabled: true }` |
 
 The `flow_id` field contains the tunnel UUID for all tunnel events.
 
-**Source**: `src/session.rs`, `src/udp_relay.rs`
+**Source**: `src/session.rs`, `src/udp_relay.rs`, `src/supervise.rs`
 
 ---
 
@@ -130,6 +132,7 @@ Emitted only by a relay built with the optional `viewer-distribution` role (defa
 
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
+| critical | Viewer-distribution subsystem stopped: {error} | The distribution subsystem ended: its origin root could not be used (the error names the directory — on 2026-09-22 a root-owned `/var/lib/bilbycast/relay/origin`), an HTTP or ingest listener could not bind or stopped, or the task panicked. The relay **keeps forwarding** QUIC and native-UDP tunnels — before relay#15 this exited the whole process — withdraws the `viewer-distribution` and `origin-policy` capabilities, refuses every later `configure_distribution` push (so the manager keeps what it sent as owed), and reports `distribution_error` on health (`"distribution": "stopped"` on the public `/health`). WHEP viewers, the LL-HLS origin and DVR on this relay are down until the cause is fixed and the relay restarted; the subsystem is not retried in-process (`src/supervise.rs`) | `{ error_code: "relay_distribution_stopped", error }` |
 | info | WHIP ingest opened for stream '{stream}' | A WHIP-in ingest began feeding a stream's hub | `{ stream }` |
 | info | distribution ingest opened for stream '{stream}' | A QUIC ES ingest began feeding a stream's hub | `{ stream, has_audio }` |
 | info | distribution ingest closed for stream '{stream}' | A QUIC ES ingest stopped; the stream tears down | `{ stream }` |
@@ -160,19 +163,19 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | Category | Count | Description |
 |----------|-------|-------------|
 | `edge` | 6 | Edge QUIC connection lifecycle (now with structured details), incl. per-IP DoS cap |
-| `tunnel` | 11 | Tunnel state changes, authentication, lifecycle (waiting, unbound), per-connection DoS cap, native plain-UDP register rejections (invalid token, per-IP session cap, implausible source address, live-slot takeover), and the one-shot startup posture warning |
+| `tunnel` | 13 | Tunnel state changes, authentication, lifecycle (waiting, unbound), per-connection DoS cap, native plain-UDP register rejections (invalid token, per-IP session cap, implausible source address, live-slot takeover), the one-shot startup posture warning, and the native-UDP plane stopping and recovering |
 | `manager` | 6 | Manager connection and credential management |
-| `distribution` | 6 | Viewer-distribution ingest lifecycle, per-IP viewer cap, the WebRTC media source pin, and str0m negotiation panics (only on `viewer-distribution` builds) |
-| **Total** | **29** | |
+| `distribution` | 7 | Viewer-distribution ingest lifecycle, per-IP viewer cap, the WebRTC media source pin, str0m negotiation panics, and the subsystem stopping (only on `viewer-distribution` builds) |
+| **Total** | **32** | |
 
-The always-compiled `edge`, `tunnel`, and `manager` categories account for 23 events. The `distribution` category (6 events) is present only when the relay is built with the optional `viewer-distribution` role.
+The always-compiled `edge`, `tunnel`, and `manager` categories account for 25 events. The `distribution` category (7 events) is present only when the relay is built with the optional `viewer-distribution` role.
 
 ### By Severity
 
-The always-compiled surface (excluding the optional `distribution` category) is critical=1, warning=15, info=7.
+The always-compiled surface (excluding the optional `distribution` category) is critical=2, warning=15, info=8.
 
 | Severity | Count | Description |
 |----------|-------|-------------|
-| critical | 1 | Manager authentication failure |
+| critical | 2 | Manager authentication failure, the native-UDP plane stopping |
 | warning | 15 | Disconnects, bind rejections, protocol mismatches, QUIC failures, persistence failures, DoS-cap rejections (per-IP + per-connection + native-UDP session cap), native-UDP token rejections, native-UDP source-plausibility and live-slot-takeover refusals, and the unauthenticated-native-plane startup warning |
-| info | 7 | Connections, tunnel activation/waiting/unbound, secret rotation |
+| info | 8 | Connections, tunnel activation/waiting/unbound, secret rotation, the native-UDP plane recovering |

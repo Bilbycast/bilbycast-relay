@@ -3175,3 +3175,109 @@ async fn a_str0m_panic_in_negotiation_raises_one_rate_limited_warning() {
 
     cancel.cancel();
 }
+
+/// relay#15: a distribution subsystem that cannot start returns an error that
+/// names the directory, so the relay can report it and keep forwarding — and
+/// it cancels its token, so nothing it spawned outlives it.
+#[tokio::test]
+async fn run_distribution_names_an_unusable_origin_root_and_cancels() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("not-a-directory");
+    std::fs::write(&file, b"x").unwrap();
+    let root = file.join("origin");
+    let cfg = DistributionConfig {
+        origin_storage_dir: Some(root.display().to_string()),
+        ..Default::default()
+    };
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let (events, _rx) = event_channel();
+    let cancel = CancellationToken::new();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        bilbycast_relay::distribution::run_distribution(
+            cfg,
+            control,
+            Arc::new(DistributionHub::new()),
+            cancel.clone(),
+            events,
+            Arc::new(bilbycast_relay::stats::RelayStats::new()),
+        ),
+    )
+    .await
+    .expect("returns promptly")
+    .expect_err("an origin root under a file cannot be used");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.starts_with(&format!("distribution origin storage dir {}: ", root.display())),
+        "{msg}"
+    );
+    assert!(cancel.is_cancelled());
+}
+
+/// relay#15: a listener that cannot bind ends the subsystem with an error
+/// naming it, rather than an `Ok` that says nothing.
+#[tokio::test]
+async fn run_distribution_names_a_listener_it_cannot_bind_and_cancels() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = taken.local_addr().unwrap();
+    let origin = tempfile::tempdir().unwrap();
+    let cfg = DistributionConfig {
+        origin_storage_dir: Some(origin.path().join("origin").display().to_string()),
+        http_addrs: Some(vec![addr.to_string()]),
+        ingest_addrs: Some(vec!["127.0.0.1:0".to_string()]),
+        ..Default::default()
+    };
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let (events, _rx) = event_channel();
+    let cancel = CancellationToken::new();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        bilbycast_relay::distribution::run_distribution(
+            cfg,
+            control,
+            Arc::new(DistributionHub::new()),
+            cancel.clone(),
+            events,
+            Arc::new(bilbycast_relay::stats::RelayStats::new()),
+        ),
+    )
+    .await
+    .expect("returns promptly")
+    .expect_err("the HTTP address is taken");
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with(&format!("failed to bind distribution HTTP on {addr}: ")), "{msg}");
+    assert!(cancel.is_cancelled());
+    drop(taken);
+}
+
+/// relay#15: shut down through its token, the subsystem returns `Ok` — only an
+/// unexpected stop is an error.
+#[tokio::test]
+async fn run_distribution_returns_ok_when_cancelled() {
+    let origin = tempfile::tempdir().unwrap();
+    let cfg = DistributionConfig {
+        origin_storage_dir: Some(origin.path().join("origin").display().to_string()),
+        http_addrs: Some(vec!["127.0.0.1:0".to_string()]),
+        ingest_addrs: Some(vec!["127.0.0.1:0".to_string()]),
+        ..Default::default()
+    };
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let (events, _rx) = event_channel();
+    let cancel = CancellationToken::new();
+    let run = tokio::spawn(bilbycast_relay::distribution::run_distribution(
+        cfg,
+        control,
+        Arc::new(DistributionHub::new()),
+        cancel.clone(),
+        events,
+        Arc::new(bilbycast_relay::stats::RelayStats::new()),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!run.is_finished(), "a healthy subsystem keeps running");
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("returns promptly")
+        .unwrap()
+        .expect("a requested shutdown is not an error");
+}

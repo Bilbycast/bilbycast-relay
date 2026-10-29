@@ -123,7 +123,7 @@ All fields are optional. Defaults are used for any omitted field.
 | `api_addr` | `0.0.0.0:4480` | REST API listen address (legacy single-address; ignored when `api_addrs` is set) |
 | `api_addrs` | `["0.0.0.0:4480", "[::]:4480"]` | Dual-stack REST API listener addresses (same semantics as `quic_addrs`) |
 | `public_quic_addr` | (none — falls back to `quic_addr`) | Publicly-reachable QUIC address remote edges dial (IP literal or DNS `host:port`). Advertised to the manager and surfaced in the tunnel-creation dropdown. Unspecified addresses (`0.0.0.0`/`[::]`) are rejected |
-| `udp_relay_enabled` | `true` | Enable the native SRT/RIST plain-UDP data plane (no QUIC). Set `false` for a QUIC-only relay. Bind failures are non-fatal: the relay logs, drops the `udp-relay` capability, and continues |
+| `udp_relay_enabled` | `true` | Enable the native SRT/RIST plain-UDP data plane (no QUIC). Set `false` for a QUIC-only relay. Bind failures are non-fatal: the relay logs, raises a Critical `relay_udp_plane_stopped` event, drops the `udp-relay` capability, reports `"udp_relay": "stopped"` on `/health`, retries the bind (5 s doubling to 60 s), and continues |
 | `udp_relay_addrs` | `["0.0.0.0:4434", "[::]:4434"]` | Dual-stack listener addresses for the native SRT/RIST path (same semantics as `quic_addrs`) |
 | `public_udp_addr` | (none — manager falls back to `public_quic_addr`'s host + the UDP port) | Publicly-reachable address remote edges dial for the native SRT/RIST path. Advertised to the manager. Unspecified addresses are rejected |
 | `tls_cert_path` | (auto-generated) | Path to TLS certificate PEM. Self-signed cert generated if absent |
@@ -231,7 +231,7 @@ The opaque forwarder is stateless — a restart drops connected edges, which all
 
 | Endpoint | Auth | Description |
 |----------|------|-------------|
-| `GET /health` | Public | Health check (always unauthenticated). Includes `udp_sessions_total` / `udp_sessions_active` for the native SRT/RIST plane, plus a `manager` object (`connected`, `disconnected_secs`, `reconnecting`) when a manager is configured — the only unauthenticated way to alert on a lost manager link |
+| `GET /health` | Public | Health check (always unauthenticated). Includes `udp_sessions_total` / `udp_sessions_active` for the native SRT/RIST plane, plus a `manager` object (`connected`, `disconnected_secs`, `reconnecting`) when a manager is configured — the only unauthenticated way to alert on a lost manager link. `distribution` reads `"running"` or `"stopped"` on a relay that runs (or ran) the viewer-distribution subsystem, and `udp_relay` reads `"stopped"` once the native-UDP plane has stopped: either one stopping leaves the relay forwarding and `status` at `"ok"`, so alert on these fields, not on the status code. The reason is in the log and the manager's Critical event, not here |
 | `GET /metrics` | Token | Prometheus metrics. Includes `bilbycast_relay_manager_connected` (gauge, 1 = link up, 0 = down) and `bilbycast_relay_manager_disconnected_seconds` (gauge, 0 while connected), both emitted only when a manager is configured |
 | `GET /api/v1/tunnels` | Token | List active QUIC tunnels |
 | `DELETE /api/v1/tunnels/{id}` | Token (required) | Administrative teardown of a QUIC tunnel when the manager is unavailable. **Fail-closed**: returns `403` unless `api_token` is set |

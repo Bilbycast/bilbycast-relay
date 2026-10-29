@@ -1475,6 +1475,35 @@ fn apply_configure_distribution(
 /// The whole `configure_distribution` command as the handler runs it: apply,
 /// and persist to `config.json` only what was applied, so the config survives a
 /// relay restart without the manager having to re-push.
+/// Why a `configure_distribution` push must be refused outright: the
+/// subsystem it configures has stopped (relay#15). It used to be acked as
+/// applied — the `DistributionControl` outlives the subsystem — so a drop or
+/// retirement went into a queue nothing reads, and the manager, told it had
+/// landed, settled the drop debt or deleted the expired session's row while
+/// its clips stayed on disk for the stream's next owner. Refused, the manager
+/// keeps the debt and re-pushes at the next reconnect. The second test covers
+/// the moment between the origin letting go of its drop queue and the
+/// watcher recording the stop.
+fn distribution_refusal(
+    stats: &RelayStats,
+    control: Option<&Arc<DistributionControl>>,
+) -> Option<String> {
+    if let Some(reason) = stats.distribution_stopped() {
+        return Some(format!(
+            "the viewer-distribution subsystem on this relay has stopped ({reason}); nothing \
+             pushed can take effect until the cause is fixed and the relay restarted"
+        ));
+    }
+    if control.is_some_and(|c| c.drops_closed()) {
+        return Some(
+            "the viewer-distribution subsystem on this relay is stopping; nothing pushed can \
+             take effect until the relay is restarted"
+                .to_string(),
+        );
+    }
+    None
+}
+
 fn configure_distribution(
     control: Option<&Arc<DistributionControl>>,
     relay_config: &RelayConfig,
@@ -1606,9 +1635,12 @@ fn build_health_message(
     let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
 
     // Capability bits the manager UI gates on. "udp-relay" => native SRT/RIST
-    // (no-QUIC) tunnels. "viewer-distribution" => WHEP SFU + LL-HLS origin.
+    // (no-QUIC) tunnels, withdrawn if the plane stopped (relay#15).
+    // "viewer-distribution" => WHEP SFU + LL-HLS origin, present only while the
+    // subsystem publishes telemetry — which a stopped one never does again.
     let mut capabilities: Vec<&str> = Vec::new();
-    if relay_config.udp_relay_enabled {
+    let udp_relay_stopped = relay_stats.udp_relay_stopped();
+    if relay_config.udp_relay_enabled && udp_relay_stopped.is_none() {
         capabilities.push("udp-relay");
     }
     let dist_snapshot = relay_stats.distribution_snapshot();
@@ -1649,6 +1681,17 @@ fn build_health_message(
         "udp_sessions_active": ctx.udp_sessions.active_count(),
         "capabilities": capabilities
     });
+
+    // An optional subsystem that stopped, and why — the relay is still
+    // forwarding, so this is how the manager learns what it has lost beyond
+    // the one Critical event (relay#15). Additive: an older manager ignores
+    // both keys.
+    if let Some(reason) = relay_stats.distribution_stopped() {
+        payload["distribution_error"] = serde_json::json!(reason.as_str());
+    }
+    if let Some(reason) = udp_relay_stopped {
+        payload["udp_relay_error"] = serde_json::json!(reason.as_str());
+    }
 
     // Distribution telemetry + advertised viewer base URL, when the subsystem
     // is running. Lets the manager render live viewer counts and build
@@ -1871,8 +1914,10 @@ where
             // owns the operational policy so the operator never hand-edits the
             // relay's config.json.
             if action_type == "configure_distribution" {
-                let result =
-                    configure_distribution(distribution_control, relay_config, config_path, action);
+                let result = match distribution_refusal(&ctx.relay_stats, distribution_control) {
+                    Some(why) => Err(why),
+                    None => configure_distribution(distribution_control, relay_config, config_path, action),
+                };
                 let ack = serde_json::json!({
                     "type": "command_ack",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -3802,5 +3847,165 @@ mod link_deadline_tests {
             .session(&mut creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
             .await;
         assert_eq!(shown["node_secret"], OLD);
+    }
+}
+
+#[cfg(test)]
+mod stopped_subsystem_health_tests {
+    //! relay#15: an optional subsystem that stopped is reported, and its
+    //! capability withdrawn, while the relay goes on forwarding.
+    use super::*;
+    use crate::config::RelayConfig;
+
+    fn health(stats: &Arc<RelayStats>, config: &RelayConfig) -> serde_json::Value {
+        let (events, _rx) = crate::manager::event_channel();
+        let ctx = crate::server::create_session_context(stats.clone(), events, false, 64, 100);
+        build_health_message(&ctx, stats, config, None)["payload"].clone()
+    }
+
+    fn capabilities(payload: &serde_json::Value) -> Vec<String> {
+        payload["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_running_relay_advertises_both_subsystems_and_no_errors() {
+        let stats = Arc::new(RelayStats::new());
+        stats.set_distribution(0, 0, 0, 0, 0, Vec::new());
+        let config = RelayConfig { udp_relay_enabled: true, ..Default::default() };
+        let p = health(&stats, &config);
+        assert_eq!(
+            capabilities(&p),
+            ["udp-relay", "viewer-distribution", "origin-policy"]
+        );
+        assert!(p.get("distribution_error").is_none());
+        assert!(p.get("udp_relay_error").is_none());
+        assert!(p.get("distribution").is_some());
+    }
+
+    #[test]
+    fn a_stopped_distribution_withdraws_its_capabilities_and_says_why() {
+        let stats = Arc::new(RelayStats::new());
+        stats.set_distribution(0, 0, 0, 0, 0, Vec::new());
+        stats.mark_distribution_stopped("Permission denied (os error 13)".into());
+        let config = RelayConfig { udp_relay_enabled: true, ..Default::default() };
+        let p = health(&stats, &config);
+        assert_eq!(capabilities(&p), ["udp-relay"]);
+        assert_eq!(p["distribution_error"], "Permission denied (os error 13)");
+        assert!(p.get("distribution").is_none());
+        assert_eq!(p["status"], "ok", "the forwarder is still up");
+    }
+
+    #[test]
+    fn a_stopped_udp_plane_withdraws_udp_relay_and_says_why() {
+        let stats = Arc::new(RelayStats::new());
+        stats.mark_udp_relay_stopped("native-UDP relay: no listener could be bound".into());
+        let config = RelayConfig { udp_relay_enabled: true, ..Default::default() };
+        let p = health(&stats, &config);
+        assert!(capabilities(&p).is_empty());
+        assert_eq!(p["udp_relay_error"], "native-UDP relay: no listener could be bound");
+    }
+}
+
+#[cfg(test)]
+mod stopped_distribution_push_tests {
+    //! relay#15 review: once the distribution subsystem has stopped, a
+    //! `configure_distribution` push is refused rather than acked. Acked, the
+    //! manager settled drop debts and deleted expired sessions' rows for drops
+    //! that went into a queue nothing reads.
+    use super::rotation_tests::{Relay, manager_config};
+    use super::*;
+    use crate::config::DistributionConfig;
+    use crate::distribution_control::{DistributionControl, RuntimeDistConfig};
+    use futures_util::StreamExt;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    fn control() -> Arc<DistributionControl> {
+        let cfg = DistributionConfig::default();
+        DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![])
+    }
+
+    /// Run one `configure_distribution` push through the real handler and
+    /// return the ack the manager would read.
+    async fn push(relay: &Relay, control: &Arc<DistributionControl>, body: serde_json::Value) -> serde_json::Value {
+        let mut creds = relay.credentials();
+        let (relay_io, manager_io) = tokio::io::duplex(1 << 20);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await;
+        let mut manager_ws = WebSocketStream::from_raw_socket(manager_io, Role::Server, None).await;
+        let (mut ws_write, _ws_read) = relay_ws.split();
+        let command = serde_json::json!({
+            "type": "command",
+            "payload": { "command_id": "c1", "action": body },
+        });
+        handle_manager_message(
+            &command.to_string(),
+            &relay.ctx,
+            &relay.relay_config,
+            &relay.config_path,
+            &mut ws_write,
+            Some(control),
+            &mut creds,
+        )
+        .await
+        .expect("the ack is written");
+        let msg = manager_ws.next().await.expect("an ack").expect("a frame");
+        let ack: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        ack["payload"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_push_to_a_stopped_subsystem_is_refused_and_queues_nothing() {
+        let relay = Relay::new(manager_config(Some("s"), None));
+        let control = control();
+        relay.relay_stats.mark_distribution_stopped("Permission denied (os error 13)".into());
+
+        let ack = push(
+            &relay,
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "drop_origin_streams": ["show"] }),
+        )
+        .await;
+        assert_eq!(ack["success"], false, "{ack}");
+        let error = ack["error"].as_str().unwrap();
+        assert!(error.contains("has stopped") && error.contains("Permission denied"), "{error}");
+        let mut drops = control.take_drops().expect("never taken");
+        assert!(drops.try_recv().is_err(), "a refused push must queue no drop");
+    }
+
+    #[tokio::test]
+    async fn a_push_after_the_origin_let_go_of_its_drops_is_refused() {
+        let relay = Relay::new(manager_config(Some("s"), None));
+        let control = control();
+        drop(control.take_drops());
+        assert!(control.drops_closed());
+
+        let ack = push(
+            &relay,
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "retire_origin_streams": ["show"] }),
+        )
+        .await;
+        assert_eq!(ack["success"], false, "{ack}");
+    }
+
+    #[tokio::test]
+    async fn a_running_subsystem_still_takes_the_push() {
+        let relay = Relay::new(manager_config(Some("s"), None));
+        let control = control();
+        let mut drops = control.take_drops().unwrap();
+
+        let ack = push(
+            &relay,
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "drop_origin_streams": ["show"] }),
+        )
+        .await;
+        assert_eq!(ack["success"], true, "{ack}");
+        assert_eq!(drops.try_recv().unwrap(), "show");
     }
 }

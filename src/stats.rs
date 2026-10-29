@@ -117,6 +117,21 @@ pub struct RelayStats {
     /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
     /// viewer whose IP changed mid-session.
     pub distribution_offpath_sessions: AtomicU64,
+
+    // ── Optional subsystems that stopped ──
+    //
+    // The viewer-distribution subsystem and the native-UDP plane are optional:
+    // when either stops, the relay keeps forwarding QUIC tunnels rather than
+    // exiting (relay#15), and records why here. Distribution's is never
+    // cleared — it is not restarted in-process. The native-UDP plane's is
+    // cleared when a retried bind succeeds (`supervise::supervise_udp_relay`).
+    /// Why the distribution subsystem stopped. While set, no telemetry sample
+    /// is published, so the `viewer-distribution` / `origin-policy`
+    /// capabilities are withdrawn and the manager stops pushing to a dead
+    /// origin.
+    distribution_stopped: arc_swap::ArcSwapOption<String>,
+    /// Why the native-UDP plane stopped. While set, `udp-relay` is withdrawn.
+    udp_relay_stopped: arc_swap::ArcSwapOption<String>,
 }
 
 /// What one origin stream is costing on disk.
@@ -314,6 +329,8 @@ impl RelayStats {
                 ViewerMetricsSnapshot::default(),
             ),
             distribution_offpath_sessions: AtomicU64::new(0),
+            distribution_stopped: arc_swap::ArcSwapOption::empty(),
+            udp_relay_stopped: arc_swap::ArcSwapOption::empty(),
         }
     }
 
@@ -327,6 +344,9 @@ impl RelayStats {
         offpath_sessions: u64,
         origin_streams: Vec<OriginStreamUsage>,
     ) {
+        if self.distribution_stopped().is_some() {
+            return;
+        }
         self.distribution_origin_streams
             .store(std::sync::Arc::new(origin_streams));
         self.distribution_enabled.store(true, Ordering::Relaxed);
@@ -352,7 +372,11 @@ impl RelayStats {
     /// Snapshot the distribution telemetry. Returns `None` when the subsystem
     /// is not running (so the field is omitted from health/REST payloads).
     pub fn distribution_snapshot(&self) -> Option<DistributionStatsSnapshot> {
-        if !self.distribution_enabled.load(Ordering::Relaxed) {
+        // The stopped check is what closes the race with a telemetry tick
+        // already past `set_distribution`'s own check when the stop lands.
+        if !self.distribution_enabled.load(Ordering::Relaxed)
+            || self.distribution_stopped().is_some()
+        {
             return None;
         }
         Some(DistributionStatsSnapshot {
@@ -364,6 +388,34 @@ impl RelayStats {
             offpath_sessions: self.distribution_offpath_sessions.load(Ordering::Relaxed),
             origin_streams: self.distribution_origin_streams.load().as_ref().clone(),
         })
+    }
+
+    /// Record that the distribution subsystem stopped, and why. Withdraws its
+    /// telemetry (and with it the capabilities the manager gates on) for the
+    /// rest of the process's life.
+    pub fn mark_distribution_stopped(&self, reason: String) {
+        self.distribution_stopped.store(Some(std::sync::Arc::new(reason)));
+        self.distribution_enabled.store(false, Ordering::Relaxed);
+    }
+
+    /// Why the distribution subsystem stopped, if it did.
+    pub fn distribution_stopped(&self) -> Option<std::sync::Arc<String>> {
+        self.distribution_stopped.load_full()
+    }
+
+    /// Record that the native-UDP plane stopped, and why.
+    pub fn mark_udp_relay_stopped(&self, reason: String) {
+        self.udp_relay_stopped.store(Some(std::sync::Arc::new(reason)));
+    }
+
+    /// Why the native-UDP plane stopped, if it did.
+    pub fn udp_relay_stopped(&self) -> Option<std::sync::Arc<String>> {
+        self.udp_relay_stopped.load_full()
+    }
+
+    /// The native-UDP plane is running again.
+    pub fn clear_udp_relay_stopped(&self) {
+        self.udp_relay_stopped.store(None);
     }
 
     pub fn uptime_secs(&self) -> u64 {

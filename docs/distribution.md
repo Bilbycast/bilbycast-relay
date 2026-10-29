@@ -111,6 +111,30 @@ So roll out in this order:
    then each tier below it. A relay that only takes WHIP from edges and feeds
    no cascade can go any time after step 1.
 
+## When distribution fails, the relay keeps forwarding
+
+Distribution is optional beside the forwarder, and a failure in it costs
+distribution and nothing else. If the subsystem cannot start — an origin root
+the service user cannot write, an HTTP or ingest address already taken — or
+stops later, the relay logs `viewer-distribution subsystem stopped: <reason>`,
+raises a Critical `relay_distribution_stopped` event naming the reason, stops
+advertising `viewer-distribution` and `origin-policy`, refuses every
+`configure_distribution` push from then on (so the manager keeps a drop or a
+clip expiry it sends as owed, rather than settling one that went nowhere), and
+reports `"distribution": "stopped"` on its public `/health` and
+`distribution_error` on its manager health. QUIC and native-UDP tunnels carry
+on. Before relay#15 the same failure exited the whole
+process, and on 2026-09-22 a root-owned `/var/lib/bilbycast/relay/origin` put
+a production relay that used no distribution at all into a restart loop.
+
+The subsystem is not retried in-process: fix the cause (for that one,
+`chown -R bilbycast-relay: /var/lib/bilbycast/relay/origin`) and restart the
+relay. `upgrade-relay.sh` checks the origin root is writable by the service
+user before it swaps the binary, and warns after the upgrade if `/health` says
+the subsystem stopped. A distribution binary runs the subsystem even with no
+`distribution` block in its config; set `"distribution": {"enabled": false}`
+on a host that should not.
+
 ## Endpoints (browser-facing HTTP listener, default `:4485`)
 
 | Method | Path | Purpose |
@@ -1521,13 +1545,18 @@ up. Two things do still need care:
   operator pointed it at by mistake. A directory that exists, is not empty and
   carries no marker is refused rather than adopted (unless it has the shape of
   a store written before the marker existed — see `origin_storage_dir` under
-  "Configuration" below). That refusal **is** fatal to the relay, not just to
-  the distribution half: `run_distribution` returns the error, `main` exits on
-  the first subsystem to stop, and under the packaged unit's `Restart=always`
-  the process comes back every 3 s and refuses again, logging
-  `viewer-distribution subsystem stopped: origin storage dir … is not empty and
-  was not created by the relay` each time. So the symptom is a relay that will
-  not stay up, and the log line is the only place it is explained.
+  "Configuration" below). That refusal costs distribution and nothing else
+  (see [When distribution fails, the relay keeps
+  forwarding](#when-distribution-fails-the-relay-keeps-forwarding)): the relay
+  logs `viewer-distribution subsystem stopped: distribution origin storage dir
+  <root>: origin storage dir … is not empty and was not created by the relay`,
+  raises a Critical `relay_distribution_stopped` event, stops advertising
+  `viewer-distribution` and `origin-policy`, reports `"distribution":
+  "stopped"` on `/health`, and keeps forwarding tunnels. Distribution is not
+  retried in-process: restore the marker or point `origin_storage_dir` at a
+  directory of its own, then restart the relay. (Before relay#15 the refusal
+  ended the whole process, which under `Restart=always` came back every 3 s
+  and refused again.)
 
 **Sizing a whole-event window.** The window costs relay disk, not device
 memory — a viewer holds only `backBufferLength`, whatever the window. Measured
@@ -1567,13 +1596,15 @@ counter to look at first when a viewer reports going black.
 ### Capability bits
 
 The same health payload carries a `capabilities` array of up to three strings.
-The two distribution bits are the ones the manager gates on; `udp-relay`
-belongs to the opaque forwarder and no manager code reads it today.
+`udp-relay` belongs to the opaque forwarder: the manager (v0.89.0+) refuses a
+native-UDP tunnel or a relayed bond leg through a relay whose capabilities lack
+it (422 `relay_lacks_udp_plane`). The two distribution bits gate the
+distribution pushes.
 
 | Bit | Set when | What it gates |
 |---|---|---|
-| `udp-relay` | `udp_relay_enabled` (default true) | The native SRT/RIST plain-UDP plane — unrelated to distribution |
-| `viewer-distribution` | the subsystem has published a telemetry sample | The WHEP SFU + LL-HLS/CMAF origin surfaces |
+| `udp-relay` | `udp_relay_enabled` (default true) and the plane is running — withdrawn while its bind is failing (`udp_relay_error` on health) | The native SRT/RIST plain-UDP plane — unrelated to distribution |
+| `viewer-distribution` | the subsystem has published a telemetry sample, and has not stopped since (`distribution_error` on health) | The WHEP SFU + LL-HLS/CMAF origin surfaces |
 | `origin-policy` | same condition as `viewer-distribution` | That this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` arrived later (v0.13.0) and is not covered by the bit, nor gated on it |
 
 The last one exists because the failure it prevents is silent. A relay that
@@ -1914,10 +1945,10 @@ See `../../testbed/configs/relay-distribution.json`:
   a segment or two rather than the whole DVR depth. Give it a directory of its
   own — everything under it becomes evictable, and a non-empty directory
   carrying no `.bilbycast-origin` marker is refused rather than adopted — and
-  the refusal takes the whole relay down, not just the distribution
-  subsystem: `run_distribution` returns the error and `main` exits on the
-  first subsystem to stop, so under the packaged unit's `Restart=always` the
-  process restarts every 3 s until the path is fixed. The one exception is a
+  the refusal stops the distribution subsystem until the path is fixed and the
+  relay restarted, while the relay keeps forwarding (see [When distribution
+  fails, the relay keeps
+  forwarding](#when-distribution-fails-the-relay-keeps-forwarding)). The one exception is a
   directory with the shape of a store written by a relay that predates the
   marker (`looks_like_origin_store` in `origin.rs`, read deliberately
   narrowly): every top-level entry is a stream directory; inside, nothing but

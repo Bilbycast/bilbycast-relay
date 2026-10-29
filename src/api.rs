@@ -95,6 +95,16 @@ struct HealthResponse {
     /// Manager-link state. Omitted when no manager is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     manager: Option<ManagerLinkStatus>,
+    /// `"running"` while the viewer-distribution subsystem publishes
+    /// telemetry, `"stopped"` once it has stopped (relay#15 — the relay keeps
+    /// forwarding). Omitted when distribution is not running and never ran.
+    /// The reason is in the log and the manager event, not on this
+    /// unauthenticated endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distribution: Option<&'static str>,
+    /// `"stopped"` once the native-UDP plane has stopped; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    udp_relay: Option<&'static str>,
 }
 
 async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
@@ -109,6 +119,14 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
         udp_sessions_total: state.ctx.udp_sessions.count(),
         udp_sessions_active: state.ctx.udp_sessions.active_count(),
         manager: state.relay_stats.manager_link_status(),
+        distribution: if state.relay_stats.distribution_stopped().is_some() {
+            Some("stopped")
+        } else if state.relay_stats.distribution_snapshot().is_some() {
+            Some("running")
+        } else {
+            None
+        },
+        udp_relay: state.relay_stats.udp_relay_stopped().map(|_| "stopped"),
     })
 }
 

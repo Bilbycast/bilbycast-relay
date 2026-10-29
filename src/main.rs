@@ -10,7 +10,7 @@ use bilbycast_relay::build_tcp_listener;
 use bilbycast_relay::config::RelayConfig;
 use bilbycast_relay::distribution_control::{DistributionControl, RuntimeDistConfig};
 use bilbycast_relay::stats::RelayStats;
-use bilbycast_relay::{api, manager, observability, server, udp_relay};
+use bilbycast_relay::{api, manager, observability, server, supervise, udp_relay};
 #[cfg(feature = "viewer-distribution")]
 use bilbycast_relay::distribution;
 
@@ -350,43 +350,42 @@ async fn main() -> Result<()> {
     });
 
     // Start the plain-UDP relay data plane (native SRT/RIST, no QUIC) unless
-    // disabled. Bind failures inside are non-fatal (logged); if it can't bind
-    // any listener the task exits and the relay continues QUIC-only.
-    let udp_relay_handle = if config.udp_relay_enabled {
-        let config = config.clone();
-        let ctx = ctx.clone();
-        Some(tokio::spawn(async move {
-            if let Err(e) = udp_relay::run_udp_relay(&config, ctx).await {
-                tracing::warn!("native-UDP relay not started: {e:#}");
-            }
-        }))
+    // disabled. A listener that cannot bind is skipped; if none binds the
+    // supervisor records it, retries the bind with backoff, and the relay
+    // continues QUIC-only meanwhile (relay#15) — it must never take the
+    // forwarder down with it.
+    if config.udp_relay_enabled {
+        supervise::supervise_udp_relay(
+            udp_relay::bind_udp_relay,
+            config.clone(),
+            ctx.clone(),
+            relay_stats.clone(),
+            event_sender.clone(),
+        );
     } else {
         tracing::info!("native-UDP relay disabled by config");
-        None
-    };
+    }
 
     // Start the viewer-distribution subsystem (WHEP SFU + LL-HLS origin) when
     // compiled in AND enabled in config. Isolated behind the feature so a
     // plain opaque-forwarder build carries none of it.
+    //
+    // A failure here costs distribution and nothing else: the watcher logs
+    // it, withdraws the subsystem's capabilities and raises a Critical event,
+    // and the forwarder keeps running (relay#15).
     #[cfg(feature = "viewer-distribution")]
-    let distribution_handle = if let Some(control) = distribution_control.clone() {
+    if let Some(control) = distribution_control.clone() {
         let dist_cfg = config.distribution.clone().unwrap_or_default();
         let hub = Arc::new(distribution::hub::DistributionHub::new());
         let cancel = tokio_util::sync::CancellationToken::new();
         let events = event_sender.clone();
         let dist_stats = relay_stats.clone();
         tracing::info!("viewer-distribution subsystem enabled");
-        Some(tokio::spawn(async move {
-            if let Err(e) =
-                distribution::run_distribution(dist_cfg, control, hub, cancel, events, dist_stats)
-                    .await
-            {
-                tracing::error!("viewer-distribution subsystem stopped: {e:#}");
-            }
-        }))
-    } else {
-        None
-    };
+        let handle = tokio::spawn(async move {
+            distribution::run_distribution(dist_cfg, control, hub, cancel, events, dist_stats).await
+        });
+        supervise::watch_distribution(handle, relay_stats.clone(), event_sender.clone());
+    }
 
     #[cfg(not(feature = "viewer-distribution"))]
     if config.distribution.as_ref().map(|d| d.enabled).unwrap_or(false) {
@@ -397,31 +396,13 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Wait for any to finish
+    // Wait for any to finish. Only these end the process: the forwarder, the
+    // REST API, the manager link and a shutdown signal. The optional
+    // subsystems are watched above instead — their ending is recorded and
+    // reported, never fatal (relay#15).
     tokio::select! {
         _ = api_handle => tracing::info!("API server stopped"),
         _ = quic_handle => tracing::info!("QUIC server stopped"),
-        _ = async {
-            #[cfg(feature = "viewer-distribution")]
-            if let Some(h) = distribution_handle {
-                let _ = h.await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-            #[cfg(not(feature = "viewer-distribution"))]
-            std::future::pending::<()>().await;
-        } => {
-            tracing::info!("viewer-distribution subsystem stopped");
-        }
-        _ = async {
-            if let Some(h) = udp_relay_handle {
-                let _ = h.await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        } => {
-            tracing::info!("native-UDP relay stopped");
-        }
         _ = async {
             if let Some(h) = manager_handle {
                 let _ = h.await;

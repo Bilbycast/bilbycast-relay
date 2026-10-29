@@ -26,6 +26,9 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 pub mod stats;
+/// Watches the optional subsystems so a failure in one costs that subsystem,
+/// never the forwarder (relay#15).
+pub mod supervise;
 pub mod tunnel_router;
 pub mod udp_relay;
 pub mod util;

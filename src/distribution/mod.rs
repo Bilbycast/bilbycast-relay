@@ -319,8 +319,13 @@ fn follow_manager_storage(
 }
 
 /// Run the whole viewer-distribution subsystem: the ingest listener + the
-/// browser-facing HTTP signaling / origin listeners. Returns when the
-/// subsystem's cancel token fires or every listener dies.
+/// browser-facing HTTP signaling / origin listeners.
+///
+/// Returns `Ok` only when `cancel` fires. A listener that stops (or fails to
+/// bind) ends the subsystem with an `Err` naming it, so the caller can report
+/// why distribution went down. Every return cancels `cancel`, so the tasks the
+/// subsystem spawned — telemetry, retention sweep, cascade pulls, the ingest
+/// listener — stop with it rather than outliving it detached.
 pub async fn run_distribution(
     config: DistributionConfig,
     control: Arc<DistributionControl>,
@@ -329,6 +334,7 @@ pub async fn run_distribution(
     events: EventSender,
     relay_stats: Arc<crate::stats::RelayStats>,
 ) -> Result<()> {
+    let _stop_children = cancel.clone().drop_guard();
     let origin_cfg = crate::distribution::origin::OriginConfig {
         root: config
             .origin_storage_dir
@@ -349,7 +355,12 @@ pub async fn run_distribution(
         min_free_bytes = config.origin_min_free_bytes,
         "distribution origin: disk-backed store"
     );
-    let origin = Arc::new(OriginStore::new(origin_cfg)?);
+    // Name the directory: the bare io error ("Permission denied (os error
+    // 13)") is what the operator saw on 2026-09-22, with nothing saying where.
+    let origin_root = origin_cfg.root.clone();
+    let origin = Arc::new(OriginStore::new(origin_cfg).with_context(|| {
+        format!("distribution origin storage dir {}", origin_root.display())
+    })?);
 
     // Storage policy from the manager. The bootstrap values above are only a
     // seed; from here the manager owns retention, and a DVR session can widen
@@ -447,7 +458,7 @@ pub async fn run_distribution(
     let ingest_control = control.clone();
     let ingest_events = events.clone();
     let ingest_handle = tokio::spawn(async move {
-        if let Err(e) = ingest::run_ingest(
+        ingest::run_ingest(
             ingest_config,
             ingest_control,
             ingest_hub,
@@ -455,9 +466,6 @@ pub async fn run_distribution(
             ingest_cancel,
         )
         .await
-        {
-            tracing::error!("distribution ingest listener stopped: {e:#}");
-        }
     });
 
     // Start the browser-facing HTTP signaling + origin listeners.
@@ -471,7 +479,9 @@ pub async fn run_distribution(
         http_addrs.push(addr);
     }
 
-    let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Each listener task answers with why it ended, which becomes the
+    // subsystem's error unless the subsystem is being shut down.
+    let mut set: tokio::task::JoinSet<String> = tokio::task::JoinSet::new();
     for addr in http_addrs {
         let router = router.clone();
         let http_cancel = cancel.clone();
@@ -482,21 +492,33 @@ pub async fn run_distribution(
                     let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
                     let served = axum::serve(listener, make_svc)
                         .with_graceful_shutdown(async move { http_cancel.cancelled().await });
-                    if let Err(e) = served.await {
-                        tracing::error!("distribution HTTP on {addr}: {e}");
+                    match served.await {
+                        Ok(()) => format!("distribution HTTP on {addr} stopped"),
+                        Err(e) => format!("distribution HTTP on {addr}: {e}"),
                     }
                 }
-                Err(e) => tracing::error!("failed to bind distribution HTTP on {addr}: {e}"),
+                Err(e) => format!("failed to bind distribution HTTP on {addr}: {e}"),
             }
         });
     }
 
-    tokio::select! {
-        _ = cancel.cancelled() => {}
-        _ = set.join_next() => {}
-        _ = ingest_handle => {}
+    let stopped = tokio::select! {
+        _ = cancel.cancelled() => return Ok(()),
+        ended = set.join_next() => match ended {
+            Some(Ok(why)) => why,
+            Some(Err(join)) => format!("distribution HTTP listener task failed: {join}"),
+            None => "no distribution HTTP listener is configured".to_string(),
+        },
+        ended = ingest_handle => match ended {
+            Ok(Ok(())) => "distribution ingest listener stopped".to_string(),
+            Ok(Err(e)) => format!("distribution ingest listener stopped: {e:#}"),
+            Err(join) => format!("distribution ingest listener task failed: {join}"),
+        },
+    };
+    if cancel.is_cancelled() {
+        return Ok(());
     }
-    Ok(())
+    Err(anyhow::anyhow!(stopped))
 }
 
 /// Build the axum router for the distribution HTTP surface. `pub` so

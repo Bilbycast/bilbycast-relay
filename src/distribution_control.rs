@@ -158,6 +158,12 @@ impl DistributionControl {
         self.drop_rx.lock().ok().and_then(|mut g| g.take())
     }
 
+    /// The origin took the drop queue and has since let it go: the
+    /// subsystem has stopped, and a drop sent now would be lost.
+    pub fn drops_closed(&self) -> bool {
+        self.drop_tx.is_closed()
+    }
+
     /// Retire a stream: its media goes, its clips stay.
     ///
     /// Carried on the same channel as a drop, distinguished by a prefix, so

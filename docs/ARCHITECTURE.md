@@ -43,8 +43,8 @@ The relay carries three logically distinct path types, all forwarded the same op
 +===========================================================================+
 |                          bilbycast-relay process                          |
 |                                                                           |
-|  tokio::select! { quic_server, udp_relay(:4434), rest_api, manager,       |
-|                   distribution(:4485 + :4486), ctrl_c }                   |
+|  tokio::select! { quic_server, rest_api, manager, ctrl_c }  — any ends it |
+|  watched, never fatal: udp_relay(:4434), distribution(:4485 + :4486)      |
 |                                                                           |
 |  +----------------------------------+   +-----------------------------+  |
 |  |        QUIC Server (:4433)       |   |     REST API (:4480)        |  |
@@ -312,9 +312,12 @@ written on the slot a datagram arrived *from*, and keepalives deliberately do no
 stamp, so on a one-way path only the transmitting end's slot is protected — the
 hold-down raises the cost of a takeover, `require_bind_auth: true` is the control.
 
-Bind failures on `:4434` are non-fatal — the relay logs, drops the `udp-relay`
-capability, and continues QUIC-only, so an upgrade never bricks a relay over a
-busy port.
+Bind failures on `:4434` are non-fatal — the relay logs, raises a Critical
+`relay_udp_plane_stopped` event, drops the `udp-relay` capability, and continues
+QUIC-only while it retries the bind, so an upgrade never bricks a relay over a
+busy port. The same holds for the viewer-distribution subsystem (not retried):
+`main` does not wait on either optional task; `src/supervise.rs` watches them
+and records a stop (relay#15).
 
 ## Viewer Distribution (optional role)
 

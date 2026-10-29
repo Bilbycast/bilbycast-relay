@@ -30,7 +30,7 @@ pub struct SessionContext {
     pub router: Arc<TunnelRouter>,
     /// Native plain-UDP relay sessions (no QUIC). Shares the QUIC path's
     /// `router` bind-token registry for auth; carries its own source-address
-    /// rendezvous pairing. Populated by [`crate::udp_relay::run_udp_relay`].
+    /// rendezvous pairing. Populated by [`crate::udp_relay::serve_udp_relay`].
     pub udp_sessions: Arc<crate::udp_relay::UdpSessionRouter>,
     /// Map of connection_id -> Connection for sending notifications.
     pub edge_connections: DashMap<String, Connection>,
