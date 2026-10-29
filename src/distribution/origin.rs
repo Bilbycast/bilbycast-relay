@@ -43,6 +43,7 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use super::{token, DistributionState};
+use crate::manager::events::{category, EventSender, EventSeverity};
 
 mod marks;
 pub mod metrics;
@@ -353,11 +354,13 @@ pub struct OriginStore {
     /// Anchor for `last_put_ms`, so idle time needs no wall clock.
     started: Instant,
     /// Serialises clip admission — see [`admit_clips`](OriginStore::admit_clips) —
-    /// and a stream's removal against it. One lock for the store, not one per
-    /// stream: admission happens when an operator presses Export, so there is
-    /// nothing here to contend for. In an `Arc` so the removal, which runs on
-    /// the blocking pool, can take it there.
-    clip_admission: Arc<std::sync::Mutex<()>>,
+    /// and a stream's removal against it, and holds what each stream and each
+    /// credential has spent of its export allowance ([`ClipExportRate`]), so
+    /// the allowance is checked and charged in the same step as the count and
+    /// the byte budget. One lock for the store, not one per stream: admission
+    /// happens when somebody presses Export, never on the segment path. In an
+    /// `Arc` so the removal, which runs on the blocking pool, can take it there.
+    clip_admission: Arc<std::sync::Mutex<ClipExportRate>>,
     /// Serialises read-modify-write of a marks file, and a stream's removal
     /// against it — see [`marks`] and [`lock_marks`](OriginStore::lock_marks).
     /// Store-wide for the same reason as `clip_admission`: marks are made by
@@ -500,7 +503,107 @@ pub enum ClipRefusal {
     /// it (or nothing has been ingested yet), and a request must not make it
     /// again.
     NoStream,
+    /// The clips this request would file cost more of an export allowance
+    /// than is left — the stream's, or the credential's own. Nothing was filed
+    /// and nothing was charged. `asked_secs` is what the new clips would have
+    /// cost (see `clip_charge_secs`); the same request is admitted
+    /// `retry_after` from now, provided nobody else spends the allowance
+    /// first. `first` is set on the refusal that starts an episode — the one
+    /// that raises the operator's event.
+    RateLimited {
+        limit: ExportLimit,
+        asked_secs: u64,
+        retry_after: Duration,
+        first: bool,
+    },
     Io(std::io::Error),
+}
+
+/// Which export allowance refused a clip request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportLimit {
+    /// The stream's own, shared by every viewer of the feed
+    /// (`FEED_EXPORT_ALLOWANCE`). What bounds the work commissioned of the
+    /// edge that cuts the feed.
+    Feed,
+    /// The share of it one credential may spend (`CREDENTIAL_EXPORT_ALLOWANCE`).
+    /// What stops one token spending a feed's allowance for everyone else.
+    Credential,
+}
+
+impl ExportLimit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Feed => "feed",
+            Self::Credential => "credential",
+        }
+    }
+
+    fn allowance(self) -> &'static ExportAllowance {
+        match self {
+            Self::Feed => &FEED_EXPORT_ALLOWANCE,
+            Self::Credential => &CREDENTIAL_EXPORT_ALLOWANCE,
+        }
+    }
+}
+
+/// Which kind of token a clip request or delete arrived with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    Viewer,
+    Ingest,
+}
+
+impl CredentialKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Ingest => "ingest",
+        }
+    }
+}
+
+/// The credential a clip request or delete was admitted on: what the
+/// per-credential export allowance is charged to, and what a delete is
+/// attributed to.
+///
+/// Named by a SHA-256 of the token's [`token::Signature`], never by its text:
+/// one token verifies under any number of spellings (see `Signature`), and an
+/// allowance counted on the text would give each spelling an allowance of its
+/// own. The hash, not the signature itself, because the signature *is* the
+/// secret half of the bearer token, and the [`fingerprint`](Self::fingerprint)
+/// built from this goes into logs and onto the manager's Events page.
+///
+/// It names a token, not a person: the manager records no mint, and whoever
+/// can mint — a viewing link's key, a portal login — has a new token, and a
+/// new credential allowance, on every mint. The portal mints one per clip it
+/// deletes or downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipCredential {
+    pub kind: CredentialKind,
+    key: CredentialKey,
+}
+
+/// Leading bytes of the SHA-256 of a token's signature.
+type CredentialKey = [u8; 16];
+
+impl ClipCredential {
+    pub fn new(kind: CredentialKind, signature: &token::Signature) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(signature);
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&digest[..16]);
+        Self { kind, key }
+    }
+
+    /// Twelve hex digits naming the token in logs and events: the first six
+    /// bytes of the SHA-256 of its 32 signature bytes. Somebody holding the
+    /// token can reproduce it — the signature is the hex after the token's
+    /// last `.`:
+    /// `printf %s <hex> | xxd -r -p | sha256sum | cut -c1-12`.
+    pub fn fingerprint(&self) -> String {
+        self.key[..6].iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 /// Where a clip request can be filed.
@@ -561,6 +664,276 @@ fn write_record(dir: &std::path::Path, rec: &ClipRecord) -> std::io::Result<()> 
         return Err(e);
     }
     Ok(())
+}
+
+/// A clip request worked out against what the stream holds, nothing filed yet.
+///
+/// Planned and committed in two steps so the export allowance can be charged
+/// in between for exactly the clips the request files — a re-sent mark already
+/// on file commissions no cut, and must not cost one.
+struct ClipFiling {
+    dir: PathBuf,
+    /// One record per ask, in request order; `true` for one this request
+    /// files, `false` for a mark already on file (handed back as it stands).
+    records: Vec<(ClipRecord, bool)>,
+}
+
+impl ClipFiling {
+    /// What the clips this request files cost of an export allowance.
+    fn charge_secs(&self) -> u64 {
+        self.records
+            .iter()
+            .filter(|(_, new)| *new)
+            .map(|(rec, _)| clip_charge_secs(rec.pre_secs, rec.post_secs))
+            .sum()
+    }
+
+    /// File the new records, in request order, stopping at the first that
+    /// cannot be written (the ones before it stand, as they always have).
+    fn commit(self) -> std::io::Result<Vec<ClipRecord>> {
+        let mut out = Vec::with_capacity(self.records.len());
+        for (rec, new) in self.records {
+            if new {
+                write_record(&self.dir, &rec)?;
+            }
+            out.push(rec);
+        }
+        Ok(out)
+    }
+}
+
+/// A filing failure as the refusal the handler words.
+fn clip_io_refusal(e: std::io::Error) -> ClipRefusal {
+    match e.kind() {
+        std::io::ErrorKind::AlreadyExists => ClipRefusal::NamesExhausted(e.to_string()),
+        std::io::ErrorKind::NotFound => ClipRefusal::NoStream,
+        _ => ClipRefusal::Io(e),
+    }
+}
+
+/// What one clip costs of an export allowance, in clip-seconds: its length,
+/// but never less than [`CLIP_EXPORT_MIN_CHARGE_SECS`].
+///
+/// Length, because the edge's all-intra encode scales with it — a count would
+/// price a one-second clip and a sixty-second one the same. The floor, because
+/// every cut also pays a fixed cost the length does not show: the decode starts
+/// at the IDR before the mark, an encoder is opened, the recording index is
+/// read, and the result is uploaded. Without it a stream of one-second clips
+/// bought a full cut per clip-second.
+fn clip_charge_secs(pre_secs: u32, post_secs: u32) -> u64 {
+    u64::from(pre_secs.saturating_add(post_secs))
+        .min(u64::from(MAX_CLIP_TOTAL_SECS))
+        .max(CLIP_EXPORT_MIN_CHARGE_SECS)
+}
+
+/// The least one clip is charged, whatever its length — see [`clip_charge_secs`].
+const CLIP_EXPORT_MIN_CHARGE_SECS: u64 = 5;
+
+/// An export allowance: how many clip-seconds may be commissioned at once, and
+/// how fast a spent allowance comes back.
+///
+/// A rolling refill, not an hourly window: an allowance spent in full is
+/// admitting again a clip-second at a time as it refills, so in the hour after
+/// a full allowance up to its allowance plus an hour's refill can be admitted
+/// — about twice the allowance when the two are equal, as they are for a
+/// feed. Over any longer stretch the rate is the refill.
+struct ExportAllowance {
+    /// Clip-seconds that may be commissioned at once from a full allowance.
+    burst_secs: u64,
+    /// Clip-seconds the allowance regains in an hour.
+    refill_secs_per_hour: u64,
+}
+
+impl ExportAllowance {
+    /// Refill time one clip-second costs.
+    const fn cost_ms(&self) -> u64 {
+        3_600_000 / self.refill_secs_per_hour
+    }
+
+    /// How far ahead of now a full allowance may be spent: the burst, in
+    /// refill time.
+    const fn tolerance(&self) -> Duration {
+        Duration::from_millis(self.cost_ms() * self.burst_secs)
+    }
+
+    /// Charge `secs` to an allowance in the state `spent`, at `now`.
+    ///
+    /// GCRA (ITU-T I.371's virtual scheduling): `full_at` is when the allowance
+    /// would be whole again, each clip-second pushes it on by one cost, and a
+    /// charge is admitted if that leaves it no further ahead of now than the
+    /// burst is long. `Ok` is the new `full_at`; `Err` is how long until this
+    /// same charge would be admitted. Integer arithmetic on a monotonic clock,
+    /// so a wall-clock step neither refills nor drains it.
+    fn charge(&self, spent: Option<&Spent>, secs: u64, now: Instant) -> Result<Instant, Duration> {
+        let from = spent.map_or(now, |s| s.full_at.max(now));
+        let full_at = from + Duration::from_millis(self.cost_ms().saturating_mul(secs));
+        let ahead = full_at - now;
+        let tolerance = self.tolerance();
+        if ahead > tolerance {
+            Err(ahead - tolerance)
+        } else {
+            Ok(full_at)
+        }
+    }
+}
+
+/// Each stream's export allowance, shared by every viewer of the feed: twenty
+/// minutes of clips, refilling at twenty minutes an hour.
+///
+/// The bound on the work a feed may commission of its edge — the cut is a
+/// decode and an all-intra encode on the edge that fills the stream, through
+/// one permit it shares with the operator's own Replay exports. That work is
+/// per stream, so this is the bound that holds whoever asks: a viewer who can
+/// mint tokens gets a fresh [`CREDENTIAL_EXPORT_ALLOWANCE`] on every mint, but
+/// never a fresh one of these.
+///
+/// **What it costs the edge at worst** is more than the clip-seconds it
+/// admits. The edge retries a cut whose upload fails for any reason it does not
+/// count as permanent, up to three attempts (`MAX_ATTEMPTS` in
+/// bilbycast-edge's `engine::cmaf::clips`), each a full encode; so a feed
+/// commissions at most three times its admitted clip-seconds of encoding —
+/// 3,600 seconds of footage an hour once the first allowance is spent — and,
+/// with [`CLIP_EXPORT_MIN_CHARGE_SECS`], at most 240 new cuts an hour.
+const FEED_EXPORT_ALLOWANCE: ExportAllowance =
+    ExportAllowance { burst_secs: 1200, refill_secs_per_hour: 1200 };
+
+/// The share of a feed's allowance one credential may spend: seventeen minutes
+/// of clips, refilling at ten minutes an hour.
+///
+/// So a single token — a viewing link copied out of an address bar, a script
+/// holding one — can never take more than half of a feed's hourly refill, and
+/// everyone else watching it keeps at least the other half. It bounds one
+/// minted token, not a person: whoever can mint has a new one on every mint
+/// (see [`ClipCredential`]), which is why the feed's allowance exists as well.
+const CREDENTIAL_EXPORT_ALLOWANCE: ExportAllowance =
+    ExportAllowance { burst_secs: 1020, refill_secs_per_hour: 600 };
+
+/// The allowances' shape, checked where it is set.
+///
+/// **Every request the count and the byte budget admit fits a full allowance
+/// of either kind.** The byte budget limits one request to the clip-seconds
+/// `MAX_CLIP_BYTES_PER_STREAM` holds at the 35 Mbit/s estimate (981), and the
+/// handler limits it to `MAX_CLIPS_PER_REQUEST` clips, each charged at least
+/// the floor. That is what makes a refusal's `Retry-After` true — a request
+/// bigger than an allowance's burst could never be admitted, however long it
+/// waited — and what keeps the first export of a feed from ever being refused.
+const _: () = {
+    let most_seconds_one_request_holds = MAX_CLIP_BYTES_PER_STREAM / (35_000_000 / 8);
+    let most_clips_one_request_files = MAX_CLIPS_PER_REQUEST as u64 * CLIP_EXPORT_MIN_CHARGE_SECS;
+    let allowances = [&FEED_EXPORT_ALLOWANCE, &CREDENTIAL_EXPORT_ALLOWANCE];
+    let mut i = 0;
+    while i < allowances.len() {
+        let a = allowances[i];
+        assert!(
+            a.burst_secs >= most_seconds_one_request_holds,
+            "a request the byte budget admits would never fit this export allowance"
+        );
+        assert!(
+            a.burst_secs >= most_clips_one_request_files,
+            "fifty clips at the minimum charge would never fit this export allowance"
+        );
+        assert!(
+            a.refill_secs_per_hour > 0 && 3_600_000 % a.refill_secs_per_hour == 0,
+            "an export allowance's refill must be a whole number of ms per clip-second"
+        );
+        i += 1;
+    }
+    assert!(
+        CREDENTIAL_EXPORT_ALLOWANCE.refill_secs_per_hour * 2
+            <= FEED_EXPORT_ALLOWANCE.refill_secs_per_hour,
+        "one credential may take at most half of a feed's refill"
+    );
+};
+
+/// What one allowance has spent.
+struct Spent {
+    /// When the allowance is whole again.
+    full_at: Instant,
+    /// This allowance has refused since it was last whole: the event for its
+    /// episode has been raised, and is not raised again until it is whole.
+    refused: bool,
+}
+
+/// Why the export allowance refused, as [`ClipRefusal::RateLimited`] reports it.
+#[derive(Debug)]
+struct RateRefusal {
+    limit: ExportLimit,
+    retry_after: Duration,
+    first: bool,
+}
+
+/// What every stream, and every credential on every stream, has spent of its
+/// export allowance. Held inside `clip_admission`, so it is checked and
+/// charged in the same step as the count and the byte budget.
+///
+/// In memory only: a relay restart hands every allowance back whole, and only
+/// an operator can restart a relay. An allowance that is whole again is
+/// forgotten, which is also what bounds the maps — an entry needs a charge, a
+/// charge needs a feed with allowance left, and a feed's allowance is bounded.
+#[derive(Default)]
+struct ClipExportRate {
+    feeds: std::collections::HashMap<String, Spent>,
+    credentials: std::collections::HashMap<(String, CredentialKey), Spent>,
+}
+
+impl ClipExportRate {
+    /// Charge `secs` to this stream's allowance and the credential's share of
+    /// it, or refuse and charge neither.
+    ///
+    /// Both must admit. When both refuse, the longer wait is the one reported:
+    /// it is the one a retry has to outlast.
+    fn take(
+        &mut self,
+        stream: &str,
+        credential: &ClipCredential,
+        secs: u64,
+        now: Instant,
+    ) -> Result<(), RateRefusal> {
+        self.feeds.retain(|_, s| s.full_at > now);
+        self.credentials.retain(|_, s| s.full_at > now);
+        if secs == 0 {
+            return Ok(());
+        }
+        let key = (stream.to_string(), credential.key);
+        let feed = FEED_EXPORT_ALLOWANCE.charge(self.feeds.get(stream), secs, now);
+        let own = CREDENTIAL_EXPORT_ALLOWANCE.charge(self.credentials.get(&key), secs, now);
+        let (limit, retry_after) = match (feed, own) {
+            (Ok(feed_full_at), Ok(own_full_at)) => {
+                charge_to(self.feeds.entry(stream.to_string()), feed_full_at);
+                charge_to(self.credentials.entry(key), own_full_at);
+                return Ok(());
+            }
+            (Err(wait), Ok(_)) => (ExportLimit::Feed, wait),
+            (Ok(_), Err(wait)) => (ExportLimit::Credential, wait),
+            (Err(feed_wait), Err(own_wait)) if own_wait > feed_wait => {
+                (ExportLimit::Credential, own_wait)
+            }
+            (Err(feed_wait), Err(_)) => (ExportLimit::Feed, feed_wait),
+        };
+        let spent = match limit {
+            ExportLimit::Feed => self.feeds.get_mut(stream),
+            ExportLimit::Credential => self.credentials.get_mut(&key),
+        };
+        // There is an entry: an allowance refuses only once something has been
+        // charged to it, because every request the byte budget admits fits a
+        // whole one (the `const` block above).
+        let first = spent.is_none_or(|s| !std::mem::replace(&mut s.refused, true));
+        Err(RateRefusal { limit, retry_after, first })
+    }
+
+    /// Forget a stream's allowances: a dropped session's, so a new session
+    /// later given the same feed name does not inherit what the old one spent.
+    fn forget(&mut self, stream: &str) {
+        self.feeds.remove(stream);
+        self.credentials.retain(|(s, _), _| s != stream);
+    }
+}
+
+/// Move an allowance's `full_at` on, keeping its episode.
+fn charge_to<K>(entry: std::collections::hash_map::Entry<'_, K, Spent>, full_at: Instant) {
+    entry
+        .and_modify(|s| s.full_at = full_at)
+        .or_insert(Spent { full_at, refused: false });
 }
 
 /// Suffix on the temporary file a clip upload is written to.
@@ -807,7 +1180,7 @@ impl OriginStore {
             streams: DashMap::new(),
             total_bytes: AtomicU64::new(0),
             started: Instant::now(),
-            clip_admission: Arc::new(std::sync::Mutex::new(())),
+            clip_admission: Arc::new(std::sync::Mutex::new(ClipExportRate::default())),
             marks_lock: Arc::new(tokio::sync::Mutex::new(())),
             adopt_hold_until_ms: AtomicU64::new(0),
         };
@@ -1413,20 +1786,48 @@ impl OriginStore {
         }
     }
 
-    /// Check this stream's clip budget and file the request, as one operation.
+    /// Check this stream's clip budget and export allowance and file the
+    /// request, as one operation.
     ///
-    /// The two were separate calls with nothing held between them, so two
-    /// viewers of one feed — a link grant and a portal login, both legitimate —
-    /// each read the same count, each passed, and both wrote: a stated ceiling
-    /// of a hundred clips overshot by a batch per concurrent request. One lock
-    /// for the whole store is enough, because admission happens when an
-    /// operator presses Export, not on any hot path.
+    /// The checks and the write were separate calls with nothing held between
+    /// them, so two viewers of one feed — a link grant and a portal login, both
+    /// legitimate — each read the same count, each passed, and both wrote: a
+    /// stated ceiling of a hundred clips overshot by a batch per concurrent
+    /// request. One lock for the whole store is enough, because admission
+    /// happens when somebody presses Export, not on any hot path.
+    ///
+    /// The count and the byte budget bound what a stream **holds**; the export
+    /// allowance ([`ClipExportRate`]) bounds what it **commissions** over time.
+    /// Without it a viewer token could loop export / delete for ever, each
+    /// export an all-intra encode on the edge that cuts the feed, and each
+    /// delete handing the count and the bytes straight back. So a delete
+    /// refunds nothing: the edge has usually started the cut by then (it works
+    /// from a snapshot of the list), so a refund would reopen the loop.
+    ///
+    /// Refusals keep their order — count, bytes, then a name that cannot be
+    /// freed or a dropped stream, and only then the allowance — and each is
+    /// all or nothing: a refused request files no clip and is charged nothing.
+    /// Only clips this request files are charged; a re-sent mark already on
+    /// file costs nothing.
     pub fn admit_clips(
         &self,
         stream: &str,
         req: &ClipRequest,
+        credential: ClipCredential,
     ) -> Result<Vec<ClipRecord>, ClipRefusal> {
-        let _admitting = self.clip_admission.lock().unwrap_or_else(|e| e.into_inner());
+        self.admit_clips_at(stream, req, credential, Instant::now())
+    }
+
+    /// [`admit_clips`](Self::admit_clips) on a clock the caller names, so the
+    /// allowance's arithmetic can be tested without waiting an hour.
+    fn admit_clips_at(
+        &self,
+        stream: &str,
+        req: &ClipRequest,
+        credential: ClipCredential,
+        now: Instant,
+    ) -> Result<Vec<ClipRecord>, ClipRefusal> {
+        let mut rate = self.clip_admission.lock().unwrap_or_else(|e| e.into_inner());
 
         let (have, _landed) = self.clip_usage(stream);
         if have + req.clips.len() > MAX_CLIPS_PER_STREAM {
@@ -1446,19 +1847,39 @@ impl OriginStore {
                 limit: MAX_CLIP_BYTES_PER_STREAM,
             });
         }
-        self.record_clip_requests(stream, req)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::AlreadyExists => ClipRefusal::NamesExhausted(e.to_string()),
-                std::io::ErrorKind::NotFound => ClipRefusal::NoStream,
-                _ => ClipRefusal::Io(e),
-            })
+        let filing = self.plan_clip_requests(stream, req).map_err(clip_io_refusal)?;
+        let asked_secs = filing.charge_secs();
+        rate.take(stream, &credential, asked_secs, now).map_err(|r| {
+            ClipRefusal::RateLimited {
+                limit: r.limit,
+                asked_secs,
+                retry_after: r.retry_after,
+                first: r.first,
+            }
+        })?;
+        // Charged before the write: a disk failure part-way through the commit
+        // over-charges, which is the safe direction on a 500 path.
+        filing.commit().map_err(clip_io_refusal)
     }
 
-    /// Record what was asked for. The media follows later, from the edge.
+    /// [`plan_clip_requests`](Self::plan_clip_requests) and its commit, with no
+    /// count, budget or allowance in the way — for tests about filing alone.
+    #[cfg(test)]
+    fn record_clip_requests(
+        &self,
+        stream: &str,
+        req: &ClipRequest,
+    ) -> std::io::Result<Vec<ClipRecord>> {
+        self.plan_clip_requests(stream, req)?.commit()
+    }
+
+    /// Work out what recording this request means, writing nothing but
+    /// `clips/` itself. The media follows later, from the edge.
     ///
     /// Re-requesting the **same mark** is idempotent: the existing record is
     /// left alone, so asking again for something already cut does not throw
-    /// away the clip sitting there ready.
+    /// away the clip sitting there ready — and costs no export allowance,
+    /// because it commissions no cut.
     ///
     /// A **different** mark that happens to produce the same name is a
     /// different clip and gets a suffix. The name is built from a timecode and
@@ -1466,14 +1887,16 @@ impl OriginStore {
     /// and silently dropping the second, which is what skipping on name alone
     /// did, loses an export the operator asked for and reported nothing.
     ///
+    /// All or nothing: a mark whose every candidate name is held by a
+    /// different mark fails the whole request `AlreadyExists` before anything
+    /// is filed. (Records were once written inside this loop, so the asks
+    /// ahead of an exhausted one were filed — and cut — under a request the
+    /// player reported as refused.)
+    ///
     /// Fails `NotFound` for a stream the relay holds no directory for, and
     /// makes none: `clips/` is created inside an existing stream directory or
     /// not at all.
-    pub fn record_clip_requests(
-        &self,
-        stream: &str,
-        req: &ClipRequest,
-    ) -> std::io::Result<Vec<ClipRecord>> {
+    fn plan_clip_requests(&self, stream: &str, req: &ClipRequest) -> std::io::Result<ClipFiling> {
         let Some(dir) = self.clips_dir(stream) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1500,7 +1923,7 @@ impl OriginStore {
             Err(e) => return Err(e),
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let mut out = Vec::new();
+        let mut records = Vec::new();
         // One listing for the whole request. It used to be re-read per
         // collision — a fresh `read_dir` plus a `read` and a `stat` per record,
         // inside the per-ask loop — so re-sending a batch of fifty against a
@@ -1524,7 +1947,7 @@ impl OriginStore {
                     // pending one — and by the name it was actually filed
                     // under, which is not `ask.name` once a suffix was needed.
                     if let Some(rec) = existing.get(&name) {
-                        out.push(rec.clone());
+                        records.push((rec.clone(), false));
                     }
                 }
                 ClipSlot::Exhausted => {
@@ -1545,13 +1968,15 @@ impl OriginStore {
                         failed: false,
                         error: None,
                     };
-                    write_record(&dir, &rec)?;
+                    // Into the collision map at once, so a second ask for
+                    // this mark in the same request is `Taken` against it —
+                    // one record, and one charge.
                     existing.insert(rec.name.clone(), rec.clone());
-                    out.push(rec);
+                    records.push((rec, true));
                 }
             }
         }
-        Ok(out)
+        Ok(ClipFiling { dir, records })
     }
 
     /// Every clip this stream knows about, ready or not.
@@ -1866,14 +2291,24 @@ impl OriginStore {
         let admission = self.clip_admission.clone();
         let from = dir.to_path_buf();
         let aside = self.cfg.root.join(format!("{REMOVING_PREFIX}{stream}"));
+        let stream = stream.to_string();
         tokio::task::spawn_blocking(move || {
             let _marks = marks;
-            let _admitting = admission.lock().unwrap_or_else(|e| e.into_inner());
-            match std::fs::rename(&from, &aside) {
+            let mut admitting = admission.lock().unwrap_or_else(|e| e.into_inner());
+            let moved = match std::fs::rename(&from, &aside) {
                 Ok(()) => Ok(Some(aside)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(_) => std::fs::remove_dir_all(&from).map(|()| None),
+            };
+            // The session is gone, and so is what it spent of its export
+            // allowance: the manager may start a new session under the same
+            // feed name, and it must not inherit up to an hour of the old one's
+            // exports. Here, not on retirement — an ingest gap is not the end
+            // of a session, so a retired stream keeps what it has spent.
+            if moved.is_ok() {
+                admitting.forget(&stream);
             }
+            moved
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))
@@ -2704,6 +3139,11 @@ pub fn routes() -> Router<Arc<DistributionState>> {
 /// [`require_clip_credential`]. The cut itself happens on the edge — the only
 /// component with a decoder — so all this does is record the ask where the
 /// portal and the edge can both see it.
+///
+/// Within the feed's export allowance and the credential's share of it (see
+/// [`OriginStore::admit_clips`]): past either, `429` with a `Retry-After` and
+/// a sentence the player shows as written. A delete does not refund the
+/// allowance, because the edge has usually already started the cut.
 async fn clips_request(
     State(st): State<Arc<DistributionState>>,
     Path(stream): Path<String>,
@@ -2714,9 +3154,10 @@ async fn clips_request(
     let Some(stream) = super::sanitize_stream_id(&stream) else {
         return (StatusCode::BAD_REQUEST, "invalid stream id").into_response();
     };
-    if let Err(resp) = require_clip_credential(&st, &stream, &headers, query.as_deref()) {
-        return resp;
-    }
+    let credential = match require_clip_credential(&st, &stream, &headers, query.as_deref()) {
+        Ok(credential) => credential,
+        Err(resp) => return resp,
+    };
     if req.clips.is_empty() {
         return (StatusCode::BAD_REQUEST, "no clips requested").into_response();
     }
@@ -2755,23 +3196,29 @@ async fn clips_request(
     // record and a write per ask, and every other method on this store reaches
     // the filesystem through `tokio::fs` for the reason this one must not run
     // on a worker — the same runtime carries the QUIC and native-UDP
-    // forwarding tasks.
+    // forwarding tasks. The event an exhausted allowance raises goes out from
+    // the same task — see `admit_and_report`.
     let origin = st.origin.clone();
+    let events = st.events.clone();
     let for_task = stream.clone();
-    let admitted =
-        match tokio::task::spawn_blocking(move || origin.admit_clips(&for_task, &req)).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(stream = %stream, error = %e, "origin: clip admission task failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request")
-                    .into_response();
-            }
-        };
+    let admitted = match tokio::task::spawn_blocking(move || {
+        admit_and_report(&origin, &events, &for_task, &req, credential)
+    })
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(stream = %stream, error = %e, "origin: clip admission task failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request")
+                .into_response();
+        }
+    };
 
     match admitted {
         Ok(recs) => {
             tracing::info!(
                 stream = %stream, clips = recs.len(),
+                credential = credential.kind.as_str(), token = %credential.fingerprint(),
                 "origin: clip export requested"
             );
             (StatusCode::ACCEPTED, axum::Json(recs)).into_response()
@@ -2814,11 +3261,132 @@ async fn clips_request(
             "the relay no longer holds this feed, so there is nothing to cut a clip from",
         )
             .into_response(),
+        // `429` with the wait in `Retry-After` and in words: the player shows
+        // the sentence as written, and it is what tells a crew whether the
+        // feed or their own link is spent.
+        Err(ClipRefusal::RateLimited { limit, asked_secs, retry_after, .. }) => {
+            let wait = whole_secs_up(retry_after);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (header::RETRY_AFTER, wait.to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                rate_refusal_sentence(limit, asked_secs, wait),
+            )
+                .into_response()
+        }
         Err(ClipRefusal::Io(e)) => {
             tracing::warn!(stream = %stream, error = %e, "origin: could not record clip request");
             (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request").into_response()
         }
     }
+}
+
+/// Admit a clip request, and tell the operator when it finds an export
+/// allowance spent.
+///
+/// One function, run whole on the blocking pool, because the refusal that
+/// starts an episode is the only one that raises the event: emitted from the
+/// handler after its `await`, a client that hung up mid-admission dropped the
+/// handler — and the event with it — while the admission it started still
+/// spent the episode's `first`, so a script that never read its replies could
+/// silence the one signal a headless relay gives. Repeats in an episode log at
+/// `debug`, not `warn`: each costs a refused request, and the request is free
+/// to whoever holds a token.
+fn admit_and_report(
+    origin: &OriginStore,
+    events: &EventSender,
+    stream: &str,
+    req: &ClipRequest,
+    credential: ClipCredential,
+) -> Result<Vec<ClipRecord>, ClipRefusal> {
+    let admitted = origin.admit_clips(stream, req, credential);
+    if let Err(ClipRefusal::RateLimited { limit, asked_secs, retry_after, first }) = &admitted {
+        let wait = whole_secs_up(*retry_after);
+        let token = credential.fingerprint();
+        if *first {
+            tracing::warn!(
+                stream = %stream, limit = limit.as_str(), asked_secs, wait,
+                credential = credential.kind.as_str(), token = %token,
+                "origin: clip export allowance spent"
+            );
+            let allowance = limit.allowance();
+            let whose = match limit {
+                ExportLimit::Feed => format!("Clip export on stream '{stream}'"),
+                ExportLimit::Credential => format!(
+                    "A {} token ({token}) exporting clips on stream '{stream}'",
+                    credential.kind.as_str()
+                ),
+            };
+            events.emit_with_details(
+                EventSeverity::Warning,
+                category::DISTRIBUTION,
+                format!(
+                    "{whose} has used its allowance of {} minutes of clips, which \
+                     refills at {} minutes an hour; further exports are refused \
+                     until it refills",
+                    allowance.burst_secs / 60,
+                    allowance.refill_secs_per_hour / 60
+                ),
+                serde_json::json!({
+                    "error_code": "clip_export_rate_limited",
+                    "stream": stream,
+                    "limit": limit.as_str(),
+                    "asked_secs": asked_secs,
+                    "retry_after_secs": wait,
+                    "allowance_secs": allowance.burst_secs,
+                    "refill_secs_per_hour": allowance.refill_secs_per_hour,
+                    "credential": credential.kind.as_str(),
+                    "token_fingerprint": token,
+                }),
+            );
+        } else {
+            tracing::debug!(
+                stream = %stream, limit = limit.as_str(), asked_secs, wait,
+                credential = credential.kind.as_str(), token = %token,
+                "origin: clip export refused, allowance still spent"
+            );
+        }
+    }
+    admitted
+}
+
+/// A wait in whole seconds, rounded up — what `Retry-After` carries, and late
+/// rather than early.
+fn whole_secs_up(d: Duration) -> u64 {
+    d.as_secs() + u64::from(d.subsec_nanos() > 0)
+}
+
+/// "about N seconds" / "about N minutes", rounded up.
+fn about(secs: u64) -> String {
+    match secs {
+        1 => "1 second".to_string(),
+        0..60 => format!("{secs} seconds"),
+        _ => match secs.div_ceil(60) {
+            1 => "1 minute".to_string(),
+            m => format!("{m} minutes"),
+        },
+    }
+}
+
+/// The sentence a rate refusal is answered with. The player shows anything
+/// under 300 characters as written.
+fn rate_refusal_sentence(limit: ExportLimit, asked_secs: u64, wait: u64) -> String {
+    let allowance = limit.allowance();
+    let whose = match limit {
+        ExportLimit::Feed => "this feed has used its clip allowance, shared by everyone watching it",
+        ExportLimit::Credential => {
+            "your viewing link has used its own share of this feed's clip allowance"
+        }
+    };
+    format!(
+        "{whose} — {} minutes of clips, refilling at {} minutes an hour; \
+         these {asked_secs} seconds can be exported in about {}",
+        allowance.burst_secs / 60,
+        allowance.refill_secs_per_hour / 60,
+        about(wait)
+    )
 }
 
 /// Credential check for the clip surface, independent of `require_origin_token`.
@@ -2834,12 +3402,15 @@ async fn clips_request(
 /// secret to check one against — the same posture `require_clip_ingest` takes
 /// on the write side. Either credential passes: the edge polls this surface
 /// with its ingest token, the browser and the portal with a viewer token.
+///
+/// Hands back which credential it accepted, so a request can be charged to it
+/// and a delete attributed to it.
 fn require_clip_credential(
     st: &Arc<DistributionState>,
     stream: &str,
     headers: &HeaderMap,
     query: Option<&str>,
-) -> Result<(), Response> {
+) -> Result<ClipCredential, Response> {
     let rt = st.control.load();
     let Some(ref secret) = rt.token_secret else {
         return Err((
@@ -2848,13 +3419,13 @@ fn require_clip_credential(
         )
             .into_response());
     };
-    if super::bearer(headers)
-        .and_then(|t| token::verify_ingest_token(secret, stream, &t).ok())
-        .is_some()
+    if let Some(signature) = super::bearer(headers)
+        .and_then(|t| token::accepted_ingest_token(secret, stream, &t).ok())
     {
-        return Ok(());
+        return Ok(ClipCredential::new(CredentialKind::Ingest, &signature));
     }
-    super::check_viewer_token(st, stream, headers, query)
+    super::accepted_viewer_token(st, stream, headers, query)
+        .map(|signature| ClipCredential::new(CredentialKind::Viewer, &signature))
 }
 
 /// The same posture for the two verbs only the edge may use: upload a finished
@@ -3167,6 +3738,18 @@ async fn clip_put(
 /// required, because this is the origin's one destructive verb and it must not
 /// ride a flag whose default is off. Without it the only way to reclaim clip
 /// space was to end the session, and clips are exempt from the sweep by design.
+///
+/// Any viewer-token holder may delete any clip on the feed — deliberately
+/// (bilbycast-relay#14 keeps it) — so every delete is **attributed**: an Info
+/// `clip_deleted` event naming the stream, the clip, the kind of token and its
+/// fingerprint ([`ClipCredential::fingerprint`]). The fingerprint names a
+/// token, not a person; the portal mints a fresh one for each delete it makes
+/// on a viewer's behalf. The event's volume is bounded by the export
+/// allowance, since each delete takes a clip something commissioned.
+///
+/// A delete does not refund the export allowance: the edge has usually
+/// already started the cut, and a refund would reopen the export/delete loop
+/// the allowance exists to bound.
 async fn clip_delete(
     State(st): State<Arc<DistributionState>>,
     Path((stream, file)): Path<(String, String)>,
@@ -3180,20 +3763,60 @@ async fn clip_delete(
     if !valid_clip_name(name) {
         return (StatusCode::BAD_REQUEST, "invalid clip name").into_response();
     }
-    if let Err(resp) = require_clip_credential(&st, &stream, &headers, query.as_deref()) {
-        return resp;
-    }
-    if st.origin.delete_clip(&stream, name).await {
-        tracing::info!(stream = %stream, clip = %name, "origin: clip deleted");
-        (StatusCode::NO_CONTENT, [(header::CACHE_CONTROL, "no-store")]).into_response()
-    } else {
-        (
+    let credential = match require_clip_credential(&st, &stream, &headers, query.as_deref()) {
+        Ok(credential) => credential,
+        Err(resp) => return resp,
+    };
+    // In a task of its own, so the delete and the record of who made it are
+    // one step: a client that hangs up drops this handler where it stands, and
+    // a delete that went ahead with its event dropped would be exactly the
+    // unattributed delete the event exists to rule out.
+    let origin = st.origin.clone();
+    let events = st.events.clone();
+    let (for_task, clip) = (stream.clone(), name.to_string());
+    let deleted = tokio::spawn(async move {
+        let deleted = origin.delete_clip(&for_task, &clip).await;
+        if deleted {
+            report_clip_deleted(&events, &for_task, &clip, credential);
+        }
+        deleted
+    })
+    .await;
+    match deleted {
+        Ok(true) => (StatusCode::NO_CONTENT, [(header::CACHE_CONTROL, "no-store")]).into_response(),
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             [(header::CACHE_CONTROL, "no-store")],
             "no such clip",
         )
-            .into_response()
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(stream = %stream, error = %e, "origin: clip delete task failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not delete the clip").into_response()
+        }
     }
+}
+
+/// Say who deleted a clip: the log line and the Info `clip_deleted` event.
+fn report_clip_deleted(events: &EventSender, stream: &str, clip: &str, credential: ClipCredential) {
+    let token = credential.fingerprint();
+    let kind = credential.kind.as_str();
+    tracing::info!(
+        stream = %stream, clip = %clip, credential = kind, token = %token,
+        "origin: clip deleted"
+    );
+    events.emit_with_details(
+        EventSeverity::Info,
+        category::DISTRIBUTION,
+        format!("Clip '{clip}' deleted from stream '{stream}' with a {kind} token ({token})"),
+        serde_json::json!({
+            "error_code": "clip_deleted",
+            "stream": stream,
+            "clip": clip,
+            "credential": kind,
+            "token_fingerprint": token,
+        }),
+    );
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3463,6 +4086,12 @@ mod tests {
         let f = std::fs::File::options().write(true).open(path).unwrap();
         let when = std::time::SystemTime::now() - by;
         f.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
+    }
+
+    /// A credential for clip tests, told apart by `n` — as two different
+    /// tokens are by their signatures.
+    fn cred(n: u8) -> ClipCredential {
+        ClipCredential::new(CredentialKind::Viewer, &[n; 32])
     }
 
     async fn put_seg(s: &OriginStore, stream: &str, name: &str, len: usize) {
@@ -5329,13 +5958,14 @@ seg-1.m4s
         let fits = (MAX_CLIP_BYTES_PER_STREAM / per_clip) as usize;
         assert!(fits > 1 && fits < MAX_CLIPS_PER_STREAM, "fixture: {fits} is not a useful bound");
 
-        s.admit_clips("feed", &batch(fits)).expect("a batch inside the budget must be admitted");
+        s.admit_clips("feed", &batch(fits), cred(1))
+            .expect("a batch inside the budget must be admitted");
         // Nothing has been cut, so the *landed* total is still zero — which is
         // exactly what used to make the next request look free.
         assert_eq!(s.clip_usage("feed").1, 0, "fixture: nothing should have landed yet");
         assert!(s.clip_budget_used("feed") >= MAX_CLIP_BYTES_PER_STREAM - per_clip);
 
-        match s.admit_clips("feed", &batch(1)) {
+        match s.admit_clips("feed", &batch(1), cred(1)) {
             Err(ClipRefusal::OverBudget { would_use, limit }) => {
                 assert!(would_use > limit, "refused without being over: {would_use} vs {limit}");
             }
@@ -5446,7 +6076,7 @@ seg-1.m4s
             }],
         };
         assert!(
-            matches!(s.admit_clips("feed", &ask), Err(ClipRefusal::NoStream)),
+            matches!(s.admit_clips("feed", &ask, cred(1)), Err(ClipRefusal::NoStream)),
             "a clip was admitted for a stream the relay does not hold"
         );
         assert!(
@@ -5722,6 +6352,477 @@ seg-1.m4s
         assert_eq!(s.clip_usage("feed"), (0, 0));
         assert!(s.read_clip("feed", "spare").await.is_none());
         assert!(!s.delete_clip("feed", "spare").await, "deleting twice must not claim success");
+    }
+
+    /// `n` marks of `secs` each, at distinct instants and under distinct names
+    /// numbered from `from` — so every one is a new clip.
+    fn marks(n: usize, secs: u32, from: usize) -> ClipRequest {
+        ClipRequest {
+            pre_secs: secs / 2,
+            post_secs: secs - secs / 2,
+            clips: (from..from + n)
+                .map(|i| ClipAsk {
+                    at: format!("2026-10-29T{:02}:{:02}:00Z", i / 60, i % 60),
+                    name: format!("mark {i}"),
+                })
+                .collect(),
+        }
+    }
+
+    async fn delete_all(s: &OriginStore, stream: &str) {
+        for clip in s.list_clips(stream) {
+            assert!(s.delete_clip(stream, &clip.name).await);
+        }
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// bilbycast-relay#14: the count and the byte budget bound what a feed
+    /// holds, and a delete hands both straight back — so a viewer token could
+    /// export, delete and export again for ever, each export an all-intra
+    /// encode on the edge. The allowance is what a delete does not refund.
+    #[tokio::test]
+    async fn deleting_clips_does_not_buy_back_the_export_allowance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        let t0 = Instant::now();
+
+        s.admit_clips_at("feed", &marks(15, 60, 0), cred(1), t0)
+            .expect("fifteen minutes of clips on a fresh feed");
+        delete_all(&s, "feed").await;
+        assert_eq!(s.clip_usage("feed"), (0, 0), "fixture: the count is back to nothing");
+        assert_eq!(s.clip_budget_used("feed"), 0, "fixture: so are the bytes");
+
+        // Another viewer, so the feed's own allowance is what binds: 900 + 360
+        // clip-seconds is past its 1200.
+        match s.admit_clips_at("feed", &marks(6, 60, 100), cred(2), t0) {
+            Err(ClipRefusal::RateLimited {
+                limit: ExportLimit::Feed,
+                asked_secs: 360,
+                retry_after,
+                first: true,
+            }) => assert_eq!(retry_after, secs(180), "60 clip-seconds over, at 3 s each"),
+            other => panic!("the export/delete loop was not bounded: {other:?}"),
+        }
+        assert!(s.list_clips("feed").is_empty(), "a refused batch filed clips");
+        // The wait it names is the wait it means.
+        s.admit_clips_at("feed", &marks(6, 60, 100), cred(2), t0 + secs(180))
+            .expect("not admitted once the wait it named had passed");
+
+        // The first viewer looping on its own: its share binds, and for
+        // longer than the feed's (900 + 360 at 6 s each, less its 6120 s).
+        delete_all(&s, "feed").await;
+        match s.admit_clips_at("feed", &marks(6, 60, 200), cred(1), t0 + secs(180)) {
+            Err(ClipRefusal::RateLimited { limit: ExportLimit::Credential, retry_after, .. }) => {
+                assert_eq!(retry_after, secs(1260));
+            }
+            other => panic!("one credential's own share did not bind: {other:?}"),
+        }
+    }
+
+    /// A refused request is refused whole: nothing filed, nothing charged.
+    #[tokio::test]
+    async fn a_refused_batch_files_nothing_and_is_not_charged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        let t0 = Instant::now();
+
+        s.admit_clips_at("feed", &marks(15, 60, 0), cred(1), t0).unwrap();
+        delete_all(&s, "feed").await;
+        assert!(matches!(
+            s.admit_clips_at("feed", &marks(6, 60, 100), cred(2), t0),
+            Err(ClipRefusal::RateLimited { .. })
+        ));
+        assert!(s.list_clips("feed").is_empty(), "a refused batch filed clips");
+        // Exactly what is left: had the refusal charged its 360, the feed would
+        // be past its allowance and this would be refused too.
+        s.admit_clips_at("feed", &marks(5, 60, 100), cred(2), t0)
+            .expect("the refused batch was charged");
+    }
+
+    /// Only what a request files is charged. A re-sent batch — the player
+    /// retrying, or the same marks exported twice — commissions no cut, and
+    /// refusing it "for an hour" would be a lie.
+    #[tokio::test]
+    async fn re_requesting_a_recorded_mark_costs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        let t0 = Instant::now();
+        let names = |recs: &[ClipRecord]| recs.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+
+        let kept = marks(2, 60, 0);
+        let first = s.admit_clips_at("feed", &kept, cred(1), t0).unwrap();
+        // Spend the feed to 1140 of its 1200, deleting to stay inside the bytes.
+        s.admit_clips_at("feed", &marks(14, 60, 100), cred(2), t0).unwrap();
+        for i in 100..114 {
+            assert!(s.delete_clip("feed", &format!("mark {i}")).await);
+        }
+        s.admit_clips_at("feed", &marks(3, 60, 200), cred(3), t0).unwrap();
+
+        // Charged, these 120 seconds would take the feed past its allowance.
+        let again = s
+            .admit_clips_at("feed", &kept, cred(4), t0)
+            .expect("a re-sent batch was charged as a new export");
+        assert_eq!(names(&again), names(&first), "a re-sent mark came back under another name");
+        // ...while two new marks of the same length are refused.
+        assert!(matches!(
+            s.admit_clips_at("feed", &marks(2, 60, 300), cred(4), t0),
+            Err(ClipRefusal::RateLimited { limit: ExportLimit::Feed, asked_secs: 120, .. })
+        ));
+    }
+
+    /// Two asks for the same mark in one request are one clip, and one charge.
+    #[tokio::test]
+    async fn two_identical_asks_in_one_request_are_charged_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        let t0 = Instant::now();
+        let ask = || ClipAsk { at: "2026-10-29T10:00:00Z".into(), name: "Goal".into() };
+        let twice = ClipRequest { pre_secs: 30, post_secs: 30, clips: vec![ask(), ask()] };
+
+        let recs = s.admit_clips_at("feed", &twice, cred(1), t0).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].name, recs[1].name, "one mark filed twice");
+        assert_eq!(s.list_clips("feed").len(), 1);
+        let rate = s.clip_admission.lock().unwrap();
+        assert_eq!(rate.feeds["feed"].full_at, t0 + secs(60 * 3), "charged for two clips");
+    }
+
+    /// All or nothing. The records were once written inside the per-ask loop,
+    /// so a mark whose every name was taken refused the request only after the
+    /// marks ahead of it had been filed — and the edge cut them, for a request
+    /// the player reported as refused.
+    #[tokio::test]
+    async fn a_batch_refused_for_an_exhausted_name_files_none_of_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        for i in 0..9 {
+            s.record_clip_requests(
+                "feed",
+                &ClipRequest {
+                    pre_secs: 5,
+                    post_secs: 5,
+                    clips: vec![ClipAsk {
+                        at: format!("2026-09-09T1{i}:00:00Z"),
+                        name: "Goal".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        }
+        let before = s.list_clips("feed").len();
+        let batch = ClipRequest {
+            pre_secs: 5,
+            post_secs: 5,
+            clips: vec![
+                ClipAsk { at: "2026-09-09T20:00:00Z".into(), name: "Fresh".into() },
+                ClipAsk { at: "2026-09-09T23:00:00Z".into(), name: "Goal".into() },
+            ],
+        };
+        match s.admit_clips_at("feed", &batch, cred(1), Instant::now()) {
+            Err(ClipRefusal::NamesExhausted(_)) => {}
+            other => panic!("refused for the wrong reason, or not at all: {other:?}"),
+        }
+        assert_eq!(s.list_clips("feed").len(), before, "part of a refused batch was filed");
+        assert!(!s.list_clips("feed").iter().any(|c| c.name == "Fresh"));
+        let rate = s.clip_admission.lock().unwrap();
+        assert!(
+            rate.feeds.is_empty() && rate.credentials.is_empty(),
+            "a refused batch was charged"
+        );
+    }
+
+    /// The allowance comes after every other refusal, so a request is told the
+    /// thing it can act on first — and a dropped feed is told it is gone.
+    #[tokio::test]
+    async fn existing_refusals_keep_precedence_over_the_allowance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        let t0 = Instant::now();
+
+        s.admit_clips_at("feed", &marks(16, 60, 0), cred(1), t0).unwrap();
+        s.clip_admission.lock().unwrap().take("feed", &cred(9), 240, t0).unwrap();
+        // The allowance is spent and the byte budget full: the budget answers.
+        match s.admit_clips_at("feed", &marks(1, 60, 100), cred(2), t0) {
+            Err(ClipRefusal::OverBudget { .. }) => {}
+            other => panic!("the byte budget lost its precedence: {other:?}"),
+        }
+        // The stream gone from under the store, not through `remove_stream`
+        // (which hands the allowance back): still a dropped feed, not a wait.
+        std::fs::remove_dir_all(tmp.path().join("origin").join("feed")).unwrap();
+        match s.admit_clips_at("feed", &marks(1, 5, 200), cred(2), t0) {
+            Err(ClipRefusal::NoStream) => {}
+            other => panic!("a dropped feed was told to wait: {other:?}"),
+        }
+    }
+
+    /// A session that ends hands its allowance back, so a new session under
+    /// the same feed name starts whole; an ingest gap is not the end of one.
+    #[tokio::test]
+    async fn a_removed_stream_starts_with_a_whole_allowance_and_a_retired_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        put_seg(&s, "feed", "seg-00000.m4s", 64).await;
+        let t0 = Instant::now();
+
+        s.admit_clips_at("feed", &marks(15, 60, 0), cred(1), t0).unwrap();
+        delete_all(&s, "feed").await;
+        s.admit_clips_at("feed", &marks(5, 60, 100), cred(2), t0).unwrap();
+
+        s.retire_stream("feed").await;
+        assert!(
+            tmp.path().join("origin").join("feed").join(CLIPS_DIR).is_dir(),
+            "fixture: the retired feed kept its clips"
+        );
+        delete_all(&s, "feed").await;
+        assert!(
+            matches!(
+                s.admit_clips_at("feed", &marks(1, 60, 200), cred(3), t0),
+                Err(ClipRefusal::RateLimited { limit: ExportLimit::Feed, .. })
+            ),
+            "retiring a feed handed its spent allowance back"
+        );
+
+        s.remove_stream("feed").await;
+        ingested(&tmp, "feed");
+        s.admit_clips_at("feed", &marks(15, 60, 300), cred(1), t0)
+            .expect("a new session under a dropped feed's name inherited its spent allowance");
+    }
+
+    /// The largest requests the byte budget admits fit a whole allowance of
+    /// either kind — what the `const` block promises — and short clips are
+    /// charged the floor, not their length.
+    #[tokio::test]
+    async fn the_largest_requests_the_budget_admits_fit_a_whole_allowance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "long");
+        ingested(&tmp, "short");
+        let t0 = Instant::now();
+
+        s.admit_clips_at("long", &marks(16, 60, 0), cred(1), t0)
+            .expect("sixteen minutes of clips from one viewer on a fresh feed");
+        s.admit_clips_at("short", &marks(50, 1, 0), cred(1), t0)
+            .expect("fifty one-second clips from one viewer on a fresh feed");
+        let rate = s.clip_admission.lock().unwrap();
+        assert_eq!(
+            rate.feeds["short"].full_at,
+            t0 + secs(50 * CLIP_EXPORT_MIN_CHARGE_SECS * 3),
+            "a one-second clip was not charged the floor"
+        );
+
+        assert_eq!(clip_charge_secs(0, 1), CLIP_EXPORT_MIN_CHARGE_SECS);
+        assert_eq!(clip_charge_secs(3, 5), 8);
+        assert_eq!(clip_charge_secs(40, 40), 60, "charged past the longest clip there is");
+    }
+
+    /// After a whole allowance is spent, it admits again a clip-second at a
+    /// time as it refills — every 3 s for a feed. So the hour after a full
+    /// allowance can admit up to twice it, which is why the docs say "refills
+    /// at 20 minutes an hour" and never "20 minutes per rolling hour".
+    #[test]
+    fn a_feeds_allowance_refills_a_clip_second_every_three_seconds() {
+        let mut r = ClipExportRate::default();
+        let t0 = Instant::now();
+        // One viewer's share is 1020, so two of them spend the feed's 1200.
+        r.take("feed", &cred(1), 1000, t0).unwrap();
+        r.take("feed", &cred(2), 200, t0).unwrap();
+        let e = r.take("feed", &cred(3), 1, t0).unwrap_err();
+        assert_eq!((e.limit, e.retry_after, e.first), (ExportLimit::Feed, secs(3), true));
+        for k in 1..=5u8 {
+            let at = t0 + secs(3 * u64::from(k));
+            r.take("feed", &cred(10 + k), 1, at).expect("a refilled clip-second was refused");
+            let e = r.take("feed", &cred(10 + k), 1, at).unwrap_err();
+            assert_eq!(e.limit, ExportLimit::Feed, "more than a clip-second came back in 3 s");
+            assert!(!e.first, "a second event in one episode");
+        }
+    }
+
+    /// One credential spends at most its share — 1020 at once, refilling at a
+    /// clip-second every 6 s, half the feed's rate — and the rest of the feed
+    /// stays with everyone else.
+    #[test]
+    fn one_credential_spends_only_its_share_of_a_feed() {
+        let mut r = ClipExportRate::default();
+        let t0 = Instant::now();
+        r.take("feed", &cred(1), 1020, t0).unwrap();
+        let e = r.take("feed", &cred(1), 1, t0).unwrap_err();
+        assert_eq!((e.limit, e.retry_after, e.first), (ExportLimit::Credential, secs(6), true));
+        r.take("feed", &cred(2), 180, t0).expect("one viewer took the whole feed");
+
+        r.take("feed", &cred(1), 1, t0 + secs(6)).expect("a refilled clip-second was refused");
+        let e = r.take("feed", &cred(1), 1, t0 + secs(6)).unwrap_err();
+        assert_eq!(e.limit, ExportLimit::Credential);
+        assert!(!e.first);
+    }
+
+    /// When both refuse, the longer wait is the one a retry must outlast.
+    #[test]
+    fn when_both_allowances_refuse_the_longer_wait_is_reported() {
+        let mut r = ClipExportRate::default();
+        let t0 = Instant::now();
+        r.take("feed", &cred(1), 1020, t0).unwrap();
+        r.take("feed", &cred(2), 180, t0).unwrap();
+        // Over its own share by one clip-second, over the feed's by 1021.
+        let e = r.take("feed", &cred(3), 1021, t0).unwrap_err();
+        assert_eq!((e.limit, e.retry_after), (ExportLimit::Feed, secs(1021 * 3)));
+        // Over the feed by one, over its own share by far more.
+        let mut r = ClipExportRate::default();
+        r.take("feed", &cred(1), 1020, t0).unwrap();
+        r.take("feed", &cred(2), 179, t0).unwrap();
+        let e = r.take("feed", &cred(1), 2, t0).unwrap_err();
+        assert_eq!((e.limit, e.retry_after), (ExportLimit::Credential, secs(12)));
+    }
+
+    /// An episode is one event: the flag is set by the first refusal and
+    /// cleared only when the allowance is whole again — which is also when it
+    /// is forgotten, so the maps hold nothing that has recovered.
+    #[test]
+    fn a_whole_allowance_is_forgotten_and_its_next_episode_flagged_afresh() {
+        let mut r = ClipExportRate::default();
+        let t0 = Instant::now();
+        r.take("feed", &cred(1), 1020, t0).unwrap();
+        r.take("feed", &cred(2), 180, t0).unwrap();
+        assert!(r.take("feed", &cred(3), 1, t0).unwrap_err().first);
+        assert!(!r.take("feed", &cred(3), 1, t0).unwrap_err().first);
+
+        // An hour on, the feed and the second viewer are whole; the first
+        // viewer's share (6120 s to refill) is not.
+        let t1 = t0 + secs(3600);
+        r.take("other", &cred(9), 0, t1).unwrap();
+        assert!(!r.feeds.contains_key("feed"), "a whole allowance is still remembered");
+        assert!(r.credentials.contains_key(&("feed".to_string(), cred(1).key)));
+        assert!(!r.credentials.contains_key(&("feed".to_string(), cred(2).key)));
+
+        r.take("feed", &cred(2), 1000, t1).unwrap();
+        r.take("feed", &cred(3), 200, t1).unwrap();
+        assert!(r.take("feed", &cred(4), 1, t1).unwrap_err().first, "a new episode raised no event");
+
+        r.take("other", &cred(9), 0, t0 + secs(10_000)).unwrap();
+        assert!(r.feeds.is_empty() && r.credentials.is_empty(), "recovered allowances kept");
+    }
+
+    /// `Retry-After` is honest: for every request shape the budget admits, the
+    /// same request is admitted once the wait it was given has passed — on
+    /// either allowance, and with both refusing at once.
+    #[test]
+    fn a_refusals_retry_after_is_always_honoured() {
+        let t0 = Instant::now();
+        for (n, len) in [(1u64, 5u32), (1, 60), (6, 60), (16, 60), (50, 1), (20, 30), (3, 17)] {
+            let charge = n * clip_charge_secs(len / 2, len - len / 2);
+
+            let mut r = ClipExportRate::default();
+            r.take("feed", &cred(1), 1000, t0).unwrap();
+            r.take("feed", &cred(2), 200, t0).unwrap();
+            let e = r.take("feed", &cred(3), charge, t0).unwrap_err();
+            assert!(e.retry_after <= FEED_EXPORT_ALLOWANCE.tolerance(), "{n} x {len}s");
+            let at = t0 + secs(whole_secs_up(e.retry_after));
+            r.take("feed", &cred(3), charge, at)
+                .unwrap_or_else(|_| panic!("{n} x {len}s refused again at its Retry-After"));
+
+            let mut r = ClipExportRate::default();
+            r.take("feed", &cred(1), 1020, t0).unwrap();
+            let e = r.take("feed", &cred(1), charge, t0).unwrap_err();
+            assert_eq!(e.limit, ExportLimit::Credential, "{n} x {len}s");
+            let at = t0 + secs(whole_secs_up(e.retry_after));
+            r.take("feed", &cred(1), charge, at)
+                .unwrap_or_else(|_| panic!("{n} x {len}s refused again at its Retry-After"));
+        }
+    }
+
+    /// One feed's spent allowance is no other feed's business.
+    #[test]
+    fn the_export_allowance_is_per_feed() {
+        let mut r = ClipExportRate::default();
+        let t0 = Instant::now();
+        r.take("a", &cred(1), 1020, t0).unwrap();
+        r.take("a", &cred(2), 180, t0).unwrap();
+        assert!(r.take("a", &cred(3), 1, t0).is_err());
+        r.take("b", &cred(1), 1020, t0).expect("feed b paid for feed a's exports");
+    }
+
+    /// The event comes from the step that spends the episode's `first`, not
+    /// from the handler after it: called here exactly as the blocking task
+    /// calls it, with nobody waiting on the reply.
+    #[tokio::test]
+    async fn a_spent_allowance_raises_one_event_per_episode() {
+        use crate::manager::events::event_channel;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp, 0);
+        ingested(&tmp, "feed");
+        let (events, mut rx) = event_channel();
+        {
+            let now = Instant::now();
+            let mut rate = s.clip_admission.lock().unwrap();
+            rate.take("feed", &cred(8), 1000, now).unwrap();
+            rate.take("feed", &cred(9), 200, now).unwrap();
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                admit_and_report(&s, &events, "feed", &marks(1, 60, 0), cred(1)),
+                Err(ClipRefusal::RateLimited { limit: ExportLimit::Feed, .. })
+            ));
+        }
+        let ev = rx.try_recv().expect("a spent allowance raised no event");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::DISTRIBUTION);
+        let d = ev.details.expect("the event carries no details");
+        assert_eq!(d["error_code"], "clip_export_rate_limited");
+        assert_eq!(d["stream"], "feed");
+        assert_eq!(d["limit"], "feed");
+        assert_eq!(d["asked_secs"], 60);
+        assert!(d["retry_after_secs"].as_u64().is_some_and(|w| w > 0));
+        assert_eq!(d["credential"], "viewer");
+        assert_eq!(d["token_fingerprint"], cred(1).fingerprint());
+        assert!(rx.try_recv().is_err(), "a second refusal in one episode raised another event");
+        assert!(s.list_clips("feed").is_empty());
+    }
+
+    /// The fingerprint names the token without giving any of it away: a hash
+    /// of the signature, which is the secret half of a bearer credential.
+    #[test]
+    fn a_credentials_fingerprint_is_a_hash_of_its_signature() {
+        use sha2::{Digest, Sha256};
+
+        let signature = [0xab; 32];
+        let fp = ClipCredential::new(CredentialKind::Viewer, &signature).fingerprint();
+        assert_eq!(fp.len(), 12);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        let expected: String =
+            Sha256::digest(signature)[..6].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(fp, expected, "not the documented recipe");
+        assert!(!"ab".repeat(32).contains(&fp), "the fingerprint is a piece of the signature");
+        assert_ne!(fp, cred(1).fingerprint());
+    }
+
+    /// The refusal is a sentence the player shows as written: under its
+    /// 300-character cut-off, naming the allowance and the wait.
+    #[test]
+    fn a_rate_refusal_reads_as_a_sentence_the_player_shows() {
+        for limit in [ExportLimit::Feed, ExportLimit::Credential] {
+            for wait in [1, 59, 60, 61, 6120] {
+                let text = rate_refusal_sentence(limit, 2940, wait);
+                assert!(text.len() < 300, "{} bytes: {text}", text.len());
+                assert!(text.contains("minutes of clips"), "{text}");
+            }
+        }
+        assert!(rate_refusal_sentence(ExportLimit::Feed, 360, 180).contains("about 3 minutes"));
+        assert!(rate_refusal_sentence(ExportLimit::Credential, 60, 6).contains("your viewing link"));
+        assert_eq!(about(1), "1 second");
+        assert_eq!(about(45), "45 seconds");
+        assert_eq!(about(60), "1 minute");
+        assert_eq!(about(61), "2 minutes");
+        assert_eq!(whole_secs_up(Duration::from_millis(2001)), 3);
+        assert_eq!(whole_secs_up(secs(2)), 2);
     }
 
     /// A retired stream can still be removed, clips and all.

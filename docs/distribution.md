@@ -148,11 +148,11 @@ on a host that should not.
 | `GET` | `/dvr/hls.js` | Vendored hls.js, served to the DVR page |
 | `PUT` | `/origin/{stream}/{file}` | Edge CMAF/HLS upload (`.m3u8`/`.mpd`/`.m4s`) |
 | `GET` | `/origin/{stream}/{file}` | Serve a cached segment/manifest (CDN or player) |
-| `POST` | `/origin/{stream}/clips` | Player asks for one or more clips around marked moments; `410` once the relay holds no directory for the stream (viewer or ingest token, always) |
+| `POST` | `/origin/{stream}/clips` | Player asks for one or more clips around marked moments; `410` once the relay holds no directory for the stream; `429` with `Retry-After` once the feed's export allowance, or the token's share of it, is spent (viewer or ingest token, always) |
 | `GET` | `/origin/{stream}/clips` | List this stream's clips and their state — the edge's work queue, and the portal's listing (viewer or ingest token, always) |
 | `PUT` | `/origin/{stream}/clips/{name}.mp4` | Edge uploads a finished clip (ingest token, always; refused if no record asked for it) |
 | `GET` | `/origin/{stream}/clips/{name}.mp4` | Download a finished clip — streamed, `Range` supported (viewer or ingest token, always) |
-| `DELETE` | `/origin/{stream}/clips/{name}.mp4` | Remove a clip and reclaim its disk (viewer or ingest token, always) |
+| `DELETE` | `/origin/{stream}/clips/{name}.mp4` | Remove a clip and reclaim its disk — any clip on the feed, attributed by an Info `clip_deleted` event naming the token; refunds no export allowance (viewer or ingest token, always) |
 | `POST` | `/origin/{stream}/clips/{name}.mp4/failed` | Edge reports one it cannot produce (ingest token, always) |
 | `GET` | `/origin/{stream}/marks` | The stream's shared marks, with an `ETag`; `304` to a matching `If-None-Match` (viewer token, always) |
 | `POST` | `/origin/{stream}/marks` | Add a mark `{at, name?, colour?, exported?}` — `at` in wall-clock ms; the same instant twice is one mark; `404` while the relay holds no directory for the stream (viewer token, always) |
@@ -438,7 +438,9 @@ scope  ∈ { "viewer", "ingest" }   (only viewer tokens take the list form)
   Every verb under `/origin/{stream}/clips` demands a credential whatever the
   flags say, and refuses outright when no `token_secret` is configured. The
   list, the request, the download and the delete take a viewer *or* an ingest
-  token; the upload and the failure report take an ingest token only. That is
+  token (a request within the feed's export allowance and the token's share of
+  it, and a delete attributed to the token that made it — see "Clip export");
+  the upload and the failure report take an ingest token only. That is
   deliberate rather than tidy: `POST` commissions decode-and-encode work on
   whichever edge fills the stream, and `DELETE` destroys an operator's exported
   footage, so neither may ride a read flag whose documented default is off
@@ -1012,6 +1014,66 @@ byte ceiling charges clips that have been asked for but not yet cut at an
 estimate for their requested length — otherwise a batch in flight is invisible
 to the check that decides whether the next batch may be admitted — and is
 enforced again on upload, where the real size is known.
+
+**An export allowance bounds what a feed commissions, not only what it
+holds.** The count and the byte ceiling read what is on disk, and a delete
+hands both back, so on their own they let anyone holding a viewer token export,
+delete and export again for ever — each export a decode and an all-intra
+encode on the edge, through the one cut permit it shares with the operator's
+own Replay exports (bilbycast-relay#14). So each feed has an allowance of
+**20 minutes of clips that refills at 20 minutes an hour**, shared by everyone
+watching it, and one token may spend **17 minutes of it at once, refilling at
+10 minutes an hour** — so a single token, a viewing link copied out of an
+address bar or a script holding one, can never take more than half of a feed's
+refill from everyone else. The rules:
+
+- A clip is charged its length, but never less than 5 seconds: every cut has a
+  fixed cost on the edge (the decode starts at the IDR before the mark, an
+  encoder is opened, the result is uploaded) that the length does not show.
+- Only clips the request files are charged. A re-sent mark already on file
+  costs nothing, and a refused request — for any reason — files nothing and is
+  charged nothing. A request whose every candidate name for one mark is taken
+  is refused whole; the marks ahead of it are no longer filed.
+- **A delete refunds nothing.** The edge has usually started the cut by the
+  time anyone can delete it, and a refund would reopen the loop.
+- The refill is rolling, not an hourly window: a spent allowance admits again a
+  clip-second at a time as it refills, so the hour after a full allowance can
+  admit up to twice it. Over any longer stretch the rate is the refill.
+- Past either, the request is `429` with a `Retry-After` (whole seconds, rounded
+  up) and a sentence the player shows as written, saying whether the feed or the
+  viewer's own link is spent and how long to wait. Any request the count and the
+  byte ceiling admit fits a whole allowance of either kind — a compile-time
+  check — so a feed's first export is never refused, and the wait is always one
+  that works, unless somebody else spends the feed's allowance meanwhile.
+- The first refusal of each episode — until that allowance is whole again —
+  raises a Warning `clip_export_rate_limited` event naming the feed and the
+  token, so a headless relay tells its operator somebody is hammering exports.
+- In memory only: a relay restart hands every allowance back whole, and so does
+  the manager dropping the stream, so a new session given the same feed name
+  starts whole. Retiring a stream after an ingest gap does not.
+
+**What that bounds, at worst.** A feed commissions at most 1,200 clip-seconds
+an hour once its first allowance is spent, and at most 240 new cuts an hour.
+The work behind them can be up to three times that: the edge retries a cut
+whose upload fails for a reason it does not treat as permanent (a `507` from
+the byte ceiling on upload among them) up to three attempts, each a full
+encode — so up to 3,600 seconds of footage encoded an hour per feed. The bound
+is per feed, not per edge: an edge cutting N feeds can be asked for N times
+that. The per-token share bounds one minted token, not a person: whoever can
+mint — a viewing link's key, a portal login — gets a fresh share with every
+mint, but never a fresh feed allowance.
+
+**Who may delete.** Any viewer token for a feed may delete any of its clips —
+by design, since clips belong to the session, and kept so (bilbycast-relay#14
+records the choice). Every delete is **attributed** instead: an Info
+`clip_deleted` event naming the stream, the clip, the kind of token (`viewer` or
+`ingest`) and the token's fingerprint — the first 12 hex digits of the SHA-256
+of its 32 signature bytes, the hex after the token's last `.`
+(`printf %s <hex> | xxd -r -p | sha256sum | cut -c1-12`). The same fingerprint
+is on the `clip_export_rate_limited` event and the relay's `clip export
+requested` log line, so an export and a delete by one token can be put
+together. It names a token, not a person: the manager records no mint, and the
+portal mints a fresh token for each delete it makes on a viewer's behalf.
 
 **What the relay reclaims on its own.** Clip retention is the manager's: it
 holds the expiry and sends `drop_origin_streams` when it lapses. The relay's

@@ -222,7 +222,14 @@ fn verify_multi(secret_hex: &str, stream: &str, token: &str) -> Result<Signature
 
 /// Verify an ingest token (edge → relay distribution ingest).
 pub fn verify_ingest_token(secret_hex: &str, stream: &str, token: &str) -> Result<()> {
-    verify(secret_hex, SCOPE_INGEST, stream, token).map(drop)
+    accepted_ingest_token(secret_hex, stream, token).map(drop)
+}
+
+/// [`verify_ingest_token`], handing back the token's [`Signature`] — for a
+/// route that charges or attributes what one credential does, as the clip
+/// surface does with either kind of token.
+pub fn accepted_ingest_token(secret_hex: &str, stream: &str, token: &str) -> Result<Signature> {
+    verify(secret_hex, SCOPE_INGEST, stream, token)
 }
 
 /// Mint a viewer token (used by tests / manager-side parity checks).

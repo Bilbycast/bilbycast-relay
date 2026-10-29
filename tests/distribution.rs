@@ -1570,6 +1570,170 @@ async fn the_clip_lifecycle_works_over_http() {
     assert!(body.contains("60 seconds"), "the refusal does not name the limit: {body}");
 }
 
+/// bilbycast-relay#14 over HTTP: export, delete everything, export again — the
+/// loop any viewer-token holder could run for ever, each export a decode and an
+/// all-intra encode on the edge that cuts the feed. The count and the byte
+/// budget come back with the deletes; the feed's export allowance does not, and
+/// the refusal is a `429` the player can show. Every delete names the token
+/// that made it.
+#[tokio::test]
+async fn a_clip_export_past_the_feed_allowance_is_429_and_a_delete_does_not_reset_it() {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use bilbycast_relay::distribution::hub::DistributionHub as Hub;
+    use bilbycast_relay::distribution::{build_router, DistributionState};
+    use bilbycast_relay::distribution_control::DistUpdate;
+    use bilbycast_relay::manager::events::EventSeverity;
+    use sha2::{Digest, Sha256};
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    let cancel = CancellationToken::new();
+    let (events, mut rx) = event_channel();
+    let cfg = DistributionConfig::default();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&cfg, None), vec![]);
+    let origin = Arc::new(OriginStore::new(test_origin_config(8, 1 << 30)).unwrap());
+    let hub = Arc::new(Hub::new());
+    let state = DistributionState::new(hub, origin, cfg, control.clone(), cancel.clone(), events);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        let _ =
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+    control.apply(DistUpdate { token_secret: Some(SECRET.into()), ..Default::default() });
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    // Two viewers: a different expiry is a different signature.
+    let viewer_a = token::mint_viewer_token(SECRET, "feed", exp).unwrap();
+    let viewer_b = token::mint_viewer_token(SECRET, "feed", exp + 1).unwrap();
+    let ingest = token::mint_ingest_token(SECRET, "feed", exp).unwrap();
+
+    /// (status, head, body).
+    async fn send(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        bearer: &str,
+    ) -> (u16, String, String) {
+        let mut head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+             Authorization: Bearer {bearer}\r\n"
+        );
+        if let Some(b) = body {
+            head.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                b.len()
+            ));
+        }
+        head.push_str("\r\n");
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(head.as_bytes()).await.unwrap();
+        if let Some(b) = body {
+            s.write_all(b.as_bytes()).await.unwrap();
+        }
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        (status, head.to_ascii_lowercase(), body.to_string())
+    }
+    fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines()
+            .find_map(|l| l.strip_prefix(name).and_then(|v| v.strip_prefix(':')))
+            .map(str::trim)
+    }
+    /// `n` one-minute clips at distinct marks numbered from `from`.
+    fn batch(n: usize, from: usize) -> String {
+        let clips: Vec<String> = (from..from + n)
+            .map(|i| format!(r#"{{"at":"2026-10-29T10:{i:02}:00Z","name":"mark {i}"}}"#))
+            .collect();
+        format!(r#"{{"pre_secs":30,"post_secs":30,"clips":[{}]}}"#, clips.join(","))
+    }
+    /// The fingerprint the relay names a token by, worked out from the token's
+    /// text the way an operator holding it would.
+    fn fingerprint(token: &str) -> String {
+        let hex = token.rsplit('.').next().unwrap();
+        let raw: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        Sha256::digest(&raw)[..6].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // The feed is ingested, which gives it the directory clips are filed in.
+    let (st, _, _) = send(addr, "PUT", "/origin/feed/seg-00001.m4s", Some("x"), &ingest).await;
+    assert_eq!(st, 201);
+
+    // 1. Fifteen minutes of clips: well inside every bound.
+    let (st, _, body) = send(addr, "POST", "/origin/feed/clips", Some(&batch(15, 0)), &viewer_a).await;
+    assert_eq!(st, 202, "the first export was refused: {body}");
+
+    // 2. Every one deleted — the count and the byte budget are back to nothing —
+    //    and each delete attributed to the token that made it.
+    for i in 0..15 {
+        let (st, _, _) =
+            send(addr, "DELETE", &format!("/origin/feed/clips/mark%20{i}.mp4"), None, &viewer_a).await;
+        assert_eq!(st, 204, "mark {i} could not be deleted");
+    }
+    let (_, _, listed) = send(addr, "GET", "/origin/feed/clips", None, &viewer_a).await;
+    assert_eq!(listed, "[]", "fixture: the feed still holds clips");
+    let mut deleted = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        let d = ev.details.clone().unwrap_or_default();
+        if d["error_code"] == "clip_deleted" {
+            assert_eq!(ev.severity, EventSeverity::Info);
+            assert_eq!(d["stream"], "feed");
+            assert_eq!(d["credential"], "viewer");
+            assert_eq!(
+                d["token_fingerprint"],
+                fingerprint(&viewer_a),
+                "the delete names another token"
+            );
+            deleted.push(d["clip"].as_str().unwrap_or_default().to_string());
+        }
+    }
+    assert_eq!(deleted.len(), 15, "not every delete was attributed: {deleted:?}");
+
+    // 3. Exporting again from another viewer: 900 + 360 clip-seconds is past
+    //    the feed's twenty minutes, deletes or no deletes.
+    let (st, head, body) =
+        send(addr, "POST", "/origin/feed/clips", Some(&batch(6, 20)), &viewer_b).await;
+    assert_eq!(st, 429, "the export/delete loop was not bounded: {body}");
+    let wait: u64 = header(&head, "retry-after")
+        .and_then(|v| v.parse().ok())
+        .expect("no Retry-After a client can read");
+    assert!(wait > 0);
+    assert_eq!(header(&head, "cache-control"), Some("no-store"));
+    assert!(body.len() < 300, "the player would not show this as written: {body}");
+    assert!(body.contains("20 minutes of clips"), "the refusal does not name the allowance: {body}");
+    let (_, _, listed) = send(addr, "GET", "/origin/feed/clips", None, &viewer_a).await;
+    assert_eq!(listed, "[]", "a refused export filed clips");
+
+    // 4. One Warning for the episode, not one per refusal.
+    let (st, _, _) = send(addr, "POST", "/origin/feed/clips", Some(&batch(6, 20)), &viewer_b).await;
+    assert_eq!(st, 429);
+    let warnings: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|ev| {
+            ev.details.as_ref().is_some_and(|d| d["error_code"] == "clip_export_rate_limited")
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1, "one spent allowance, {} events", warnings.len());
+    let d = warnings[0].details.as_ref().unwrap();
+    assert_eq!(warnings[0].severity, EventSeverity::Warning);
+    assert_eq!(d["stream"], "feed");
+    assert_eq!(d["limit"], "feed");
+    assert_eq!(d["asked_secs"], 360);
+    assert_eq!(d["token_fingerprint"], fingerprint(&viewer_b));
+}
+
 /// The 256 MiB ceiling belongs to the media PUT, not to the JSON routes.
 ///
 /// `clips_request` and `clip_failed` take `axum::Json`, which collects the
