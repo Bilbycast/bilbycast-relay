@@ -636,6 +636,9 @@ async fn whep_offer(
         }
         Err(e) => {
             // Setup failed — `slot` drops on return and gives the slot back.
+            // The body is `{e}`, which is only the outermost context — the
+            // step that failed — so the viewer gets one fixed line; the chain
+            // under it is logged here, and str0m's parse error in the session.
             tracing::warn!("WHEP setup failed for stream '{stream_id}': {e:#}");
             report_negotiation_panic(&st, &e, "WHEP viewer", &stream_id, ip);
             (StatusCode::BAD_REQUEST, format!("WHEP setup failed: {e}")).into_response()
@@ -736,6 +739,7 @@ async fn whip_ingest_offer(
                 .into_response()
         }
         Err(e) => {
+            // One fixed line in the body, the chain in the log, as for WHEP.
             tracing::warn!("WHIP ingest setup failed for stream '{stream_id}': {e:#}");
             report_negotiation_panic(&st, &e, "WHIP publisher", &stream_id, peer.ip());
             (StatusCode::BAD_REQUEST, format!("WHIP ingest setup failed: {e}")).into_response()
@@ -3476,6 +3480,16 @@ mod tests {
 
     /// A `DistributionState` with default config, its origin under `dir`.
     fn test_state(dir: &std::path::Path) -> Arc<DistributionState> {
+        test_state_with_events(dir).0
+    }
+
+    /// [`test_state`], and the queue its events land in.
+    fn test_state_with_events(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<DistributionState>,
+        tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+    ) {
         let cfg = DistributionConfig::default();
         let control = DistributionControl::new(
             crate::distribution_control::RuntimeDistConfig::from_config(&cfg, None),
@@ -3490,15 +3504,16 @@ mod tests {
             idle_grace: std::time::Duration::from_secs(60),
         })
         .unwrap();
-        let (events, _rx) = crate::manager::events::event_channel();
-        DistributionState::new(
+        let (events, rx) = crate::manager::events::event_channel();
+        let state = DistributionState::new(
             Arc::new(DistributionHub::new()),
             Arc::new(origin),
             cfg,
             control,
             CancellationToken::new(),
             events,
-        )
+        );
+        (state, rx)
     }
 
     /// A WHEP `DELETE` is logged with the address it came from and the
@@ -3600,6 +3615,94 @@ mod tests {
 
         drop(elsewhere);
         assert_eq!(held(other), 0);
+    }
+
+    /// A str0m panic in a negotiation raises one Warning event naming the
+    /// peer, the step, the panic and the client's address; another inside
+    /// the gate's interval raises none, and an ordinary setup error — the
+    /// peer's own, a malformed or refused offer — never raises one.
+    ///
+    /// Driven with a `NegotiationPanic` built here: no panic reachable from a
+    /// peer's SDP is known in str0m 0.26, so the HTTP endpoints cannot be
+    /// made to raise one (`an_offer_str0m_refuses_is_a_400_that_raises_no_event`
+    /// in `tests/distribution.rs` drives them with the offer that used to).
+    /// Each error reaches `report_negotiation_panic` the way a handler's
+    /// does: `accept_offer`'s error under the context `whep.rs` and
+    /// `whip_ingest.rs` put on it, so the event is found through that
+    /// context, not only on a bare panic.
+    #[test]
+    fn a_negotiation_panic_raises_a_warning_naming_the_peer() {
+        use crate::manager::events::EventSeverity;
+        use anyhow::Context as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (st, mut events) = test_state_with_events(dir.path());
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        // `accept_offer` failing with `cause`, as `create_and_spawn_viewer`
+        // (`whep.rs`) or `create_and_spawn_ingest` (`whip_ingest.rs`) hands
+        // it to the handler.
+        let accept_failed = |cause: anyhow::Error, context: &'static str| {
+            Err::<String, _>(cause).context(context).unwrap_err()
+        };
+        let held_back = || st.negotiation_panics.held_back.load(Ordering::Relaxed);
+
+        let refused = accept_failed(
+            anyhow::anyhow!("SDP parse error: the offer is not valid SDP"),
+            "failed to accept SDP offer",
+        );
+        report_negotiation_panic(&st, &refused, "WHEP viewer", "show", ip);
+        assert!(
+            events.try_recv().is_err(),
+            "a refused offer raised an event"
+        );
+        assert_eq!(held_back(), 0, "a refused offer was counted as a panic");
+
+        let panic = |context| {
+            accept_failed(
+                NegotiationPanic {
+                    step: "SDP offer",
+                    message: "a str0m assertion".to_string(),
+                }
+                .into(),
+                context,
+            )
+        };
+        report_negotiation_panic(
+            &st,
+            &panic("failed to accept WHIP offer"),
+            "WHIP publisher",
+            "show",
+            ip,
+        );
+        let ev = events.try_recv().expect("one Warning event");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, "distribution");
+        assert_eq!(
+            ev.message,
+            "WebRTC negotiation with WHIP publisher failed: \
+             str0m panicked during SDP offer: a str0m assertion"
+        );
+        let details = ev.details.expect("details");
+        assert_eq!(details["error_code"], "webrtc_negotiation_panic");
+        assert_eq!(details["peer"], "WHIP publisher");
+        assert_eq!(details["stream"], "show");
+        assert_eq!(details["step"], "SDP offer");
+        assert_eq!(details["panic"], "a str0m assertion");
+        assert_eq!(details["ip"], "192.0.2.7");
+        assert_eq!(details["suppressed"], 0);
+
+        report_negotiation_panic(
+            &st,
+            &panic("failed to accept SDP offer"),
+            "WHEP viewer",
+            "show",
+            ip,
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a second inside the interval is held back"
+        );
+        assert_eq!(held_back(), 1, "and counted for the next event");
     }
 
     /// The negotiation-panic event gate reports the first occurrence, then at

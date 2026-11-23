@@ -260,10 +260,13 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   a unit past its cap is dropped whole.
 - **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
   each H.264 access unit goes to str0m's writer **once, whole, as Annex B** and
-  str0m packetizes it (RFC 6184) → SRTP → browser. There is no relay-side
-  packetizer: the vendored one was fed to str0m packet by packet, which
-  packetized every packet again, and no browser decoded a frame (removed, as the
-  edge removed its own in e927368). Vendored str0m session under
+  str0m packetizes it (RFC 6184) → SRTP → browser. Filler data NAL units (type
+  12) are taken out first (`session::strip_h264_filler`, borrowing the unit
+  unchanged when it has none): str0m 0.26 sends filler, which 0.24 dropped, and
+  a CBR source's filler would cost every viewer the full CBR rate. There is no
+  relay-side packetizer: the vendored one was fed to str0m packet by packet,
+  which packetized every packet again, and no browser decoded a frame (removed,
+  as the edge removed its own in e927368). Vendored str0m session under
   `src/distribution/webrtc/` (kept in sync with bilbycast-edge). A session ends
   on `DELETE` (the `/watch` player sends a `keepalive` fetch on `pagehide`), on
   the peer closing the connection (DTLS close_notify, `Event::Closed`), on ICE
@@ -286,18 +289,33 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   5.1 — same PT, RTX PT (127/121, 125/107, 108/109, 124/120, 123/119, 35/36,
   114/115), packetization mode and profile — and **no other codec**. Exactly
   one entry per (packetization mode, profile): two entries that both match an
-  offered PT make str0m panic ("Pt locked multiple times") whenever the remote
-  dictates PTs, which the old "defaults + four level-5.1 extras" set did to
-  every Chrome WHEP viewer. `get_pt` picks by codec (`send_pt`, identical to
+  offered PT made str0m up to 0.24 panic ("Pt locked multiple times") whenever
+  the remote dictates PTs, which the old "defaults + four level-5.1 extras" set
+  did to every Chrome WHEP viewer (str0m 0.26 warns and ignores the second
+  claim, #1159, so which entry wins would be an accident of order). `get_pt` picks by codec (`send_pt`, identical to
   the edge's: H.264 packetization-mode 1 first, mode 0 as a fallback, Opus on
   audio); VP8/VP9/AV1 stay out because nothing here carries them.
   bilbycast-edge must register the identical set (its WHIP output talks to this
-  ingest). str0m negotiation panics that remain are caught
+  ingest). No str0m negotiation panic reachable from a peer's SDP is known on
+  0.26 — the offer with one RTX PT repairing two PTs that 0.24.1 panicked on is
+  refused while it is parsed ("PT 103 has conflicting apt values 102 and 104",
+  #1113), a plain `400` with no event (str0m's parse error, which spans lines
+  and names a heap address, goes to the log as `WebRTC: the offer is not valid
+  SDP: …`; the body, as for any setup error, is one fixed line naming the step
+  that failed) — but any that appears is caught
   (`isolate_negotiation`, wrapping SDP parse through `to_sdp_string`, offer
-  creation and session setup) as a typed `NegotiationPanic`, fail only that
-  request with a `400`, and raise a Warning `webrtc_negotiation_panic` event
+  creation and session setup) as a typed `NegotiationPanic`, fails only that
+  request with a `400`, and raises a Warning `webrtc_negotiation_panic` event
   (at most one per 10 s); the per-IP WHEP slot is an RAII `ViewerSlot` in
   `distribution/mod.rs`, released however setup ends.
+  **str0m 0.26 receive and SDP behaviour.** Video has no count-only reorder
+  release (#1078): an incomplete frame waits for a complete successor, NACK
+  attempts and three RTTs (about 300 ms without RTX), and a frame whose last
+  packet has no RTP marker bit is never delivered, so a WHIP publisher or
+  cascade upstream that never sets the marker gets no video in. SDP
+  consistency is enforced on offers and on answers (#1100), so a third-party
+  offer, or an upstream's answer to a cascade pull, that 0.24.1 took can now be
+  refused. Detail: the `[dependencies.str0m]` comment in `Cargo.toml`.
   **Upgrade order — mixed versions panic.** Every earlier build (edge releases
   through v0.113.0 and edge trees before 5f71c4c; relay releases through
   v0.15.0) holds two entries for some pairs and panics when this set's SDP
@@ -554,8 +572,9 @@ listener in `main` before serving, so a taken port or unreadable secret exits
 at startup, and exits non-zero if either background task ever ends. Authelia's
 notifier startup check needs the listener, so Authelia is ordered after the
 portal. Adds `serde_yaml_ng`, `argon2` 0.6, `getrandom` 0.4, `lettre` 0.11
-(rustls + webpki-roots, no native-tls) and `async-trait` to the `portal`
-feature only. Operator detail, including the upgrade steps for a portal that
+(rustls + webpki-roots, no native-tls; at least 0.11.24, the fix for the
+STARTTLS reply injection in RUSTSEC-2026-0560) and `async-trait` to the
+`portal` feature only. Operator detail, including the upgrade steps for a portal that
 already ran either block: `docs/portal.md`.
 
 The trust boundary is the one thing to get right. Identity arrives in a header

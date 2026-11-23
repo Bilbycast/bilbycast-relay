@@ -458,13 +458,14 @@ async fn whip_ingest_depacketizes_h264_into_hub() {
 
 // ── H.264 over str0m's own packetizer, end to end ──
 //
-// The two tests above negotiate whatever a full str0m offer leads with, which
-// is VP8: the relay sends on the first payload type it negotiated, so H.264
-// bytes travel labelled VP8, and the VP8 (de)packetizer passes a payload
-// through untouched — any byte stream at all survives it. These two keep only
-// H.264 in the offer, so str0m's RFC 6184 packetizer and depacketizer carry
-// the media, as they do for a browser. Neither depends on *which* H.264
-// payload type the answer settles on.
+// Every session registers H.264 and Opus and no other codec (`rtc_config`),
+// so the two tests above already carry their video through str0m's RFC 6184
+// packetizer and depacketizer, but check little of what arrives: that media
+// decrypts at all, and that a reassembled keyframe reaches the hub. The tests
+// below check what a viewer or the hub gets, frame by frame, and pass their
+// offers through `h264_only` — a no-op on that codec set — so they stay on
+// H.264 if another codec joins it. None depends on *which* H.264 payload type
+// the answer settles on.
 
 /// GOP length and frame spacing (90 kHz) of the streams below.
 const GOP: u64 = 10;
@@ -707,6 +708,148 @@ fn nal_types(au: &[u8]) -> Vec<u8> {
         .iter()
         .map(|n| n[0] & 0x1f)
         .collect()
+}
+
+/// A filler data NAL unit (type 12): its header, `0xff` padding, the RBSP stop
+/// bit.
+const TEST_FILLER: &[u8] = &[0x0c, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80];
+
+/// A CBR source pads its access units with filler data, and a WHEP viewer is
+/// sent every one of them without it: the frames it reassembles are exactly
+/// [`decodable_frame`]'s. str0m 0.24 dropped filler in its packetizer, 0.26
+/// sends it (#1079), and `WebrtcSession::write_media` takes it out first. An
+/// Opus frame whose first byte reads as a filler NAL header reaches the viewer
+/// untouched: only an H.264 payload type is stripped.
+#[tokio::test]
+async fn a_whep_viewer_is_sent_no_h264_filler() {
+    use bilbycast_relay::distribution::webrtc::session::{
+        SessionConfig, SessionEvent, WebrtcSession,
+    };
+    use bilbycast_relay::distribution::whep;
+
+    let hub = Arc::new(DistributionHub::new());
+    let cancel = CancellationToken::new();
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    // Filler behind the IDR slice; around a P slice, behind 3-byte start
+    // codes and a 4-byte one.
+    let sent = |k: u64| -> Bytes {
+        if k.is_multiple_of(GOP) {
+            annex_b(&[TEST_SPS, TEST_PPS, &test_idr_slice(), TEST_FILLER]).into()
+        } else {
+            [
+                &[0, 0, 1][..],
+                TEST_FILLER,
+                &[0, 0, 1],
+                &nal_body(0x41, 300, k),
+                &[0, 0, 0, 1],
+                TEST_FILLER,
+            ]
+            .concat()
+            .into()
+        }
+    };
+    const OPUS: &[u8] = &[0x0c, 0xff, 0x80];
+    hub.publish("cbr", EsFrame::video(0, sent(0), true));
+
+    let client_cfg = SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some(lo),
+        ice_lite: false,
+    };
+    let mut client = WebrtcSession::new(&client_cfg).await.unwrap();
+    let (offer_sdp, pending) = client.create_offer(true, true, false).unwrap();
+    let offer_sdp = h264_only(&offer_sdp);
+    let (whep_events, _whep_rx) = bilbycast_relay::manager::events::event_channel();
+    let handle = whep::create_and_spawn_viewer(
+        hub.clone(),
+        "cbr".to_string(),
+        &offer_sdp,
+        Some(lo),
+        cancel.clone(),
+        whep_events,
+    )
+    .await
+    .expect("WHEP setup");
+    let h264 = h264_pts(&handle.answer_sdp);
+    assert!(
+        !h264.is_empty(),
+        "the answer must carry H.264:\n{}",
+        handle.answer_sdp
+    );
+    client.apply_answer(&handle.answer_sdp, pending).unwrap();
+
+    let pub_hub = hub.clone();
+    let pub_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut k = 0;
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    k += 1;
+                    let pts = k * FRAME_90K;
+                    pub_hub.publish("cbr", EsFrame::video(pts, sent(k), k.is_multiple_of(GOP)));
+                    pub_hub.publish("cbr", EsFrame::audio(pts, Bytes::from_static(OPUS)));
+                }
+            }
+        }
+    });
+
+    // Every video frame the viewer reassembles, (RTP timestamp, bytes), and
+    // every audio frame's bytes.
+    let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut audio: Vec<Vec<u8>> = Vec::new();
+    let client_cancel = CancellationToken::new();
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match client.poll_event(&client_cancel).await {
+                SessionEvent::MediaData {
+                    pt, data, rtp_time, ..
+                } => {
+                    if h264.contains(&*pt) {
+                        frames.push((rtp_time.numer(), data.to_vec()));
+                    } else {
+                        audio.push(data.to_vec());
+                    }
+                    let idrs = frames
+                        .iter()
+                        .filter(|(t, _)| (t / FRAME_90K).is_multiple_of(GOP))
+                        .count();
+                    if idrs >= 2 && frames.len() > GOP as usize && !audio.is_empty() {
+                        return true;
+                    }
+                }
+                SessionEvent::Disconnected => return false,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    cancel.cancel();
+    assert!(
+        matches!(done, Ok(true)),
+        "viewer must receive two IDRs and audio, got {done:?} after {} video and {} audio frames",
+        frames.len(),
+        audio.len()
+    );
+
+    for (i, (t, data)) in frames.iter().enumerate() {
+        assert_eq!(
+            t % FRAME_90K,
+            0,
+            "frame {i}: RTP timestamp {t} is not a frame's"
+        );
+        let k = t / FRAME_90K;
+        assert!(
+            data == &decodable_frame(k),
+            "frame {i} (k={k}): {} bytes, NAL types {:?}",
+            data.len(),
+            nal_types(data),
+        );
+    }
+    assert!(audio.iter().all(|a| a == OPUS), "audio frames {audio:02x?}");
 }
 
 /// `es::MAX_PARAM_SETS_ON_THE_WIRE` is str0m's real limit: an IDR whose SPS
@@ -2828,11 +2971,13 @@ async fn single_pt_answers_negotiate_in_both_client_roles() {
     }
 }
 
-/// An offer whose one RTX PT repairs two H.264 PTs. str0m 0.24.1 locks that RTX
-/// PT once per primary and panics ("Pt locked multiple times: 103") whatever
-/// codecs are registered, because both of these primaries — Baseline in
-/// packetization mode 1 and in mode 0 — are in every H.264 set str0m ships.
-/// So it stands for any negotiation panic still left in str0m.
+/// An offer whose one RTX PT repairs two H.264 PTs. str0m 0.24.1 locked that
+/// RTX PT once per primary and panicked ("Pt locked multiple times: 103")
+/// whatever codecs were registered, because both of these primaries —
+/// Baseline in packetization mode 1 and in mode 0 — are in every H.264 set
+/// str0m ships. str0m 0.26 refuses it as it parses it ("PT 103 has
+/// conflicting apt values 102 and 104", #1113), so it now stands for SDP
+/// str0m cannot reconcile, not for a panic.
 fn offer_with_an_rtx_pt_repairing_two_pts(direction: &str) -> String {
     const FP: &str = "5B:7E:0A:26:41:91:C4:7F:33:D8:12:6E:A0:5C:B9:E4:08:71:2D:9F:C6:3A:55:EB:10:84:7D:F2:69:0C:A3:1E";
     format!(
@@ -2848,18 +2993,36 @@ fn offer_with_an_rtx_pt_repairing_two_pts(direction: &str) -> String {
     )
 }
 
-/// A panic inside str0m's negotiation is an error for that one session, not a
-/// crash: `accept_offer` (WHEP and WHIP ingest) and `apply_answer` (the
-/// cascade pull) both return `Err`.
+/// SDP str0m cannot reconcile is a plain error for that one session:
+/// `accept_offer` (WHEP and WHIP ingest) and `apply_answer` (the cascade pull)
+/// both return `Err`, and neither is a `NegotiationPanic` — str0m 0.24.1
+/// panicked on both, and the relay caught it. str0m's parser names the
+/// conflict; the error says only that the SDP is not valid, because str0m's
+/// reason spans lines and names a heap address (`PointerOffset(0x…)`), so the
+/// session logs it instead.
 #[tokio::test]
-async fn a_str0m_panic_during_negotiation_is_an_error() {
-    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+async fn sdp_str0m_cannot_reconcile_is_an_error_in_both_roles() {
+    use bilbycast_relay::distribution::webrtc::session::{
+        NegotiationPanic, SessionConfig, WebrtcSession,
+    };
 
+    let offer = offer_with_an_rtx_pt_repairing_two_pts("recvonly");
+    let parse = str0m::change::SdpOffer::from_sdp_string(&offer)
+        .expect_err("str0m refuses this offer as it parses it")
+        .to_string();
+    assert!(
+        parse.contains("PT 103 has conflicting apt values 102 and 104 for mid: 0"),
+        "{parse}"
+    );
     let mut s = ice_lite_session().await;
     let err = s
-        .accept_offer(&offer_with_an_rtx_pt_repairing_two_pts("recvonly"))
+        .accept_offer(&offer)
         .expect_err("str0m cannot negotiate this offer");
-    assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+    assert!(err.downcast_ref::<NegotiationPanic>().is_none(), "{err:#}");
+    assert_eq!(
+        format!("{err:#}"),
+        "SDP parse error: the offer is not valid SDP"
+    );
 
     // The same SDP shape as an answer to a WHIP client's offer, on two PTs
     // that offer carries (Baseline in mode 1 and mode 0, one RTX for both).
@@ -2885,10 +3048,19 @@ async fn a_str0m_panic_during_negotiation_is_an_error() {
         .replace(":103 ", ":121 ")
         .replace("apt=102", "apt=127")
         .replace("apt=104", "apt=125");
+    let parse = str0m::change::SdpAnswer::from_sdp_string(&answer)
+        .expect_err("str0m refuses this answer as it parses it")
+        .to_string();
+    let conflict = format!("PT 121 has conflicting apt values 127 and 125 for mid: {mid}");
+    assert!(parse.contains(&conflict), "{parse}");
     let err = c
         .apply_answer(&answer, pending)
         .expect_err("str0m cannot accept this answer");
-    assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+    assert!(err.downcast_ref::<NegotiationPanic>().is_none(), "{err:#}");
+    assert_eq!(
+        format!("{err:#}"),
+        "SDP answer parse error: the answer is not valid SDP"
+    );
 }
 
 /// A distribution node on loopback, served as `run_distribution` serves it —
@@ -2984,14 +3156,16 @@ fn held(st: &bilbycast_relay::distribution::DistributionState) -> u32 {
 }
 
 /// The per-IP viewer cap, through the real router: offers that fail — here,
-/// by panicking str0m — give their slot back, so no number of them shuts an IP
+/// refused by str0m — give their slot back, so no number of them shuts an IP
 /// out, and a real viewer's slot comes back when it is deleted.
 ///
 /// Before, the slot was released by hand in the handler's `Err` arm only. A
-/// panic unwound straight past it (and dropped the connection with no
-/// response), so each one leaked a slot for the life of the process; with the
-/// default cap of 256, 256 Chrome WHEP attempts locked an IP out for good. The
-/// WHIP ingest route had the same crash with nothing to leak.
+/// str0m panic (0.24.1 panicked on this offer) unwound straight past it and
+/// dropped the connection with no response, so each one leaked a slot for the
+/// life of the process; with the default cap of 256, 256 Chrome WHEP attempts
+/// locked an IP out for good. The WHIP ingest route had the same crash with
+/// nothing to leak. `ViewerSlot` now gives the slot back however the handler
+/// is left, a panic included.
 #[tokio::test]
 async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
     const CAP: u32 = 2;
@@ -3450,63 +3624,42 @@ async fn an_offer_that_never_connects_is_closed_at_the_setup_deadline() {
     cancel.cancel();
 }
 
-/// A str0m panic during negotiation on the public WHEP or WHIP endpoint
-/// raises one Warning event naming the peer, the step, the panic and the
-/// client's address — rate limited, so a flood of hostile offers raises one —
-/// and a merely malformed offer raises none.
+/// An offer str0m refuses, on the public WHEP or WHIP endpoint, is a 400 and
+/// raises no event — it is the peer's own fault, as a malformed offer is.
+/// The body is one fixed line naming the step that failed: str0m's parse
+/// error, several lines naming a heap address of the relay, is logged and
+/// never sent to whoever POSTed the offer.
 ///
-/// Before, the panic was caught and the request failed with a 400, but the
-/// only trace was a `warn!` line on a headless relay; bilbycast-edge raises
-/// `webrtc_negotiation_panic` for the same panic.
+/// str0m 0.24.1 panicked on the hostile offer, and the relay raised a
+/// rate-limited `webrtc_negotiation_panic` Warning for it; str0m 0.26 refuses
+/// it while parsing it (#1113). The Warning stays for a panic a later str0m
+/// may grow, and
+/// `distribution::tests::a_negotiation_panic_raises_a_warning_naming_the_peer`
+/// covers it.
 #[tokio::test]
-async fn a_str0m_panic_in_negotiation_raises_one_rate_limited_warning() {
-    use bilbycast_relay::manager::events::EventSeverity;
-
+async fn an_offer_str0m_refuses_is_a_400_that_raises_no_event() {
     let cancel = CancellationToken::new();
     let (_state, addr, mut events) = serve_distribution(8, &cancel).await;
 
-    let (status, _, body) = http(addr, "POST", "/whep/show", "v=0\r\nnot an offer\r\n").await;
-    assert_eq!(status, 400, "{body}");
-    assert!(
-        events.try_recv().is_err(),
-        "a malformed offer raised an event"
-    );
-
     let hostile = offer_with_an_rtx_pt_repairing_two_pts("recvonly");
-    for _ in 0..3 {
-        let (status, _, body) = http(addr, "POST", "/whep/show", &hostile).await;
-        assert_eq!(status, 400, "{body}");
-    }
-    let (status, _, body) = http(addr, "POST", "/whip/show", &hostile).await;
-    assert_eq!(status, 400, "{body}");
-
-    let ev = events.try_recv().expect("one Warning event");
-    assert_eq!(ev.severity, EventSeverity::Warning);
-    assert_eq!(ev.category, "distribution");
-    assert!(
-        ev.message.starts_with(
-            "WebRTC negotiation with WHEP viewer failed: str0m panicked during SDP offer"
+    for (path, reason) in [
+        (
+            "/whep/show",
+            "WHEP setup failed: failed to accept SDP offer",
         ),
-        "{}",
-        ev.message
-    );
-    let details = ev.details.expect("details");
-    assert_eq!(details["error_code"], "webrtc_negotiation_panic");
-    assert_eq!(details["peer"], "WHEP viewer");
-    assert_eq!(details["stream"], "show");
-    assert_eq!(details["step"], "SDP offer");
-    assert!(
-        details["panic"]
-            .as_str()
-            .unwrap()
-            .contains("Pt locked multiple times"),
-        "{details}"
-    );
-    assert_eq!(details["ip"], "127.0.0.1");
-    assert_eq!(details["suppressed"], 0);
+        (
+            "/whip/show",
+            "WHIP ingest setup failed: failed to accept WHIP offer",
+        ),
+    ] {
+        for offer in [hostile.as_str(), "v=0\r\nnot an offer\r\n"] {
+            let (status, _, body) = http(addr, "POST", path, offer).await;
+            assert_eq!((status, body.as_str()), (400, reason), "{path}");
+        }
+    }
     assert!(
         events.try_recv().is_err(),
-        "the other three inside the interval are held back"
+        "a refused offer raised an event"
     );
 
     cancel.cancel();

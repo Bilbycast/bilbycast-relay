@@ -29,26 +29,25 @@ result_large_err = "allow"
 [dependencies]
 # QUIC
 quinn = "0.11.12"
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.10"
 
 # Async runtime
-tokio = { version = "1.53.2", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 
 # Direct socket-option control for IPV6_V6ONLY on dual-stack QUIC + REST listeners.
 socket2 = "0.6.5"
 
 # HTTP API
 axum = "0.8.9"
-tower-http = { version = "0.7.1", features = ["cors"] }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 
 # CLI
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 
 # Logging
 tracing = "0.1.44"
@@ -92,20 +91,19 @@ futures-util = "0.3.34"
 chrono = { version = "0.4.45", features = ["serde"] }
 
 # Utilities
-uuid = { version = "1.27.0", features = ["v4", "serde"] }
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
 anyhow = "1.0.104"
-bytes = "1.12.1"
+bytes = "1.12.2"
 
 # Certificate pinning (SHA-256 fingerprint)
-sha2 = "0.11.0"
-hmac = "0.13.0"
-webpki-roots = "1.0.9"
+sha2 = "0.11.1"
+webpki-roots = "1.0.12"
 
 # Lock-free cell used by the always-compiled `distribution_control` module (the
 # runtime config the manager pushes over WS) + the per-stream keyframe cache.
 # Non-optional so the manager-client command handler can hold a
 # `DistributionControl` handle without a feature gate. Tiny crate.
-arc-swap = "1.9.2"
+arc-swap = "1.9.5"
 
 # ── Viewer distribution subsystem (feature: viewer-distribution, default OFF) ──
 # A stateful, media-terminating WHEP SFU + LL-HLS origin co-located in the relay
@@ -114,63 +112,78 @@ arc-swap = "1.9.2"
 # is str0m (same as bilbycast-edge) with the OpenSSL DTLS backend — the pure-Rust
 # dimpl DTLS stalls on localhost active↔passive handshakes (see edge Cargo.toml).
 [dependencies.str0m]
-# 0.24.1, moved in lockstep with bilbycast-edge (both ends of a WHEP session
-# must agree). The lockfile moves `str0m` 0.23.1 -> 0.24.1 and `is` 0.11.0 ->
-# 0.11.1 and nothing else: `dimpl` 0.7.4 and `sctp-proto` 0.10.5 already met
-# the raised floors. MSRV is still 1.85.0, and the `openssl` / `vendored`
-# features are unchanged, so `viewer-distribution-vendored` still unifies
+# 0.26.0, moved in lockstep with bilbycast-edge (both ends of a WHEP session
+# must agree). The lockfile moves `str0m` 0.24.1 -> 0.26.0, `is` 0.11.1 ->
+# 0.12.1, `str0m-openssl` 0.6.0 -> 0.7.0, `str0m-proto` 0.7.0 -> 0.8.0 and
+# `dimpl` 0.7 -> 0.9.0, and adds no crate: dimpl 0.9's dependencies were all
+# in the graph already. MSRV rises from 1.85.0 to 1.89.0. The `openssl` /
+# `vendored` features are unchanged and str0m-openssl 0.7.0 asks for the same
+# openssl / openssl-sys, so `viewer-distribution-vendored` still unifies
 # str0m's OpenSSL into the static build. Earlier steps are audited in
-# bilbycast-edge/Cargo.toml; the last change that needed code here is still
-# `MediaData.data` becoming `Arc<[u8]>` in 0.20.
+# bilbycast-edge/Cargo.toml; the last change before this one that needed code
+# here was `MediaData.data` becoming `Arc<[u8]>` in 0.20.
 #
-# Correction: 0.23.0 -> 0.23.1 was not dependency-only, as this note used to
-# say. It also shipped #1029, bounds checks on malformed SRTP/SRTCP/RTCP/SCTP
-# input — parse hardening with nothing to adapt.
+# 0.24.1 -> 0.26.0 at compile time: one break. `set_reordering_timeout_video`
+# is gone (#1078), so `rtc_config` no longer calls it. Every other builder,
+# SDP, writer and event call in `distribution::{webrtc::session, whep,
+# whip_ingest, cascade}` keeps its signature, and str0m's seven built-in H.264
+# entries, Opus PT 111, the default extmap and the 1150-byte datagram target
+# are unchanged — so is the codec set below.
 #
-# 0.23.1 -> 0.24.1 at compile time: no code change. The breaking changes miss
-# this crate. `enable_opus` / `enable_pcmu` / ... gained a `use_red` argument
-# (RED, #982); none of them was called here at the bump, and the codec set
-# below now calls `enable_opus(true, false)`, RED off. `BweKind` variants
-# gained named fields (#1048), but no BWE is configured and `handle_event` ends
-# in `_ => None`. The new `Codec::Red` / `Codec::Tele` variants are not matched,
-# and `MediaKind` is still `Audio | Video`. Every builder, SDP, writer and event
-# call in `distribution::{webrtc::session, whep, whip_ingest, cascade}` keeps
-# its 0.23 signature. The per-media write queue cap rose from 100 to 512 and is
-# now ordered by send time; we drain after every write, so it holds one entry.
+# 0.24.1 -> 0.26.0 in behaviour:
+# - Video receive reordering has no count-only mode any more (#1078). An
+#   incomplete frame waits for a complete successor, then the missing
+#   packets' NACK attempts, then three RTTs — or three RTTs from the
+#   successor's receipt when the publisher negotiated no RTX, about 300 ms
+#   until an RTT is measured — and is then dropped. 0.24.1 with the deadline
+#   off released it once 30 complete frames had queued behind it (1.02 s
+#   measured at 30 fps without RTX). Not re-measured on 0.26. A video frame
+#   whose last packet carries no RTP marker bit is now never delivered: so an
+#   H.264 WHIP publisher or cascade upstream that never sets the marker gets
+#   no video through WHIP ingest or the cascade pull at all (Chrome, ffmpeg,
+#   OBS and str0m set it; 0.24.1 delimited such frames on the timestamp
+#   change). Audio keeps count-only release (`set_reordering_timeout_audio`).
+# - SDP consistency is enforced on offers AND answers (#1100, #1097, #1113).
+#   0.24.1 stopped its session-level check at the first consistent m-line;
+#   0.26 refuses duplicate mids, a BUNDLE group whose mids do not match the
+#   m-lines in number and order, and an RTX PT repairing two PTs, and reads
+#   ICE and DTLS attributes from the m-line the BUNDLE group's first mid
+#   names (#1158). So a third-party WHIP or WHEP offer 0.24.1 took can now
+#   get a 400, and an upstream's answer it took can now fail a cascade pull.
+#   The captured Chrome 124 and ffmpeg 8.1 offers pass; nothing else was
+#   tried.
+# - The negotiation panics the relay caught are gone: the offer with one RTX
+#   PT repairing two PTs is refused while it is parsed (#1113), and a PT
+#   claimed twice is warned about and ignored (#1159). `isolate_negotiation`
+#   stays as defence in depth, so `webrtc_negotiation_panic` now fires only
+#   for a panic nobody has found yet.
+# - H.264 filler data NAL units are packetized and sent (#1079); 0.24
+#   dropped them. A CBR source's filler would cost every WHEP viewer the full
+#   CBR rate for bytes its decoder discards, so `WebrtcSession::write_media`
+#   strips them first (`strip_h264_filler`), keeping 0.24's wire.
+# - ICE-Lite nomination (is 0.12, #1168): nominations from the last 6 s rank
+#   first, then PRIORITY, then recency, so a NAT port rebind is followed;
+#   0.11.1 ranked by PRIORITY alone. `PeerPin` pins the IP only, so a port
+#   rebind still passes it.
+# - A rejected m-line is written `m=<media> 0 <proto> 0` (#1101), which a
+#   browser and str0m can read; 0.24.1 wrote an empty format list.
+# - NACK and RTX: per-packet NACK retries are paced by the RTT (#1070), a
+#   NACKed packet is resent at most once per RTT (#1134), and RTX more than
+#   128 sequence numbers behind the newest is dropped (#1089). TWCC feedback
+#   to Chrome publishers is corrected (#1143, #1144, #1150, #1151, #1152),
+#   which changes what their bandwidth estimate sees. Candidates and STUN
+#   from port 0 or an unspecified IP are ignored (#1148).
+# - `poll_output` skips redundant work behind a readiness flag (#1011) and
+#   the NullPacer drains without a timeout (#1112, #1115), so the Transmit /
+#   Timeout cadence the session loops see can differ.
 #
-# 0.23.1 -> 0.24.1 in behaviour. All but the first are upstream defaults left
-# as they are.
-# - Receive reordering now has a deadline by default (#1041/#1057): 2 s for
-#   video, 1 s for audio. An incomplete frame at the head of the buffer holds
-#   every later frame until it completes or expires, where 30 complete video
-#   frames (15 audio) queued behind it used to release it, about 1 s at 30 fps.
-#   On WHIP ingest and the cascade pull, a packet lost by a publisher with no
-#   NACK/RTX stalled video 2.03 s instead of 1.02 s (measured). So
-#   `WebrtcSession::new` sets `set_reordering_timeout_{video,audio}(None)`,
-#   restoring count-only release exactly, as the edge does.
-# - transport-cc is negotiated per payload type: an answer carries
-#   `a=rtcp-fb:<pt> transport-cc` only for a PT the offer gave it to. Checked
-#   against `WebrtcSession::accept_offer`: the answer to an ffmpeg-shaped WHIP
-#   offer carried it on 0.23.1 and drops it on 0.24.1. Chrome and str0m peers
-#   offer it, so their answers keep it. Nothing here runs BWE.
-# - SSRC-0 bandwidth probes no longer re-arm an immediate RTCP timeout (#1052),
-#   which could spin the session loop on Chrome WHIP ingest.
-# - An offer's `a=msid:-` is no longer echoed in the answer (#1060), and stopped
-#   m-lines carry no msid or ssrc lines (#1063). RED and telephone-event are
-#   opt-in, so answers are otherwise unchanged.
-# - `is` 0.11.1 matches the transport protocol when it invalidates a candidate
-#   (#1035). A controlled ICE-lite agent now marks a pair Succeeded when it
-#   answers a Binding Request (#1039). Only `has_viable_remote_candidate` /
-#   `Rtc::accepts` read that state, and neither is called here; controlled-side
-#   `evaluate_nomination` still ranks by nomination. `PeerPin` is unaffected.
+# Not verified live: nothing above has been run against a real browser,
+# ffmpeg or OBS peer, or across a 0.24 edge talking to a 0.26 relay (answers
+# differ only in a rejected m-line now carrying format 0). The evidence is
+# source reading, the suites in `tests/distribution.rs` (str0m at both ends)
+# and offline SDP probes.
 #
-# Not verified live: nothing above has been run against a real browser, ffmpeg
-# or OBS peer, or across a 0.23 edge talking to a 0.24 relay (0.24 enables no
-# new wire feature by default, so that should work). The evidence is source
-# reading, the suites in `tests/distribution.rs` (str0m at both ends) and
-# offline SDP probes.
-#
-# Codec set. str0m 0.24.1's built-in H.264 entries are still level 3.1, so
+# Codec set. str0m 0.26.0's built-in H.264 entries are still level 3.1, so
 # `WebrtcSession::new` re-registers them at level 5.1: Opus (no RED) plus those
 # seven entries with the same PT, RTX PT, packetization mode and profile
 # (`H264_LEVEL_5_1` in `webrtc/session.rs`), and no other codec. It used to
@@ -178,20 +191,18 @@ arc-swap = "1.9.2"
 # 0.22 (#1016) an H.264 level mismatch only lowers the match score, so an
 # offered PT matched a built-in entry and an extra alike; wherever the remote
 # dictates the PTs (a recvonly or sendrecv offer, a recvonly answer to our
-# sendonly offer) str0m locked it twice and panicked ("Pt locked multiple
-# times: 102") — every Chrome WHEP viewer. The default set also put VP8 first,
-# so between two `WebrtcSession`s `get_pt` sent H.264 on PT 96, labelled VP8.
-# What changes on the wire: answers list only the H.264 (+ RTX) PTs the offer
-# gave H.264, with our level 5.1, and only Opus for audio; our offers list only
-# those seven H.264 entries and Opus. bilbycast-edge registers the identical
-# set, because its WHIP output negotiates with this crate's WHIP ingest. Tested
-# in `tests/distribution.rs` against a captured Chrome 124 WHEP offer, a
-# captured Chrome publisher offer, an ffmpeg 8.1-shaped WHIP offer and
-# single-PT answers, and run live at 18cd89a against HeadlessChrome 124 (edge
-# WHIP -> relay -> Chrome WHEP, and Chrome WHIP -> relay -> Chrome WHEP). A
-# negotiation panic str0m still has (an offer whose one RTX PT repairs two
-# H.264 PTs) is caught in `webrtc::session::isolate_negotiation` and fails that
-# one request.
+# sendonly offer) str0m up to 0.24 locked it twice and panicked ("Pt locked
+# multiple times: 102") — every Chrome WHEP viewer. The default set also put
+# VP8 first, so between two `WebrtcSession`s `get_pt` sent H.264 on PT 96,
+# labelled VP8. What changes on the wire: answers list only the H.264 (+ RTX)
+# PTs the offer gave H.264, with our level 5.1, and only Opus for audio; our
+# offers list only those seven H.264 entries and Opus. bilbycast-edge
+# registers the identical set, because its WHIP output negotiates with this
+# crate's WHIP ingest. Tested in `tests/distribution.rs` against a captured
+# Chrome 124 WHEP offer, a captured Chrome publisher offer, an ffmpeg
+# 8.1-shaped WHIP offer and single-PT answers, and run live at 18cd89a (str0m
+# 0.24.1) against HeadlessChrome 124 (edge WHIP -> relay -> Chrome WHEP, and
+# Chrome WHIP -> relay -> Chrome WHEP).
 #
 # UPGRADE ORDER — this set and the old one do not interoperate both ways.
 # Every earlier build (bilbycast-edge releases through v0.113.0 and edge trees
@@ -209,20 +220,31 @@ arc-swap = "1.9.2"
 #
 # KNOWN GAP, also predating this bump: unlike bilbycast-edge, this crate
 # carries no `[patch.crates-io]` and no vendored `is`, so it builds against
-# upstream's strict ICE parser (`stun.rs` is byte-identical in 0.11.1). Its
-# WHIP ingest therefore REJECTS Binding Requests with no PRIORITY attribute,
-# which is what ffmpeg 8.0.x (n8.0 to n8.0.3) sends. ffmpeg 8.1 and later send
-# PRIORITY (upstream 7fd967c2c1) and are accepted. Vendoring a permissive parser
-# here would also have to replace the unguarded `.expect("STUN request prio")`
-# in `is`'s `stun_server_handle_message`, which such a request would then
-# reach.
-version = "0.24.1"
+# upstream's strict ICE parser — `is` 0.12.1 still refuses a Binding Request
+# with no PRIORITY attribute (`stun.rs`, "STUN packet missing priority"). Its
+# WHIP ingest therefore REJECTS such requests, which is what ffmpeg 8.0.x (n8.0
+# to n8.0.3) sends. ffmpeg 8.1 and later send PRIORITY (upstream 7fd967c2c1)
+# and are accepted. Vendoring a permissive parser here would also have to
+# replace the unguarded `.expect("STUN request prio")` in `is`'s
+# `stun_server_handle_message`, which such a request would then reach.
+version = "0.26.0"
 optional = true
 default-features = false
 features = ["openssl"]
 
+# The viewer and ingest tokens (`distribution::token`) are HMAC-SHA256.
+[dependencies.hmac]
+version = "0.13.0"
+optional = true
+
+# The distribution HTTP surface's CORS layer (`distribution::build_router`).
+[dependencies.tower-http]
+version = "0.7.1"
+optional = true
+features = ["cors"]
+
 [dependencies.tokio-util]
-version = "0.7.19"
+version = "0.7.20"
 optional = true
 # `io` is what turns a `tokio::fs::File` into a response body: a clip is up to
 # 256 MiB and the origin must not hold one in memory to hand it out.
@@ -256,8 +278,12 @@ optional = true
 # it receives them on loopback and relays them through the configured SMTP
 # service. `lettre` is the client; rustls + webpki-roots to match the rest of
 # the portal's TLS, never native-tls.
+#
+# 0.11.24 is a security floor: RUSTSEC-2026-0560 to -0565, among them a
+# STARTTLS reply injection, and the portal's outbound mail is STARTTLS by
+# default.
 [dependencies.lettre]
-version = "0.11"
+version = "0.11.24"
 optional = true
 default-features = false
 features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"]
@@ -305,7 +331,7 @@ features = ["json", "query", "rustls-no-provider", "http2", "stream"]
 # OFF by default: a plain `cargo build` produces the pure opaque forwarder with
 # zero media-termination surface and no OpenSSL/str0m build dependency.
 default = []
-viewer-distribution = ["dep:str0m", "dep:tokio-util"]
+viewer-distribution = ["dep:str0m", "dep:tokio-util", "dep:hmac", "dep:tower-http"]
 # Release variant: viewer-distribution + statically-vendored OpenSSL, for the
 # static-musl release build (no system libssl at build or run time).
 viewer-distribution-vendored = ["viewer-distribution", "dep:openssl", "openssl/vendored"]
@@ -321,8 +347,8 @@ portal = ["dep:reqwest", "dep:serde_yaml_ng", "dep:argon2", "dep:getrandom",
 tempfile = "3.27.0"
 # `test-util` for a paused clock, so a test can run the manager client's
 # reconnect loop through its 5 s backoff without waiting for it.
-tokio = { version = "1.53.2", features = ["test-util"] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 
 [[test]]
 name = "distribution"

@@ -185,7 +185,7 @@ pub struct H264ParamSets {
 /// (measured: 210 bytes of ingest published as 31 MB).
 pub const MAX_PARAM_SET_BYTES: usize = 1024;
 
-/// The payload size str0m 0.24.1's H.264 packetizer is given: its default
+/// The payload size str0m 0.26.0's H.264 packetizer is given: its default
 /// 1150-byte datagram target (`str0m::DATAGRAM_MTU_TARGET`) less the 16-byte
 /// SRTP tag, rounded down to the 16-byte SRTP block — 1120 (`do_payload` in
 /// str0m's `media/mod.rs`). The relay sets no MTU of its own.

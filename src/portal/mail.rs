@@ -549,8 +549,9 @@ pub fn extract_link(data: &[u8]) -> Option<String> {
 
 /// A display name fit for a header and a page. It is whatever an operator
 /// typed: control characters become spaces — a CR or LF above all, which
-/// lettre cannot encode and panics on when it writes the header — and runs of
-/// whitespace collapse.
+/// lettre before 0.11.24 could not encode and panicked on when it wrote the
+/// header (0.11.24 writes each as a space itself; this does it first, and for
+/// every other control character too) — and runs of whitespace collapse.
 fn clean_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_control() { ' ' } else { c })

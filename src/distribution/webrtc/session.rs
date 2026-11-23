@@ -7,9 +7,10 @@
 //! str0m + tokio + anyhow — zero edge-internal types — so it lifts cleanly.
 //! The relay uses it in the ICE-Lite **server** role only (per-viewer WHEP).
 //! Keep in sync with the edge; the SDP-normalise / `is`-ICE-priority
-//! interop workarounds and the codec set ([`H264_LEVEL_5_1`]) must not diverge
-//! across the two str0m deployments — the edge's WHIP output negotiates with
-//! this file's WHIP ingest.
+//! interop workarounds, the codec set ([`H264_LEVEL_5_1`]) and the H.264
+//! filler strip (`strip_h264_filler`) must not diverge across the two str0m
+//! deployments — the edge's WHIP output negotiates with this file's WHIP
+//! ingest.
 //!
 //! **KNOWN, DELIBERATE DIVERGENCE — do not "resync" it away.** This copy
 //! carries a security control the edge copy does not: [`PeerPin`], an ingress
@@ -49,6 +50,7 @@
 //! SRTP, and media I/O. Integrates str0m's sans-I/O model with tokio
 //! by driving the UDP socket and str0m poll loop in a select! loop.
 
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -63,7 +65,7 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 /// The H.264 entries every session registers, as `(pt, rtx_pt,
-/// packetization_mode_1, profile_level_id)`: str0m 0.24.1's own seven
+/// packetization_mode_1, profile_level_id)`: str0m 0.26.0's own seven
 /// built-in entries (`CodecConfig::enable_h264`) with the same payload type,
 /// RTX payload type, packetization mode and profile, and only the level byte
 /// raised from 3.1 (`0x1f`) to 5.1 (`0x33`). With Opus they are the whole
@@ -81,9 +83,11 @@ use tokio_util::sync::CancellationToken;
 /// offered Baseline mode-1 PT matched both the built-in 3.1 entry and the
 /// extra 5.1 one. When the remote dictates the PTs — a browser's `recvonly`
 /// WHEP offer, or a `recvonly` answer to our `sendonly` offer — both entries
-/// lock that one PT and str0m panics, "Pt locked multiple times: 102". Every
-/// Chrome WHEP viewer hit it. With one entry per pair, an offered PT can match
-/// at most one local entry.
+/// lock that one PT, and str0m up to 0.24 panicked, "Pt locked multiple
+/// times: 102". Every Chrome WHEP viewer hit it. str0m 0.26 (#1159) warns and
+/// ignores the second claim instead, but which entry wins is then an accident
+/// of codec-config order. With one entry per pair, an offered PT can match at
+/// most one local entry.
 ///
 /// **Why only H.264 and Opus.** They are all this pipeline carries
 /// (`EsKind::{VideoH264, AudioOpus}`). Every other codec in str0m's default set
@@ -110,15 +114,22 @@ const H264_LEVEL_5_1: [(u8, u8, bool, u32); 7] = [
 /// The str0m configuration every session is built from: Opus without RED, the
 /// [`H264_LEVEL_5_1`] entries, and no other codec.
 ///
-/// str0m 0.24 also added a receive-reorder deadline (2 s video, 1 s audio) that
-/// holds every later frame behind an incomplete one until it expires. Without
-/// retransmission, one lost packet then stalls video about twice as long as
-/// 0.23 did. `None` restores 0.23's release by frame count, which is what this
-/// pipeline was tuned against.
+/// **Receive reordering.** An incomplete frame at the head of a receive buffer
+/// holds every later frame behind it. Audio keeps the release by frame count
+/// this pipeline was tuned against: `set_reordering_timeout_audio(None)` turns
+/// off the 1 s deadline str0m 0.24 added, so a gap is skipped once 15 complete
+/// frames have queued behind it. Video has had no count-only mode since str0m
+/// 0.25 (#1078), and nothing here can configure one: an incomplete frame waits
+/// for a complete successor, then the missing packets' NACK attempts (at most
+/// 5, paced by the RTT), then three RTTs — or, when the peer negotiated no
+/// RTX, three RTTs from that successor's receipt (100 ms RTT until one is
+/// measured, so about 300 ms) — and is then dropped. An incomplete frame with
+/// no complete successor has no deadline at all, and a video frame is
+/// complete only on a packet carrying the RTP marker bit, so an H.264 sender
+/// that never sets the marker gets no video through.
 fn rtc_config(ice_lite: bool) -> RtcConfig {
     let mut config = Rtc::builder()
         .set_ice_lite(ice_lite)
-        .set_reordering_timeout_video(None)
         .set_reordering_timeout_audio(None)
         .clear_codecs()
         .enable_opus(true, false);
@@ -158,15 +169,19 @@ impl std::error::Error for NegotiationPanic {}
 /// Run one synchronous str0m negotiation step, turning a panic inside it into
 /// a [`NegotiationPanic`] error.
 ///
-/// str0m still asserts its way through some SDP it cannot reconcile — an offer
-/// whose one RTX PT repairs two H.264 PTs makes 0.24.1 panic "Pt locked
-/// multiple times" whatever codecs are registered — and the input is whatever
-/// a WHEP viewer, a WHIP publisher or a cascade upstream sent. Unchecked, the
-/// panic unwinds through the HTTP handler: the client gets a dropped
-/// connection, and before `ViewerSlot` existed the per-IP slot leaked with it.
-/// Contained here, it is an error for that one request. Each step wraps
-/// everything str0m does with the peer's SDP — parsing it and writing ours
-/// included — as bilbycast-edge's `isolate_negotiation` does.
+/// Defence in depth. The input is whatever a WHEP viewer, a WHIP publisher or
+/// a cascade upstream sent, and str0m up to 0.24 asserted its way through SDP
+/// it could not reconcile: an offer whose one RTX PT repairs two H.264 PTs
+/// made 0.24.1 panic "Pt locked multiple times" whatever codecs were
+/// registered. str0m 0.26 refuses that offer as it parses it ("PT 103 has
+/// conflicting apt values 102 and 104", #1113) and warns about and ignores a
+/// PT claimed twice (#1159), so no panic reachable from a peer's SDP is known
+/// today — but one that appears in a later str0m must still fail one request,
+/// not the handler: unchecked, a panic unwinds through it, the client gets a
+/// dropped connection, and before `ViewerSlot` existed the per-IP slot leaked
+/// with it. Each step wraps everything str0m does with the peer's SDP —
+/// parsing it and writing ours included — as bilbycast-edge's
+/// `isolate_negotiation` does.
 ///
 /// `AssertUnwindSafe` is sound because nothing observes the `Rtc` afterwards:
 /// every caller discards the whole session when one of these steps returns
@@ -215,6 +230,72 @@ fn send_pt<'a>(kind: MediaKind, params: impl Iterator<Item = &'a PayloadParams>)
         }
     }
     mode_0
+}
+
+/// H.264 `nal_unit_type` of filler data (ITU-T H.264 Table 7-1).
+const H264_FILLER_NAL_TYPE: u8 = 12;
+
+/// `au`, an Annex-B H.264 access unit, without its filler data NAL units
+/// (type 12). Borrowed unchanged, with no allocation, when it carries none.
+///
+/// str0m up to 0.24 dropped filler in its H.264 packetizer; since 0.25
+/// (#1079) it packetizes and sends it. A CBR broadcast encoder pads its
+/// stream with filler to hold its rate, and a WebRTC viewer's decoder throws
+/// it away, so sending it would cost every viewer the whole CBR rate for
+/// nothing. This keeps 0.24's behaviour.
+///
+/// NAL units are delimited exactly as str0m's packetizer delimits them: a
+/// start code is two or more zero bytes and a one, and the zeros before a one
+/// belong to its start code, not to the NAL unit they follow. A filler unit
+/// goes with its start code. Removing any filler also removes whatever comes
+/// before the first start code, which str0m ignores anyway; an `au` with no
+/// start code at all is one NAL unit to str0m, and so is removed whole when
+/// it is filler. What str0m then packetizes from the result is what 0.24
+/// packetized from `au`.
+fn strip_h264_filler(au: &[u8]) -> Cow<'_, [u8]> {
+    // The next start code at or after `from`, as (its first byte, the NAL
+    // unit's first byte) — str0m's `H264Packetizer::next_ind`.
+    let next_start_code = |from: usize| -> Option<(usize, usize)> {
+        let mut zeros = 0;
+        for (i, &b) in au.iter().enumerate().skip(from) {
+            match b {
+                0 => zeros += 1,
+                1 if zeros >= 2 => return Some((i - zeros, i + 1)),
+                _ => zeros = 0,
+            }
+        }
+        None
+    };
+    let is_filler = |nal: &[u8]| {
+        nal.first()
+            .is_some_and(|b| b & 0x1f == H264_FILLER_NAL_TYPE)
+    };
+
+    let Some(first) = next_start_code(0) else {
+        return if is_filler(au) {
+            Cow::Borrowed(&[])
+        } else {
+            Cow::Borrowed(au)
+        };
+    };
+    // Allocated at the first filler unit, with everything from the first
+    // start code up to it; every later unit that is not filler is added.
+    let mut kept: Option<Vec<u8>> = None;
+    let mut code = Some(first);
+    while let Some((start, nal)) = code {
+        code = next_start_code(nal);
+        let end = code.map_or(au.len(), |(next, _)| next);
+        if is_filler(&au[nal..end]) {
+            kept.get_or_insert_with(|| {
+                let mut kept = Vec::with_capacity(au.len());
+                kept.extend_from_slice(&au[first.0..start]);
+                kept
+            });
+        } else if let Some(kept) = kept.as_mut() {
+            kept.extend_from_slice(&au[start..end]);
+        }
+    }
+    kept.map_or(Cow::Borrowed(au), Cow::Owned)
 }
 
 /// How long ICE may stay disconnected before the session is over
@@ -322,12 +403,13 @@ pub struct SessionConfig {
 /// **Why this exists.** ICE-Lite mints a *peer-reflexive* remote candidate from
 /// any STUN Binding Request that carries a correct MESSAGE-INTEGRITY, and — in
 /// lite mode — marks the resulting pair nominated the instant the request sets
-/// USE-CANDIDATE (`is-0.11.1/src/agent.rs`: `pair.nominate(self.ice_lite)`
-/// forces `NominationState::Success`, then `evaluate_nomination` picks the
-/// highest-**PRIORITY** nominated pair — and PRIORITY is an attribute the
-/// sender chooses). str0m then routes every DTLS/SRTP transmit to that pair's
-/// address (`str0m-0.24.1/src/lib.rs`, the `send_addr` branch of
-/// `poll_output`).
+/// USE-CANDIDATE (`is-0.12.1/src/agent.rs`: `pair.nominate(self.ice_lite)`
+/// forces `NominationState::Success`, then `evaluate_ice_lite_nomination`
+/// picks the nominated pair to send on: among pairs nominated in the last 6 s
+/// (`RECENT_NOMINATION`), the highest **PRIORITY** and then the most recent —
+/// and PRIORITY is an attribute the sender chooses). str0m then routes every
+/// DTLS/SRTP transmit to that pair's address (`str0m-0.26.0/src/lib.rs`, the
+/// `send_addr` branch of `poll_output`).
 ///
 /// The relay hands its ICE ufrag/pwd to whoever POSTs a WHEP offer, in the 201
 /// answer. So a client that has completed one legitimate session already holds
@@ -336,7 +418,7 @@ pub struct SessionConfig {
 /// the spoofed address, and one more every few seconds keeps it there: a UDP
 /// reflector with a four-to-five-order-of-magnitude amplification ratio.
 ///
-/// There is no upstream switch for this. `is` 0.11 implements no consent
+/// There is no upstream switch for this. `is` 0.12 implements no consent
 /// freshness (RFC 7675) — the word "consent" appears in that crate exactly
 /// once, in a doc comment about RTT measurement.
 ///
@@ -355,13 +437,15 @@ pub struct SessionConfig {
 ///
 /// **What it costs.** The pin is on the IP only, so a NAT *port* rebind — the
 /// common case — still passes. A viewer whose **IP** changes mid-stream
-/// (Wi-Fi → cellular) is dropped and must re-POST the WHEP offer. That is a
-/// small incremental cost, because mid-session IP migration barely works here
-/// today either: `evaluate_nomination` ranks nominated pairs purely by
-/// priority with no liveness filter, so a roaming viewer's new pair only wins
-/// if it happens to outrank the dead one. Making migration *safe* rather than
-/// merely absent needs a return-routability check (RFC 7675 consent, or a full
-/// non-lite agent) that neither str0m nor `is` offers today.
+/// (Wi-Fi → cellular) is dropped and must re-POST the WHEP offer. Without the
+/// pin that viewer would now be followed: since `is` 0.12 (#1168) an ICE-Lite
+/// agent prefers a pair the peer nominated in the last 6 s, so the new path
+/// takes over once the dead one's nominations go stale, where 0.11 ranked
+/// nominated pairs purely by priority and a roaming viewer's new pair won only
+/// if it happened to outrank the dead one. It follows a spoofer the same way,
+/// which is why the pin stays. Making migration *safe* rather than absent
+/// needs a return-routability check (RFC 7675 consent, or a full non-lite
+/// agent) that neither str0m nor `is` offers today.
 ///
 /// It costs one more thing, in the **client** (non-ICE-Lite) role that
 /// `cascade.rs` uses: there the relay is the controlling agent and
@@ -589,15 +673,21 @@ impl WebrtcSession {
     pub fn accept_offer(&mut self, offer_sdp: &str) -> Result<String> {
         // str0m 0.18's SDP parser accepted only `s=-` as the session name,
         // and ffmpeg and other WHIP publishers send a real one (e.g.
-        // `s=FFmpegPublishSession`, which RFC 8866 allows). str0m 0.24.1
+        // `s=FFmpegPublishSession`, which RFC 8866 allows). str0m 0.26.0
         // accepts any non-empty name, so that rewrite now matters only for an
         // empty `s=`, which str0m still rejects. The BUNDLE rewrite is a
         // separate workaround; see `normalise_sdp_offer_for_str0m`.
         let normalised = normalise_sdp_offer_for_str0m(offer_sdp);
 
         let answer_sdp = isolate_negotiation("SDP offer", || {
-            let offer = SdpOffer::from_sdp_string(&normalised)
-                .map_err(|e| anyhow::anyhow!("SDP parse error: {}", e))?;
+            // The parser's own error stays in the log, as bilbycast-edge keeps
+            // it: it spans several lines of parser internals and names a heap
+            // address of this process (`PointerOffset(0x…)`), which is nothing
+            // to hand whoever POSTed the offer to a public endpoint.
+            let offer = SdpOffer::from_sdp_string(&normalised).map_err(|e| {
+                tracing::warn!("WebRTC: the offer is not valid SDP: {e}");
+                anyhow::anyhow!("SDP parse error: the offer is not valid SDP")
+            })?;
 
             tracing::info!("SDP offer (normalised):\n{}", normalised);
 
@@ -649,8 +739,11 @@ impl WebrtcSession {
     /// On `Err` the session must be discarded, as for [`Self::accept_offer`].
     pub fn apply_answer(&mut self, answer_sdp: &str, pending: str0m::change::SdpPendingOffer) -> Result<()> {
         isolate_negotiation("SDP answer", || {
-            let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp)
-                .map_err(|e| anyhow::anyhow!("SDP answer parse error: {}", e))?;
+            // The parser's own error stays in the log, as for an offer.
+            let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp).map_err(|e| {
+                tracing::warn!("WebRTC: the answer is not valid SDP: {e}");
+                anyhow::anyhow!("SDP answer parse error: the answer is not valid SDP")
+            })?;
 
             self.rtc
                 .sdp_api()
@@ -679,7 +772,8 @@ impl WebrtcSession {
         self.local_addr
     }
 
-    /// Write media data to a track.
+    /// Write media data to a track. An H.264 access unit goes out without its
+    /// filler data (see `strip_h264_filler`).
     pub fn write_media(
         &mut self,
         mid: Mid,
@@ -689,12 +783,20 @@ impl WebrtcSession {
         data: &[u8],
     ) -> Result<()> {
         if let Some(writer) = self.rtc.writer(mid) {
+            let h264 = writer
+                .payload_params()
+                .any(|p| p.pt() == pt && p.spec().codec == Codec::H264);
+            let data = if h264 {
+                strip_h264_filler(data)
+            } else {
+                Cow::Borrowed(data)
+            };
             // str0m 0.20+ takes `impl Into<Arc<[u8]>>`. Building the `Arc`
             // straight from the slice costs one allocation + one copy;
             // going via `to_vec()` would pay for both twice, on every
             // egress RTP payload, per viewer.
             writer
-                .write(pt, wallclock, rtp_time, Arc::<[u8]>::from(data))
+                .write(pt, wallclock, rtp_time, Arc::<[u8]>::from(&*data))
                 .map_err(|e| anyhow::anyhow!("Write error: {}", e))?;
         }
         Ok(())
@@ -1206,17 +1308,19 @@ fn resolve_destination(
 /// metadata, never ICE, DTLS, crypto, or codec semantics):
 ///
 /// 1. **Session name** (`s=`): rewritten to `s=-`. str0m 0.18 accepted
-///    nothing else, and ffmpeg sends `s=FFmpegPublishSession`. str0m 0.24.1
+///    nothing else, and ffmpeg sends `s=FFmpegPublishSession`. str0m 0.26.0
 ///    accepts any non-empty name (RFC 8866 §5.3), so this now only rescues
 ///    an empty `s=`, which it still rejects.
 ///
 /// 2. **BUNDLE group** (`a=group:BUNDLE`): ffmpeg 8.x WHIP muxer emits
 ///    `a=group:BUNDLE 0 1` but only includes one m-section with
-///    `a=mid:1` — mid 0 doesn't exist. str0m tries to reconcile the
-///    group with the actual m-sections and silently drops the codec
-///    payload parameters, producing an answer with an empty
-///    `m=video 0 UDP/TLS/RTP/SAVPF ` line. We rewrite the BUNDLE group
-///    to only list MIDs that have a corresponding `a=mid:X` attribute.
+///    `a=mid:1` — mid 0 doesn't exist. str0m up to 0.24 tried to reconcile
+///    the group with the actual m-sections and silently dropped the codec
+///    payload parameters, producing an answer with a rejected video
+///    m-line. str0m 0.26 refuses the offer outright ("missing
+///    a=ice-ufrag/pwd": it reads the ICE credentials from the m-line the
+///    group's first mid names, #1158). We rewrite the BUNDLE group to only
+///    list MIDs that have a corresponding `a=mid:X` attribute.
 fn normalise_sdp_offer_for_str0m(offer: &str) -> String {
     // First pass: collect all MIDs declared in the SDP via `a=mid:X`.
     let mut declared_mids: Vec<String> = Vec::new();
@@ -1896,13 +2000,63 @@ mod tests {
         );
     }
 
-    /// An offer that str0m cannot negotiate fails as a [`NegotiationPanic`]
-    /// of the step it reached, and one that does not even parse fails as a
-    /// plain error — the parse now runs inside the isolated step too.
+    /// One `tracing` event a test saw.
+    #[derive(Debug)]
+    struct Record {
+        level: tracing::Level,
+        target: String,
+        message: String,
+    }
+
+    /// Every `tracing` event, kept whole — level, target and message — so a
+    /// test can tell the relay's own records from str0m's.
+    #[derive(Clone, Default)]
+    struct Records(Arc<std::sync::Mutex<Vec<Record>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Records {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            let meta = event.metadata();
+            self.0.lock().unwrap().push(Record {
+                level: *meta.level(),
+                target: meta.target().to_string(),
+                message: message.0,
+            });
+        }
+    }
+
+    /// An offer str0m cannot reconcile is refused as a plain error, and so is
+    /// one that is not SDP at all — the parse runs inside the isolated step
+    /// too. Neither is a [`NegotiationPanic`]: the offer below made str0m
+    /// 0.24.1 panic ("Pt locked multiple times"), and 0.26 refuses it while
+    /// parsing it instead (#1113). The error says only that the offer is not
+    /// valid SDP; str0m's own reason, which names the conflict, spans lines
+    /// and names a heap address of this process, goes to the relay's log
+    /// record `WebRTC: the offer is not valid SDP: …`. Only the relay's
+    /// records are read: str0m's m-line parser warns the same conflict text
+    /// itself (`warn!("{:?}", err)`), and that record must not be what
+    /// passes. That a panic still fails only its own step is
+    /// `isolate_negotiation_turns_a_panic_into_a_typed_error`'s job.
     #[tokio::test]
-    async fn accept_offer_reports_which_step_panicked() {
-        // Baseline in packetization mode 1 and 0, one RTX PT repairing both:
-        // str0m 0.24.1 locks that RTX PT twice and panics.
+    async fn accept_offer_refuses_an_offer_str0m_cannot_reconcile() {
+        // Baseline in packetization mode 1 and 0, one RTX PT repairing both.
         let hostile = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n\
              m=video 9 UDP/TLS/RTP/SAVPF 102 104 103\r\nc=IN IP4 0.0.0.0\r\n\
              a=ice-ufrag:hstl\r\na=ice-pwd:hostilepasswordhostile\r\n\
@@ -1913,21 +2067,144 @@ mod tests {
              a=rtpmap:104 H264/90000\r\n\
              a=fmtp:104 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\r\n\
              a=rtpmap:103 rtx/90000\r\na=fmtp:103 apt=102\r\na=fmtp:103 apt=104\r\n";
-        let err = test_session().await.accept_offer(hostile).unwrap_err();
-        let panic = err
-            .downcast_ref::<NegotiationPanic>()
-            .expect("a str0m panic");
-        assert_eq!(panic.step, "SDP offer");
-        assert!(
-            panic.message.contains("Pt locked multiple times"),
-            "{panic}"
-        );
+        let captured = Records::default();
+        let subscriber = || {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(captured.clone()),
+            )
+        };
+        let mut sessions = Vec::new();
+        for _ in 0..3 {
+            sessions.push(test_session().await);
+        }
+        // A first pass registers the callsite against a subscriber: one first
+        // hit by a parallel test with none installed can cache "never"
+        // process-wide, and the next subscriber's registration rebuilds it.
+        drop({
+            let warm = subscriber();
+            let _ = sessions.pop().unwrap().accept_offer(hostile);
+            warm
+        });
+        let _guard = subscriber();
 
-        let err = test_session()
-            .await
-            .accept_offer("v=0\r\nnot an offer\r\n")
-            .unwrap_err();
-        assert!(err.downcast_ref::<NegotiationPanic>().is_none(), "{err}");
+        for offer in [hostile, "v=0\r\nnot an offer\r\n"] {
+            captured.0.lock().unwrap().clear();
+            let err = sessions.pop().unwrap().accept_offer(offer).unwrap_err();
+            assert!(err.downcast_ref::<NegotiationPanic>().is_none(), "{err}");
+            assert_eq!(
+                format!("{err:#}"),
+                "SDP parse error: the offer is not valid SDP"
+            );
+            let records = captured.0.lock().unwrap();
+            let relay: Vec<&Record> = records
+                .iter()
+                .filter(|r| r.target.starts_with("bilbycast_relay::"))
+                .collect();
+            let [record] = relay[..] else {
+                panic!("not one record of the relay's own: {records:#?}");
+            };
+            assert_eq!(record.level, tracing::Level::WARN, "{record:#?}");
+            assert_eq!(
+                record.target, "bilbycast_relay::distribution::webrtc::session",
+                "{record:#?}"
+            );
+            let message = &record.message;
+            assert!(
+                message.starts_with("WebRTC: the offer is not valid SDP: SDP parse: "),
+                "{message}"
+            );
+            assert!(message.contains("PointerOffset(0x"), "{message}");
+            if offer == hostile {
+                assert!(
+                    message.contains("PT 103 has conflicting apt values 102 and 104 for mid: 0"),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    // ── H.264 filler ──────────────────────────────────────────────────
+
+    /// A filler data NAL unit: its header, `0xff` padding, the RBSP stop bit.
+    const FILLER: &[u8] = &[0x0c, 0xff, 0xff, 0xff, 0x80];
+    /// A slice of each kind. No zero byte in either.
+    const IDR: &[u8] = &[0x65, 0x88, 0x84, 0x21, 0x0c];
+    const SLICE: &[u8] = &[0x41, 0x9a, 0x0c, 0x03];
+    const SC3: &[u8] = &[0, 0, 1];
+    const SC4: &[u8] = &[0, 0, 0, 1];
+
+    /// What `strip_h264_filler` makes of the concatenation of `parts`.
+    fn stripped(parts: &[&[u8]]) -> Vec<u8> {
+        strip_h264_filler(&parts.concat()).into_owned()
+    }
+
+    /// A filler unit goes, with the start code in front of it, wherever it
+    /// sits and whichever start code it has. A `0x0c` byte inside a slice is
+    /// not a filler unit.
+    #[test]
+    fn filler_goes_from_the_start_middle_and_end_of_an_access_unit() {
+        assert_eq!(stripped(&[SC4, FILLER, SC4, IDR]), [SC4, IDR].concat());
+        assert_eq!(
+            stripped(&[SC3, IDR, SC3, FILLER, SC3, SLICE]),
+            [SC3, IDR, SC3, SLICE].concat()
+        );
+        assert_eq!(stripped(&[SC4, SLICE, SC3, FILLER]), [SC4, SLICE].concat());
+        assert_eq!(
+            stripped(&[
+                SC3, FILLER, SC4, IDR, SC4, FILLER, SC3, FILLER, SC3, SLICE, SC4, FILLER
+            ]),
+            [SC4, IDR, SC3, SLICE].concat()
+        );
+    }
+
+    /// Zero bytes in front of a start code's one are part of the start code,
+    /// as str0m's packetizer reads them, so they go with a filler unit, and
+    /// the unit before it keeps exactly the bytes str0m would have sent.
+    #[test]
+    fn the_zeros_before_a_filler_start_code_go_with_it() {
+        assert_eq!(
+            stripped(&[SC4, SLICE, &[0, 0, 0, 0, 0, 1], FILLER, SC3, IDR]),
+            [SC4, SLICE, SC3, IDR].concat()
+        );
+    }
+
+    /// An access unit of filler alone strips to nothing, which str0m sends as
+    /// no packet at all — as 0.24 sent the filler. So does one bare filler
+    /// unit, with no start code, which str0m takes as one NAL unit.
+    #[test]
+    fn an_access_unit_of_filler_alone_strips_to_nothing() {
+        assert!(stripped(&[SC4, FILLER, SC3, FILLER]).is_empty());
+        assert!(stripped(&[FILLER]).is_empty());
+    }
+
+    /// Without filler the access unit is handed back as it is — borrowed, not
+    /// copied — bare, with bytes ahead of its first start code, or empty.
+    #[test]
+    fn an_access_unit_without_filler_is_borrowed_unchanged() {
+        for au in [
+            [SC4, IDR, SC3, SLICE].concat(),
+            SLICE.to_vec(),
+            [&[0x99][..], SC4, SLICE].concat(),
+            Vec::new(),
+        ] {
+            match strip_h264_filler(&au) {
+                Cow::Borrowed(out) => assert!(std::ptr::eq(out, &au[..]), "{au:02x?}"),
+                Cow::Owned(out) => panic!("{au:02x?} was copied to {out:02x?}"),
+            }
+        }
+    }
+
+    /// Bytes ahead of the first start code are not a NAL unit to str0m, which
+    /// skips them; once filler is removed they go too, so that an access unit
+    /// left without a start code is not taken for one bare NAL unit.
+    #[test]
+    fn bytes_before_the_first_start_code_go_with_the_filler() {
+        assert_eq!(
+            stripped(&[&[0x99], SC4, SLICE, SC4, FILLER]),
+            [SC4, SLICE].concat()
+        );
+        assert!(stripped(&[&[0x99], SC4, FILLER]).is_empty());
     }
 
     // ── The send payload type ─────────────────────────────────────────

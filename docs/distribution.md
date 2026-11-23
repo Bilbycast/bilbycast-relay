@@ -70,6 +70,44 @@ they are not either/or.
 - **Keyframe cache**: the relay caches the last IDR access unit per stream, so a
   late-joining viewer decodes immediately instead of waiting for the source's
   next IDR.
+- **No filler to viewers**: a CBR source pads its H.264 with filler data NAL
+  units (type 12). The relay takes them out of each access unit before str0m
+  packetizes it for a WHEP viewer (`strip_h264_filler` in
+  `src/distribution/webrtc/session.rs`) — str0m 0.26 sends filler, 0.24 did
+  not, and a viewer's decoder discards it, so passing it on would cost every
+  viewer the source's full CBR rate.
+
+### What str0m 0.26 refuses that 0.24 took
+
+WHIP ingest, WHEP and the cascade pull run on str0m 0.26. Two changes in it
+can turn away a third-party peer the relay used to serve:
+
+- **A publisher that never sets the RTP marker bit gets no video in.** str0m
+  now delimits a received video frame only on a packet carrying the marker
+  bit, and waits on an incomplete frame for a complete successor, the missing
+  packets' retransmissions and three round trips (about 300 ms with no RTX)
+  before dropping it. A frame with no marker is never delivered. RFC 6184
+  requires the marker, and Chrome, ffmpeg, OBS and str0m set it; a WHIP
+  publisher or a cascade upstream that does not is the case to look for when
+  a stream connects and no video reaches the hub.
+- **SDP is checked for consistency on offers and on answers.** Duplicate mids
+  and a BUNDLE group whose mids do not match the m-lines in number and order
+  are refused, and ICE and DTLS attributes are read from the m-line the BUNDLE
+  group's first mid names — a WHIP or WHEP offer with a `400`, an upstream's
+  answer by failing the cascade pull, which retries. (The relay already drops
+  BUNDLE mids that name no m-line from an offer, the ffmpeg 8.x shape, before
+  str0m reads it.) The captured Chrome 124 and ffmpeg 8.1 offers pass; other
+  clients were not tried. What str0m says goes to the relay's log, never into
+  the `400`, whose body is one fixed line naming the step that failed: `WHEP
+  setup failed: failed to accept SDP offer`, or `WHIP ingest setup failed:
+  failed to accept WHIP offer`. The `WHEP setup failed for stream …` (`WHIP
+  ingest setup failed for stream …`, `cascade '…': … will retry`) warning
+  carries str0m's reason for a refusal made while accepting the SDP, the
+  mid and BUNDLE checks above. One made while parsing it — every per-m-line
+  check, which is where an RTX PT repairing two PTs is refused, and SDP that
+  does not parse at all — is on a line of its own, `WebRTC: the offer is not
+  valid SDP: …` (`the answer …`), because str0m's parse error spans several
+  lines and names a heap address of the relay.
 
 ### Upgrade order: edges first, then relays upstream first
 
@@ -242,10 +280,12 @@ The pin is on the IP only, so an ordinary NAT **port** rebind still passes. The
 operational consequence worth knowing: **a viewer whose public IP changes
 mid-session goes black** — a Wi-Fi → cellular handover, a CGNAT pool rotation —
 and recovers only by re-POSTing its WHEP offer, which mints a new session. That
-is not a relay fault and there is no per-session override. Mid-session IP
-migration barely worked here before the pin either; making it *safe* rather than
-merely absent needs a return-routability check (RFC 7675 consent, or a full
-non-lite agent) that neither str0m nor its ICE agent implements today.
+is not a relay fault and there is no per-session override. Without the pin
+str0m would now follow the viewer (since `is` 0.12 its ICE-Lite agent prefers
+a path the peer nominated in the last 6 s), but it would follow a spoofer just
+as readily; making migration *safe* rather than absent needs a
+return-routability check (RFC 7675 consent, or a full non-lite agent) that
+neither str0m nor its ICE agent implements today.
 
 The first such drop in a WHEP session raises the warning event
 `webrtc_offpath_source` and increments
@@ -1770,7 +1810,7 @@ does for tunnels). Automatic geo/latency-based viewer assignment is a follow-up
 *(Historical note: the cascade WHEP-client offering audio previously tripped a
 str0m PT-collision — an `add_h264` workaround reused PT 111, which is Opus's
 default. That workaround, four level-5.1 H.264 entries added on top of str0m's
-default codec set, is gone too: on str0m 0.22 and later it made every Chrome
+default codec set, is gone too: on str0m 0.22 to 0.24 it made every Chrome
 WHEP offer panic str0m ("Pt locked multiple times: 102"), and the default set
 it sat on had the send loop label H.264 as VP8. Every WebRTC session — WHEP,
 WHIP ingest and the cascade pull — now registers Opus plus str0m's own H.264
@@ -2100,9 +2140,23 @@ as ignored at startup.
   (`a_peer_that_closes_without_a_delete_ends_at_once`); a WHEP viewer and a
   WHIP publisher that never connect are closed at the 30 s setup deadline
   (`an_offer_that_never_connects_is_closed_at_the_setup_deadline`, 30 s).
-- **Negotiation panics**: an offer str0m panics on fails that request with a
-  `400` and raises one rate-limited `webrtc_negotiation_panic` event
-  (`a_str0m_panic_in_negotiation_raises_one_rate_limited_warning`).
+- **H.264 filler**: a WHEP viewer of a stream padded with filler data
+  receives every access unit without it, and an Opus frame whose first byte
+  reads as a filler header untouched (`a_whep_viewer_is_sent_no_h264_filler`).
+- **Refused negotiations**: the offer str0m 0.24.1 panicked on (one RTX PT
+  repairing two PTs), and an offer that is not SDP at all, is a `400` on WHEP
+  and WHIP that raises no event and whose body is exactly `WHEP setup failed:
+  failed to accept SDP offer` (`WHIP ingest setup failed: failed to accept
+  WHIP offer`) (`an_offer_str0m_refuses_is_a_400_that_raises_no_event`);
+  str0m's reason, the conflict named, is in the relay's log record
+  `WebRTC: the offer is not valid SDP: …`, told apart from the warning str0m
+  logs naming the same conflict
+  (`distribution::webrtc::session::tests::accept_offer_refuses_an_offer_str0m_cannot_reconcile`).
+  A str0m panic, if one appears, still raises one rate-limited
+  `webrtc_negotiation_panic` event, found under the context the WHEP and WHIP
+  setup puts on the error
+  (`distribution::tests::a_negotiation_panic_raises_a_warning_naming_the_peer`,
+  a unit test, since no offer that panics str0m 0.26 is known).
 - **Cascade**: an upstream relay serving WHEP + a downstream relay pulling it
   (real HTTP signalling + real ICE/DTLS/SRTP) and republishing to its own hub
   (`cascade_pulls_upstream_whep_and_republishes`).
