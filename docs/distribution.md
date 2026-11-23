@@ -76,7 +76,7 @@ they are not either/or.
   `src/distribution/webrtc/session.rs`) — str0m 0.26 sends filler, 0.24 did
   not, and a viewer's decoder discards it, so passing it on would cost every
   viewer the source's full CBR rate. `bilbycast_relay_distribution_bytes_out_total`
-  counts what goes to str0m, after the strip; up to 0.21.0 it counted each
+  counts what goes to str0m, after the strip; until 2026-11 it counted each
   access unit with its filler.
 - **Payload type by profile**: a viewer's offer names one H.264 payload type
   per profile it decodes (Chrome: Baseline, Constrained Baseline, Main). The
@@ -89,7 +89,7 @@ they are not either/or.
   to (a High 10 stream, or a High one to Chrome, which offers no High). Until
   the first SPS — a viewer is primed with the cached keyframe, so normally
   none — it is the viewer's first packetization-mode=1 PT, as every PT was
-  up to 0.21.0: an x264 Main stream went out on Chrome's Baseline PT. The
+  until 2026-11: an x264 Main stream went out on Chrome's Baseline PT. The
   choice (`h264_pt_for_sps`) is bilbycast-edge's, kept identical.
 
 ### What str0m 0.26 refuses that 0.24 took

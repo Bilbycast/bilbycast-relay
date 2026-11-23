@@ -265,7 +265,7 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   unchanged when it has none): str0m 0.26 sends filler, which 0.24 dropped, and
   a CBR source's filler would cost every viewer the full CBR rate; the
   stream's bytes-out counts what `write_media` hands str0m, after the strip
-  (it counted the unit with its filler up to 0.21.0). There is no
+  (it counted the unit with its filler until 2026-11). There is no
   relay-side packetizer: the vendored one was fed to str0m packet by packet,
   which packetized every packet again, and no browser decoded a frame (removed,
   as the edge removed its own in e927368). Vendored str0m session under
@@ -302,7 +302,7 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   edge's: the viewer's mode-1 PT of the stream's own profile — profile_idc
   plus constraint flags, level not compared under `level-asymmetry-allowed`
   — else of a profile whose decoders decode it, else of the most capable
-  profile the viewer accepted); up to 0.21.0 a Main stream went out on the
+  profile the viewer accepted); until 2026-11 a Main stream went out on the
   viewer's Baseline PT with its Main PT negotiated beside it.
   bilbycast-edge must register the identical set (its WHIP output talks to this
   ingest). No str0m negotiation panic reachable from a peer's SDP is known on
