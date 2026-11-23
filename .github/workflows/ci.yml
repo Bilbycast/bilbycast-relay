@@ -189,6 +189,10 @@ jobs:
   # behind nine cargo invocations. jsdom is installed `--no-save`, so no
   # package.json or lockfile enters the repo (`.gitignore` covers the
   # `node_modules/` it leaves behind).
+  #
+  # The `/watch` player (`player.html`) lives beside `dvr.html`, so its suite,
+  # `tests/player_page.test.cjs`, runs here as a second step on the same
+  # install, under the same name, with `PLAYER_PAGE_REQUIRE_JSDOM=1`.
   # ---------------------------------------------------------------
   dvr-page:
     name: DVR page (jsdom)
@@ -210,6 +214,12 @@ jobs:
         run: |
           npm i --no-save --no-audit --no-fund jsdom@30
           DVR_PAGE_REQUIRE_JSDOM=1 node --test tests/dvr_page.test.cjs
+
+      # The `/watch` player beside it: its reconnect and back-off, which no
+      # cargo command runs either. Same directory, same jsdom install.
+      - name: Watch player jsdom suite
+        working-directory: src/distribution
+        run: PLAYER_PAGE_REQUIRE_JSDOM=1 node --test tests/player_page.test.cjs
 
   # ---------------------------------------------------------------
   # The portal page's jsdom suite.
