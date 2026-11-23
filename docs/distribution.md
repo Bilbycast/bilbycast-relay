@@ -75,7 +75,22 @@ they are not either/or.
   packetizes it for a WHEP viewer (`strip_h264_filler` in
   `src/distribution/webrtc/session.rs`) — str0m 0.26 sends filler, 0.24 did
   not, and a viewer's decoder discards it, so passing it on would cost every
-  viewer the source's full CBR rate.
+  viewer the source's full CBR rate. `bilbycast_relay_distribution_bytes_out_total`
+  counts what goes to str0m, after the strip; up to 0.21.0 it counted each
+  access unit with its filler.
+- **Payload type by profile**: a viewer's offer names one H.264 payload type
+  per profile it decodes (Chrome: Baseline, Constrained Baseline, Main). The
+  relay sends the stream on the viewer's PT of the stream's own profile, read
+  from its SPS (profile_idc and constraint flags; the level is not compared,
+  as every entry carries `level-asymmetry-allowed=1`), else on a profile whose
+  decoders decode it (Constrained Baseline on Baseline, Main on High), else on
+  the most capable profile the viewer accepted (High, then Main, then the
+  Baselines) — the PT likeliest to decode a stream nothing accepted is sure
+  to (a High 10 stream, or a High one to Chrome, which offers no High). Until
+  the first SPS — a viewer is primed with the cached keyframe, so normally
+  none — it is the viewer's first packetization-mode=1 PT, as every PT was
+  up to 0.21.0: an x264 Main stream went out on Chrome's Baseline PT. The
+  choice (`h264_pt_for_sps`) is bilbycast-edge's, kept identical.
 
 ### What str0m 0.26 refuses that 0.24 took
 
@@ -2142,7 +2157,11 @@ as ignored at startup.
   (`an_offer_that_never_connects_is_closed_at_the_setup_deadline`, 30 s).
 - **H.264 filler**: a WHEP viewer of a stream padded with filler data
   receives every access unit without it, and an Opus frame whose first byte
-  reads as a filler header untouched (`a_whep_viewer_is_sent_no_h264_filler`).
+  reads as a filler header untouched (`a_whep_viewer_is_sent_no_h264_filler`),
+  and what goes to str0m is what bytes-out counts
+  (`a_viewers_bytes_out_leave_the_filler_out`).
+- **Payload type by profile**: a Main-profile stream reaches a viewer on its
+  Main PT (`a_whep_viewer_is_sent_a_main_stream_on_its_main_pt`).
 - **Refused negotiations**: the offer str0m 0.24.1 panicked on (one RTX PT
   repairing two PTs), and an offer that is not SDP at all, is a `400` on WHEP
   and WHIP that raises no event and whose body is exactly `WHEP setup failed:

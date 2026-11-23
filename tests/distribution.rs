@@ -852,6 +852,87 @@ async fn a_whep_viewer_is_sent_no_h264_filler() {
     assert!(audio.iter().all(|a| a == OPUS), "audio frames {audio:02x?}");
 }
 
+/// A Main-profile stream goes out to a WHEP viewer on the viewer's Main PT,
+/// chosen from the stream's SPS (`h264_pt_for_sps`, shared with
+/// bilbycast-edge); it went out on the first packetization-mode=1 PT the
+/// viewer accepted, Baseline, whatever the stream's profile. The viewer
+/// offers the relay's own H.264 set: Baseline on PT 127, Main on PT 123.
+#[tokio::test]
+async fn a_whep_viewer_is_sent_a_main_stream_on_its_main_pt() {
+    use bilbycast_relay::distribution::webrtc::session::{
+        SessionConfig, SessionEvent, WebrtcSession,
+    };
+    use bilbycast_relay::distribution::whep;
+
+    /// [`TEST_SPS`] as Main profile with constraint_set1, as x264 writes it.
+    const MAIN_SPS: &[u8] = &[0x67, 0x4d, 0x40, 0x1f, 0x8c, 0x8d, 0x40, 0x50, 0x1e, 0xd0];
+    let frame = |k: u64| -> (Bytes, bool) {
+        let idr = k.is_multiple_of(GOP);
+        let au = if idr {
+            annex_b(&[MAIN_SPS, TEST_PPS, &test_idr_slice()])
+        } else {
+            annex_b(&[&nal_body(0x41, 300, k)])
+        };
+        (au.into(), idr)
+    };
+    let hub = Arc::new(DistributionHub::new());
+    let cancel = CancellationToken::new();
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let (au, idr) = frame(0);
+    hub.publish("main", EsFrame::video(0, au, idr));
+
+    let client_cfg = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: Some(lo), ice_lite: false };
+    let mut client = WebrtcSession::new(&client_cfg).await.unwrap();
+    let (offer_sdp, pending) = client.create_offer(true, false, false).unwrap();
+    let offer_sdp = h264_only(&offer_sdp);
+    let (whep_events, _whep_rx) = bilbycast_relay::manager::events::event_channel();
+    let handle = whep::create_and_spawn_viewer(
+        hub.clone(),
+        "main".to_string(),
+        &offer_sdp,
+        Some(lo),
+        cancel.clone(),
+        whep_events,
+    )
+    .await
+    .expect("WHEP setup");
+    client.apply_answer(&handle.answer_sdp, pending).unwrap();
+
+    let pub_hub = hub.clone();
+    let pub_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut k = 0;
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    k += 1;
+                    let (au, idr) = frame(k);
+                    pub_hub.publish("main", EsFrame::video(k * FRAME_90K, au, idr));
+                }
+            }
+        }
+    });
+
+    let mut pts = Vec::new();
+    let client_cancel = CancellationToken::new();
+    let heard = tokio::time::timeout(Duration::from_secs(20), async {
+        while pts.len() < 2 * GOP as usize {
+            match client.poll_event(&client_cancel).await {
+                SessionEvent::MediaData { pt, .. } => pts.push(*pt),
+                SessionEvent::Disconnected => return false,
+                _ => {}
+            }
+        }
+        true
+    })
+    .await;
+    cancel.cancel();
+    assert!(matches!(heard, Ok(true)), "the viewer heard {} frames", pts.len());
+    assert!(pts.iter().all(|&pt| pt == 123), "video came on PTs {pts:?}");
+}
+
 /// `es::MAX_PARAM_SETS_ON_THE_WIRE` is str0m's real limit: an IDR whose SPS
 /// and PPS add up to it reaches the viewer behind both, and one a byte over
 /// it reaches the viewer bare — str0m's packetizer drops the STAP-A. The hub
