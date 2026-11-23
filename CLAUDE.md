@@ -271,8 +271,9 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   (`superseded_frames`, one warning per episode) and, once no newer ingest
   holds the stream id, takes it back on that frame (`take_back`: a fresh
   stream inheriting its SPS / PPS and audio flag, or the unclaimed one viewers
-  wait on). An ingest that is ending never takes the stream back
-  (`Publisher::mark_ending`, set by
+  wait on). The SPS / PPS it sends while superseded are kept on its closed
+  stream for that (`track_param_sets`), and an ingest that is ending never
+  takes the stream back (`Publisher::mark_ending`, set by
   `AuAssembler::finish` before a WHIP or cascade session's last flush).
   `Publisher::end` returns a `StreamEnd` — `Closed`, `HeldByAnother` or
   `Unheld` — which the QUIC ingest's closed event reports as `held_by`.

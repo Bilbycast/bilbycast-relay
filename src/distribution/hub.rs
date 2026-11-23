@@ -209,6 +209,21 @@ impl StreamState {
         Ok(())
     }
 
+    /// Refresh the SPS / PPS from a video frame that is not sent: one a
+    /// superseded ingest published into this, its closed stream. A stream it
+    /// takes back inherits them, so they are the ones its source uses now —
+    /// a source that changed them while superseded (a resolution change, the
+    /// new sets sent once) would otherwise have every bare IDR after the
+    /// take-back go out behind the old ones.
+    fn track_param_sets(&self, frame: &EsFrame) {
+        if frame.kind != EsKind::VideoH264 {
+            return;
+        }
+        if let Some(sets) = restore_param_sets(&frame.data, &self.param_sets.load()).param_sets {
+            self.param_sets.store(Arc::new(sets));
+        }
+    }
+
     /// Carry over what an ingest's stream knew about its media into the
     /// stream it took back: the SPS / PPS it would put back ahead of a bare
     /// IDR — a sender that sends them once would otherwise leave every viewer
@@ -384,8 +399,9 @@ impl Publisher<'_> {
     }
 
     /// The closed path: a newer ingest took the stream. Take it back if that
-    /// ingest has gone, else drop the frame. An ingest that is ending drops
-    /// it outright.
+    /// ingest has gone, else drop the frame — keeping the SPS / PPS it
+    /// carried, which a stream taken back later inherits. An ingest that is
+    /// ending drops it outright.
     #[cold]
     fn publish_superseded(&self, frame: EsFrame) {
         if self.ending.load(Ordering::Relaxed) {
@@ -403,6 +419,7 @@ impl Publisher<'_> {
             self.state.store(stream);
             return;
         }
+        current.track_param_sets(&frame);
         self.hub.superseded_frames.fetch_add(1, Ordering::Relaxed);
         if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::warn!(
@@ -1170,5 +1187,44 @@ mod tests {
         assert_eq!(old.end(), StreamEnd::Unheld);
         assert!(Arc::ptr_eq(&hub.get("s1").unwrap(), &waiting.state), "they wait on");
         assert_eq!(StreamEnd::Unheld.held_by(), "none");
+    }
+
+    /// The SPS / PPS a superseded ingest sends while its frames are dropped
+    /// are the ones a stream it takes back goes out behind: a source that
+    /// changed them meanwhile — a resolution change, the new sets sent once,
+    /// with an IDR that was dropped — has its next bare IDR carry the new
+    /// ones.
+    ///
+    /// Before, the take-back inherited the sets from before the stream was
+    /// taken, and every bare IDR went out behind the old SPS, undecodable.
+    #[test]
+    fn a_take_back_goes_out_behind_the_parameter_sets_sent_while_superseded() {
+        let hub = DistributionHub::new();
+        let old = hub.claim("s1");
+        old.publish(EsFrame::video(0, idr_au(), true));
+        let new = hub.claim("s1");
+
+        let changed = Bytes::from_static(&[
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, //
+            0, 0, 0, 1, 0x68, 0xee, 0x3c, //
+            0, 0, 0, 1, 0x65, 0x88, 0x84, //
+        ]);
+        old.publish(EsFrame::video(3000, changed, true));
+        old.publish(EsFrame::audio(3000, Bytes::from_static(&[0xfc, 0x01])));
+        assert_eq!(hub.superseded_frames(), 2, "dropped");
+
+        assert_eq!(new.end(), StreamEnd::Closed);
+        let mut viewer = hub.subscribe("s1");
+        old.publish(EsFrame::video(6000, bare_idr(), true));
+        let f = viewer.rx.try_recv().expect("the older ingest takes the stream back");
+        assert_eq!(
+            &f.data[..],
+            &[
+                0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, //
+                0, 0, 0, 1, 0x68, 0xee, 0x3c, //
+                0, 0, 0, 1, 0x65, 0x99, 0x77, //
+            ],
+            "behind the SPS / PPS its source sent last"
+        );
     }
 }

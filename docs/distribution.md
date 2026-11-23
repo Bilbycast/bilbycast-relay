@@ -309,10 +309,11 @@ until that one ends`) — and:
 
 - **If the newer push ends first**, the older one's next frame takes the
   stream back (logged, with the number of frames dropped meanwhile): a fresh
-  stream carrying over the older push's SPS / PPS and whether it has audio,
-  or the one viewers are already waiting on. The newer push's viewers end with
-  it, and those that come back play the older push from its next keyframe. So
-  a stream id is never dead while any publisher of it is live.
+  stream carrying over the SPS / PPS the older push last sent — those it sent
+  while its frames were dropped included — and whether it has audio, or the
+  one viewers are already waiting on. The newer push's viewers end with it,
+  and those that come back play the older push from its next keyframe. So a
+  stream id is never dead while any publisher of it is live.
 - **A push that is ending never takes the stream back.** A WHIP or cascade
   session that ends flushes the last access unit its depacketizer held, and
   that unit goes only into a stream the push still holds. So the late end of
@@ -2304,8 +2305,9 @@ as ignored at startup.
   (`a_live_older_push_that_leaves_first_leaves_the_newer_ones_viewers_playing`).
   The hub's own tests cover the rest: no trading between two live pushes, the
   newest of several holding the stream, a push that is ending never taking it
-  back, what an ingest's end reports, and an unclaimed stream leaving with
-  its last viewer, raced against a claim on three threads
+  back, a take-back going out behind the parameter sets sent while
+  superseded, what an ingest's end reports, and an unclaimed stream leaving
+  with its last viewer, raced against a claim on three threads
   (`distribution::hub::tests`).
 - **The media source pin's grace, through the real router**: a WHEP viewer's
   datagrams from another address it named count on the other-path counter and
