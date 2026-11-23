@@ -379,9 +379,12 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   whether a retention override is in force) that rides health rather than the
   1 s stats tick; the manager health payload advertises the
   `viewer-distribution` capability + a `distribution` object +
-  `distribution_base_url`. `offpath_sessions` counts viewer sessions that had a
-  datagram refused by the WebRTC ingress source pin — one per session, never per
-  datagram, so a reflection flood cannot inflate it. Non-zero means a
+  `distribution_base_url`. `offpath_sessions` counts viewer sessions that had an
+  off-path datagram refused by the WebRTC ingress source pin — one per session,
+  never per datagram, so a reflection flood cannot inflate it. Off-path means
+  from an address that is neither the peer's (named in its SDP, or used before
+  DTLS completed) nor one the session advertised: a multi-homed peer's other
+  paths are dropped too but count nothing (`PeerPin`). Non-zero means a
   source-spoofed ICE reflection attempt or a viewer whose IP changed mid-session
   (that viewer goes black until it re-POSTs its WHEP offer). The per-stream
   `StreamSnapshot` carries it too, and it is exported as

@@ -455,8 +455,24 @@ pub struct SessionConfig {
 /// route-discovered LAN IP, so a same-host cascade peer is exactly that —
 /// answers from more than one source IP. After arming, replies from the
 /// non-nominated IP are dropped, those pairs fail `is_still_possible` and get
-/// pruned. The session survives on its nominated pair but silently loses its
-/// ICE failover redundancy.
+/// pruned. The session survives on its nominated pair but loses its ICE
+/// failover redundancy.
+///
+/// **What counts as off-path.** A dropped datagram raises the alarm (the
+/// warning, and through [`WebrtcSession::take_offpath_alert`] the WHEP
+/// `webrtc_offpath_source` event and telemetry) only when its source is an
+/// address with no claim to the session: not one of the peer's — an IP it
+/// named among its ICE candidates in the SDP this session took
+/// ([`Self::note_candidates`]), or one its datagrams came from before the pin
+/// armed, a peer-reflexive path such as a browser hiding its host
+/// candidates behind mDNS names — and not one of the addresses this session
+/// advertised as its own candidates. Those are the peer's other paths, or a
+/// same-host peer reaching this session over another of its addresses: a
+/// multi-homed peer goes on checking every pair after one is nominated, and
+/// every session with one used to raise the alarm. They are still dropped —
+/// the session keeps the one path DTLS proved — so the control is unchanged:
+/// naming an address in its SDP lets a peer quiet the alarm for it, never get
+/// a datagram from it past the pin.
 ///
 /// **Divergence from the edge.** This file is vendored from
 /// `bilbycast-edge::engine::webrtc::session` and the two are meant to be kept
@@ -477,7 +493,16 @@ struct PeerPin {
     /// [`WebrtcSession::ingest`]), so this is never arbitrary unvalidated
     /// bytes' source.
     last_recv_src: Option<IpAddr>,
-    /// Off-path datagrams dropped since arming. Exposed for diagnostics.
+    /// The peer's addresses besides the pinned one: the IPs it named among
+    /// its ICE candidates, and the sources whose datagrams reached the session
+    /// before the pin armed. At most [`PEER_ADDRS_MAX`].
+    peer_ips: Vec<IpAddr>,
+    /// The addresses this session advertised as its own candidates. A
+    /// same-host peer that reaches it on one comes from that address.
+    local_ips: Vec<IpAddr>,
+    /// Off-path datagrams dropped since arming — from an address that is
+    /// neither the peer's nor one this session advertised. Exposed for
+    /// diagnostics.
     dropped: u64,
     /// The first off-path source of this session, latched for exactly one read
     /// by the owning transport (see [`WebrtcSession::take_offpath_alert`]) so
@@ -486,7 +511,16 @@ struct PeerPin {
     alert: Option<SocketAddr>,
 }
 
+/// The most peer addresses [`PeerPin`] keeps: the offer is the peer's to
+/// write, and these only quiet an alarm.
+const PEER_ADDRS_MAX: usize = 16;
+
 impl PeerPin {
+    /// A pin for a session that advertised `local_ips`.
+    fn new(local_ips: Vec<IpAddr>) -> Self {
+        Self { local_ips, ..Self::default() }
+    }
+
     /// Does this UDP payload demultiplex as a DTLS record? RFC 9443 §3: STUN
     /// is 0..=3, DTLS 20..=63, RTP/RTCP 128..=191.
     fn is_dtls(payload: &[u8]) -> bool {
@@ -500,9 +534,40 @@ impl PeerPin {
         }
     }
 
-    /// Observe an inbound datagram we are about to hand to str0m.
+    /// Observe an inbound datagram we are about to hand to str0m. Before
+    /// the pin arms, its source is one of the peer's paths.
     fn note_receive(&mut self, source: SocketAddr) {
         self.last_recv_src = Some(source.ip());
+        if self.pinned.is_none() {
+            self.note_peer_ip(source.ip());
+        }
+    }
+
+    /// Note the addresses the peer named among its ICE candidates in `sdp`
+    /// (an offer or an answer this session took): each `a=candidate` line's
+    /// connection address that is an IP. An mDNS name (`….local`) is none.
+    fn note_candidates(&mut self, sdp: &str) {
+        for line in sdp.lines() {
+            let Some(candidate) = line.trim().strip_prefix("a=candidate:") else {
+                continue;
+            };
+            // foundation component transport priority address port typ …
+            if let Some(Ok(ip)) = candidate.split_whitespace().nth(4).map(str::parse) {
+                self.note_peer_ip(ip);
+            }
+        }
+    }
+
+    fn note_peer_ip(&mut self, ip: IpAddr) {
+        if self.peer_ips.len() < PEER_ADDRS_MAX && !self.peer_ips.contains(&ip) {
+            self.peer_ips.push(ip);
+        }
+    }
+
+    /// Is `ip` the peer's, or one this session advertised? See "What counts
+    /// as off-path".
+    fn is_known(&self, ip: IpAddr) -> bool {
+        self.local_ips.contains(&ip) || self.peer_ips.contains(&ip)
     }
 
     /// Arm the pin on the DTLS peer. Idempotent — `Connected` fires once, but
@@ -530,6 +595,13 @@ impl PeerPin {
         match self.pinned {
             None => true,
             Some(ip) if ip == source.ip() => true,
+            Some(ip) if self.is_known(source.ip()) => {
+                tracing::trace!(
+                    "WebRTC: dropped a datagram from {source}, another of the peer's paths \
+                     (pinned to {ip})"
+                );
+                false
+            }
             Some(ip) => {
                 self.dropped += 1;
                 // Loud once, then quiet: a reflection attempt is a flood by
@@ -632,7 +704,7 @@ impl WebrtcSession {
             candidate_ips: candidate_ips.clone(),
             video_mid: None,
             audio_mid: None,
-            pin: PeerPin::default(),
+            pin: PeerPin::new(candidate_ips),
             ended: None,
             ice_disconnected_since: None,
             buf: vec![0u8; 2048],
@@ -645,15 +717,17 @@ impl WebrtcSession {
         self.pin.pinned
     }
 
-    /// Datagrams dropped by the ingress source pin — spoofed ICE reflection
-    /// attempts, or a viewer whose IP changed. Non-zero on a healthy session
-    /// only under attack.
+    /// Off-path datagrams dropped by the ingress source pin — spoofed ICE
+    /// reflection attempts, or a viewer whose IP changed. Non-zero on a
+    /// healthy session only under attack: the peer's other paths are dropped
+    /// too, but not counted (see [`PeerPin`]).
     pub fn offpath_datagrams_dropped(&self) -> u64 {
         self.pin.dropped
     }
 
     /// Take the one-shot off-path alert: `(pinned_ip, offending_source)`, set
-    /// the first time this session drops a datagram from an unpinned address
+    /// the first time this session drops a datagram from an address that is
+    /// neither the peer's nor one this session advertised (see [`PeerPin`])
     /// and cleared by this read.
     ///
     /// The transport layer polls this (see `whep::viewer_loop`) and turns it
@@ -699,6 +773,7 @@ impl WebrtcSession {
             Ok(answer.to_sdp_string())
         })?;
         tracing::info!("SDP answer:\n{}", answer_sdp);
+        self.pin.note_candidates(offer_sdp);
 
         // MIDs will be discovered via MediaAdded events
         Ok(answer_sdp)
@@ -762,7 +837,9 @@ impl WebrtcSession {
             let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
 
             Ok(())
-        })
+        })?;
+        self.pin.note_candidates(answer_sdp);
+        Ok(())
     }
 
     /// Get the local socket address.
@@ -1870,6 +1947,111 @@ mod tests {
             1,
             "poll_event must run received datagrams through the source pin"
         );
+    }
+
+    /// A multi-homed peer — here an edge bound to `0.0.0.0`, which offers the
+    /// same port on loopback and on its LAN address — goes on checking its
+    /// second pair after DTLS completes on the first. Those datagrams are
+    /// still dropped, but they come from an address the peer named in its
+    /// offer: they raise no alarm and are not counted. One from an address
+    /// the peer never named still does both.
+    ///
+    /// Before, every session with such a peer raised the off-path alarm — the
+    /// warning and, for a viewer, the `webrtc_offpath_source` event and
+    /// telemetry — on its first second.
+    #[tokio::test]
+    async fn a_multi_homed_peers_other_path_raises_no_alarm() {
+        let mut s = test_session().await;
+        let mut peer_session = WebrtcSession::new(&SessionConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_ip: Some("127.0.0.1".parse().unwrap()),
+            ice_lite: false,
+        })
+        .await
+        .unwrap();
+        let (offer, _pending) = peer_session.create_offer(true, false, true).unwrap();
+        // The peer's one candidate, and the same port on a second address.
+        let first = offer
+            .lines()
+            .find(|l| l.starts_with("a=candidate:"))
+            .expect("the offer names a candidate");
+        let port = peer_session.local_addr().port();
+        assert!(first.contains(&format!("127.0.0.1 {port} ")), "{first}");
+        let second = first.replace("127.0.0.1", "192.0.2.50");
+        let offer = offer.replacen(first, &format!("{first}\r\n{second}"), 1);
+        s.accept_offer(&offer).expect("the offer is accepted");
+
+        let peer = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
+        arm_on(&mut s, peer);
+        s.buf[..STUN_BINDING_REQUEST.len()].copy_from_slice(STUN_BINDING_REQUEST);
+        let other_path = SocketAddr::new("192.0.2.50".parse().unwrap(), port);
+        assert!(
+            !s.ingest(STUN_BINDING_REQUEST.len(), other_path),
+            "the peer's other path is still dropped"
+        );
+        assert_eq!(s.take_offpath_alert(), None, "but it is no off-path source");
+        assert_eq!(s.offpath_datagrams_dropped(), 0);
+
+        let spoofed = sa("203.0.113.7:40000");
+        assert!(!s.ingest(STUN_BINDING_REQUEST.len(), spoofed));
+        assert_eq!(s.take_offpath_alert(), Some((peer.ip(), spoofed)));
+        assert_eq!(s.offpath_datagrams_dropped(), 1);
+    }
+
+    /// The peer's addresses are the IPs its SDP names in `a=candidate` lines
+    /// — not an mDNS name, not a malformed line — and the sources it used
+    /// before the pin armed: a browser that hides its host candidates behind
+    /// mDNS names is known only by those. None raises the alarm once the pin
+    /// has armed, and neither does an address this session advertised, which
+    /// is where a same-host peer reaching it over its other address comes
+    /// from (the relay advertises loopback and its LAN address when it is
+    /// bound to `0.0.0.0`). Any other source still does.
+    #[test]
+    fn the_peers_own_addresses_and_this_sessions_are_not_off_path() {
+        let lan: IpAddr = "192.168.50.2".parse().unwrap();
+        let mut pin = PeerPin::new(vec!["127.0.0.1".parse().unwrap(), lan]);
+        pin.note_candidates(
+            "v=0\r\n\
+             a=candidate:1 1 udp 2130706175 198.51.100.20 40000 typ host\r\n\
+             a=candidate:2 1 udp 2130705663 2001:db8::20 40000 typ host\r\n\
+             a=candidate:3 1 udp 2113937151 ce133dc3-a263.local 48968 typ host\r\n\
+             a=candidate:4 1 udp\r\n",
+        );
+        // A peer-reflexive path, seen before the pin arms.
+        pin.note_receive(sa("198.51.100.30:5000"));
+        pin.note_receive(sa("127.0.0.1:48968"));
+        pin.note_transmit(sa("127.0.0.1:48968"), DTLS);
+        pin.arm();
+        // Seen after it armed: no claim.
+        pin.note_receive(sa("198.51.100.31:5000"));
+        assert_eq!(pin.pinned, Some("127.0.0.1".parse::<IpAddr>().unwrap()));
+
+        for known in [
+            "198.51.100.20:40000",
+            "[2001:db8::20]:40000",
+            "198.51.100.30:6000",
+            "192.168.50.2:48968",
+        ] {
+            assert!(!pin.accept(sa(known)), "{known} is still dropped");
+            assert_eq!(pin.alert, None, "{known} raised the alarm");
+        }
+        assert_eq!(pin.dropped, 0);
+
+        assert!(!pin.accept(sa("198.51.100.31:5000")));
+        assert_eq!(pin.alert, Some(sa("198.51.100.31:5000")));
+        assert_eq!(pin.dropped, 1);
+    }
+
+    /// The SDP is the peer's to write: no number of candidates grows the
+    /// list past `PEER_ADDRS_MAX`.
+    #[test]
+    fn the_peers_addresses_are_bounded() {
+        let mut pin = PeerPin::default();
+        let sdp: String = (0..1000)
+            .map(|i| format!("a=candidate:{i} 1 udp 1 10.0.{}.{} 9 typ host\r\n", i / 256, i % 256))
+            .collect();
+        pin.note_candidates(&sdp);
+        assert_eq!(pin.peer_ips.len(), PEER_ADDRS_MAX);
     }
 
     /// With nothing observed at all, fail OPEN rather than wedge a live

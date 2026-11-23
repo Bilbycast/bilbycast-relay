@@ -345,7 +345,26 @@ as readily; making migration *safe* rather than absent needs a
 return-routability check (RFC 7675 consent, or a full non-lite agent) that
 neither str0m nor its ICE agent implements today.
 
-The first such drop in a WHEP session raises the warning event
+A dropped datagram is **off-path** only when its source has no claim to the
+session: it is none of the IPs the peer named among its ICE candidates in the
+SDP the relay took (its offer; a cascade pull's upstream answer), none of the
+sources the peer's datagrams came from before the pin armed, and none of the
+addresses the session advertised as its own candidates. Those are the peer's
+other paths: a multi-homed peer — an edge bound to `0.0.0.0` offering the same
+port on loopback and on its LAN address, a browser on two networks, which
+hides its host candidates behind mDNS names and so is known by the sources it
+used — goes on checking every candidate pair after one is nominated, and a
+same-host peer reaching a relay bound to `0.0.0.0` (which advertises loopback
+and its LAN address) arrives from the relay's own address. Those datagrams are
+still dropped — the session keeps the one path DTLS proved — but they raise
+nothing. Before, they raised the alarm on every session with such a peer
+(every one in the live edge → relay → Chrome run). Naming an address in its
+SDP lets a peer quiet the alarm for that address, never get a datagram from it
+past the pin. A second path whose first check arrives only after DTLS has
+completed, from an address the peer did not name — a browser's second network
+on a fast handshake — still raises it.
+
+The first off-path drop in a WHEP session raises the warning event
 `webrtc_offpath_source` and increments
 `bilbycast_relay_distribution_offpath_sessions` — once per session, never per
 datagram, so a reflection flood cannot amplify its own alarm.
@@ -1768,7 +1787,7 @@ absence as "not running", not as zero.
 | `bilbycast_relay_distribution_viewers` | gauge | Connected WHEP viewers across all streams |
 | `bilbycast_relay_distribution_bytes_out_total` | counter | Media bytes fanned out to viewers |
 | `bilbycast_relay_distribution_origin_bytes` | gauge | Bytes currently held in the LL-HLS origin cache |
-| `bilbycast_relay_distribution_offpath_sessions` | counter | WHEP sessions that had a datagram refused by the media source pin — a spoofed ICE reflection attempt, or a viewer whose IP changed mid-session. Counted once per session |
+| `bilbycast_relay_distribution_offpath_sessions` | counter | WHEP sessions that had an off-path datagram refused by the media source pin — a spoofed ICE reflection attempt, or a viewer whose IP changed mid-session; a multi-homed viewer's other paths are not off-path ([Media source pin](#media-source-pin)). Counted once per session |
 
 The same figures ride to the manager on the health payload's `distribution`
 object, and the per-stream `StreamSnapshot` carries `offpath_sessions` too. A
