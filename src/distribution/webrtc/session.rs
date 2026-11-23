@@ -900,7 +900,7 @@ impl WebrtcSession {
     ///   has lasted [`ICE_DISCONNECT_GRACE`]. Before, the first `Disconnected`
     ///   ended it, so a viewer whose consent checks paused for 15 s was closed
     ///   although str0m and the browser would both have resumed, and the
-    ///   `/watch` player, which does not reconnect, stayed black.
+    ///   `/watch` player, which did not reconnect then, stayed black.
     pub fn end(&self) -> Option<SessionEnd> {
         if let Some(end) = self.ended {
             return Some(end);

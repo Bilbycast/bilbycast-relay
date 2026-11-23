@@ -3751,4 +3751,49 @@ mod tests {
             "the teardown is a keepalive DELETE of the session resource: {teardown}"
         );
     }
+
+    /// The `/watch` player comes back for its stream when its session ends
+    /// under it: the relay closes a viewer's session — a DTLS close_notify,
+    /// which closes the page's DTLS transport — when the stream's ingest goes
+    /// or a newer push takes the stream over, and a connection can fail. It
+    /// asks again after a back-off of 1 s doubling to 30 s, which a session
+    /// that stayed up starts over, so a stream that has gone for good is asked
+    /// for every 30 s and never in a loop.
+    ///
+    /// It did not come back at all: a viewer whose session ended stayed black
+    /// until somebody pressed Watch again. Until the relay closed a viewer's
+    /// session with its stream, nothing told the page either.
+    #[test]
+    fn the_watch_player_comes_back_when_its_session_ends() {
+        let html = include_str!("player.html");
+        assert!(
+            html.contains(
+                "const RETRY_MIN_MS = 1000, RETRY_MAX_MS = 30000, RETRY_RESET_AFTER_MS = 10000;"
+            ),
+            "the back-off is bounded"
+        );
+        let retry = js_fn(html, "retry(");
+        assert!(
+            retry.contains("if (!watching || retryTimer) return;"),
+            "one retry at a time, and none once the viewer stopped: {retry}"
+        );
+        assert!(
+            retry.contains("Math.min(backoffMs * 2, RETRY_MAX_MS)")
+                && retry.contains("setTimeout(() => { retryTimer = null; start(); }, backoffMs)"),
+            "the next attempt waits out the back-off: {retry}"
+        );
+        assert!(
+            html.contains(r#"if (transport.state === "closed") retry("stream ended", false);"#),
+            "a session the relay closed is asked for again"
+        );
+        assert!(
+            html.contains(r#"me.connectionState === "failed") retry("connection lost", true);"#),
+            "so is one whose connection failed"
+        );
+        let stop = js_fn(html, "stop(");
+        assert!(
+            stop.contains("watching = false;") && stop.contains("clearTimeout(retryTimer);"),
+            "pressing Stop cancels a pending retry: {stop}"
+        );
+    }
 }

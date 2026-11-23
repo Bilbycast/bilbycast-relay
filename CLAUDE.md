@@ -258,6 +258,17 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   their origin took — the re-inserted SPS / PPS and 4-byte start codes, each
   at most once along a chain — so what an origin takes reaches every tier;
   a unit past its cap is dropped whole.
+  A stream lives as long as the ingest that claimed it
+  (`DistributionHub::claim` → `Publisher`, dropped when the ingest ends, a
+  panic included): its end closes the broadcast — the sender sits in an
+  `ArcSwapOption` that is emptied, since viewers hold the state for its
+  counters — and every viewer on it ends `stream closed`, sent a DTLS
+  close_notify. A push for a stream another ingest still holds gets a fresh
+  stream and closes the older one, whose ingest's end then removes only its
+  own (`Arc::ptr_eq`); a stream viewers made ahead of any ingest is taken over
+  as it is. Before, viewers held the sender, so no broadcast ever closed, and
+  an ingest's end removed whatever was registered under its id
+  (`docs/distribution.md`, "When the stream ends").
 - **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
   each H.264 access unit goes to str0m's writer **once, whole, as Annex B** and
   str0m packetizes it (RFC 6184) → SRTP → browser. Filler data NAL units (type
@@ -269,7 +280,8 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   as the edge removed its own in e927368). Vendored str0m session under
   `src/distribution/webrtc/` (kept in sync with bilbycast-edge). A session ends
   on `DELETE` (the `/watch` player sends a `keepalive` fetch on `pagehide`), on
-  the peer closing the connection (DTLS close_notify, `Event::Closed`), on ICE
+  the peer closing the connection (DTLS close_notify, `Event::Closed`), on its
+  stream closing (the relay then closes it: RTCP BYE + close_notify), on ICE
   staying disconnected for `session::ICE_DISCONNECT_GRACE` (15 s, on top of
   `is`'s 15 s — about 30 s from a viewer's last check; an ICE-Lite agent comes
   back on the peer's next nomination, so the first disconnect is not the end)
@@ -330,7 +342,9 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
 - **A restart keeps the window** (`origin::ADOPT_HOLD`, 10 min): a session's window is a per-stream policy the manager pushes and those are deliberately not persisted, while the node default is 60 s. Each stream that adopted segments or thumbnail sheets at startup is therefore **held from the node default** — not trimmed by age, and its byte cap widened by what it adopted (`StreamOrigin::adopted_bytes`), because the session's own cap arrives in the same per-stream policy as its retention and a long window is bigger than the default cap — until the manager's push names its per-stream policies (`OriginStore::take_manager_policy`, which calls `manager_policy_received` when `per_stream` is `Some`, an empty list included, on the watch and on the value retained while the store was still adopting) or the hold runs out, which the first eviction to notice logs — at `warn`, naming the streams, only when an adopted window is wider than the default it is trimmed to from here (by bytes, or by the span `StreamOrigin::adopted_span_ms` it covers), at `info` otherwise, because on a relay with no DVR work every restart lapses and a warning on each would be the line operators learn to ignore (a restart inside the previous run's own hold still warns for its live streams, since that run trimmed none by age). Within a run, growth after the restart is still held to the default cap on top of what was adopted; across restarts the widening stops at `MAX_ADOPT_WIDENING` (128 GiB, above the 126 GiB the manager's largest session window is sized to), because each start adopts what the last one grew while held, and a relay restarting faster than the hold lapses otherwise compounded it with no per-stream byte bound at all. That ceiling bounds a stream, not the disk: on a volume that cannot hold every live stream at the default cap plus 128 GiB above the free-space floor, a crash loop with nothing ending its holds meets the floor first, and the floor then evicts round-robin across every stream, a DVR window included. The free-space floor applies throughout, and a stream that began after the restart is not held. The manager names per-stream policies only to a relay with DVR work, so on any other relay the hold runs its full ten minutes. Before this the first PUT after a restart evicted the whole adopted window against the default, ~40 s before the push that said to keep it.
 - **Players**: two, and they are not variants of each other. `GET /watch/{stream}`
   (`player.html`) is the WHEP one — sub-second, live-only, no buffer, no
-  seekable range. `GET /dvr/{stream}` (`dvr.html`) plays the LL-HLS origin, so
+  seekable range; when its session ends under it (the relay closed it with its
+  stream, or the connection failed) it offers again after a back-off of 1 s
+  doubling to 30 s, started over by a session that stayed up 10 s. `GET /dvr/{stream}` (`dvr.html`) plays the LL-HLS origin, so
   it seeks back across the whole advertised window, steps frames, shuttles and
   shows a scrub preview. It expects **two renditions** — `{stream}` long-GOP and
   `{stream}-proxy` low-res all-intra — plus the edge's optional thumbnail track,

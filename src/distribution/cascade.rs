@@ -173,11 +173,10 @@ async fn cascade_attempt(
         Setup::TimedOut => bail!("upstream did not complete ICE + DTLS within {setup_deadline:?}"),
     }
     tracing::info!("cascade '{}': connected to upstream", source.local_stream);
-    hub.register(&source.local_stream);
-
-    republish_from_session(client, hub, &source.local_stream, cancel, MAX_RTP_AU_BYTES).await;
-
-    hub.remove(&source.local_stream);
+    // The local stream ends with this pull, its viewers with it — unless a
+    // newer ingest has taken it over meanwhile (see `Publisher`).
+    let publisher = hub.claim(&source.local_stream);
+    republish_from_session(client, &publisher, cancel, MAX_RTP_AU_BYTES).await;
     Ok(())
 }
 
