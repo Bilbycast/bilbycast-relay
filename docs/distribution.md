@@ -84,8 +84,9 @@ they are not either/or.
   from its SPS (profile_idc and constraint flags; the level is not compared,
   as every entry carries `level-asymmetry-allowed=1`), else on a profile whose
   decoders decode it (Constrained Baseline on Baseline, Main on High), else on
-  the most capable profile the viewer accepted (High, then Main, then the
-  Baselines) — the PT likeliest to decode a stream nothing accepted is sure
+  the most capable profile the viewer accepted (`H264_FALLBACK_ORDER`: High,
+  then Constrained High, then Main, then Constrained Baseline, then
+  Baseline) — the PT likeliest to decode a stream nothing accepted is sure
   to (a High 10 stream, or a High one to Chrome, which offers no High). Until
   the first SPS — a viewer is primed with the cached keyframe, so normally
   none — it is the viewer's first packetization-mode=1 PT, as every PT was
