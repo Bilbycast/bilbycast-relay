@@ -338,9 +338,11 @@ until that one ends`) — and:
 - **If the older push ends first**, its end leaves the newer stream and its
   viewers alone. Its log line — and, for a QUIC ingest, its `distribution
   ingest closed` event (`held_by: "another"`) — says that another ingest holds
-  the stream, which plays on. A push that ends after every newer one has gone,
-  without having sent a frame since (so it never took the stream back), says
-  instead that no ingest holds the stream now (`held_by: "none"`).
+  the stream, which plays on — whichever ingest that is, an older live push
+  that took the stream back included. A push that ends with no ingest holding
+  the stream (every newer one gone, none taking it back, and it sent no frame
+  since) says instead that no ingest holds the stream now
+  (`held_by: "none"`).
 - Taking back never takes a stream from a newer push, so two live pushes
   settle on the newer one and never trade it. Of three or more, the newest
   still live ends up holding it: an older one that took the stream back first

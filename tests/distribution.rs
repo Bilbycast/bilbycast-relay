@@ -1018,8 +1018,9 @@ async fn a_whep_viewer_is_sent_a_main_stream_on_its_main_pt() {
     let hub = Arc::new(DistributionHub::new());
     let cancel = CancellationToken::new();
     let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let publisher = hub.claim("main");
     let (au, idr) = frame(0);
-    hub.publish("main", EsFrame::video(0, au, idr));
+    publisher.publish(EsFrame::video(0, au, idr));
 
     let client_cfg = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: Some(lo), ice_lite: false };
     let mut client = WebrtcSession::new(&client_cfg).await.unwrap();
@@ -1038,26 +1039,21 @@ async fn a_whep_viewer_is_sent_a_main_stream_on_its_main_pt() {
     .expect("WHEP setup");
     client.apply_answer(&handle.answer_sdp, pending).unwrap();
 
-    let pub_hub = hub.clone();
-    let pub_cancel = cancel.clone();
-    tokio::spawn(async move {
+    // The live stream, published by the same ingest while the viewer receives.
+    let live = async {
         let mut k = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
-            tokio::select! {
-                _ = pub_cancel.cancelled() => break,
-                _ = tick.tick() => {
-                    k += 1;
-                    let (au, idr) = frame(k);
-                    pub_hub.publish("main", EsFrame::video(k * FRAME_90K, au, idr));
-                }
-            }
+            tick.tick().await;
+            k += 1;
+            let (au, idr) = frame(k);
+            publisher.publish(EsFrame::video(k * FRAME_90K, au, idr));
         }
-    });
+    };
 
     let mut pts = Vec::new();
     let client_cancel = CancellationToken::new();
-    let heard = tokio::time::timeout(Duration::from_secs(20), async {
+    let receive = tokio::time::timeout(Duration::from_secs(20), async {
         while pts.len() < 2 * GOP as usize {
             match client.poll_event(&client_cancel).await {
                 SessionEvent::MediaData { pt, .. } => pts.push(*pt),
@@ -1066,8 +1062,11 @@ async fn a_whep_viewer_is_sent_a_main_stream_on_its_main_pt() {
             }
         }
         true
-    })
-    .await;
+    });
+    let heard = tokio::select! {
+        heard = receive => heard,
+        _ = live => unreachable!("the live publisher never ends"),
+    };
     cancel.cancel();
     assert!(matches!(heard, Ok(true)), "the viewer heard {} frames", pts.len());
     assert!(pts.iter().all(|&pt| pt == 123), "video came on PTs {pts:?}");
