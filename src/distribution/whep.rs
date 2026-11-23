@@ -331,7 +331,7 @@ fn report_offpath(
 }
 
 /// Hand one video access unit to str0m (see [`write_video_au_on`]) and count
-/// it on the stream's bytes-out.
+/// what it handed on the stream's bytes-out.
 async fn write_video(
     session: &mut WebrtcSession,
     mid: str0m::media::Mid,
@@ -344,7 +344,10 @@ async fn write_video(
 }
 
 /// Send one H.264 access unit on a known (mid, pt) as **one** str0m frame,
-/// Annex B. Returns the number of access-unit bytes written.
+/// Annex B. Returns the bytes handed to str0m — the access unit without its
+/// filler (`WebrtcSession::write_media`); 0 when the write failed. It
+/// returned the access unit's length, filler included, which the stream's
+/// bytes-out counted.
 ///
 /// str0m's writer packetizes a frame itself (RFC 6184): the SPS / PPS go out
 /// as one STAP-A ahead of the next slice, a NAL past its MTU as FU-A, every
@@ -365,14 +368,17 @@ async fn write_video_au_on(
     au: &[u8],
 ) -> usize {
     let media_time = MediaTime::new(pts_90k, Frequency::NINETY_KHZ);
-    if let Err(e) = session.write_media(mid, pt, Instant::now(), media_time, au) {
-        tracing::trace!("video write error: {e}");
-    }
+    let handed = session
+        .write_media(mid, pt, Instant::now(), media_time, au)
+        .unwrap_or_else(|e| {
+            tracing::trace!("video write error: {e}");
+            0
+        });
     // str0m queues up to 512 writes (`MAX_PENDING_PAYLOADS`) and packetizes
     // them only from a timeout; drain now so the unit's packets go out at once
     // and the queue never nears that cap.
     session.drain_outputs().await;
-    au.len()
+    handed
 }
 
 /// Send one H.264 access unit over a session, resolving the video (mid, pt)
@@ -394,11 +400,14 @@ async fn write_audio(
 ) {
     // Source PTS is 90 kHz; Opus RTP runs at 48 kHz.
     let media_time = MediaTime::new(frame.pts_90k * 48_000 / 90_000, Frequency::FORTY_EIGHT_KHZ);
-    if let Err(e) = session.write_media(mid, pt, Instant::now(), media_time, &frame.data) {
-        tracing::trace!("WHEP audio write error: {e}");
-    }
+    let handed = session
+        .write_media(mid, pt, Instant::now(), media_time, &frame.data)
+        .unwrap_or_else(|e| {
+            tracing::trace!("WHEP audio write error: {e}");
+            0
+        });
     session.drain_outputs().await;
-    sub.state.add_bytes_out(frame.data.len() as u64);
+    sub.state.add_bytes_out(handed as u64);
 }
 
 #[cfg(test)]
@@ -457,5 +466,39 @@ mod tests {
         ] {
             assert_eq!(end.to_string(), line);
         }
+    }
+
+    /// What a viewer's video counts on the stream's bytes-out is what went to
+    /// str0m: the access unit without its filler (`write_media` strips it).
+    /// It counted the unit as it came, so a CBR source's bytes-out read its
+    /// padding too.
+    #[tokio::test]
+    async fn a_viewers_bytes_out_leave_the_filler_out() {
+        let config = |ice_lite| SessionConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_ip: None,
+            ice_lite,
+        };
+        let mut viewer = WebrtcSession::new(&config(false)).await.unwrap();
+        let mut relay = WebrtcSession::new(&config(true)).await.unwrap();
+        let (offer, _pending) = viewer.create_offer(true, false, false).unwrap();
+        let answer = relay.accept_offer(&offer).unwrap();
+        let mid = answer
+            .lines()
+            .find_map(|l| l.trim_end().strip_prefix("a=mid:"))
+            .map(str0m::media::Mid::from)
+            .unwrap();
+        let pt = relay.get_pt(mid).unwrap();
+
+        const SC: &[u8] = &[0, 0, 0, 1];
+        let (sps, idr): (&[u8], &[u8]) = (&[0x67, 0x4d, 0x40, 0x1f, 0xec], &[0x65, 0x88, 0x84, 0x21]);
+        let mut filler = vec![0x0c];
+        filler.resize(6_000, 0xff);
+        filler.push(0x80);
+        let au = [SC, sps, SC, idr, SC, &filler].concat();
+        assert_eq!(
+            write_video_au_on(&mut relay, mid, pt, 0, &au).await,
+            2 * SC.len() + sps.len() + idr.len()
+        );
     }
 }
