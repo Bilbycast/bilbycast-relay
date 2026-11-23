@@ -271,7 +271,12 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   (`superseded_frames`, one warning per episode) and, once no newer ingest
   holds the stream id, takes it back on that frame (`take_back`: a fresh
   stream inheriting its SPS / PPS and audio flag, or the unclaimed one viewers
-  wait on). Ingests are numbered as they claim (`StreamState::owner`), and a
+  wait on). An ingest that is ending never takes the stream back
+  (`Publisher::mark_ending`, set by
+  `AuAssembler::finish` before a WHIP or cascade session's last flush).
+  `Publisher::end` returns a `StreamEnd` — `Closed`, `HeldByAnother` or
+  `Unheld` — which the QUIC ingest's closed event reports as `held_by`.
+  Ingests are numbered as they claim (`StreamState::owner`), and a
   take-back never takes a stream from a newer one, so two live ingests settle
   on the newer and never trade it. A stream viewers made ahead of any ingest
   is taken over as it is, and leaves the registry with its last viewer

@@ -36,7 +36,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::es::{EsFrame, MAX_FRAME_BYTES, au_is_idr};
-use super::hub::{DistributionHub, Publisher};
+use super::hub::{DistributionHub, Publisher, StreamEnd};
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
 
@@ -202,6 +202,16 @@ impl AuAssembler {
         self.keyframe = false;
     }
 
+    /// The session has ended: emit the unit still held — the assembler
+    /// emits one only when the next one starts — as an ingest that is ending
+    /// ([`Publisher::mark_ending`]). So a superseded ingest's last unit,
+    /// which may be many seconds old when its session times out, never takes
+    /// its stream back only for its end to close it again.
+    fn finish(mut self, stream: &Publisher<'_>) {
+        stream.mark_ending();
+        self.flush(stream);
+    }
+
     /// Drop the unit being built at `pts_90k` — it would pass `max_bytes` —
     /// and give its buffer back. Warns at most once per
     /// [`OVERSIZE_WARN_INTERVAL`].
@@ -255,16 +265,21 @@ async fn ingest_loop(
     }
 
     // The stream ends with this ingest, its viewers with it — unless a newer
-    // ingest holds it by then, which plays on (see `Publisher`).
+    // ingest has taken it from this one (see `Publisher`).
     let publisher = hub.claim(stream_id);
     republish_from_session(session, &publisher, &cancel, MAX_WHIP_AU_BYTES).await;
-    if publisher.end() {
-        tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
-    } else {
-        tracing::info!(
-            "WHIP ingest '{session_id}' closed (stream '{stream_id}'); a newer ingest holds the \
+    match publisher.end() {
+        StreamEnd::Closed => {
+            tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
+        }
+        StreamEnd::HeldByAnother => tracing::info!(
+            "WHIP ingest '{session_id}' closed (stream '{stream_id}'); another ingest holds the \
              stream, which plays on"
-        );
+        ),
+        StreamEnd::Unheld => tracing::info!(
+            "WHIP ingest '{session_id}' closed (stream '{stream_id}'); a newer ingest had taken \
+             the stream from it, and no ingest holds the stream now"
+        ),
     }
 }
 
@@ -317,7 +332,7 @@ pub(crate) async fn republish_from_session(
         }
     }
 
-    asm.flush(stream);
+    asm.finish(stream);
 }
 
 #[cfg(test)]
@@ -354,6 +369,45 @@ mod tests {
         assert_eq!(f2.pts_90k, 3600);
         assert!(!f2.keyframe);
         assert_eq!(&f2.data[..], p_au);
+    }
+
+    /// As a session ends, the unit its assembler still holds goes out as an
+    /// ingest that is ending: into the stream it holds, and nowhere else. A
+    /// superseded ingest's last unit — seconds old when its session times
+    /// out — does not take back the stream viewers wait on, so its end does
+    /// not close that stream under them.
+    ///
+    /// Before, that flush took the stream for the instant until the ingest's
+    /// end closed it: every waiting viewer got a stale frame, then "stream
+    /// closed", and offered again.
+    #[test]
+    fn a_superseded_ingests_last_unit_takes_nothing_back() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let hub = DistributionHub::new();
+        let dead = hub.claim("s");
+        let mut asm = AuAssembler::new("s".to_string(), MAX_WHIP_AU_BYTES);
+        asm.push(&dead, 0, &[0, 0, 0, 1, 0x65, 0x88]);
+        // A newer push took the stream and has ended; viewers wait on it.
+        assert_eq!(hub.claim("s").end(), StreamEnd::Closed);
+        let mut waiting = hub.subscribe("s");
+
+        asm.finish(&dead);
+        assert!(matches!(waiting.rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(dead.end(), StreamEnd::Unheld);
+        assert!(
+            matches!(waiting.rx.try_recv(), Err(TryRecvError::Empty)),
+            "the waiting viewer is not ended"
+        );
+        assert!(Arc::ptr_eq(&hub.get("s").unwrap(), &waiting.state));
+
+        // An ingest that holds its stream still sends its last unit.
+        let live = hub.claim("s");
+        let mut asm = AuAssembler::new("s".to_string(), MAX_WHIP_AU_BYTES);
+        asm.push(&live, 3000, &[0, 0, 0, 1, 0x65, 0x99]);
+        asm.finish(&live);
+        assert_eq!(waiting.rx.try_recv().unwrap().pts_90k, 3000);
+        assert_eq!(live.end(), StreamEnd::Closed);
     }
 
     /// An RTP padding probe arrives as a payload-less frame. It is no access

@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use crate::config::CascadeSource;
 use crate::distribution_control::DistributionControl;
 
-use super::hub::DistributionHub;
+use super::hub::{DistributionHub, StreamEnd};
 use super::webrtc::session::{SessionConfig, WebrtcSession};
 use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
 use super::whip_ingest::{MAX_RTP_AU_BYTES, republish_from_session};
@@ -175,14 +175,20 @@ async fn cascade_attempt(
     }
     tracing::info!("cascade '{}': connected to upstream", source.local_stream);
     // The local stream ends with this pull, its viewers with it — unless a
-    // newer ingest holds it by then, which plays on (see `Publisher`).
+    // newer ingest has taken it from this one (see `Publisher`).
     let publisher = hub.claim(&source.local_stream);
     republish_from_session(client, &publisher, cancel, MAX_RTP_AU_BYTES).await;
-    if !publisher.end() {
-        tracing::info!(
-            "cascade '{}': a newer ingest holds the local stream, which plays on",
+    match publisher.end() {
+        StreamEnd::Closed => {}
+        StreamEnd::HeldByAnother => tracing::info!(
+            "cascade '{}': another ingest holds the local stream, which plays on",
             source.local_stream
-        );
+        ),
+        StreamEnd::Unheld => tracing::info!(
+            "cascade '{}': a newer ingest had taken the local stream from this pull, and no \
+             ingest holds it now",
+            source.local_stream
+        ),
     }
     Ok(())
 }

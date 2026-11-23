@@ -38,7 +38,7 @@ use crate::distribution_control::DistributionControl;
 use crate::manager::events::{category, EventSender, EventSeverity};
 
 use super::es::{EsFrame, EsKind, MAX_FRAME_BYTES};
-use super::hub::{DistributionHub, Publisher};
+use super::hub::{DistributionHub, Publisher, StreamEnd};
 use super::token;
 
 /// ALPN for the distribution ingest QUIC endpoint.
@@ -220,31 +220,42 @@ async fn handle_ingest_stream(
         serde_json::json!({ "stream": stream_id, "has_audio": hello.has_audio }),
     );
     // The stream ends with this ingest, its viewers with it — unless a newer
-    // ingest holds it by then, which plays on (see `Publisher`).
+    // ingest has taken it from this one (see `Publisher`).
     let publisher = hub.claim(&stream_id);
 
     // 3. Frame loop.
     let result = read_frames(&mut recv, &publisher).await;
-    let (message, superseded) = if publisher.end() {
-        (format!("distribution ingest closed for stream '{stream_id}'"), false)
-    } else {
-        (
-            format!(
-                "distribution ingest closed for stream '{stream_id}'; a newer ingest holds the \
-                 stream, which plays on"
-            ),
-            true,
-        )
-    };
+    let end = publisher.end();
+    let message = closed_message(&stream_id, end);
 
     tracing::info!("{message}");
     events.emit_with_details(
         EventSeverity::Info,
         category::DISTRIBUTION,
         message,
-        serde_json::json!({ "stream": stream_id, "superseded": superseded }),
+        serde_json::json!({
+            "stream": stream_id,
+            "superseded": end != StreamEnd::Closed,
+            "held_by": end.held_by(),
+        }),
     );
     result
+}
+
+/// The `distribution ingest closed` event's message: what the ingest's end
+/// found of its stream.
+fn closed_message(stream_id: &str, end: StreamEnd) -> String {
+    match end {
+        StreamEnd::Closed => format!("distribution ingest closed for stream '{stream_id}'"),
+        StreamEnd::HeldByAnother => format!(
+            "distribution ingest closed for stream '{stream_id}'; another ingest holds the \
+             stream, which plays on"
+        ),
+        StreamEnd::Unheld => format!(
+            "distribution ingest closed for stream '{stream_id}'; a newer ingest had taken the \
+             stream from it, and no ingest holds the stream now"
+        ),
+    }
 }
 
 async fn read_frames(recv: &mut RecvStream, stream: &Publisher<'_>) -> Result<()> {

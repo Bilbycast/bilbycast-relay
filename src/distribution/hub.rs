@@ -86,8 +86,9 @@ pub struct StreamState {
     /// The latest SPS / PPS the stream carried in-band. Written only by the
     /// ingest publishing this stream, read on each video frame it publishes.
     param_sets: ArcSwap<H264ParamSets>,
-    /// True once at least one audio frame has been published — WHEP viewers
-    /// use this to decide whether to negotiate an audio m-line.
+    /// True once at least one audio frame has been published. Telemetry only
+    /// ([`StreamSnapshot::has_audio`]): a WHEP viewer's answer takes its
+    /// audio m-line from the viewer's own offer, never from this.
     has_audio: AtomicBool,
     viewers: AtomicU64,
     frames_in: AtomicU64,
@@ -161,17 +162,10 @@ impl StreamState {
         self.offpath_sessions.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Publish one elementary frame into this stream as it is. Never blocks:
-    /// if no viewers are attached the frame is dropped after refreshing the
-    /// keyframe cache, and on a stream that has closed it is dropped
-    /// outright. An ingest publishes through its [`Publisher`] instead, which
-    /// also takes its stream back once a newer ingest that held it has ended.
-    pub fn publish(&self, frame: EsFrame) {
-        let _ = self.send(frame);
-    }
-
     /// Publish one elementary frame, or hand it back (`Err`) when the stream
-    /// has closed.
+    /// has closed. Never blocks: with no viewers attached the frame is
+    /// dropped after refreshing the keyframe cache. Only a [`Publisher`] —
+    /// the ingest that owns the stream — calls this.
     ///
     /// An IDR access unit that does not carry its own SPS / PPS goes out (and
     /// into the keyframe cache) behind the stream's latest ones, so every
@@ -219,8 +213,10 @@ impl StreamState {
     /// stream it took back: the SPS / PPS it would put back ahead of a bare
     /// IDR — a sender that sends them once would otherwise leave every viewer
     /// of the taken-back stream undecodable — and whether it carries audio,
-    /// which a viewer's offer is answered by. Not the keyframe: the cached one
-    /// is from before the stream was taken, so viewers start on the next.
+    /// so the stream's telemetry does not read audio-less until the next
+    /// audio frame (a viewer's answer takes its audio from the viewer's
+    /// offer, not from this). Not the keyframe: the cached one is from before
+    /// the stream was taken, so viewers start on the next.
     fn inherit(&self, from: &StreamState) {
         self.param_sets.store(from.param_sets.load_full());
         if from.has_audio() {
@@ -324,7 +320,8 @@ impl Drop for ViewerGuard {
 /// whether a newer ingest still holds the stream; once none does, this
 /// ingest takes the stream back and publishes into it. Its session is left
 /// alone throughout: ending it would only have its client push again and
-/// take the stream from the newer ingest, and then the reverse.
+/// take the stream from the newer ingest, and then the reverse. An ingest
+/// that is ending ([`Publisher::mark_ending`]) never takes it back.
 pub struct Publisher<'a> {
     hub: &'a DistributionHub,
     stream_id: String,
@@ -338,8 +335,39 @@ pub struct Publisher<'a> {
     /// holds it. The first drop of an episode is logged, and the count with
     /// the take-back.
     dropped: AtomicU64,
+    /// [`Publisher::mark_ending`]: the ingest is ending, so it no longer
+    /// takes its stream back.
+    ending: AtomicBool,
     /// [`Publisher::end`] released the stream already.
     released: bool,
+}
+
+/// What an ingest's end found of its stream ([`Publisher::end`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The ingest held its stream, which closed with it: its viewers end.
+    Closed,
+    /// A newer ingest had taken the stream from this one, and another ingest
+    /// holds it now, which plays on: that newer one, or an older one that
+    /// took the stream back once the ingests newer than it had ended.
+    HeldByAnother,
+    /// A newer ingest had taken the stream from this one, and no ingest holds
+    /// it now: every ingest that held it since has ended. Nothing is
+    /// registered under the stream id, or viewers wait there, sent nothing,
+    /// for the next ingest.
+    Unheld,
+}
+
+impl StreamEnd {
+    /// Who held the stream when the ingest ended, as event details name it:
+    /// `"this"`, `"another"` or `"none"`.
+    pub fn held_by(self) -> &'static str {
+        match self {
+            StreamEnd::Closed => "this",
+            StreamEnd::HeldByAnother => "another",
+            StreamEnd::Unheld => "none",
+        }
+    }
 }
 
 impl Publisher<'_> {
@@ -356,9 +384,13 @@ impl Publisher<'_> {
     }
 
     /// The closed path: a newer ingest took the stream. Take it back if that
-    /// ingest has gone, else drop the frame.
+    /// ingest has gone, else drop the frame. An ingest that is ending drops
+    /// it outright.
     #[cold]
     fn publish_superseded(&self, frame: EsFrame) {
+        if self.ending.load(Ordering::Relaxed) {
+            return;
+        }
         let current = self.state.load_full();
         if let Some(stream) = self.hub.take_back(&current, self.seq) {
             let dropped = self.dropped.swap(0, Ordering::Relaxed);
@@ -381,12 +413,36 @@ impl Publisher<'_> {
         }
     }
 
-    /// End this ingest's hold on its stream now. `true` when it still held
-    /// the stream, whose end that is — it closed, ending its viewers;
-    /// `false` when a newer ingest held it, which plays on.
-    pub fn end(mut self) -> bool {
+    /// The ingest is ending: what it publishes from now on — the unit its
+    /// depacketizer still held, flushed as its session ends — goes into its
+    /// stream if it still holds it, and is dropped otherwise. It never takes
+    /// the stream back: it would hold it only until its end, a moment later,
+    /// closed it again, ending the viewers that were waiting on it — or those
+    /// of an older live ingest that had taken it back, which would then take
+    /// it back once more on its next frame.
+    pub fn mark_ending(&self) {
+        self.ending.store(true, Ordering::Relaxed);
+    }
+
+    /// End this ingest's hold on its stream now, and say what that found:
+    /// the stream closed with it ([`StreamEnd::Closed`]), or a newer ingest
+    /// had taken it, and another ingest holds it now
+    /// ([`StreamEnd::HeldByAnother`]) or none does ([`StreamEnd::Unheld`]).
+    pub fn end(mut self) -> StreamEnd {
         self.released = true;
-        self.hub.release(&self.state.load())
+        if self.hub.release(&self.state.load()) {
+            return StreamEnd::Closed;
+        }
+        let held = self
+            .hub
+            .streams
+            .get(&self.stream_id)
+            .is_some_and(|s| s.owner.load(Ordering::Acquire) != UNCLAIMED);
+        if held {
+            StreamEnd::HeldByAnother
+        } else {
+            StreamEnd::Unheld
+        }
     }
 }
 
@@ -467,6 +523,7 @@ impl DistributionHub {
             seq,
             state: ArcSwap::new(state),
             dropped: AtomicU64::new(0),
+            ending: AtomicBool::new(false),
             released: false,
         }
     }
@@ -784,7 +841,7 @@ mod tests {
         // Whatever the older ingest still publishes reaches nobody.
         old.publish(EsFrame::video(1, idr_au(), true));
         assert_eq!(hub.superseded_frames(), 1);
-        assert!(!old.end(), "the older ingest no longer held the stream");
+        assert_eq!(old.end(), StreamEnd::HeldByAnother, "the newer ingest holds the stream");
 
         assert!(Arc::ptr_eq(&hub.get("s1").unwrap(), &new.state.load_full()), "still registered");
         new.publish(EsFrame::video(3000, idr_au(), true));
@@ -840,7 +897,7 @@ mod tests {
         new.publish(EsFrame::video(5000, idr_au(), true));
         assert_eq!(viewer.rx.recv().await.unwrap().pts_90k, 5000, "the newer one plays on");
 
-        assert!(new.end(), "the newer ingest's end is its stream's");
+        assert_eq!(new.end(), StreamEnd::Closed, "the newer ingest's end is its stream's");
         assert!(matches!(viewer.rx.recv().await, Err(broadcast::error::RecvError::Closed)));
         drop(viewer);
 
@@ -862,12 +919,12 @@ mod tests {
         let stream = hub.get("s1").unwrap();
         assert!(Arc::ptr_eq(&stream, &back.state));
         assert!(Arc::ptr_eq(&stream, &old.state.load_full()));
-        assert!(stream.has_audio(), "a viewer's offer is answered with audio");
+        assert!(stream.has_audio(), "the stream's telemetry still reports audio");
         assert_eq!(old.dropped.load(Ordering::Relaxed), 0, "the episode is over");
 
         // A viewer joining now is primed with its keyframe.
         assert_eq!(hub.subscribe("s1").keyframe.unwrap().frame.pts_90k, 9000);
-        assert!(old.end());
+        assert_eq!(old.end(), StreamEnd::Closed);
         assert_eq!(hub.stream_count(), 0);
     }
 
@@ -923,7 +980,7 @@ mod tests {
         a.publish(EsFrame::video(0, idr_au(), true));
         b.publish(EsFrame::video(0, idr_au(), true));
         assert!(held_by(&c));
-        assert!(c.end());
+        assert_eq!(c.end(), StreamEnd::Closed);
 
         a.publish(EsFrame::video(1, idr_au(), true));
         assert!(held_by(&a), "the first to publish takes it back");
@@ -932,7 +989,7 @@ mod tests {
         a.publish(EsFrame::video(2, idr_au(), true));
         assert!(held_by(&b), "but not the reverse");
 
-        assert!(b.end());
+        assert_eq!(b.end(), StreamEnd::Closed);
         a.publish(EsFrame::video(3, idr_au(), true));
         assert!(held_by(&a));
     }
@@ -946,7 +1003,7 @@ mod tests {
         let new = hub.claim("s1");
         let mut viewer = hub.subscribe("s1");
         old.publish(EsFrame::video(1, idr_au(), true));
-        assert!(!old.end());
+        assert_eq!(old.end(), StreamEnd::HeldByAnother);
         new.publish(EsFrame::video(2, idr_au(), true));
         assert_eq!(viewer.rx.recv().await.unwrap().pts_90k, 2);
         assert_eq!(hub.stream_count(), 1);
@@ -1015,5 +1072,103 @@ mod tests {
         });
         assert_eq!(hub.stream_count(), 0);
         assert_eq!(hub.superseded_frames(), 0);
+    }
+
+    /// A superseded ingest that is ending — its session gone, flushing the
+    /// last unit its depacketizer held — never takes its stream back, so it
+    /// churns nobody's viewers.
+    ///
+    /// Before, that flush took the stream back for the instant until the
+    /// ingest's end closed it again: viewers waiting on a stream no ingest
+    /// held got a stale frame and then "stream closed", and an older live
+    /// ingest that had taken the stream back had it closed under its viewers.
+    #[test]
+    fn an_ending_ingest_never_takes_its_stream_back() {
+        use broadcast::error::TryRecvError;
+
+        // Viewers wait on a stream no ingest holds: the newer ingest ended,
+        // and the superseded one's session ends before it sent again.
+        let hub = DistributionHub::new();
+        let dead = hub.claim("s1");
+        dead.publish(EsFrame::video(0, idr_au(), true));
+        assert_eq!(hub.claim("s1").end(), StreamEnd::Closed);
+        let mut waiting = hub.subscribe("s1");
+        dead.mark_ending();
+        dead.publish(EsFrame::video(3000, idr_au(), true));
+        assert!(
+            matches!(waiting.rx.try_recv(), Err(TryRecvError::Empty)),
+            "the ending ingest's frame reaches nobody"
+        );
+        assert_eq!(dead.end(), StreamEnd::Unheld);
+        assert!(
+            matches!(waiting.rx.try_recv(), Err(TryRecvError::Empty)),
+            "and the waiting viewer is not ended"
+        );
+        assert!(Arc::ptr_eq(&hub.get("s1").unwrap(), &waiting.state));
+        let next = hub.claim("s1");
+        next.publish(EsFrame::video(6000, idr_au(), true));
+        assert_eq!(waiting.rx.try_recv().unwrap().pts_90k, 6000, "it plays the next ingest");
+
+        // An older live ingest took the stream back once the newest ended;
+        // an ingest between the two, superseded too, then ends.
+        let hub = DistributionHub::new();
+        let older = hub.claim("s1");
+        let dead = hub.claim("s1");
+        assert_eq!(hub.claim("s1").end(), StreamEnd::Closed);
+        older.publish(EsFrame::video(0, idr_au(), true));
+        let mut viewer = hub.subscribe("s1");
+        dead.mark_ending();
+        dead.publish(EsFrame::video(3000, idr_au(), true));
+        assert_eq!(dead.end(), StreamEnd::HeldByAnother);
+        older.publish(EsFrame::video(6000, idr_au(), true));
+        assert_eq!(
+            viewer.rx.try_recv().unwrap().pts_90k,
+            6000,
+            "the older ingest's viewer plays on, never ended"
+        );
+        assert!(Arc::ptr_eq(&hub.get("s1").unwrap(), &older.state.load_full()));
+        assert!(Arc::ptr_eq(&viewer.state, &older.state.load_full()));
+    }
+
+    /// An ingest's end says what it found of its stream: its own, which
+    /// closed; held by another ingest — the newer one that took it, or an
+    /// older one that took it back since — which plays on; or held by none,
+    /// whether nothing is registered under the stream id or viewers wait
+    /// there for the next ingest.
+    ///
+    /// Before, any end that did not hold the stream read as a newer ingest
+    /// holding it, which plays on, while its viewers were black.
+    #[test]
+    fn an_ingests_end_says_what_holds_the_stream() {
+        let hub = DistributionHub::new();
+        assert_eq!(hub.claim("s1").end(), StreamEnd::Closed);
+
+        // A newer ingest holds the stream.
+        let old = hub.claim("s1");
+        let new = hub.claim("s1");
+        assert_eq!(old.end(), StreamEnd::HeldByAnother);
+        assert_eq!(new.end(), StreamEnd::Closed);
+
+        // An older ingest took it back once the newest had ended.
+        let older = hub.claim("s1");
+        let middle = hub.claim("s1");
+        assert_eq!(hub.claim("s1").end(), StreamEnd::Closed);
+        older.publish(EsFrame::video(0, idr_au(), true));
+        assert_eq!(middle.end(), StreamEnd::HeldByAnother);
+        assert_eq!(older.end(), StreamEnd::Closed);
+
+        // Nothing is registered under the stream id.
+        let old = hub.claim("s1");
+        assert_eq!(hub.claim("s1").end(), StreamEnd::Closed);
+        assert!(hub.get("s1").is_none());
+        assert_eq!(old.end(), StreamEnd::Unheld);
+
+        // Viewers wait on the stream id, which no ingest holds.
+        let old = hub.claim("s1");
+        assert_eq!(hub.claim("s1").end(), StreamEnd::Closed);
+        let waiting = hub.subscribe("s1");
+        assert_eq!(old.end(), StreamEnd::Unheld);
+        assert!(Arc::ptr_eq(&hub.get("s1").unwrap(), &waiting.state), "they wait on");
+        assert_eq!(StreamEnd::Unheld.held_by(), "none");
     }
 }

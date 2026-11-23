@@ -313,10 +313,17 @@ until that one ends`) — and:
   or the one viewers are already waiting on. The newer push's viewers end with
   it, and those that come back play the older push from its next keyframe. So
   a stream id is never dead while any publisher of it is live.
+- **A push that is ending never takes the stream back.** A WHIP or cascade
+  session that ends flushes the last access unit its depacketizer held, and
+  that unit goes only into a stream the push still holds. So the late end of
+  a dead push — an edge's session timing out — neither sends viewers a stale
+  frame nor closes a stream they wait on, or one an older live push took back.
 - **If the older push ends first**, its end leaves the newer stream and its
   viewers alone. Its log line — and, for a QUIC ingest, its `distribution
-  ingest closed` event — says that a newer ingest holds the stream, which
-  plays on.
+  ingest closed` event (`held_by: "another"`) — says that another ingest holds
+  the stream, which plays on. A push that ends after every newer one has gone,
+  without having sent a frame since (so it never took the stream back), says
+  instead that no ingest holds the stream now (`held_by: "none"`).
 - Taking back never takes a stream from a newer push, so two live pushes
   settle on the newer one and never trade it. Of three or more, the newest
   still live ends up holding it: an older one that took the stream back first
@@ -336,10 +343,15 @@ What each consumer does when its session is ended so:
 - **The `/watch` player** asks again: its DTLS transport closes, and on that
   (or on its connection failing) it POSTs a new offer after a back-off of 1 s,
   doubling to 30 s, which a session that stayed connected for 10 s starts
-  over. So a stream that has gone for good is asked for every 30 s, never in a
-  loop. A refusal that asking again will not change (a `4xx` other than `429`)
-  stops it with the reason; pressing Stop cancels a pending retry. Before, it
-  did not reconnect at all.
+  over. The relay answers that offer `201` whatever the stream id — a stream
+  no ingest holds is one the viewer waits on — so a viewer of a stream that
+  has gone for good asks once and stays connected, sent nothing and holding
+  one of its IP's viewer slots, until the next push for that stream id plays.
+  The back-off grows towards 30 s only while offers fail (`429`, a `5xx`, the
+  network) or sessions keep closing, so it never asks in a loop. A refusal
+  that asking again will not change (a `4xx` other than `429`) stops it with
+  the reason; pressing Stop cancels a pending retry. Before, it did not
+  reconnect at all.
 - **A cascade pull** sees the upstream close the connection, ends — closing
   its own local stream, so its viewers end too — and pulls again 3 s later,
   like any pull that ends.
@@ -2282,14 +2294,17 @@ as ignored at startup.
   ingest's viewer sees its broadcast close at the ingest's end
   (`ingest_over_quic_delivers_frames_to_hub`), and a QUIC ingest a newer one
   took the stream from says so as it closes
-  (`a_superseded_quic_ingest_says_so_when_it_closes`).
+  (`a_superseded_quic_ingest_says_so_when_it_closes`), or that no ingest holds
+  the stream once the newer one has gone too
+  (`a_superseded_quic_ingest_ending_after_the_newer_one_says_none_holds_the_stream`).
 - **Two live pushes, through the real router**: when the newer one leaves
   first, the older one takes the stream back and a viewer that comes back
   plays it (`a_live_older_push_takes_its_stream_back_when_the_newer_one_leaves`);
   when the older one leaves first, the newer one's viewer plays on
   (`a_live_older_push_that_leaves_first_leaves_the_newer_ones_viewers_playing`).
   The hub's own tests cover the rest: no trading between two live pushes, the
-  newest of several holding the stream, and an unclaimed stream leaving with
+  newest of several holding the stream, a push that is ending never taking it
+  back, what an ingest's end reports, and an unclaimed stream leaving with
   its last viewer, raced against a claim on three threads
   (`distribution::hub::tests`).
 - **The media source pin's grace, through the real router**: a WHEP viewer's

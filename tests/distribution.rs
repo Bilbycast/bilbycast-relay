@@ -224,7 +224,9 @@ async fn ingest_over_quic_delivers_frames_to_hub() {
     assert!(hub.get("show").is_none());
     let closed = quic_ingest_closed_event(&mut event_rx).await;
     assert_eq!(closed.message, "distribution ingest closed for stream 'show'");
-    assert_eq!(closed.details.unwrap()["superseded"], false);
+    let details = closed.details.unwrap();
+    assert_eq!(details["superseded"], false);
+    assert_eq!(details["held_by"], "this");
 
     cancel.cancel();
     drop(conn);
@@ -246,13 +248,18 @@ async fn quic_ingest_closed_event(
     .expect("the ingest raises its closed event")
 }
 
-/// A QUIC ingest that a newer ingest took the stream from says so when it
-/// ends — the stream plays on under the newer one — rather than reading as
-/// the stream going down. Its end leaves the newer stream registered.
-#[tokio::test]
-async fn a_superseded_quic_ingest_says_so_when_it_closes() {
-    let hub = Arc::new(DistributionHub::new());
-    let (events, mut event_rx) = event_channel();
+/// A QUIC ingest whose ES stream is open on a fresh accept loop, holding
+/// stream `stream_id` once its first frame has reached the hub.
+async fn quic_ingest_holding(
+    hub: &Arc<DistributionHub>,
+    stream_id: &str,
+) -> (
+    quinn::Connection,
+    quinn::SendStream,
+    tokio::sync::mpsc::Receiver<bilbycast_relay::manager::events::Event>,
+    CancellationToken,
+) {
+    let (events, event_rx) = event_channel();
     let cancel = CancellationToken::new();
     let config = DistributionConfig { require_ingest_token: false, ..Default::default() };
     let server_cfg = ingest::build_ingest_server_config().unwrap();
@@ -273,7 +280,7 @@ async fn a_superseded_quic_ingest_says_so_when_it_closes() {
     let mut uni = conn.open_uni().await.unwrap();
     uni.write_all(&encode_hello(&IngestHello {
         v: 1,
-        stream: "handed".into(),
+        stream: stream_id.into(),
         token: None,
         has_audio: false,
     }))
@@ -281,12 +288,22 @@ async fn a_superseded_quic_ingest_says_so_when_it_closes() {
     .unwrap();
     uni.write_all(&encode_frame(&EsFrame::video(0, idr_au(), true))).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while hub.get("handed").is_none_or(|s| s.frames_in() == 0) {
+        while hub.get(stream_id).is_none_or(|s| s.frames_in() == 0) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("the QUIC ingest holds the stream");
+    (conn, uni, event_rx, cancel)
+}
+
+/// A QUIC ingest that a newer ingest took the stream from says so when it
+/// ends — the stream plays on under the newer one — rather than reading as
+/// the stream going down. Its end leaves the newer stream registered.
+#[tokio::test]
+async fn a_superseded_quic_ingest_says_so_when_it_closes() {
+    let hub = Arc::new(DistributionHub::new());
+    let (conn, mut uni, mut event_rx, cancel) = quic_ingest_holding(&hub, "handed").await;
 
     // A newer ingest takes the stream; then the QUIC ingest ends.
     let newer = hub.claim("handed");
@@ -297,12 +314,44 @@ async fn a_superseded_quic_ingest_says_so_when_it_closes() {
     let closed = quic_ingest_closed_event(&mut event_rx).await;
     assert_eq!(
         closed.message,
-        "distribution ingest closed for stream 'handed'; a newer ingest holds the stream, \
+        "distribution ingest closed for stream 'handed'; another ingest holds the stream, \
          which plays on"
     );
-    assert_eq!(closed.details.unwrap()["superseded"], true);
+    let details = closed.details.unwrap();
+    assert_eq!(details["superseded"], true);
+    assert_eq!(details["held_by"], "another");
     assert!(Arc::ptr_eq(&hub.get("handed").unwrap(), &newer_stream), "still registered");
     drop(newer);
+
+    cancel.cancel();
+    drop(conn);
+}
+
+/// A QUIC ingest a newer ingest took the stream from, which ends after that
+/// newer one has ended too and without having sent since, says that no
+/// ingest holds the stream: its viewers wait, sent nothing. Before, it said a
+/// newer ingest held the stream, which played on, while nothing fed it.
+#[tokio::test]
+async fn a_superseded_quic_ingest_ending_after_the_newer_one_says_none_holds_the_stream() {
+    let hub = Arc::new(DistributionHub::new());
+    let (conn, mut uni, mut event_rx, cancel) = quic_ingest_holding(&hub, "dark").await;
+
+    // A newer ingest takes the stream and ends; a viewer comes back for it.
+    drop(hub.claim("dark"));
+    let waiting = hub.subscribe("dark");
+    uni.write_all(&encode_eos()).await.unwrap();
+    uni.finish().unwrap();
+
+    let closed = quic_ingest_closed_event(&mut event_rx).await;
+    assert_eq!(
+        closed.message,
+        "distribution ingest closed for stream 'dark'; a newer ingest had taken the stream \
+         from it, and no ingest holds the stream now"
+    );
+    let details = closed.details.unwrap();
+    assert_eq!(details["superseded"], true);
+    assert_eq!(details["held_by"], "none");
+    assert!(Arc::ptr_eq(&hub.get("dark").unwrap(), &waiting.state), "the viewer waits on");
 
     cancel.cancel();
     drop(conn);
@@ -721,28 +770,23 @@ async fn whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on()
     assert!(!h264.is_empty(), "the answer must carry H.264:\n{}", handle.answer_sdp);
     client.apply_answer(&handle.answer_sdp, pending).unwrap();
 
-    // The live stream, on from where the history stopped.
-    let stream = hub.get("mid-join").unwrap();
-    let pub_cancel = cancel.clone();
-    tokio::spawn(async move {
+    // The live stream, on from where the history stopped, published by the
+    // same ingest while the viewer receives.
+    let live = async {
         let mut k = GOP;
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
-            tokio::select! {
-                _ = pub_cancel.cancelled() => break,
-                _ = tick.tick() => {
-                    k += 1;
-                    let (au, idr) = sent(k);
-                    stream.publish(EsFrame::video(k * FRAME_90K, au, idr));
-                }
-            }
+            tick.tick().await;
+            k += 1;
+            let (au, idr) = sent(k);
+            publisher.publish(EsFrame::video(k * FRAME_90K, au, idr));
         }
-    });
+    };
 
     // Every frame the viewer reassembles: (RTP timestamp, bytes).
     let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
     let client_cancel = CancellationToken::new();
-    let done = tokio::time::timeout(Duration::from_secs(20), async {
+    let receive = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match client.poll_event(&client_cancel).await {
                 SessionEvent::MediaData { pt, data, rtp_time, .. } => {
@@ -765,8 +809,11 @@ async fn whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on()
                 _ => {}
             }
         }
-    })
-    .await;
+    });
+    let done = tokio::select! {
+        done = receive => done,
+        _ = live => unreachable!("the live publisher never ends"),
+    };
     cancel.cancel();
     assert!(
         matches!(done, Ok(true)),
@@ -874,30 +921,25 @@ async fn a_whep_viewer_is_sent_no_h264_filler() {
     );
     client.apply_answer(&handle.answer_sdp, pending).unwrap();
 
-    let stream = hub.get("cbr").unwrap();
-    let pub_cancel = cancel.clone();
-    tokio::spawn(async move {
+    // The ingest publishes while the viewer receives.
+    let live = async {
         let mut k = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
-            tokio::select! {
-                _ = pub_cancel.cancelled() => break,
-                _ = tick.tick() => {
-                    k += 1;
-                    let pts = k * FRAME_90K;
-                    stream.publish(EsFrame::video(pts, sent(k), k.is_multiple_of(GOP)));
-                    stream.publish(EsFrame::audio(pts, Bytes::from_static(OPUS)));
-                }
-            }
+            tick.tick().await;
+            k += 1;
+            let pts = k * FRAME_90K;
+            publisher.publish(EsFrame::video(pts, sent(k), k.is_multiple_of(GOP)));
+            publisher.publish(EsFrame::audio(pts, Bytes::from_static(OPUS)));
         }
-    });
+    };
 
     // Every video frame the viewer reassembles, (RTP timestamp, bytes), and
     // every audio frame's bytes.
     let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut audio: Vec<Vec<u8>> = Vec::new();
     let client_cancel = CancellationToken::new();
-    let done = tokio::time::timeout(Duration::from_secs(20), async {
+    let receive = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match client.poll_event(&client_cancel).await {
                 SessionEvent::MediaData {
@@ -920,8 +962,11 @@ async fn a_whep_viewer_is_sent_no_h264_filler() {
                 _ => {}
             }
         }
-    })
-    .await;
+    });
+    let done = tokio::select! {
+        done = receive => done,
+        _ = live => unreachable!("the live publisher never ends"),
+    };
     cancel.cancel();
     assert!(
         matches!(done, Ok(true)),

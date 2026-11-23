@@ -58,8 +58,10 @@
   const playBtn = document.getElementById("play");
   // A session that ends under the viewer is asked for again after a
   // back-off: 1 s, doubling to 30 s, started over by a session that stayed
-  // connected for 10 s. So a stream that has gone for good is asked for every
-  // 30 s, never in a loop.
+  // connected for 10 s. The relay answers an offer for any stream id, so a
+  // stream that has gone for good is asked for once and waited on, connected;
+  // the back-off grows only while offers fail or sessions keep closing, so
+  // it never asks in a loop.
   const RETRY_MIN_MS = 1000, RETRY_MAX_MS = 30000, RETRY_RESET_AFTER_MS = 10000;
   let pc = null, resourceUrl = null;
   let watching = false, retryTimer = null, backoffMs = 0, connectedAt = 0;
