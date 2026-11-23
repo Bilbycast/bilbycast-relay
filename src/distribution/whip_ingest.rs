@@ -36,7 +36,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::es::{EsFrame, MAX_FRAME_BYTES, au_is_idr};
-use super::hub::DistributionHub;
+use super::hub::{DistributionHub, Publisher, StreamEnd};
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
 
@@ -96,6 +96,7 @@ pub async fn create_and_spawn_ingest(
     let mut session = WebrtcSession::new(&session_config)
         .await
         .context("failed to create WHIP ingest session")?;
+    session.count_other_paths_into(hub.other_path_counter());
     let answer_sdp = session
         .accept_offer(offer_sdp)
         .context("failed to accept WHIP offer")?;
@@ -117,7 +118,7 @@ pub async fn create_and_spawn_ingest(
 }
 
 /// Accumulates depacketized frames into access units and publishes them to
-/// the hub.
+/// the ingest's stream.
 struct AuAssembler {
     stream_id: String,
     /// The largest access unit built: [`MAX_WHIP_AU_BYTES`] for a WHIP
@@ -159,12 +160,12 @@ impl AuAssembler {
     /// relay ran out of memory, while its viewers got nothing. A unit that
     /// would pass the cap is dropped whole, and the rest of it with it:
     /// publishing its tail would hand viewers a fragment.
-    fn push(&mut self, hub: &DistributionHub, pts_90k: u64, data: &[u8]) {
+    fn push(&mut self, stream: &Publisher<'_>, pts_90k: u64, data: &[u8]) {
         if data.is_empty() {
             return;
         }
         if self.cur_pts != Some(pts_90k) {
-            self.flush(hub);
+            self.flush(stream);
             self.cur_pts = Some(pts_90k);
             self.oversized = false;
         }
@@ -190,15 +191,25 @@ impl AuAssembler {
         }
     }
 
-    /// Emit the accumulated access unit (if any) to the hub.
-    fn flush(&mut self, hub: &DistributionHub) {
+    /// Emit the accumulated access unit (if any) to the stream.
+    fn flush(&mut self, stream: &Publisher<'_>) {
         if self.nalus.is_empty() {
             return;
         }
         let pts = self.cur_pts.unwrap_or(0);
         let au = Bytes::from(std::mem::take(&mut self.nalus));
-        hub.publish(&self.stream_id, EsFrame::video(pts, au, self.keyframe));
+        stream.publish(EsFrame::video(pts, au, self.keyframe));
         self.keyframe = false;
+    }
+
+    /// The session has ended: emit the unit still held — the assembler
+    /// emits one only when the next one starts — as an ingest that is ending
+    /// ([`Publisher::mark_ending`]). So a superseded ingest's last unit,
+    /// which may be many seconds old when its session times out, never takes
+    /// its stream back only for its end to close it again.
+    fn finish(mut self, stream: &Publisher<'_>) {
+        stream.mark_ending();
+        self.flush(stream);
     }
 
     /// Drop the unit being built at `pts_90k` — it would pass `max_bytes` —
@@ -239,7 +250,6 @@ async fn ingest_loop(
     match await_connected(&mut session, &cancel, SETUP_DEADLINE).await {
         Setup::Connected => {
             tracing::info!("WHIP ingest '{session_id}' connected for stream '{stream_id}'");
-            hub.register(stream_id);
         }
         Setup::Disconnected => {
             tracing::info!("WHIP ingest '{session_id}' disconnected during setup");
@@ -254,14 +264,27 @@ async fn ingest_loop(
         }
     }
 
-    republish_from_session(session, &hub, stream_id, &cancel, MAX_WHIP_AU_BYTES).await;
-
-    hub.remove(stream_id);
-    tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
+    // The stream ends with this ingest, its viewers with it — unless a newer
+    // ingest has taken it from this one (see `Publisher`).
+    let publisher = hub.claim(stream_id);
+    republish_from_session(session, &publisher, &cancel, MAX_WHIP_AU_BYTES).await;
+    match publisher.end() {
+        StreamEnd::Closed => {
+            tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
+        }
+        StreamEnd::HeldByAnother => tracing::info!(
+            "WHIP ingest '{session_id}' closed (stream '{stream_id}'); another ingest holds the \
+             stream, which plays on"
+        ),
+        StreamEnd::Unheld => tracing::info!(
+            "WHIP ingest '{session_id}' closed (stream '{stream_id}'); a newer ingest had taken \
+             the stream from it, and no ingest holds the stream now"
+        ),
+    }
 }
 
 /// Drive a **connected** WebRTC session, depacketizing its inbound media into
-/// the hub: H.264 NALs are regrouped into access units (by PTS) and published
+/// `stream`: H.264 NALs are regrouped into access units (by PTS) and published
 /// as video frames; Opus frames pass straight through. Returns when the
 /// session disconnects or `cancel` fires. Shared by WHIP ingest (server role)
 /// and the cascade WHEP-client (client role) — both receive WebRTC media and
@@ -269,14 +292,13 @@ async fn ingest_loop(
 /// [`MAX_WHIP_AU_BYTES`] for the one, [`MAX_RTP_AU_BYTES`] for the other.
 pub(crate) async fn republish_from_session(
     mut session: WebrtcSession,
-    hub: &DistributionHub,
-    stream_id: &str,
+    stream: &Publisher<'_>,
     cancel: &CancellationToken,
     max_au_bytes: usize,
 ) {
     session.drain_pending_events();
 
-    let mut asm = AuAssembler::new(stream_id.to_string(), max_au_bytes);
+    let mut asm = AuAssembler::new(stream.stream_id().to_string(), max_au_bytes);
 
     loop {
         match session.poll_event(cancel).await {
@@ -287,7 +309,7 @@ pub(crate) async fn republish_from_session(
                     // str0m video MediaTime is already the 90 kHz clock. One
                     // `MediaData` is one whole depacketized frame, Annex B.
                     let pts_90k = rtp_time.numer();
-                    asm.push(hub, pts_90k, &data);
+                    asm.push(stream, pts_90k, &data);
                 } else if is_audio {
                     // Opus 48 kHz clock → 90 kHz.
                     let numer = rtp_time.numer() as u128;
@@ -302,7 +324,7 @@ pub(crate) async fn republish_from_session(
                     // `AsRef<[u8]> + Send + 'static` and keeps it alive — so
                     // handing over the `Arc` is zero-copy, where
                     // `copy_from_slice` would allocate per Opus frame.
-                    hub.publish(stream_id, EsFrame::audio(pts_90k, Bytes::from_owner(data)));
+                    stream.publish(EsFrame::audio(pts_90k, Bytes::from_owner(data)));
                 }
             }
             SessionEvent::Disconnected => break,
@@ -310,7 +332,7 @@ pub(crate) async fn republish_from_session(
         }
     }
 
-    asm.flush(hub);
+    asm.finish(stream);
 }
 
 #[cfg(test)]
@@ -326,6 +348,7 @@ mod tests {
     fn a_whole_annex_b_frame_goes_through_unchanged_and_flags_its_idr() {
         let hub = DistributionHub::new();
         let mut sub = hub.subscribe("s");
+        let stream = hub.claim("s");
         let mut asm = AuAssembler::new("s".to_string(), MAX_WHIP_AU_BYTES);
 
         let idr_au: &[u8] = &[
@@ -334,9 +357,9 @@ mod tests {
             0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, //
         ];
         let p_au: &[u8] = &[0, 0, 0, 1, 0x41, 0x9a, 0x21];
-        asm.push(&hub, 0, idr_au);
-        asm.push(&hub, 3600, p_au);
-        asm.flush(&hub);
+        asm.push(&stream, 0, idr_au);
+        asm.push(&stream, 3600, p_au);
+        asm.flush(&stream);
 
         let f1 = sub.rx.try_recv().unwrap();
         assert_eq!(f1.pts_90k, 0);
@@ -348,19 +371,59 @@ mod tests {
         assert_eq!(&f2.data[..], p_au);
     }
 
+    /// As a session ends, the unit its assembler still holds goes out as an
+    /// ingest that is ending: into the stream it holds, and nowhere else. A
+    /// superseded ingest's last unit — seconds old when its session times
+    /// out — does not take back the stream viewers wait on, so its end does
+    /// not close that stream under them.
+    ///
+    /// Before, that flush took the stream for the instant until the ingest's
+    /// end closed it: every waiting viewer got a stale frame, then "stream
+    /// closed", and offered again.
+    #[test]
+    fn a_superseded_ingests_last_unit_takes_nothing_back() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let hub = DistributionHub::new();
+        let dead = hub.claim("s");
+        let mut asm = AuAssembler::new("s".to_string(), MAX_WHIP_AU_BYTES);
+        asm.push(&dead, 0, &[0, 0, 0, 1, 0x65, 0x88]);
+        // A newer push took the stream and has ended; viewers wait on it.
+        assert_eq!(hub.claim("s").end(), StreamEnd::Closed);
+        let mut waiting = hub.subscribe("s");
+
+        asm.finish(&dead);
+        assert!(matches!(waiting.rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(dead.end(), StreamEnd::Unheld);
+        assert!(
+            matches!(waiting.rx.try_recv(), Err(TryRecvError::Empty)),
+            "the waiting viewer is not ended"
+        );
+        assert!(Arc::ptr_eq(&hub.get("s").unwrap(), &waiting.state));
+
+        // An ingest that holds its stream still sends its last unit.
+        let live = hub.claim("s");
+        let mut asm = AuAssembler::new("s".to_string(), MAX_WHIP_AU_BYTES);
+        asm.push(&live, 3000, &[0, 0, 0, 1, 0x65, 0x99]);
+        asm.finish(&live);
+        assert_eq!(waiting.rx.try_recv().unwrap().pts_90k, 3000);
+        assert_eq!(live.end(), StreamEnd::Closed);
+    }
+
     /// An RTP padding probe arrives as a payload-less frame. It is no access
     /// unit: it publishes nothing and does not flush the one being built.
     #[test]
     fn a_payload_less_frame_is_no_access_unit() {
         let hub = DistributionHub::new();
         let mut sub = hub.subscribe("s");
+        let stream = hub.claim("s");
         let mut asm = AuAssembler::new("s".to_string(), MAX_WHIP_AU_BYTES);
 
-        asm.push(&hub, 0, &[0, 0, 0, 1, 0x65, 0x88]);
-        asm.push(&hub, 1800, &[]);
-        asm.push(&hub, 0, &[0, 0, 0, 1, 0x65, 0x99]);
+        asm.push(&stream, 0, &[0, 0, 0, 1, 0x65, 0x88]);
+        asm.push(&stream, 1800, &[]);
+        asm.push(&stream, 0, &[0, 0, 0, 1, 0x65, 0x99]);
         assert!(sub.rx.try_recv().is_err(), "the probe flushed nothing");
-        asm.flush(&hub);
+        asm.flush(&stream);
         let f = sub.rx.try_recv().unwrap();
         assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x65, 0x99]);
         assert!(sub.rx.try_recv().is_err(), "and published nothing of its own");
@@ -378,19 +441,20 @@ mod tests {
         for cap in [MAX_WHIP_AU_BYTES, MAX_RTP_AU_BYTES] {
             let hub = DistributionHub::new();
             let mut sub = hub.subscribe("s");
+            let stream = hub.claim("s");
             let mut asm = AuAssembler::new("s".to_string(), cap);
 
             let slice = vec![0x41u8; 100_000];
             for _ in 0..(cap / slice.len() + 20) {
-                asm.push(&hub, 3000, &slice);
+                asm.push(&stream, 3000, &slice);
                 assert!(
                     asm.nalus.len() <= cap,
                     "buffered {} bytes on one timestamp, cap {cap}",
                     asm.nalus.len()
                 );
             }
-            asm.push(&hub, 6000, &[0, 0, 0, 1, 0x65, 0x88]);
-            asm.flush(&hub);
+            asm.push(&stream, 6000, &[0, 0, 0, 1, 0x65, 0x88]);
+            asm.flush(&stream);
             let f = sub.rx.try_recv().expect("the next unit goes out");
             assert_eq!(
                 (f.pts_90k, f.keyframe),
@@ -403,8 +467,8 @@ mod tests {
             // A unit of exactly the limit is not oversized.
             let mut whole = vec![0x65u8];
             whole.resize(cap - 4, 0x11);
-            asm.push(&hub, 9000, &whole);
-            asm.flush(&hub);
+            asm.push(&stream, 9000, &whole);
+            asm.flush(&stream);
             let f = sub.rx.try_recv().expect("a unit at the limit goes out");
             assert_eq!(f.data.len(), cap);
         }
@@ -423,6 +487,7 @@ mod tests {
 
         let upstream = DistributionHub::new();
         let mut published = upstream.subscribe("s");
+        let origin = upstream.claim("s");
         // The stream's parameter sets, as large as the upstream re-inserts.
         let sps_len = MAX_PARAM_SET_BYTES;
         let pps_len = MAX_PARAM_SETS_ON_THE_WIRE - sps_len;
@@ -431,7 +496,7 @@ mod tests {
         first.extend_from_slice(&[0, 0, 0, 1, 0x68]);
         first.resize(first.len() + pps_len - 1, 0xce);
         first.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
-        upstream.publish("s", EsFrame::video(0, first.into(), true));
+        origin.publish(EsFrame::video(0, first.into(), true));
         let _ = published.rx.try_recv().unwrap();
 
         // An IDR without its own sets, exactly at the QUIC ingest's cap: 512
@@ -443,7 +508,7 @@ mod tests {
             idr.resize(idr.len() + MAX_FRAME_BYTES / slices - 4, 0x11);
         }
         assert_eq!(idr.len(), MAX_FRAME_BYTES);
-        upstream.publish("s", EsFrame::video(3000, idr.into(), true));
+        origin.publish(EsFrame::video(3000, idr.into(), true));
         let au = published.rx.try_recv().unwrap();
         assert_eq!(
             au.data.len(),
@@ -453,9 +518,10 @@ mod tests {
 
         let downstream = DistributionHub::new();
         let mut sub = downstream.subscribe("s");
+        let tier = downstream.claim("s");
         let mut asm = AuAssembler::new("s".to_string(), MAX_RTP_AU_BYTES);
-        asm.push(&downstream, 3000, &au.data);
-        asm.flush(&downstream);
+        asm.push(&tier, 3000, &au.data);
+        asm.flush(&tier);
         let f = sub
             .rx
             .try_recv()
@@ -485,14 +551,17 @@ mod tests {
             DistributionHub::new(),
         ];
         let mut subs = hubs.each_ref().map(|h| h.subscribe("s"));
+        let streams = hubs.each_ref().map(|h| h.claim("s"));
         let mut asms = [MAX_WHIP_AU_BYTES, MAX_RTP_AU_BYTES, MAX_RTP_AU_BYTES]
             .map(|cap| AuAssembler::new("s".to_string(), cap));
         // How many of the three relays a unit at `pts` gets out of.
         let mut relay = |pts: u64, au: Vec<u8>| -> usize {
             let mut au = Bytes::from(au);
-            for (tier, ((hub, sub), asm)) in hubs.iter().zip(&mut subs).zip(&mut asms).enumerate() {
-                asm.push(hub, pts, &au);
-                asm.flush(hub);
+            for (tier, ((stream, sub), asm)) in
+                streams.iter().zip(&mut subs).zip(&mut asms).enumerate()
+            {
+                asm.push(stream, pts, &au);
+                asm.flush(stream);
                 match sub.rx.try_recv() {
                     Ok(f) => au = f.data.clone(),
                     Err(_) => return tier,
@@ -539,14 +608,15 @@ mod tests {
     fn au_assembler_groups_by_pts_and_flags_keyframe() {
         let hub = DistributionHub::new();
         let mut sub = hub.subscribe("s");
+        let stream = hub.claim("s");
         let mut asm = AuAssembler::new("s".to_string(), MAX_WHIP_AU_BYTES);
 
         // Frame 1 (keyframe): SPS + PPS + IDR at pts 0.
-        asm.push(&hub, 0, &[0x67, 0x42]);
-        asm.push(&hub, 0, &[0x68, 0xce]);
-        asm.push(&hub, 0, &[0x65, 0x88]);
+        asm.push(&stream, 0, &[0x67, 0x42]);
+        asm.push(&stream, 0, &[0x68, 0xce]);
+        asm.push(&stream, 0, &[0x65, 0x88]);
         // Frame 2 (P) at pts 3600 — pushing it flushes frame 1.
-        asm.push(&hub, 3600, &[0x41, 0x9a]);
+        asm.push(&stream, 3600, &[0x41, 0x9a]);
 
         let f1 = sub.rx.try_recv().unwrap();
         assert_eq!(f1.pts_90k, 0);
@@ -554,7 +624,7 @@ mod tests {
         // Frame 1 contains 3 start-code-separated NALs.
         assert_eq!(f1.data.windows(4).filter(|w| *w == [0, 0, 0, 1]).count(), 3);
 
-        asm.flush(&hub);
+        asm.flush(&stream);
         let f2 = sub.rx.try_recv().unwrap();
         assert_eq!(f2.pts_90k, 3600);
         assert!(!f2.keyframe);

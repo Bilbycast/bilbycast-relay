@@ -1172,6 +1172,8 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
             // parses this object loosely, so an older manager simply ignores
             // it. No wire-format or protocol-version change.
             "offpath_sessions": d.offpath_sessions,
+            "other_path_datagrams": d.other_path_datagrams,
+            "superseded_frames": d.superseded_frames,
         });
     }
 
@@ -1704,6 +1706,11 @@ fn build_health_message(
             "bytes_out": d.bytes_out,
             "origin_bytes": d.origin_bytes,
             "offpath_sessions": d.offpath_sessions,
+            // Additive, like the rest of this object: other-path drops inside
+            // the source pin's grace, and frames dropped while a newer
+            // ingest held a live one's stream.
+            "other_path_datagrams": d.other_path_datagrams,
+            "superseded_frames": d.superseded_frames,
             // Per-stream breakdown of origin_bytes, so an operator watching a
             // volume fill can see *which* stream is spending it and whether a
             // retention override put it there. Rides health (15 s), not stats
@@ -3885,6 +3892,26 @@ mod stopped_subsystem_health_tests {
         assert!(p.get("distribution_error").is_none());
         assert!(p.get("udp_relay_error").is_none());
         assert!(p.get("distribution").is_some());
+    }
+
+    /// The source pin's other-path drops and the frames dropped while a
+    /// newer ingest held a live one's stream reach the manager on both the
+    /// health and the stats payloads, from the telemetry tick's sample.
+    #[test]
+    fn the_distribution_drop_counters_reach_health_and_stats() {
+        let stats = Arc::new(RelayStats::new());
+        stats.set_distribution(0, 0, 0, 0, 0, Vec::new());
+        stats.set_distribution_drops(18, 250);
+        let config = RelayConfig::default();
+        let p = health(&stats, &config);
+        assert_eq!(p["distribution"]["other_path_datagrams"], 18);
+        assert_eq!(p["distribution"]["superseded_frames"], 250);
+
+        let (events, _rx) = crate::manager::event_channel();
+        let ctx = crate::server::create_session_context(stats.clone(), events, false, 64, 100);
+        let s = build_stats_payload(&ctx, &stats);
+        assert_eq!(s["distribution"]["other_path_datagrams"], 18);
+        assert_eq!(s["distribution"]["superseded_frames"], 250);
     }
 
     #[test]

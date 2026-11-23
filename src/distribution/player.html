@@ -56,31 +56,71 @@
   const dot = document.getElementById("dot");
   const statusEl = document.getElementById("status");
   const playBtn = document.getElementById("play");
+  // A session that ends under the viewer is asked for again after a
+  // back-off: 1 s, doubling to 30 s, started over by a session that stayed
+  // connected for 10 s. The relay answers an offer for any stream id, so a
+  // stream that has gone for good is asked for once and waited on, connected;
+  // the back-off grows only while offers fail or sessions keep closing, so
+  // it never asks in a loop.
+  const RETRY_MIN_MS = 1000, RETRY_MAX_MS = 30000, RETRY_RESET_AFTER_MS = 10000;
   let pc = null, resourceUrl = null;
+  let watching = false, retryTimer = null, backoffMs = 0, connectedAt = 0;
 
   function setStatus(s, err) {
     statusEl.textContent = s;
     statusEl.className = "status" + (err ? " err" : "");
   }
 
+  // Drop the current session. The DELETE is best effort: when the relay
+  // ended the session itself, the resource is gone already.
+  function teardown() {
+    if (resourceUrl) fetch(resourceUrl, { method: "DELETE" }).catch(() => {});
+    const old = pc;
+    pc = null;
+    resourceUrl = null;
+    if (old) old.close();
+    dot.classList.remove("live");
+  }
+
+  // The session ended while the viewer was watching: the relay closed it
+  // (it does when the stream's ingest goes, or another takes the stream
+  // over) or the connection failed. Come back for the stream after the
+  // back-off. A viewer that came back to a stream with no ingest stays
+  // connected and plays when the next push arrives.
+  function retry(why, err) {
+    if (!watching || retryTimer) return;
+    teardown();
+    if (connectedAt && Date.now() - connectedAt >= RETRY_RESET_AFTER_MS) backoffMs = 0;
+    connectedAt = 0;
+    backoffMs = backoffMs ? Math.min(backoffMs * 2, RETRY_MAX_MS) : RETRY_MIN_MS;
+    setStatus(why + " — reconnecting in " + Math.round(backoffMs / 1000) + " s", err);
+    retryTimer = setTimeout(() => { retryTimer = null; start(); }, backoffMs);
+  }
+
   async function start() {
-    playBtn.disabled = true;
     setStatus("connecting…");
-    pc = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
-    pc.addTransceiver("video", { direction: "recvonly" });
-    pc.addTransceiver("audio", { direction: "recvonly" });
+    const me = pc = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+    // Events from a session this page has already dropped are not its own.
+    const stale = () => me !== pc;
+    me.addTransceiver("video", { direction: "recvonly" });
+    me.addTransceiver("audio", { direction: "recvonly" });
     const stream = new MediaStream();
-    pc.ontrack = (e) => { stream.addTrack(e.track); v.srcObject = stream; };
-    pc.oniceconnectionstatechange = () => {
-      const st = pc.iceConnectionState;
+    me.ontrack = (e) => { stream.addTrack(e.track); v.srcObject = stream; };
+    me.oniceconnectionstatechange = () => {
+      if (stale()) return;
+      const st = me.iceConnectionState;
       setStatus(st, st === "failed" || st === "disconnected");
       const live = st === "connected" || st === "completed";
       dot.classList.toggle("live", live);
-      if (live) { v.muted = false; }
+      if (live) { v.muted = false; connectedAt = connectedAt || Date.now(); }
+    };
+    me.onconnectionstatechange = () => {
+      if (!stale() && me.connectionState === "failed") retry("connection lost", true);
     };
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+    const offer = await me.createOffer();
+    await me.setLocalDescription(offer);
+    if (stale()) return;
 
     const headers = { "Content-Type": "application/sdp" };
     if (token) headers["Authorization"] = "Bearer " + token;
@@ -90,31 +130,50 @@
       resp = await fetch("/whep/" + encodeURIComponent(STREAM), {
         method: "POST", headers, body: offer.sdp,
       });
-    } catch (e) { setStatus("network error", true); playBtn.disabled = false; return; }
+    } catch (e) { if (!stale()) retry("network error", true); return; }
+    if (stale()) return;
 
     if (!resp.ok) {
-      setStatus("WHEP " + resp.status + ": " + (await resp.text()), true);
-      playBtn.disabled = false;
+      const why = "WHEP " + resp.status + ": " + (await resp.text());
+      if (stale()) return;
+      // A busy or failing relay may take the viewer later; a refusal of the
+      // viewer or its offer will not change by asking again.
+      if (resp.status === 429 || resp.status >= 500) { retry(why, true); return; }
+      stop();
+      setStatus(why, true);
       return;
     }
     resourceUrl = resp.headers.get("Location");
     const answer = await resp.text();
-    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    if (stale()) return;
+    await me.setRemoteDescription({ type: "answer", sdp: answer });
+    if (stale()) return;
+    // The relay ends a viewer's session with a DTLS close_notify when its
+    // stream closes, which closes this transport.
+    const transport = me.getReceivers().map((r) => r.transport).find(Boolean);
+    if (transport) {
+      transport.onstatechange = () => {
+        if (stale()) return;
+        if (transport.state === "closed") retry("stream ended", false);
+        else if (transport.state === "failed") retry("connection lost", true);
+      };
+    }
     setStatus("negotiated");
   }
 
-  async function stop() {
-    if (resourceUrl) { try { await fetch(resourceUrl, { method: "DELETE" }); } catch (_) {} }
-    if (pc) { pc.close(); pc = null; }
-    resourceUrl = null;
-    dot.classList.remove("live");
+  function stop() {
+    watching = false;
+    clearTimeout(retryTimer);
+    retryTimer = null;
+    backoffMs = 0;
+    connectedAt = 0;
+    teardown();
     setStatus("stopped");
-    playBtn.disabled = false;
     playBtn.textContent = "Watch";
   }
 
   playBtn.addEventListener("click", () => {
-    if (pc) { stop(); } else { playBtn.textContent = "Stop"; start(); }
+    if (watching) { stop(); } else { watching = true; playBtn.textContent = "Stop"; start(); }
   });
   // Tear the session down on the way out. The resource answers DELETE only,
   // and a beacon can only POST, so it is a fetch that outlives the page.

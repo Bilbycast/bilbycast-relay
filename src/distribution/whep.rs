@@ -13,7 +13,8 @@
 //!
 //! The RTP packetizing is str0m's: each H.264 access unit goes to str0m's
 //! writer once, whole, as Annex B. The hub has already put the stream's SPS /
-//! PPS back ahead of any IDR that lacked them (`DistributionHub::publish`).
+//! PPS back ahead of any IDR that lacked them as it published it
+//! (`StreamState::send` in `hub.rs`).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -68,6 +69,7 @@ pub async fn create_and_spawn_viewer(
     let mut session = WebrtcSession::new(&session_config)
         .await
         .context("failed to create WebRTC session")?;
+    session.count_other_paths_into(hub.other_path_counter());
 
     let answer_sdp = session
         .accept_offer(offer_sdp)
@@ -125,7 +127,8 @@ enum ViewerEnd {
     SetupTimedOut,
     /// The viewer negotiated no video, or no H.264 PT on it.
     NoVideo,
-    /// The stream's broadcast closed: its ingest is gone.
+    /// The stream's broadcast closed: its ingest is gone, or a newer push took
+    /// the stream over.
     StreamClosed,
     /// The session itself ended.
     Session(SessionEnd),
@@ -272,6 +275,16 @@ async fn send_to_viewer(
             }
         }
     };
+
+    // A stream that closed tells its viewer so — an RTCP BYE and a DTLS
+    // close_notify — and the viewer's player learns at once that the stream
+    // has gone and can come back for the next push, rather than finding out
+    // when ICE fails on a session the relay has dropped. Its stream used to
+    // close never, and the viewer stayed connected to nothing.
+    if end == ViewerEnd::StreamClosed {
+        session.close();
+        session.drain_outputs().await;
+    }
 
     // A session can be torn down by the pin's own consequence (its pairs get
     // pruned), so check once more on the way out — otherwise the very sessions

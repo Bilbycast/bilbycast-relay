@@ -258,6 +258,35 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   their origin took — the re-inserted SPS / PPS and 4-byte start codes, each
   at most once along a chain — so what an origin takes reaches every tier;
   a unit past its cap is dropped whole.
+  A stream lives as long as the ingest that claimed it
+  (`DistributionHub::claim` → `Publisher`, dropped or `end()`ed when the
+  ingest ends, a panic included): its end closes the broadcast — the sender
+  sits in an `ArcSwapOption` that is emptied, since viewers hold the state for
+  its counters — and every viewer on it ends `stream closed`, sent a DTLS
+  close_notify. **The newest live ingest owns a stream id**: a push for a
+  stream another ingest still holds gets a fresh stream and closes the older
+  one, whose ingest's end then removes only its own (`Arc::ptr_eq`). The older
+  ingest is not ended (its client would push again and the two would trade
+  the stream): `Publisher::publish` finds its stream closed, drops the frame
+  (`superseded_frames`, one warning per episode) and, once no newer ingest
+  holds the stream id, takes it back on that frame (`take_back`: a fresh
+  stream inheriting its SPS / PPS and audio flag, or the unclaimed one viewers
+  wait on). The SPS / PPS it sends while superseded are kept on its closed
+  stream for that (`track_param_sets`), and an ingest that is ending never
+  takes the stream back (`Publisher::mark_ending`, set by
+  `AuAssembler::finish` before a WHIP or cascade session's last flush).
+  `Publisher::end` returns a `StreamEnd` — `Closed`, `HeldByAnother` or
+  `Unheld` — which the QUIC ingest's closed event reports as `held_by`.
+  Ingests are numbered as they claim (`StreamState::owner`), and a
+  take-back never takes a stream from a newer one, so two live ingests settle
+  on the newer and never trade it. A stream viewers made ahead of any ingest
+  is taken over as it is, and leaves the registry with its last viewer
+  (`ViewerGuard`: `remove_if` re-checks owner and viewers under the
+  registry's lock on that entry, which `claim` and `subscribe` hold too, so a
+  claim or a viewer arriving at that moment keeps it). Before, viewers held the
+  sender, so no broadcast ever closed, and an ingest's end removed whatever
+  was registered under its id (`docs/distribution.md`, "When the stream
+  ends").
 - **WHEP** (`POST /whep/{stream}`): per-viewer str0m ICE-Lite server session;
   each H.264 access unit goes to str0m's writer **once, whole, as Annex B** and
   str0m packetizes it (RFC 6184) → SRTP → browser. Filler data NAL units (type
@@ -269,7 +298,8 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   as the edge removed its own in e927368). Vendored str0m session under
   `src/distribution/webrtc/` (kept in sync with bilbycast-edge). A session ends
   on `DELETE` (the `/watch` player sends a `keepalive` fetch on `pagehide`), on
-  the peer closing the connection (DTLS close_notify, `Event::Closed`), on ICE
+  the peer closing the connection (DTLS close_notify, `Event::Closed`), on its
+  stream closing (the relay then closes it: RTCP BYE + close_notify), on ICE
   staying disconnected for `session::ICE_DISCONNECT_GRACE` (15 s, on top of
   `is`'s 15 s — about 30 s from a viewer's last check; an ICE-Lite agent comes
   back on the peer's next nomination, so the first disconnect is not the end)
@@ -330,7 +360,13 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
 - **A restart keeps the window** (`origin::ADOPT_HOLD`, 10 min): a session's window is a per-stream policy the manager pushes and those are deliberately not persisted, while the node default is 60 s. Each stream that adopted segments or thumbnail sheets at startup is therefore **held from the node default** — not trimmed by age, and its byte cap widened by what it adopted (`StreamOrigin::adopted_bytes`), because the session's own cap arrives in the same per-stream policy as its retention and a long window is bigger than the default cap — until the manager's push names its per-stream policies (`OriginStore::take_manager_policy`, which calls `manager_policy_received` when `per_stream` is `Some`, an empty list included, on the watch and on the value retained while the store was still adopting) or the hold runs out, which the first eviction to notice logs — at `warn`, naming the streams, only when an adopted window is wider than the default it is trimmed to from here (by bytes, or by the span `StreamOrigin::adopted_span_ms` it covers), at `info` otherwise, because on a relay with no DVR work every restart lapses and a warning on each would be the line operators learn to ignore (a restart inside the previous run's own hold still warns for its live streams, since that run trimmed none by age). Within a run, growth after the restart is still held to the default cap on top of what was adopted; across restarts the widening stops at `MAX_ADOPT_WIDENING` (128 GiB, above the 126 GiB the manager's largest session window is sized to), because each start adopts what the last one grew while held, and a relay restarting faster than the hold lapses otherwise compounded it with no per-stream byte bound at all. That ceiling bounds a stream, not the disk: on a volume that cannot hold every live stream at the default cap plus 128 GiB above the free-space floor, a crash loop with nothing ending its holds meets the floor first, and the floor then evicts round-robin across every stream, a DVR window included. The free-space floor applies throughout, and a stream that began after the restart is not held. The manager names per-stream policies only to a relay with DVR work, so on any other relay the hold runs its full ten minutes. Before this the first PUT after a restart evicted the whole adopted window against the default, ~40 s before the push that said to keep it.
 - **Players**: two, and they are not variants of each other. `GET /watch/{stream}`
   (`player.html`) is the WHEP one — sub-second, live-only, no buffer, no
-  seekable range. `GET /dvr/{stream}` (`dvr.html`) plays the LL-HLS origin, so
+  seekable range; when its session ends under it (the relay closed it with its
+  stream, or the connection failed) it offers again after a back-off of 1 s
+  doubling to 30 s, started over by a session that stayed up 10 s, stopping
+  on a `4xx` other than `429` — driven in jsdom by
+  `src/distribution/tests/player_page.test.cjs` (fake `RTCPeerConnection`,
+  `fetch` and clock), which CI runs as a second step of the `dvr-page` job
+  with `PLAYER_PAGE_REQUIRE_JSDOM=1`. `GET /dvr/{stream}` (`dvr.html`) plays the LL-HLS origin, so
   it seeks back across the whole advertised window, steps frames, shuttles and
   shows a scrub preview. It expects **two renditions** — `{stream}` long-GOP and
   `{stream}-proxy` low-res all-intra — plus the edge's optional thumbnail track,
@@ -360,16 +396,32 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   plain build logs it as ignored). Example:
   `../testbed/configs/relay-distribution.json`.
 - **Telemetry**: the subsystem publishes `{streams, viewers, bytes_out,
-  origin_bytes, offpath_sessions, origin_streams}` onto `RelayStats` — the last
+  origin_bytes, offpath_sessions, other_path_datagrams, superseded_frames,
+  origin_streams}` onto `RelayStats` — the last
   a per-stream breakdown of `origin_bytes` (segments, bytes, idle seconds,
   whether a retention override is in force) that rides health rather than the
   1 s stats tick; the manager health payload advertises the
   `viewer-distribution` capability + a `distribution` object +
-  `distribution_base_url`. `offpath_sessions` counts viewer sessions that had a
-  datagram refused by the WebRTC ingress source pin — one per session, never per
-  datagram, so a reflection flood cannot inflate it. Non-zero means a
+  `distribution_base_url`. `offpath_sessions` counts viewer sessions that had an
+  off-path datagram refused by the WebRTC ingress source pin — one per session,
+  never per datagram, so a reflection flood cannot inflate it. A datagram from
+  an address with a *claim* to the session — named among the SDP's ICE
+  candidates, seen before DTLS completed (recorded before str0m checks
+  integrity, so any sender's), or advertised by the session — is dropped
+  without the alarm inside a bounded grace (`session::OTHER_PATH_GRACE` 30 s
+  after the pin armed, `OTHER_PATH_BUDGET` 64 datagrams; measured, a
+  multi-homed peer's other paths stop within 24 datagrams and 17.3 s) and
+  counted on `other_path_datagrams` (every session kind, through the hub's
+  shared counter, `WebrtcSession::count_other_paths_into`); past the grace it
+  is off-path, because the peer writes its SDP and can name its victim
+  (`PeerPin`). Non-zero `offpath_sessions` means a
   source-spoofed ICE reflection attempt or a viewer whose IP changed mid-session
-  (that viewer goes black until it re-POSTs its WHEP offer). The per-stream
+  (that viewer goes black until it re-POSTs its WHEP offer). `superseded_frames`
+  counts frames a live ingest published while a newer one held its stream. Both
+  new counters are relay-wide and monotonic, exported as
+  `bilbycast_relay_distribution_other_path_datagrams_total` and
+  `…_superseded_frames_total`, and additive on the health and stats payloads.
+  The per-stream
   `StreamSnapshot` carries it too, and it is exported as
   `bilbycast_relay_distribution_offpath_sessions` on `/metrics` alongside a
   one-shot `webrtc_offpath_source` event — a relay is headless, so those are the
@@ -627,7 +679,10 @@ otherwise only ever run for real, against a signed release, on somebody's server
 
 Two more jobs run the hand-written browser pages, which no cargo command
 executes (`mod.rs` only serves them, or reads them as text): **`dvr-page`**
-drives `dvr.html` through `src/distribution/tests/dvr_page.test.cjs`, and
+drives `dvr.html` through `src/distribution/tests/dvr_page.test.cjs` and, as a
+second step on the same jsdom install, the `/watch` player `player.html`
+through `src/distribution/tests/player_page.test.cjs`
+(`PLAYER_PAGE_REQUIRE_JSDOM=1`), and
 **`portal-page`** drives the real `portal.html` + `portal.js` through
 `src/portal/tests/portal_page.test.cjs` — a fake network, a virtual clock the
 test advances, a settable `document.hidden` and a `location` whose reloads and

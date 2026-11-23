@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use crate::config::CascadeSource;
 use crate::distribution_control::DistributionControl;
 
-use super::hub::DistributionHub;
+use super::hub::{DistributionHub, StreamEnd};
 use super::webrtc::session::{SessionConfig, WebrtcSession};
 use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
 use super::whip_ingest::{MAX_RTP_AU_BYTES, republish_from_session};
@@ -151,6 +151,7 @@ async fn cascade_attempt(
     // Client role (NOT ice-lite): we build the offer.
     let cfg = SessionConfig { bind_addr, public_ip, ice_lite: false };
     let mut client = WebrtcSession::new(&cfg).await.context("create cascade session")?;
+    client.count_other_paths_into(hub.other_path_counter());
 
     // Recvonly video + audio.
     let (offer, pending) = client
@@ -173,11 +174,22 @@ async fn cascade_attempt(
         Setup::TimedOut => bail!("upstream did not complete ICE + DTLS within {setup_deadline:?}"),
     }
     tracing::info!("cascade '{}': connected to upstream", source.local_stream);
-    hub.register(&source.local_stream);
-
-    republish_from_session(client, hub, &source.local_stream, cancel, MAX_RTP_AU_BYTES).await;
-
-    hub.remove(&source.local_stream);
+    // The local stream ends with this pull, its viewers with it — unless a
+    // newer ingest has taken it from this one (see `Publisher`).
+    let publisher = hub.claim(&source.local_stream);
+    republish_from_session(client, &publisher, cancel, MAX_RTP_AU_BYTES).await;
+    match publisher.end() {
+        StreamEnd::Closed => {}
+        StreamEnd::HeldByAnother => tracing::info!(
+            "cascade '{}': another ingest holds the local stream, which plays on",
+            source.local_stream
+        ),
+        StreamEnd::Unheld => tracing::info!(
+            "cascade '{}': a newer ingest had taken the local stream from this pull, and no \
+             ingest holds it now",
+            source.local_stream
+        ),
+    }
     Ok(())
 }
 

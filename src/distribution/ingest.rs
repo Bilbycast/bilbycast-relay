@@ -38,7 +38,7 @@ use crate::distribution_control::DistributionControl;
 use crate::manager::events::{category, EventSender, EventSeverity};
 
 use super::es::{EsFrame, EsKind, MAX_FRAME_BYTES};
-use super::hub::DistributionHub;
+use super::hub::{DistributionHub, Publisher, StreamEnd};
 use super::token;
 
 /// ALPN for the distribution ingest QUIC endpoint.
@@ -219,24 +219,46 @@ async fn handle_ingest_stream(
         format!("distribution ingest opened for stream '{stream_id}'"),
         serde_json::json!({ "stream": stream_id, "has_audio": hello.has_audio }),
     );
-    hub.register(&stream_id);
+    // The stream ends with this ingest, its viewers with it — unless a newer
+    // ingest has taken it from this one (see `Publisher`).
+    let publisher = hub.claim(&stream_id);
 
     // 3. Frame loop.
-    let result = read_frames(&mut recv, &hub, &stream_id).await;
+    let result = read_frames(&mut recv, &publisher).await;
+    let end = publisher.end();
+    let message = closed_message(&stream_id, end);
 
-    tracing::info!("distribution ingest for stream '{stream_id}' closed");
-    // Tear the stream down so live viewers see the broadcast close and exit.
-    hub.remove(&stream_id);
+    tracing::info!("{message}");
     events.emit_with_details(
         EventSeverity::Info,
         category::DISTRIBUTION,
-        format!("distribution ingest closed for stream '{stream_id}'"),
-        serde_json::json!({ "stream": stream_id }),
+        message,
+        serde_json::json!({
+            "stream": stream_id,
+            "superseded": end != StreamEnd::Closed,
+            "held_by": end.held_by(),
+        }),
     );
     result
 }
 
-async fn read_frames(recv: &mut RecvStream, hub: &DistributionHub, stream_id: &str) -> Result<()> {
+/// The `distribution ingest closed` event's message: what the ingest's end
+/// found of its stream.
+fn closed_message(stream_id: &str, end: StreamEnd) -> String {
+    match end {
+        StreamEnd::Closed => format!("distribution ingest closed for stream '{stream_id}'"),
+        StreamEnd::HeldByAnother => format!(
+            "distribution ingest closed for stream '{stream_id}'; another ingest holds the \
+             stream, which plays on"
+        ),
+        StreamEnd::Unheld => format!(
+            "distribution ingest closed for stream '{stream_id}'; a newer ingest had taken the \
+             stream from it, and no ingest holds the stream now"
+        ),
+    }
+}
+
+async fn read_frames(recv: &mut RecvStream, stream: &Publisher<'_>) -> Result<()> {
     loop {
         let mut hdr = [0u8; 1];
         match recv.read_exact(&mut hdr).await {
@@ -267,7 +289,7 @@ async fn read_frames(recv: &mut RecvStream, hub: &DistributionHub, stream_id: &s
             KIND_AUDIO => EsFrame::audio(pts_90k, data),
             other => bail!("unknown ingest frame kind {other}"),
         };
-        hub.publish(stream_id, frame);
+        stream.publish(frame);
     }
 }
 

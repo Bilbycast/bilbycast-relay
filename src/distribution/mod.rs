@@ -431,6 +431,10 @@ pub async fn run_distribution(
                                 })
                                 .collect(),
                         );
+                        stats.set_distribution_drops(
+                            hub.other_path_datagrams(),
+                            hub.superseded_frames(),
+                        );
                         // The players' own reports ride the same tick; the
                         // health builder reads the published copy.
                         stats.set_viewer_metrics(viewer_metrics.snapshot());

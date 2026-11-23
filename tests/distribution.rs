@@ -36,9 +36,10 @@ fn idr_au() -> Bytes {
 #[tokio::test]
 async fn hub_fans_out_to_multiple_viewers_with_keyframe_cache() {
     let hub = DistributionHub::new();
+    let publisher = hub.claim("show");
 
     // First IDR arrives before anyone is watching → cached.
-    hub.publish("show", EsFrame::video(0, idr_au(), true));
+    publisher.publish(EsFrame::video(0, idr_au(), true));
 
     // Two late joiners both get the cached keyframe.
     let mut a = hub.subscribe("show");
@@ -48,7 +49,7 @@ async fn hub_fans_out_to_multiple_viewers_with_keyframe_cache() {
     assert_eq!(hub.get("show").unwrap().viewer_count(), 2);
 
     // A live P-frame reaches both.
-    hub.publish("show", EsFrame::video(3600, Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a]), false));
+    publisher.publish(EsFrame::video(3600, Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a]), false));
     let fa = a.rx.recv().await.unwrap();
     let fb = b.rx.recv().await.unwrap();
     assert_eq!(fa.pts_90k, 3600);
@@ -147,7 +148,7 @@ fn ingest_wire_frame_and_hello_shapes() {
 #[tokio::test]
 async fn ingest_over_quic_delivers_frames_to_hub() {
     let hub = Arc::new(DistributionHub::new());
-    let (events, _rx) = event_channel();
+    let (events, mut event_rx) = event_channel();
     let cancel = CancellationToken::new();
     let config = DistributionConfig { require_ingest_token: false, ..Default::default() };
 
@@ -207,10 +208,150 @@ async fn ingest_over_quic_delivers_frames_to_hub() {
 
     // The stream registered audio + primed its keyframe cache. Read through
     // the subscription's Arc — the ingest handler tears the stream out of the
-    // hub registry on EOS (correct: live viewers see the broadcast close), but
-    // the StreamState stays alive as long as a viewer holds it.
+    // hub registry on EOS, but the StreamState stays alive as long as a viewer
+    // holds it.
     assert!(sub.state.has_audio());
     assert!(sub.state.keyframe().is_some());
+
+    // And the viewer sees its broadcast close, which is what ends a WHEP
+    // session ("stream closed"). Before, the viewer's own hold on the stream
+    // kept the broadcast open, so it never closed.
+    let closed = tokio::time::timeout(Duration::from_secs(5), sub.rx.recv()).await;
+    assert!(
+        matches!(closed, Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))),
+        "the viewer's broadcast must close when its ingest ends: {closed:?}"
+    );
+    assert!(hub.get("show").is_none());
+    let closed = quic_ingest_closed_event(&mut event_rx).await;
+    assert_eq!(closed.message, "distribution ingest closed for stream 'show'");
+    let details = closed.details.unwrap();
+    assert_eq!(details["superseded"], false);
+    assert_eq!(details["held_by"], "this");
+
+    cancel.cancel();
+    drop(conn);
+}
+
+/// The `distribution ingest closed` event the QUIC ingest raises as it ends.
+async fn quic_ingest_closed_event(
+    rx: &mut tokio::sync::mpsc::Receiver<bilbycast_relay::manager::events::Event>,
+) -> bilbycast_relay::manager::events::Event {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let e = rx.recv().await.expect("the event channel stays open");
+            if e.message.starts_with("distribution ingest closed") {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("the ingest raises its closed event")
+}
+
+/// A QUIC ingest whose ES stream is open on a fresh accept loop, holding
+/// stream `stream_id` once its first frame has reached the hub.
+async fn quic_ingest_holding(
+    hub: &Arc<DistributionHub>,
+    stream_id: &str,
+) -> (
+    quinn::Connection,
+    quinn::SendStream,
+    tokio::sync::mpsc::Receiver<bilbycast_relay::manager::events::Event>,
+    CancellationToken,
+) {
+    let (events, event_rx) = event_channel();
+    let cancel = CancellationToken::new();
+    let config = DistributionConfig { require_ingest_token: false, ..Default::default() };
+    let server_cfg = ingest::build_ingest_server_config().unwrap();
+    let server = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let control = DistributionControl::new(
+        RuntimeDistConfig::from_config(&config, None),
+        config.cascade_sources.clone(),
+    );
+    let accept_hub = hub.clone();
+    let accept_cancel = cancel.clone();
+    tokio::spawn(async move {
+        ingest::accept_loop(server, control, accept_hub, events, accept_cancel).await;
+    });
+
+    let client = make_ingest_client();
+    let conn = client.connect(server_addr, "bilbycast-distribution").unwrap().await.unwrap();
+    let mut uni = conn.open_uni().await.unwrap();
+    uni.write_all(&encode_hello(&IngestHello {
+        v: 1,
+        stream: stream_id.into(),
+        token: None,
+        has_audio: false,
+    }))
+    .await
+    .unwrap();
+    uni.write_all(&encode_frame(&EsFrame::video(0, idr_au(), true))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while hub.get(stream_id).is_none_or(|s| s.frames_in() == 0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the QUIC ingest holds the stream");
+    (conn, uni, event_rx, cancel)
+}
+
+/// A QUIC ingest that a newer ingest took the stream from says so when it
+/// ends — the stream plays on under the newer one — rather than reading as
+/// the stream going down. Its end leaves the newer stream registered.
+#[tokio::test]
+async fn a_superseded_quic_ingest_says_so_when_it_closes() {
+    let hub = Arc::new(DistributionHub::new());
+    let (conn, mut uni, mut event_rx, cancel) = quic_ingest_holding(&hub, "handed").await;
+
+    // A newer ingest takes the stream; then the QUIC ingest ends.
+    let newer = hub.claim("handed");
+    let newer_stream = hub.get("handed").unwrap();
+    uni.write_all(&encode_eos()).await.unwrap();
+    uni.finish().unwrap();
+
+    let closed = quic_ingest_closed_event(&mut event_rx).await;
+    assert_eq!(
+        closed.message,
+        "distribution ingest closed for stream 'handed'; another ingest holds the stream, \
+         which plays on"
+    );
+    let details = closed.details.unwrap();
+    assert_eq!(details["superseded"], true);
+    assert_eq!(details["held_by"], "another");
+    assert!(Arc::ptr_eq(&hub.get("handed").unwrap(), &newer_stream), "still registered");
+    drop(newer);
+
+    cancel.cancel();
+    drop(conn);
+}
+
+/// A QUIC ingest a newer ingest took the stream from, which ends after that
+/// newer one has ended too and without having sent since, says that no
+/// ingest holds the stream: its viewers wait, sent nothing. Before, it said a
+/// newer ingest held the stream, which played on, while nothing fed it.
+#[tokio::test]
+async fn a_superseded_quic_ingest_ending_after_the_newer_one_says_none_holds_the_stream() {
+    let hub = Arc::new(DistributionHub::new());
+    let (conn, mut uni, mut event_rx, cancel) = quic_ingest_holding(&hub, "dark").await;
+
+    // A newer ingest takes the stream and ends; a viewer comes back for it.
+    drop(hub.claim("dark"));
+    let waiting = hub.subscribe("dark");
+    uni.write_all(&encode_eos()).await.unwrap();
+    uni.finish().unwrap();
+
+    let closed = quic_ingest_closed_event(&mut event_rx).await;
+    assert_eq!(
+        closed.message,
+        "distribution ingest closed for stream 'dark'; a newer ingest had taken the stream \
+         from it, and no ingest holds the stream now"
+    );
+    let details = closed.details.unwrap();
+    assert_eq!(details["superseded"], true);
+    assert_eq!(details["held_by"], "none");
+    assert!(Arc::ptr_eq(&hub.get("dark").unwrap(), &waiting.state), "the viewer waits on");
 
     cancel.cancel();
     drop(conn);
@@ -309,9 +450,10 @@ async fn whep_viewer_receives_encrypted_media_end_to_end() {
     let pub_hub = hub.clone();
     let pub_cancel = cancel.clone();
     tokio::spawn(async move {
+        let publisher = pub_hub.claim("live");
         let mut pts: u64 = 0;
         // Prime with a keyframe immediately.
-        pub_hub.publish("live", EsFrame::video(pts, idr_au(), true));
+        publisher.publish(EsFrame::video(pts, idr_au(), true));
         let mut tick = tokio::time::interval(Duration::from_millis(30));
         loop {
             tokio::select! {
@@ -320,12 +462,12 @@ async fn whep_viewer_receives_encrypted_media_end_to_end() {
                     pts += 2700; // ~30 fps at 90 kHz
                     // Periodic IDR so a late DTLS completion still decodes.
                     if pts.is_multiple_of(27_000) {
-                        pub_hub.publish("live", EsFrame::video(pts, idr_au(), true));
+                        publisher.publish(EsFrame::video(pts, idr_au(), true));
                     } else {
-                        pub_hub.publish("live", EsFrame::video(
+                        publisher.publish(EsFrame::video(
                             pts, Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a, 0x33]), false));
                     }
-                    pub_hub.publish("live", EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55, 0x66])));
+                    publisher.publish(EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55, 0x66])));
                 }
             }
         }
@@ -603,9 +745,10 @@ async fn whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on()
     };
     // The history the viewer missed, up to an IDR without parameter sets —
     // the keyframe it is primed with.
+    let publisher = hub.claim("mid-join");
     for k in 0..=GOP {
         let (au, idr) = sent(k);
-        hub.publish("mid-join", EsFrame::video(k * FRAME_90K, au, idr));
+        publisher.publish(EsFrame::video(k * FRAME_90K, au, idr));
     }
 
     let client_cfg = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: Some(lo), ice_lite: false };
@@ -627,28 +770,23 @@ async fn whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on()
     assert!(!h264.is_empty(), "the answer must carry H.264:\n{}", handle.answer_sdp);
     client.apply_answer(&handle.answer_sdp, pending).unwrap();
 
-    // The live stream, on from where the history stopped.
-    let pub_hub = hub.clone();
-    let pub_cancel = cancel.clone();
-    tokio::spawn(async move {
+    // The live stream, on from where the history stopped, published by the
+    // same ingest while the viewer receives.
+    let live = async {
         let mut k = GOP;
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
-            tokio::select! {
-                _ = pub_cancel.cancelled() => break,
-                _ = tick.tick() => {
-                    k += 1;
-                    let (au, idr) = sent(k);
-                    pub_hub.publish("mid-join", EsFrame::video(k * FRAME_90K, au, idr));
-                }
-            }
+            tick.tick().await;
+            k += 1;
+            let (au, idr) = sent(k);
+            publisher.publish(EsFrame::video(k * FRAME_90K, au, idr));
         }
-    });
+    };
 
     // Every frame the viewer reassembles: (RTP timestamp, bytes).
     let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
     let client_cancel = CancellationToken::new();
-    let done = tokio::time::timeout(Duration::from_secs(20), async {
+    let receive = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match client.poll_event(&client_cancel).await {
                 SessionEvent::MediaData { pt, data, rtp_time, .. } => {
@@ -671,8 +809,11 @@ async fn whep_viewer_receives_whole_h264_access_units_it_can_start_decoding_on()
                 _ => {}
             }
         }
-    })
-    .await;
+    });
+    let done = tokio::select! {
+        done = receive => done,
+        _ = live => unreachable!("the live publisher never ends"),
+    };
     cancel.cancel();
     assert!(
         matches!(done, Ok(true)),
@@ -750,7 +891,8 @@ async fn a_whep_viewer_is_sent_no_h264_filler() {
         }
     };
     const OPUS: &[u8] = &[0x0c, 0xff, 0x80];
-    hub.publish("cbr", EsFrame::video(0, sent(0), true));
+    let publisher = hub.claim("cbr");
+    publisher.publish(EsFrame::video(0, sent(0), true));
 
     let client_cfg = SessionConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -779,30 +921,25 @@ async fn a_whep_viewer_is_sent_no_h264_filler() {
     );
     client.apply_answer(&handle.answer_sdp, pending).unwrap();
 
-    let pub_hub = hub.clone();
-    let pub_cancel = cancel.clone();
-    tokio::spawn(async move {
+    // The ingest publishes while the viewer receives.
+    let live = async {
         let mut k = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
-            tokio::select! {
-                _ = pub_cancel.cancelled() => break,
-                _ = tick.tick() => {
-                    k += 1;
-                    let pts = k * FRAME_90K;
-                    pub_hub.publish("cbr", EsFrame::video(pts, sent(k), k.is_multiple_of(GOP)));
-                    pub_hub.publish("cbr", EsFrame::audio(pts, Bytes::from_static(OPUS)));
-                }
-            }
+            tick.tick().await;
+            k += 1;
+            let pts = k * FRAME_90K;
+            publisher.publish(EsFrame::video(pts, sent(k), k.is_multiple_of(GOP)));
+            publisher.publish(EsFrame::audio(pts, Bytes::from_static(OPUS)));
         }
-    });
+    };
 
     // Every video frame the viewer reassembles, (RTP timestamp, bytes), and
     // every audio frame's bytes.
     let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut audio: Vec<Vec<u8>> = Vec::new();
     let client_cancel = CancellationToken::new();
-    let done = tokio::time::timeout(Duration::from_secs(20), async {
+    let receive = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match client.poll_event(&client_cancel).await {
                 SessionEvent::MediaData {
@@ -825,8 +962,11 @@ async fn a_whep_viewer_is_sent_no_h264_filler() {
                 _ => {}
             }
         }
-    })
-    .await;
+    });
+    let done = tokio::select! {
+        done = receive => done,
+        _ = live => unreachable!("the live publisher never ends"),
+    };
     cancel.cancel();
     assert!(
         matches!(done, Ok(true)),
@@ -903,13 +1043,14 @@ async fn parameter_sets_past_the_stap_a_budget_never_reach_a_viewer() {
     let pub_hub = hub.clone();
     let pub_cancel = cancel.clone();
     tokio::spawn(async move {
+        let publisher = pub_hub.claim("budget");
         let mut k = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {
                 _ = pub_cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    pub_hub.publish("budget", EsFrame::video(k * FRAME_90K, frame(k).into(), true));
+                    publisher.publish(EsFrame::video(k * FRAME_90K, frame(k).into(), true));
                     k += 1;
                 }
             }
@@ -1346,8 +1487,9 @@ async fn cascade_pulls_upstream_whep_and_republishes() {
     let pub_hub = up_hub.clone();
     let pub_cancel = cancel.clone();
     tokio::spawn(async move {
+        let publisher = pub_hub.claim("big-game");
         let mut pts: u64 = 0;
-        pub_hub.publish("big-game", EsFrame::video(pts, idr_au(), true));
+        publisher.publish(EsFrame::video(pts, idr_au(), true));
         let mut tick = tokio::time::interval(Duration::from_millis(30));
         loop {
             tokio::select! {
@@ -1355,11 +1497,11 @@ async fn cascade_pulls_upstream_whep_and_republishes() {
                 _ = tick.tick() => {
                     pts += 2700;
                     if pts.is_multiple_of(27_000) {
-                        pub_hub.publish("big-game", EsFrame::video(pts, idr_au(), true));
+                        publisher.publish(EsFrame::video(pts, idr_au(), true));
                     } else {
-                        pub_hub.publish("big-game", EsFrame::video(pts, Bytes::from_static(&[0,0,0,1,0x41,0x9a]), false));
+                        publisher.publish(EsFrame::video(pts, Bytes::from_static(&[0,0,0,1,0x41,0x9a]), false));
                     }
-                    pub_hub.publish("big-game", EsFrame::audio(pts, Bytes::from_static(&[0xfc,0x22])));
+                    publisher.publish(EsFrame::audio(pts, Bytes::from_static(&[0xfc,0x22])));
                 }
             }
         }
@@ -3278,6 +3420,7 @@ async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back
     let hub = state.hub.clone();
     let pub_cancel = cancel.clone();
     tokio::spawn(async move {
+        let publisher = hub.claim("live");
         let mut tick = tokio::time::interval(Duration::from_millis(33));
         let mut k: u64 = 0;
         loop {
@@ -3285,22 +3428,19 @@ async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back
                 _ = pub_cancel.cancelled() => break,
                 _ = tick.tick() => {
                     let pts = k * FRAME_90K;
-                    hub.publish(
-                        "live",
+                    publisher.publish(
                         EsFrame::video(pts, decodable_frame(k).into(), k.is_multiple_of(GOP)),
                     );
-                    hub.publish("live", EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55])));
+                    publisher.publish(EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55])));
                     k += 1;
                 }
             }
         }
     });
     // The stalled stream: one keyframe — which primes the viewer, proving its
-    // session connected — and then nothing.
-    state.hub.publish(
-        "stalled",
-        EsFrame::video(0, decodable_frame(0).into(), true),
-    );
+    // session connected — and then nothing, its ingest still connected.
+    let stalled_ingest = state.hub.claim("stalled");
+    stalled_ingest.publish(EsFrame::video(0, decodable_frame(0).into(), true));
 
     let live = watch(addr, "live").await;
     let stalled = watch(addr, "stalled").await;
@@ -3357,7 +3497,7 @@ async fn a_viewer_that_leaves_without_a_delete_is_reaped_and_gives_its_slot_back
 ///
 /// Before, a session ended on the first ICE `Disconnected`, so this viewer was
 /// reaped at about 15 s although str0m and the viewer would both have resumed
-/// — and the `/watch` player does not reconnect, so it stayed black. The last
+/// — and the `/watch` player did not reconnect then, so it stayed black. The last
 /// check is what proves the return reaches the code that cancels the grace
 /// (`Connected` / `Completed` in `handle_event`): without it a returning
 /// viewer is reaped `ICE_DISCONNECT_GRACE` after its disconnect, 10 to 13 s
@@ -3378,6 +3518,7 @@ async fn a_viewer_whose_ice_pauses_and_comes_back_is_kept() {
     let hub = state.hub.clone();
     let (pub_cancel, pub_next) = (cancel.clone(), next.clone());
     tokio::spawn(async move {
+        let publisher = hub.claim("blip");
         let mut tick = tokio::time::interval(Duration::from_millis(33));
         loop {
             tokio::select! {
@@ -3385,11 +3526,10 @@ async fn a_viewer_whose_ice_pauses_and_comes_back_is_kept() {
                 _ = tick.tick() => {
                     let k = pub_next.fetch_add(1, Ordering::Relaxed);
                     let pts = k * FRAME_90K;
-                    hub.publish(
-                        "blip",
+                    publisher.publish(
                         EsFrame::video(pts, decodable_frame(k).into(), k.is_multiple_of(GOP)),
                     );
-                    hub.publish("blip", EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55])));
+                    publisher.publish(EsFrame::audio(pts, Bytes::from_static(&[0xfc, 0x55])));
                 }
             }
         }
@@ -3552,6 +3692,498 @@ async fn a_peer_that_closes_without_a_delete_ends_at_once() {
         state.ingests.len(),
         state.hub.get("pub").is_some()
     );
+
+    cancel.cancel();
+}
+
+/// A WHIP publisher on `/whip/{stream}` through the router, connected — what
+/// an edge's WHIP output is to the relay. Returns the session and the path of
+/// its resource (the 201's `Location`).
+async fn whip_publisher(
+    addr: std::net::SocketAddr,
+    stream: &str,
+) -> (
+    bilbycast_relay::distribution::webrtc::session::WebrtcSession,
+    String,
+) {
+    use bilbycast_relay::distribution::webrtc::session::{SessionConfig, WebrtcSession};
+    use bilbycast_relay::distribution::webrtc::{Setup, await_connected};
+
+    let mut publisher = WebrtcSession::new(&SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: false,
+    })
+    .await
+    .unwrap();
+    let (offer, pending) = publisher.create_offer(true, false, true).unwrap();
+    let (status, location, answer) = http(addr, "POST", &format!("/whip/{stream}"), &offer).await;
+    assert_eq!(status, 201, "WHIP {stream}: {answer}");
+    publisher.apply_answer(&answer, pending).unwrap();
+    let cancel = CancellationToken::new();
+    assert_eq!(
+        await_connected(&mut publisher, &cancel, Duration::from_secs(10)).await,
+        Setup::Connected,
+        "WHIP {stream}"
+    );
+    publisher.drain_pending_events();
+    (publisher, location)
+}
+
+/// Push a decodable stream through `publisher` — a frame every 33 ms, an IDR
+/// every `GOP` — numbering frames on from `next`, until `stop` fires; then
+/// hand the session back, still open.
+fn spawn_pusher(
+    mut publisher: bilbycast_relay::distribution::webrtc::session::WebrtcSession,
+    next: Arc<std::sync::atomic::AtomicU64>,
+    stop: CancellationToken,
+) -> tokio::task::JoinHandle<bilbycast_relay::distribution::webrtc::session::WebrtcSession> {
+    use bilbycast_relay::distribution::whep;
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return publisher,
+                _ = tick.tick() => {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    whep::write_video_au(&mut publisher, k * FRAME_90K, &decodable_frame(k)).await;
+                    let _ = publisher.drive_udp_io().await;
+                }
+            }
+        }
+    })
+}
+
+/// Drive `viewer` until its session ends, for `within` at most; `true` when
+/// it ended.
+async fn ends_within(
+    viewer: &mut bilbycast_relay::distribution::webrtc::session::WebrtcSession,
+    within: Duration,
+) -> bool {
+    use bilbycast_relay::distribution::webrtc::session::SessionEvent;
+
+    let cancel = CancellationToken::new();
+    tokio::time::timeout(within, async {
+        while !matches!(viewer.poll_event(&cancel).await, SessionEvent::Disconnected) {}
+    })
+    .await
+    .is_ok()
+}
+
+/// Drive `viewer` until it receives video published at `pts` or later, for
+/// `within` at most; `true` when it did.
+async fn plays_from(
+    viewer: &mut bilbycast_relay::distribution::webrtc::session::WebrtcSession,
+    pts: u64,
+    within: Duration,
+) -> bool {
+    use bilbycast_relay::distribution::webrtc::session::SessionEvent;
+
+    let video = viewer.video_mid;
+    let cancel = CancellationToken::new();
+    matches!(
+        tokio::time::timeout(within, async {
+            loop {
+                match viewer.poll_event(&cancel).await {
+                    SessionEvent::MediaData { mid, rtp_time, .. }
+                        if Some(mid) == video && rtp_time.numer() >= pts =>
+                    {
+                        return true;
+                    }
+                    SessionEvent::Disconnected => return false,
+                    _ => {}
+                }
+            }
+        })
+        .await,
+        Ok(true)
+    )
+}
+
+/// When its ingest ends, a WHEP viewer's session ends too: the relay closes
+/// it (a DTLS close_notify, so the viewer's end is `Closed`, not ICE giving
+/// up), gives its per-IP slot back, and a viewer that comes back plays the
+/// next push.
+///
+/// Before, the viewer held the stream state its broadcast sender lived in, so
+/// the broadcast never closed: the viewer stayed connected, sent nothing,
+/// holding its slot, for as long as it kept answering ICE — measured live at
+/// 240 s, until the test closed it — and the next push went into a stream it
+/// never saw.
+#[tokio::test]
+async fn a_viewer_ends_with_its_ingest_and_one_that_comes_back_plays_the_next_push() {
+    use bilbycast_relay::distribution::webrtc::session::SessionEnd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    let (publisher, _) = whip_publisher(addr, "relive").await;
+    let stop = CancellationToken::new();
+    let pusher = spawn_pusher(publisher, Arc::new(AtomicU64::new(0)), stop.clone());
+    let mut viewer = watch(addr, "relive").await;
+    assert_eq!((held(&state), state.sessions.len()), (1, 1));
+
+    // The publisher goes, closing its connection as a WHIP client that stops
+    // does.
+    stop.cancel();
+    let mut publisher = pusher.await.unwrap();
+    publisher.close();
+    publisher.drain_outputs().await;
+
+    assert!(
+        ends_within(&mut viewer, Duration::from_secs(10)).await,
+        "the viewer's session must end with its ingest"
+    );
+    assert_eq!(viewer.end(), Some(SessionEnd::Closed), "the relay closed it");
+    assert!(
+        eventually(Duration::from_secs(5), || held(&state) == 0
+            && state.sessions.is_empty())
+        .await,
+        "{} slots held, {} viewer sessions",
+        held(&state),
+        state.sessions.len()
+    );
+
+    // The next push, and a viewer that comes back for it.
+    let next = Arc::new(AtomicU64::new(100 * GOP));
+    let (publisher, _) = whip_publisher(addr, "relive").await;
+    let stop = CancellationToken::new();
+    let _pusher = spawn_pusher(publisher, next.clone(), stop.clone());
+    let mut back = watch(addr, "relive").await;
+    let from = next.load(Ordering::Relaxed) * FRAME_90K;
+    assert!(
+        plays_from(&mut back, from, Duration::from_secs(10)).await,
+        "the viewer that came back must play the next push"
+    );
+
+    stop.cancel();
+    cancel.cancel();
+}
+
+/// Two pushes for one stream, the older still registered when the newer
+/// connects — an edge's WHIP session the relay has not yet seen end, and the
+/// restarted edge pushing again. The older one's late end leaves the newer
+/// one's stream, and its viewers, alone.
+///
+/// Before, the newer push published into the older one's stream, and the
+/// older one's end removed the stream under its id whoever had registered it:
+/// a viewer of the newer push went black for good, 12 s after it started
+/// playing in the live run.
+#[tokio::test]
+async fn an_older_ingests_late_end_leaves_a_newer_ones_viewers_playing() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    // The older push: its edge dies without a word, sending nothing more and
+    // closing nothing, so the relay still holds it.
+    let (older, older_resource) = whip_publisher(addr, "handover").await;
+    let stop = CancellationToken::new();
+    let pusher = spawn_pusher(older, Arc::new(AtomicU64::new(0)), stop.clone());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.cancel();
+    let _older = pusher.await.unwrap();
+
+    // The restarted edge pushes again, and a viewer watches.
+    let next = Arc::new(AtomicU64::new(100 * GOP));
+    let (newer, _) = whip_publisher(addr, "handover").await;
+    let stop = CancellationToken::new();
+    let _pusher = spawn_pusher(newer, next.clone(), stop.clone());
+    assert_eq!(state.ingests.len(), 2);
+    let mut viewer = watch(addr, "handover").await;
+
+    // The older push ends — what its ICE timing out does, sooner.
+    let (status, _, _) = http(addr, "DELETE", &older_resource, "").await;
+    assert_eq!(status, 200, "DELETE {older_resource}");
+    assert!(eventually(Duration::from_secs(5), || state.ingests.len() == 1).await);
+
+    let from = next.load(Ordering::Relaxed) * FRAME_90K;
+    assert!(
+        plays_from(&mut viewer, from, Duration::from_secs(10)).await,
+        "the newer push's viewer must keep playing after the older one ends"
+    );
+    assert_eq!((held(&state), state.sessions.len()), (1, 1));
+
+    stop.cancel();
+    cancel.cancel();
+}
+
+/// A push for a stream whose earlier push the relay still holds takes the
+/// stream over: the earlier push's viewers end ("stream closed") at once,
+/// rather than when the relay sees that push end, and one that comes back
+/// plays the new push.
+#[tokio::test]
+async fn a_push_that_takes_a_stream_over_ends_the_earlier_ones_viewers() {
+    use bilbycast_relay::distribution::webrtc::session::SessionEnd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    let (older, _) = whip_publisher(addr, "takeover").await;
+    let stop = CancellationToken::new();
+    let pusher = spawn_pusher(older, Arc::new(AtomicU64::new(0)), stop.clone());
+    let mut early = watch(addr, "takeover").await;
+    stop.cancel();
+    let _older = pusher.await.unwrap();
+
+    let next = Arc::new(AtomicU64::new(100 * GOP));
+    let (newer, _) = whip_publisher(addr, "takeover").await;
+    let stop = CancellationToken::new();
+    let _pusher = spawn_pusher(newer, next.clone(), stop.clone());
+
+    assert!(
+        ends_within(&mut early, Duration::from_secs(10)).await,
+        "the earlier push's viewer must end when a new push takes the stream over"
+    );
+    assert_eq!(early.end(), Some(SessionEnd::Closed));
+    assert_eq!(state.ingests.len(), 2, "the earlier push is still held");
+
+    let mut back = watch(addr, "takeover").await;
+    let from = next.load(Ordering::Relaxed) * FRAME_90K;
+    assert!(plays_from(&mut back, from, Duration::from_secs(10)).await);
+
+    stop.cancel();
+    cancel.cancel();
+}
+
+/// Drive `viewer` until it receives video published at a pts in `range`, for
+/// `within` at most; `true` when it did.
+async fn plays_within(
+    viewer: &mut bilbycast_relay::distribution::webrtc::session::WebrtcSession,
+    range: std::ops::Range<u64>,
+    within: Duration,
+) -> bool {
+    use bilbycast_relay::distribution::webrtc::session::SessionEvent;
+
+    let video = viewer.video_mid;
+    let cancel = CancellationToken::new();
+    matches!(
+        tokio::time::timeout(within, async {
+            loop {
+                match viewer.poll_event(&cancel).await {
+                    SessionEvent::MediaData { mid, rtp_time, .. }
+                        if Some(mid) == video && range.contains(&rtp_time.numer()) =>
+                    {
+                        return true;
+                    }
+                    SessionEvent::Disconnected => return false,
+                    _ => {}
+                }
+            }
+        })
+        .await,
+        Ok(true)
+    )
+}
+
+/// Two live pushes for one stream, and the newer one leaves first: the
+/// stream is not left dead while the older push is live and connected. The
+/// newer push's viewers end with it, and one that comes back plays the
+/// older push, which took the stream back on its next frame. While the
+/// newer one held the stream, the older one's frames were dropped and
+/// counted, and its session was left alone.
+///
+/// Before, the older push published into the stream the newer one had
+/// closed for as long as it lived: every frame dropped without a word, and
+/// a viewer that came back waited on a stream nothing would ever publish to.
+#[tokio::test]
+async fn a_live_older_push_takes_its_stream_back_when_the_newer_one_leaves() {
+    use bilbycast_relay::distribution::webrtc::session::SessionEnd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    // Pts ranges that tell the two pushes apart.
+    const NEWER_FROM: u64 = 100_000 * FRAME_90K;
+    let (older, _) = whip_publisher(addr, "both-live").await;
+    let older_next = Arc::new(AtomicU64::new(0));
+    let older_stop = CancellationToken::new();
+    let _older = spawn_pusher(older, older_next.clone(), older_stop.clone());
+    let (newer, _) = whip_publisher(addr, "both-live").await;
+    let newer_stop = CancellationToken::new();
+    let newer_pusher =
+        spawn_pusher(newer, Arc::new(AtomicU64::new(NEWER_FROM / FRAME_90K)), newer_stop.clone());
+
+    let mut viewer = watch(addr, "both-live").await;
+    assert!(
+        plays_within(&mut viewer, NEWER_FROM..u64::MAX, Duration::from_secs(10)).await,
+        "the newer push holds the stream"
+    );
+    assert!(
+        eventually(Duration::from_secs(5), || state.hub.superseded_frames() > 0).await,
+        "the older push's frames are dropped and counted"
+    );
+    assert_eq!(state.ingests.len(), 2, "and its session left alone");
+
+    // The newer push leaves, closing its connection.
+    newer_stop.cancel();
+    let mut newer = newer_pusher.await.unwrap();
+    newer.close();
+    newer.drain_outputs().await;
+    assert!(
+        ends_within(&mut viewer, Duration::from_secs(10)).await,
+        "the newer push's viewer ends with it"
+    );
+    assert_eq!(viewer.end(), Some(SessionEnd::Closed));
+
+    let mut back = watch(addr, "both-live").await;
+    let from = older_next.load(Ordering::Relaxed) * FRAME_90K;
+    assert!(
+        plays_within(&mut back, from..NEWER_FROM, Duration::from_secs(10)).await,
+        "a viewer that comes back plays the older push"
+    );
+    assert_eq!(state.hub.stream_count(), 1);
+
+    older_stop.cancel();
+    cancel.cancel();
+}
+
+/// Two live pushes for one stream, and the older one leaves first: the
+/// newer push's viewer plays on through it, and the older push's frames,
+/// dropped while it lived, never took the stream from the newer one.
+#[tokio::test]
+async fn a_live_older_push_that_leaves_first_leaves_the_newer_ones_viewers_playing() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let cancel = CancellationToken::new();
+    let (state, addr, _events) = serve_distribution(8, &cancel).await;
+
+    const NEWER_FROM: u64 = 100_000 * FRAME_90K;
+    let (older, older_resource) = whip_publisher(addr, "older-leaves").await;
+    let older_stop = CancellationToken::new();
+    let _older = spawn_pusher(older, Arc::new(AtomicU64::new(0)), older_stop.clone());
+    let (newer, _) = whip_publisher(addr, "older-leaves").await;
+    let newer_next = Arc::new(AtomicU64::new(NEWER_FROM / FRAME_90K));
+    let newer_stop = CancellationToken::new();
+    let _newer = spawn_pusher(newer, newer_next.clone(), newer_stop.clone());
+
+    let mut viewer = watch(addr, "older-leaves").await;
+    assert!(eventually(Duration::from_secs(5), || state.hub.superseded_frames() > 0).await);
+
+    let (status, _, _) = http(addr, "DELETE", &older_resource, "").await;
+    assert_eq!(status, 200, "DELETE {older_resource}");
+    assert!(eventually(Duration::from_secs(5), || state.ingests.len() == 1).await);
+
+    let from = newer_next.load(Ordering::Relaxed) * FRAME_90K;
+    assert!(
+        plays_within(&mut viewer, from..u64::MAX, Duration::from_secs(10)).await,
+        "the newer push's viewer plays on"
+    );
+    assert_eq!((held(&state), state.sessions.len()), (1, 1));
+
+    older_stop.cancel();
+    newer_stop.cancel();
+    cancel.cancel();
+}
+
+/// A WHEP viewer's datagrams from another address it named in its offer are
+/// dropped by the media source pin, counted on the hub's other-path counter
+/// that telemetry reports, and raise no alarm inside the grace; past it they
+/// raise the `webrtc_offpath_source` event and count on the stream's
+/// `offpath_sessions`, like any off-path source. Through the real router, so
+/// the WHEP session is wired to the counter and to the alarm.
+///
+/// Before, a viewer that named an address could make every datagram from it
+/// invisible: no event, no count.
+#[tokio::test]
+async fn a_viewers_named_address_counts_inside_the_grace_and_alarms_past_it() {
+    use bilbycast_relay::distribution::webrtc::session::{
+        OTHER_PATH_BUDGET, SessionConfig, SessionEvent, WebrtcSession,
+    };
+
+    let cancel = CancellationToken::new();
+    let (state, addr, mut events) = serve_distribution(8, &cancel).await;
+    let hub = state.hub.clone();
+    let pub_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let publisher = hub.claim("named");
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        let mut k: u64 = 0;
+        loop {
+            tokio::select! {
+                _ = pub_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    publisher.publish(EsFrame::video(
+                        k * FRAME_90K, decodable_frame(k).into(), k.is_multiple_of(GOP)));
+                    k += 1;
+                }
+            }
+        }
+    });
+
+    // A viewer on 127.0.0.1 that also names 127.0.0.2 among its candidates.
+    let mut client = WebrtcSession::new(&SessionConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        public_ip: Some("127.0.0.1".parse().unwrap()),
+        ice_lite: false,
+    })
+    .await
+    .unwrap();
+    let (offer, pending) = client.create_offer(true, true, false).unwrap();
+    let first = offer.lines().find(|l| l.starts_with("a=candidate:")).unwrap().to_string();
+    let named = first.replace("127.0.0.1", "127.0.0.2");
+    let offer = offer.replacen(&first, &format!("{first}\r\n{named}"), 1);
+    let (status, _, answer) = http(addr, "POST", "/whep/named", &offer).await;
+    assert_eq!(status, 201, "{answer}");
+    client.apply_answer(&answer, pending).unwrap();
+    let relay_port: u16 = answer
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.strip_prefix("a=candidate:")?.split_whitespace().collect();
+            (f.get(4) == Some(&"127.0.0.1")).then(|| f[5].parse().unwrap())
+        })
+        .expect("the relay's candidate");
+    let poll = CancellationToken::new();
+    let got_media = tokio::time::timeout(Duration::from_secs(20), async {
+        while !matches!(client.poll_event(&poll).await, SessionEvent::MediaData { .. }) {}
+    })
+    .await;
+    assert!(got_media.is_ok(), "the viewer plays");
+
+    let other = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+    let stun: &[u8] = &[
+        0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, //
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+    ];
+    let relay: std::net::SocketAddr = ("127.0.0.1".parse::<std::net::IpAddr>().unwrap(), relay_port).into();
+    let offpath = |state: &bilbycast_relay::distribution::DistributionState| {
+        state.hub.get("named").map_or(0, |s| s.offpath_sessions())
+    };
+
+    for _ in 0..10 {
+        other.send_to(stun, relay).await.unwrap();
+    }
+    assert!(
+        eventually(Duration::from_secs(5), || state.hub.other_path_datagrams() == 10).await,
+        "counted: {}",
+        state.hub.other_path_datagrams()
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(offpath(&state), 0, "no alarm inside the grace");
+
+    for _ in 10..OTHER_PATH_BUDGET + 5 {
+        other.send_to(stun, relay).await.unwrap();
+    }
+    assert!(
+        eventually(Duration::from_secs(5), || offpath(&state) == 1).await,
+        "the alarm past the grace"
+    );
+    assert_eq!(state.hub.other_path_datagrams(), OTHER_PATH_BUDGET);
+    let mut alarms = Vec::new();
+    while let Ok(e) = events.try_recv() {
+        let d = e.details.unwrap_or_default();
+        if d["error_code"] == "webrtc_offpath_source" {
+            alarms.push(d);
+        }
+    }
+    assert_eq!(alarms.len(), 1, "one event: {alarms:?}");
+    assert_eq!(alarms[0]["source_ip"], "127.0.0.2");
+    assert_eq!(alarms[0]["pinned_ip"], "127.0.0.1");
 
     cancel.cancel();
 }

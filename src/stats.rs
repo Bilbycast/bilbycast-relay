@@ -117,6 +117,15 @@ pub struct RelayStats {
     /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
     /// viewer whose IP changed mid-session.
     pub distribution_offpath_sessions: AtomicU64,
+    /// Datagrams the WebRTC ingress source pin dropped from another of a
+    /// peer's paths inside its grace, which raised no alarm (an off-path
+    /// datagram past the grace raises it and counts in
+    /// `distribution_offpath_sessions` instead). Relay-wide, every session
+    /// kind — WHEP viewers, WHIP ingests, cascade pulls.
+    pub distribution_other_path_datagrams: AtomicU64,
+    /// Frames live ingests published while a newer ingest held their stream,
+    /// dropped. Non-zero while two publishers push one stream id.
+    pub distribution_superseded_frames: AtomicU64,
 
     // ── Optional subsystems that stopped ──
     //
@@ -278,6 +287,8 @@ pub struct DistributionStatsSnapshot {
     pub bytes_out: u64,
     pub origin_bytes: u64,
     pub offpath_sessions: u64,
+    pub other_path_datagrams: u64,
+    pub superseded_frames: u64,
     /// Per-stream breakdown of `origin_bytes`.
     pub origin_streams: Vec<OriginStreamUsage>,
 }
@@ -329,6 +340,8 @@ impl RelayStats {
                 ViewerMetricsSnapshot::default(),
             ),
             distribution_offpath_sessions: AtomicU64::new(0),
+            distribution_other_path_datagrams: AtomicU64::new(0),
+            distribution_superseded_frames: AtomicU64::new(0),
             distribution_stopped: arc_swap::ArcSwapOption::empty(),
             udp_relay_stopped: arc_swap::ArcSwapOption::empty(),
         }
@@ -355,6 +368,15 @@ impl RelayStats {
         self.distribution_bytes_out.store(bytes_out, Ordering::Relaxed);
         self.distribution_origin_bytes.store(origin_bytes, Ordering::Relaxed);
         self.distribution_offpath_sessions.store(offpath_sessions, Ordering::Relaxed);
+    }
+
+    /// Publish the distribution hub's relay-wide drop counters (called by the
+    /// subsystem on the same tick as [`Self::set_distribution`]).
+    pub fn set_distribution_drops(&self, other_path_datagrams: u64, superseded_frames: u64) {
+        self.distribution_other_path_datagrams
+            .store(other_path_datagrams, Ordering::Relaxed);
+        self.distribution_superseded_frames
+            .store(superseded_frames, Ordering::Relaxed);
     }
 
     /// Publish what the viewers' players last reported (called by the
@@ -386,6 +408,8 @@ impl RelayStats {
             bytes_out: self.distribution_bytes_out.load(Ordering::Relaxed),
             origin_bytes: self.distribution_origin_bytes.load(Ordering::Relaxed),
             offpath_sessions: self.distribution_offpath_sessions.load(Ordering::Relaxed),
+            other_path_datagrams: self.distribution_other_path_datagrams.load(Ordering::Relaxed),
+            superseded_frames: self.distribution_superseded_frames.load(Ordering::Relaxed),
             origin_streams: self.distribution_origin_streams.load().as_ref().clone(),
         })
     }

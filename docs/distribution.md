@@ -70,6 +70,12 @@ they are not either/or.
 - **Keyframe cache**: the relay caches the last IDR access unit per stream, so a
   late-joining viewer decodes immediately instead of waiting for the source's
   next IDR.
+- **A stream lives as long as its ingest**: when the ingest that publishes a
+  stream ends, or a newer push for the same stream id takes it over, the
+  stream closes and every WHEP viewer on it is ended with a DTLS
+  close_notify; see [How a viewer session ends](#how-a-viewer-session-ends).
+  The newest live push owns a stream id, and an older push still live takes
+  it back when that one ends ([When the stream ends](#when-the-stream-ends)).
 - **No filler to viewers**: a CBR source pads its H.264 with filler data NAL
   units (type 12). The relay takes them out of each access unit before str0m
   packetizes it for a WHEP viewer (`strip_h264_filler` in
@@ -216,6 +222,13 @@ ends on whichever comes first:
 - **The peer closing the connection** — `RTCPeerConnection.close()` sends a
   DTLS close_notify, and the session ends on it at once. (Closing a Chrome tab
   sends none: measured live, that tab was reaped by ICE.)
+- **Its stream closing** (`stream closed`) — the ingest publishing the stream
+  ends (its `DELETE`, its connection closing, its ICE failing, the QUIC ingest
+  stream ending, the cascade pull ending), or a newer push for the same stream
+  id takes the stream over — one connecting, or, of three or more live
+  pushes, a newer one taking it back from an older one. The relay sends the viewer an RTCP BYE and a DTLS
+  close_notify, so its player learns at once; see
+  [When the stream ends](#when-the-stream-ends).
 - **ICE staying disconnected** — a crashed tab, a lost network. str0m's
   ICE agent reports a silent viewer disconnected about 15 s after its last
   binding request, and the session then has `ICE_DISCONNECT_GRACE` (15 s) to
@@ -231,8 +244,9 @@ ends on whichever comes first:
   ICE fails (measured with Chrome 124: a 20 s freeze and a 14 s network loss
   both came back). Chrome fails a connection after about 15 s of unanswered
   checks, not RFC 7675's 30 s, and then stops checking for good — neither
-  side restarts ICE, and the `/watch` player does not reconnect — so a longer
-  network outage loses the viewer whatever the relay does. Ending the
+  side restarts ICE — so after a longer network outage the viewer's session
+  is lost whatever the relay does, and the `/watch` player comes back with a
+  new one (see [When the stream ends](#when-the-stream-ends)). Ending the
   session on the first disconnect lost the ones that would have come back.
   str0m keeps sending to the viewer's last address meanwhile, so a viewer
   that really left is sent about 30 s of the stream.
@@ -264,6 +278,91 @@ The relay logs each viewer's end with its reason (`WHEP viewer '…' closed
 came from and the viewer's (`WHEP viewer '…' deleted by 203.0.113.9:51234
 (viewer 198.51.100.7)`) — anyone holding a session's id can delete it.
 
+### When the stream ends
+
+A stream lives as long as the ingest that publishes it — a WHIP push, a QUIC
+ES ingest or a cascade pull, which each take the stream when they connect
+(`DistributionHub::claim`, `src/distribution/hub.rs`) — and closes when it
+ends: the stream leaves the registry, its broadcast closes and every viewer
+on it ends with `stream closed`. A viewer that comes back subscribes afresh.
+Until an ingest arrives it waits, connected and sent nothing, on a stream no
+ingest holds, and the first ingest to connect takes that stream over, viewers
+and all. A stream no ingest holds leaves the registry with its last viewer,
+so the stream count on `/metrics` and in health holds only streams something
+publishes or someone waits on.
+
+**The newest live push owns the stream.** A push for a stream another ingest
+still holds — typically an edge's WHIP session the relay has not yet seen end
+(an edge that dies sends no `DELETE`, so the relay notices when ICE fails,
+about 15 s later) while the restarted edge pushes again; or a second
+publisher, a test push, on a stream id in use — gets a stream of its own, and
+the older stream closes at once: its viewers end and come back to the new
+push rather than waiting for the older one to time out.
+
+The older ingest is **not** ended. If it is genuinely live, ending it would
+only have its client push again and take the stream back from the newer one,
+and then the reverse, for as long as both lived. Instead its frames are
+dropped while the newer push holds the stream — counted on
+`bilbycast_relay_distribution_superseded_frames_total`, with one warning in the
+log per episode (`a newer ingest holds it, so this one's frames are dropped
+until that one ends`) — and:
+
+- **If the newer push ends first**, the older one's next frame takes the
+  stream back (logged, with the number of frames dropped meanwhile): a fresh
+  stream carrying over the SPS / PPS the older push last sent — those it sent
+  while its frames were dropped included — and whether it has audio, or the
+  one viewers are already waiting on. The newer push's viewers end with it,
+  and those that come back play the older push from its next keyframe. So a
+  stream id is never dead while any publisher of it is live.
+- **A push that is ending never takes the stream back.** A WHIP or cascade
+  session that ends flushes the last access unit its depacketizer held, and
+  that unit goes only into a stream the push still holds. So the late end of
+  a dead push — an edge's session timing out — neither sends viewers a stale
+  frame nor closes a stream they wait on, or one an older live push took back.
+- **If the older push ends first**, its end leaves the newer stream and its
+  viewers alone. Its log line — and, for a QUIC ingest, its `distribution
+  ingest closed` event (`held_by: "another"`) — says that another ingest holds
+  the stream, which plays on. A push that ends after every newer one has gone,
+  without having sent a frame since (so it never took the stream back), says
+  instead that no ingest holds the stream now (`held_by: "none"`).
+- Taking back never takes a stream from a newer push, so two live pushes
+  settle on the newer one and never trade it. Of three or more, the newest
+  still live ends up holding it: an older one that took the stream back first
+  gives it up to a newer one that is still live.
+
+Before, neither happened. A viewer held the stream state its broadcast sender
+lived in, so the broadcast never closed: when the ingest went, its viewers
+stayed connected, sent nothing and held their per-IP slots for as long as
+they answered ICE (240 s, measured, until the test closed the tab), invisible
+to the viewer count, and the next push went into a new stream they never saw.
+And an ingest's end removed whatever was registered under its stream id, so
+an older push timing out after the restarted edge had pushed again took the
+new push's stream away from its viewers, for good.
+
+What each consumer does when its session is ended so:
+
+- **The `/watch` player** asks again: its DTLS transport closes, and on that
+  (or on its connection failing) it POSTs a new offer after a back-off of 1 s,
+  doubling to 30 s, which a session that stayed connected for 10 s starts
+  over. The relay answers that offer `201` whatever the stream id — a stream
+  no ingest holds is one the viewer waits on — so a viewer of a stream that
+  has gone for good asks once and stays connected, sent nothing and holding
+  one of its IP's viewer slots, until the next push for that stream id plays.
+  The back-off grows towards 30 s only while offers fail (`429`, a `5xx`, the
+  network) or sessions keep closing, so it never asks in a loop. A refusal
+  that asking again will not change (a `4xx` other than `429`) stops it with
+  the reason; pressing Stop cancels a pending retry. Before, it did not
+  reconnect at all.
+- **A cascade pull** sees the upstream close the connection, ends — closing
+  its own local stream, so its viewers end too — and pulls again 3 s later,
+  like any pull that ends.
+- **bilbycast-edge's WHEP input** ends its pull on the close, `DELETE`s its
+  resource (gone already: a `404`, which the edge logs at `warn`) and
+  reconnects after its own back-off, 1 s doubling to 30 s, started over by a
+  pull that lasted 10 s.
+- **The DVR player** (`/dvr/{stream}`) plays the LL-HLS origin, which an
+  ingest's end does not touch.
+
 ### Media source pin
 
 The relay runs the **ICE-Lite server** role for WHEP viewers and WHIP ingest,
@@ -287,10 +386,48 @@ as readily; making migration *safe* rather than absent needs a
 return-routability check (RFC 7675 consent, or a full non-lite agent) that
 neither str0m nor its ICE agent implements today.
 
-The first such drop in a WHEP session raises the warning event
+A multi-homed peer goes on checking its other candidate pairs for a while
+after one is nominated — an edge bound to `0.0.0.0` that offered the same port
+on loopback and on its LAN address, a browser on two networks, a same-host peer
+reaching a relay bound to `0.0.0.0` (which advertises loopback and its LAN
+address) over the relay's other address. Those datagrams are dropped like any
+other, and they used to raise the alarm below on every session with such a
+peer (every one in the live edge → relay → Chrome run). So the pin gives them
+a **bounded grace**: a datagram from an address with a *claim* to the session
+is dropped without the alarm for `OTHER_PATH_GRACE` (30 s) after the pin armed
+and for at most `OTHER_PATH_BUDGET` (64) such datagrams a session; past either,
+it is **off-path** like any other source. Every one dropped inside the grace is
+still counted — `bilbycast_relay_distribution_other_path_datagrams_total`, for
+WHEP viewers, WHIP ingests and cascade pulls alike — so nothing the pin drops
+is invisible.
+
+An address has a claim when it is one of:
+
+- an IP named among the ICE candidates of the SDP the session took (a viewer's
+  or publisher's offer; a cascade pull's upstream answer). The peer wrote it,
+  and the peer — the one party holding the ICE password, so the only one able
+  to draw STUN replies with a spoofed source — is exactly who the alarm
+  watches: a viewer can name its victim. That is why the claim lapses;
+- the source of a datagram that reached the session before the pin armed.
+  These are recorded before str0m checks a datagram's integrity, so they are
+  *any sender's*, not necessarily the peer's. It is also how a browser that
+  hides its host candidates behind mDNS names is known;
+- an address the session advertised as its own candidate.
+
+The bound comes from the live run: the pin answers none of a peer's checks on
+its other paths, so the peer fails those pairs and stops — an edge's after
+18 drops, 17.3 s after arming (str0m's ICE agent gives a pair 9 unanswered
+checks; the edge had two pairs from its second address), Chrome 124's after
+24, 14.7 s after arming — while a reflection attempt goes on. A peer that
+keeps sending from another path past the grace — one whose ICE moved its
+traffic to a path the pin refuses, which is the "viewer whose IP changed" case
+below — raises the alarm, as it should.
+
+The first off-path drop in a WHEP session raises the warning event
 `webrtc_offpath_source` and increments
 `bilbycast_relay_distribution_offpath_sessions` — once per session, never per
-datagram, so a reflection flood cannot amplify its own alarm.
+datagram, so a reflection flood cannot amplify its own alarm. A WHIP ingest or
+a cascade pull logs the same warning without the event.
 
 ### The advertised window must be one the origin can serve
 
@@ -1710,10 +1847,14 @@ absence as "not running", not as zero.
 | `bilbycast_relay_distribution_viewers` | gauge | Connected WHEP viewers across all streams |
 | `bilbycast_relay_distribution_bytes_out_total` | counter | Media bytes fanned out to viewers |
 | `bilbycast_relay_distribution_origin_bytes` | gauge | Bytes currently held in the LL-HLS origin cache |
-| `bilbycast_relay_distribution_offpath_sessions` | counter | WHEP sessions that had a datagram refused by the media source pin — a spoofed ICE reflection attempt, or a viewer whose IP changed mid-session. Counted once per session |
+| `bilbycast_relay_distribution_offpath_sessions` | counter | WHEP sessions that had an off-path datagram refused by the media source pin — a spoofed ICE reflection attempt, or a viewer whose IP changed mid-session; a multi-homed viewer's other paths are not off-path inside their grace ([Media source pin](#media-source-pin)). Counted once per session. A sum over the streams the hub holds, so it falls when a stream ends |
+| `bilbycast_relay_distribution_other_path_datagrams_total` | counter | Datagrams the media source pin dropped from an address with a claim to the session inside its grace, which raised no alarm — WHEP, WHIP and cascade sessions alike. Steady growth with no `offpath_sessions` is multi-homed peers; a session past its grace counts in `offpath_sessions` instead |
+| `bilbycast_relay_distribution_superseded_frames_total` | counter | Frames a live ingest published while a newer ingest held its stream, dropped ([When the stream ends](#when-the-stream-ends)). Non-zero while two publishers push one stream id |
 
-The same figures ride to the manager on the health payload's `distribution`
-object, and the per-stream `StreamSnapshot` carries `offpath_sessions` too. A
+The same figures ride to the manager on the health and stats payloads'
+`distribution` object (`other_path_datagrams` and `superseded_frames` are
+additive fields there; an older manager ignores them), and the per-stream
+`StreamSnapshot` carries `offpath_sessions` too. A
 relay is headless: `offpath_sessions` has no other local channel, and it is the
 counter to look at first when a viewer reports going black.
 
@@ -1771,7 +1912,10 @@ nearby viewers. **Implemented** (`src/distribution/cascade.rs`):
   to its own [`hub::DistributionHub`] under a local stream name — the downstream
   relay is "just another viewer" of the upstream, then an SFU to its own viewers.
   Its own viewers, LL-HLS origin, and keyframe cache all work unchanged. It
-  reconnects automatically if the upstream stream isn't live yet.
+  reconnects automatically if the upstream stream isn't live yet, and when the
+  upstream's stream ends: the upstream closes the pull's session, the pull's
+  local stream closes with it, ending its viewers, and the pull tries again
+  3 s later ([When the stream ends](#when-the-stream-ends)).
 - Configure per source in the `distribution.cascade_sources` list:
 
   ```json
@@ -2093,7 +2237,7 @@ as ignored at startup.
 | File | Responsibility |
 |------|----------------|
 | `mod.rs` | Subsystem assembly, axum router, per-IP viewer cap + session reaper, `run_distribution` |
-| `hub.rs` | Per-stream fan-out (`tokio::broadcast`) + lock-free keyframe cache + SPS / PPS restored ahead of every IDR |
+| `hub.rs` | Per-stream fan-out (`tokio::broadcast`) + lock-free keyframe cache + SPS / PPS restored ahead of every IDR; an ingest claims its stream (`claim` → `Publisher`) and the stream closes with it; the newest live ingest owns a stream id, and a live older one takes it back when that one ends; an unclaimed stream leaves with its last viewer |
 | `es.rs` | Elementary-frame types + Annex-B NAL splitter + parameter-set restore |
 | `whep.rs` | Per-viewer WHEP session + send loop (one whole access unit per str0m write; str0m packetizes → SRTP) |
 | `whip_ingest.rs` | WHIP-in: terminate DTLS/SRTP, str0m depacketizes whole frames → access units → hub |
@@ -2102,7 +2246,7 @@ as ignored at startup.
 | `origin.rs` | LL-HLS/CMAF HTTP origin; manifests in memory, segments on disk, age- and size-bounded |
 | `token.rs` | Short-lived HMAC token mint/verify (viewer + ingest scopes) |
 | `webrtc/` | Vendored str0m session wrapper (str0m does the RFC 6184 packetizing) |
-| `player.html` | Built-in browser WHEP player (live only) |
+| `player.html` | Built-in browser WHEP player (live only); reconnects with a back-off. Its jsdom suite is `tests/player_page.test.cjs` |
 | `dvr.html` | Browser DVR player — main + all-intra proxy, jog / shuttle / reverse |
 | `vendor/` | Vendored browser assets (hls.js); see `vendor/README.md` |
 
@@ -2140,6 +2284,44 @@ as ignored at startup.
   (`a_peer_that_closes_without_a_delete_ends_at_once`); a WHEP viewer and a
   WHIP publisher that never connect are closed at the 30 s setup deadline
   (`an_offer_that_never_connects_is_closed_at_the_setup_deadline`, 30 s).
+- **A stream ends with its ingest, through the real router**: a viewer's
+  session ends with a close_notify when its WHIP push goes, its slot comes
+  back, and a viewer that comes back plays the next push
+  (`a_viewer_ends_with_its_ingest_and_one_that_comes_back_plays_the_next_push`);
+  a push for a stream an earlier push still holds ends the earlier one's
+  viewers (`a_push_that_takes_a_stream_over_ends_the_earlier_ones_viewers`),
+  and the earlier push's late end leaves the newer one's viewers playing
+  (`an_older_ingests_late_end_leaves_a_newer_ones_viewers_playing`); a QUIC
+  ingest's viewer sees its broadcast close at the ingest's end
+  (`ingest_over_quic_delivers_frames_to_hub`), and a QUIC ingest a newer one
+  took the stream from says so as it closes
+  (`a_superseded_quic_ingest_says_so_when_it_closes`), or that no ingest holds
+  the stream once the newer one has gone too
+  (`a_superseded_quic_ingest_ending_after_the_newer_one_says_none_holds_the_stream`).
+- **Two live pushes, through the real router**: when the newer one leaves
+  first, the older one takes the stream back and a viewer that comes back
+  plays it (`a_live_older_push_takes_its_stream_back_when_the_newer_one_leaves`);
+  when the older one leaves first, the newer one's viewer plays on
+  (`a_live_older_push_that_leaves_first_leaves_the_newer_ones_viewers_playing`).
+  The hub's own tests cover the rest: no trading between two live pushes, the
+  newest of several holding the stream, a push that is ending never taking it
+  back, a take-back going out behind the parameter sets sent while
+  superseded, what an ingest's end reports, and an unclaimed stream leaving
+  with its last viewer, raced against a claim on three threads
+  (`distribution::hub::tests`).
+- **The media source pin's grace, through the real router**: a WHEP viewer's
+  datagrams from another address it named count on the other-path counter and
+  raise nothing for the first 64, then raise one `webrtc_offpath_source` event
+  (`a_viewers_named_address_counts_inside_the_grace_and_alarms_past_it`); the
+  time bound is a unit test
+  (`distribution::webrtc::session::tests::a_claim_lapses_with_the_grace`).
+- **The `/watch` player** (`src/distribution/tests/player_page.test.cjs`, jsdom,
+  run by CI's `dvr-page` job, not by cargo): the page's real script against a
+  fake `RTCPeerConnection`, `fetch` and clock — a session the relay closes or
+  whose connection fails is asked for again, the back-off doubles to 30 s and
+  stays there, a session that stayed up 10 s starts it over, Stop cancels a
+  pending retry, a `4xx` other than `429` stops, and events from a dropped
+  session are ignored.
 - **H.264 filler**: a WHEP viewer of a stream padded with filler data
   receives every access unit without it, and an Opus frame whose first byte
   reads as a filler header untouched (`a_whep_viewer_is_sent_no_h264_filler`).
