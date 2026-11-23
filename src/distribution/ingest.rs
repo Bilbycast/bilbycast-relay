@@ -38,7 +38,7 @@ use crate::distribution_control::DistributionControl;
 use crate::manager::events::{category, EventSender, EventSeverity};
 
 use super::es::{EsFrame, EsKind, MAX_FRAME_BYTES};
-use super::hub::{DistributionHub, StreamState};
+use super::hub::{DistributionHub, Publisher};
 use super::token;
 
 /// ALPN for the distribution ingest QUIC endpoint.
@@ -220,24 +220,34 @@ async fn handle_ingest_stream(
         serde_json::json!({ "stream": stream_id, "has_audio": hello.has_audio }),
     );
     // The stream ends with this ingest, its viewers with it — unless a newer
-    // ingest has taken it over meanwhile (see `Publisher`).
+    // ingest holds it by then, which plays on (see `Publisher`).
     let publisher = hub.claim(&stream_id);
 
     // 3. Frame loop.
     let result = read_frames(&mut recv, &publisher).await;
-    drop(publisher);
+    let (message, superseded) = if publisher.end() {
+        (format!("distribution ingest closed for stream '{stream_id}'"), false)
+    } else {
+        (
+            format!(
+                "distribution ingest closed for stream '{stream_id}'; a newer ingest holds the \
+                 stream, which plays on"
+            ),
+            true,
+        )
+    };
 
-    tracing::info!("distribution ingest for stream '{stream_id}' closed");
+    tracing::info!("{message}");
     events.emit_with_details(
         EventSeverity::Info,
         category::DISTRIBUTION,
-        format!("distribution ingest closed for stream '{stream_id}'"),
-        serde_json::json!({ "stream": stream_id }),
+        message,
+        serde_json::json!({ "stream": stream_id, "superseded": superseded }),
     );
     result
 }
 
-async fn read_frames(recv: &mut RecvStream, stream: &StreamState) -> Result<()> {
+async fn read_frames(recv: &mut RecvStream, stream: &Publisher<'_>) -> Result<()> {
     loop {
         let mut hdr = [0u8; 1];
         match recv.read_exact(&mut hdr).await {

@@ -13,7 +13,8 @@
 //!
 //! The RTP packetizing is str0m's: each H.264 access unit goes to str0m's
 //! writer once, whole, as Annex B. The hub has already put the stream's SPS /
-//! PPS back ahead of any IDR that lacked them (`DistributionHub::publish`).
+//! PPS back ahead of any IDR that lacked them as it published it
+//! (`StreamState::send` in `hub.rs`).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -68,6 +69,7 @@ pub async fn create_and_spawn_viewer(
     let mut session = WebrtcSession::new(&session_config)
         .await
         .context("failed to create WebRTC session")?;
+    session.count_other_paths_into(hub.other_path_counter());
 
     let answer_sdp = session
         .accept_offer(offer_sdp)

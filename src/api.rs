@@ -508,6 +508,16 @@ async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> impl IntoResp
         let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_offpath_sessions counter");
         let _ = writeln!(out, "bilbycast_relay_distribution_offpath_sessions {}", d.offpath_sessions);
         let _ = writeln!(out);
+
+        let _ = writeln!(out, "# HELP bilbycast_relay_distribution_other_path_datagrams_total Datagrams the WebRTC ingress source pin dropped from another of a peer's paths (an address named in its SDP, seen before DTLS completed, or advertised by the session) inside the grace after it armed, which raise no alarm. Past the grace such a datagram is off-path.");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_other_path_datagrams_total counter");
+        let _ = writeln!(out, "bilbycast_relay_distribution_other_path_datagrams_total {}", d.other_path_datagrams);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "# HELP bilbycast_relay_distribution_superseded_frames_total Frames live ingests published while a newer ingest held their stream, dropped. Non-zero while two publishers push one stream id; the older takes the stream back when the newer ends.");
+        let _ = writeln!(out, "# TYPE bilbycast_relay_distribution_superseded_frames_total counter");
+        let _ = writeln!(out, "bilbycast_relay_distribution_superseded_frames_total {}", d.superseded_frames);
+        let _ = writeln!(out);
     }
 
     // Manager-link state (local observability only). Emitted when a

@@ -36,7 +36,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::es::{EsFrame, MAX_FRAME_BYTES, au_is_idr};
-use super::hub::{DistributionHub, StreamState};
+use super::hub::{DistributionHub, Publisher};
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 use super::webrtc::{SETUP_DEADLINE, Setup, await_connected};
 
@@ -96,6 +96,7 @@ pub async fn create_and_spawn_ingest(
     let mut session = WebrtcSession::new(&session_config)
         .await
         .context("failed to create WHIP ingest session")?;
+    session.count_other_paths_into(hub.other_path_counter());
     let answer_sdp = session
         .accept_offer(offer_sdp)
         .context("failed to accept WHIP offer")?;
@@ -159,7 +160,7 @@ impl AuAssembler {
     /// relay ran out of memory, while its viewers got nothing. A unit that
     /// would pass the cap is dropped whole, and the rest of it with it:
     /// publishing its tail would hand viewers a fragment.
-    fn push(&mut self, stream: &StreamState, pts_90k: u64, data: &[u8]) {
+    fn push(&mut self, stream: &Publisher<'_>, pts_90k: u64, data: &[u8]) {
         if data.is_empty() {
             return;
         }
@@ -191,7 +192,7 @@ impl AuAssembler {
     }
 
     /// Emit the accumulated access unit (if any) to the stream.
-    fn flush(&mut self, stream: &StreamState) {
+    fn flush(&mut self, stream: &Publisher<'_>) {
         if self.nalus.is_empty() {
             return;
         }
@@ -254,11 +255,17 @@ async fn ingest_loop(
     }
 
     // The stream ends with this ingest, its viewers with it — unless a newer
-    // ingest has taken it over meanwhile (see `Publisher`).
+    // ingest holds it by then, which plays on (see `Publisher`).
     let publisher = hub.claim(stream_id);
     republish_from_session(session, &publisher, &cancel, MAX_WHIP_AU_BYTES).await;
-    drop(publisher);
-    tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
+    if publisher.end() {
+        tracing::info!("WHIP ingest '{session_id}' closed (stream '{stream_id}')");
+    } else {
+        tracing::info!(
+            "WHIP ingest '{session_id}' closed (stream '{stream_id}'); a newer ingest holds the \
+             stream, which plays on"
+        );
+    }
 }
 
 /// Drive a **connected** WebRTC session, depacketizing its inbound media into
@@ -270,7 +277,7 @@ async fn ingest_loop(
 /// [`MAX_WHIP_AU_BYTES`] for the one, [`MAX_RTP_AU_BYTES`] for the other.
 pub(crate) async fn republish_from_session(
     mut session: WebrtcSession,
-    stream: &StreamState,
+    stream: &Publisher<'_>,
     cancel: &CancellationToken,
     max_au_bytes: usize,
 ) {

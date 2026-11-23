@@ -151,6 +151,7 @@ async fn cascade_attempt(
     // Client role (NOT ice-lite): we build the offer.
     let cfg = SessionConfig { bind_addr, public_ip, ice_lite: false };
     let mut client = WebrtcSession::new(&cfg).await.context("create cascade session")?;
+    client.count_other_paths_into(hub.other_path_counter());
 
     // Recvonly video + audio.
     let (offer, pending) = client
@@ -174,9 +175,15 @@ async fn cascade_attempt(
     }
     tracing::info!("cascade '{}': connected to upstream", source.local_stream);
     // The local stream ends with this pull, its viewers with it — unless a
-    // newer ingest has taken it over meanwhile (see `Publisher`).
+    // newer ingest holds it by then, which plays on (see `Publisher`).
     let publisher = hub.claim(&source.local_stream);
     republish_from_session(client, &publisher, cancel, MAX_RTP_AU_BYTES).await;
+    if !publisher.end() {
+        tracing::info!(
+            "cascade '{}': a newer ingest holds the local stream, which plays on",
+            source.local_stream
+        );
+    }
     Ok(())
 }
 
