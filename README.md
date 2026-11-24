@@ -249,7 +249,7 @@ The opaque forwarder is stateless — a restart drops connected edges, which all
 | Transport | TLS 1.3 via QUIC (all edge-relay traffic encrypted) |
 | End-to-end | ChaCha20-Poly1305 between edges (relay sees only ciphertext) |
 | REST API | Optional Bearer token authentication |
-| Tunnel binding | Optional per-tunnel HMAC-SHA256 bind tokens (managed via manager) |
+| Tunnel binding | Optional per-tunnel HMAC-SHA256 bind tokens (managed via manager). Only a connection that has bound a side of a QUIC tunnel can send into it |
 | Config read-back | The manager's `get_config` shows every credential the relay holds (API token, registration token, node secret, distribution token secret, cascade upstream tokens, and a credential carried in a manager or cascade URL) as `***REDACTED***` |
 | ALPN | `bilbycast-relay` protocol enforced |
 
