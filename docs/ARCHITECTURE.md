@@ -351,15 +351,16 @@ the tunnel and its figures.
 A datagram is counted in its own tunnel's atomics and nowhere else. A relay-wide
 atomic beside them would be one cache line written by every forwarding thread:
 measured on 24 cores, the tunnel lookup and count of one datagram (55-60 ns)
-took 13 % longer with two such atomics on one thread, and about 5 to 18 times as
-long on 8 and 16; with a cache-padded total per thread it took 8 to 21 % longer.
-So each router keeps a `DepartedTunnels` (`stats.rs`) instead. Every removal
-goes through it and takes the tunnel out of the map under its lock, and a reader
-adds up the map and what has departed under the same lock, so a tunnel is in the
-sum once whenever the reader comes. One that a forwarding task still holds is
-kept whole, because the task may count into it yet; its counts are folded into
-one figure at the first removal after nothing holds it. The forward path takes
-no lock and does what it did before.
+took 13 % longer with two such atomics on one thread, and about 4 to 18 times as
+long on 8 and 16; with a cache-padded total per thread it took about 10 to 20 %
+longer. So each router keeps a `DepartedTunnels` (`stats.rs`) instead. Every
+removal goes through it: under its lock and the map's, the tunnel goes on its
+list and out of the map. A reader adds up the map, the list and what has been
+folded under the same lock, so a tunnel is in the sum once whenever the reader
+comes. One that a forwarding task still holds is kept whole, because the task
+may count into it yet; its counts are folded into one figure at the first
+removal after nothing holds it. The forward path takes no lock and does what it
+did before.
 
 **Upgrading from relay v0.20.0 or earlier.** Up to v0.20.0 each of the seven was
 a sum over the tunnels, or the native-UDP sessions, held when it was read, so it
@@ -368,19 +369,27 @@ REST, or reaped. `rate()` / `increase()` read that as a counter reset, and
 `total_bandwidth_bps` read 0 or low for the sample in which a tunnel ended. All
 seven now only grow, names, types and JSON keys unchanged. A panel or an alert
 that read a value as the traffic of the tunnels now up shows a total since the
-relay started: take its `rate()`, or sum the per-tunnel series. On the manager,
-"Total Forwarded" and its neighbours on the relay's page become totals since the
-start, and the Throughput column of the Flows page's relay table, which falls
-back to the byte total while the bandwidth reads 0, shows that total for an idle
-relay with no tunnels, where it showed a dash.
+relay started: take its `rate()`, or sum what is held now. For the QUIC tunnels
+that is the per-tunnel series. A native-UDP session has no series of its own on
+`/metrics`; its figures are in its `udp_sessions` row (the manager's stats
+payload) or its `GET /api/v1/udp-sessions` row.
+
+On the manager, "Total Forwarded" and its neighbours on the relay's page become
+totals since the start. The Throughput column of the Flows page's relay table
+falls back to the byte total while the bandwidth reads 0, with the datagram total
+beneath. All three figures are the QUIC tunnels' only, so a relay that has
+carried QUIC tunnels and holds none shows those totals where it showed a dash:
+an idle one, and one that is busy with native-UDP sessions or bond legs alone.
 
 Pinned by `stats::tunnel_totals_tests` (a tunnel counted once wherever it is, a
-late count kept, a finished one let go, the lock held throughout a removal and a
-read), `tunnel_router::totals_tests` and `udp_relay::totals_tests` (every way out
-of each router, and no figure falling while tunnels are removed and bound again
-under four forwarding threads), `session::tunnel_counter_tests` (real edges, with
-a TCP stream that outlives its tunnel) and
-`manager::client::tunnel_counter_tests` (the four surfaces agree).
+late count kept, a finished one let go, a removal that waits for a read to end
+and lists the tunnel before the map lets go of it), `tunnel_router::totals_tests`
+and `udp_relay::totals_tests` (every way out of each router, and no figure
+falling while tunnels are removed and bound again under four forwarding threads;
+the first also that a side bound before the empty tunnel is removed keeps it),
+`session::tunnel_counter_tests` (real edges, with a TCP stream that outlives its
+tunnel) and `manager::client::tunnel_counter_tests` (the four surfaces agree, and
+the bandwidth figure takes in a tunnel that ended).
 
 ## Viewer Distribution (optional role)
 
