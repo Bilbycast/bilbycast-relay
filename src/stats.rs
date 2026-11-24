@@ -98,7 +98,8 @@ pub struct RelayStats {
     pub distribution_streams: AtomicU64,
     /// Total concurrent viewers across all streams.
     pub distribution_viewers: AtomicU64,
-    /// Total bytes fanned out to viewers (pre-SRTP ES accounting).
+    /// Total bytes fanned out to viewers (pre-SRTP ES accounting), on every
+    /// stream there has been: it never falls.
     pub distribution_bytes_out: AtomicU64,
     /// Bytes currently held in the LL-HLS origin cache.
     pub distribution_origin_bytes: AtomicU64,
@@ -115,7 +116,8 @@ pub struct RelayStats {
     /// Viewer sessions that had a datagram refused by the WebRTC ingress
     /// source pin (`webrtc::session::PeerPin`). One per session, not per
     /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
-    /// viewer whose IP changed mid-session.
+    /// viewer whose IP changed mid-session. Relay-wide, on every stream there
+    /// has been: it never falls.
     pub distribution_offpath_sessions: AtomicU64,
     /// Datagrams the WebRTC ingress source pin dropped from another of a
     /// peer's paths inside its grace, which raised no alarm (an off-path

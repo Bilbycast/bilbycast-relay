@@ -410,34 +410,7 @@ pub async fn run_distribution(
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tick.tick() => {
-                        let snap = hub.snapshot();
-                        let bytes_out: u64 = snap.iter().map(|s| s.bytes_out).sum();
-                        let offpath: u64 = snap.iter().map(|s| s.offpath_sessions).sum();
-                        stats.set_distribution(
-                            hub.stream_count() as u64,
-                            hub.total_viewers(),
-                            bytes_out,
-                            origin.total_bytes(),
-                            offpath,
-                            origin
-                                .usage()
-                                .into_iter()
-                                .map(|u| crate::stats::OriginStreamUsage {
-                                    stream: u.stream,
-                                    segments: u.segments as u64,
-                                    bytes: u.bytes,
-                                    idle_secs: u.idle_secs,
-                                    policy_overridden: u.policy_overridden,
-                                })
-                                .collect(),
-                        );
-                        stats.set_distribution_drops(
-                            hub.other_path_datagrams(),
-                            hub.superseded_frames(),
-                        );
-                        // The players' own reports ride the same tick; the
-                        // health builder reads the published copy.
-                        stats.set_viewer_metrics(viewer_metrics.snapshot());
+                        publish_telemetry(&hub, &origin, &viewer_metrics, &stats);
                     }
                 }
             }
@@ -523,6 +496,42 @@ pub async fn run_distribution(
         return Ok(());
     }
     Err(anyhow::anyhow!(stopped))
+}
+
+/// Publish one telemetry sample onto `stats`, which `/metrics`, the health
+/// message and the stats message are built from.
+///
+/// `bytes_out` and `offpath_sessions` are the hub's totals. They were the sum
+/// over the streams it held (up to relay v0.20.0), so each fell when a stream
+/// ended, although `/metrics` exports both as counters.
+pub(crate) fn publish_telemetry(
+    hub: &DistributionHub,
+    origin: &OriginStore,
+    viewer_metrics: &origin::metrics::ViewerMetrics,
+    stats: &crate::stats::RelayStats,
+) {
+    stats.set_distribution(
+        hub.stream_count() as u64,
+        hub.total_viewers(),
+        hub.bytes_out(),
+        origin.total_bytes(),
+        hub.offpath_sessions(),
+        origin
+            .usage()
+            .into_iter()
+            .map(|u| crate::stats::OriginStreamUsage {
+                stream: u.stream,
+                segments: u.segments as u64,
+                bytes: u.bytes,
+                idle_secs: u.idle_secs,
+                policy_overridden: u.policy_overridden,
+            })
+            .collect(),
+    );
+    stats.set_distribution_drops(hub.other_path_datagrams(), hub.superseded_frames());
+    // The players' own reports ride the same tick; the health builder reads
+    // the published copy.
+    stats.set_viewer_metrics(viewer_metrics.snapshot());
 }
 
 /// Build the axum router for the distribution HTTP surface. `pub` so

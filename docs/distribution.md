@@ -1854,7 +1854,7 @@ Android Chrome has no native HLS, so the page cannot function without it. See
 ## Observability
 
 `GET /metrics` on the REST listener (`:4480`, Bearer-gated when `api_token` is
-set) exposes five distribution series. They are emitted only once the subsystem
+set) exposes seven distribution series. They are emitted only once the subsystem
 has published a sample, so a plain forwarder build — or a relay with
 distribution disabled — exposes none of them, and a dashboard should treat their
 absence as "not running", not as zero.
@@ -1863,18 +1863,38 @@ absence as "not running", not as zero.
 |---|---|---|
 | `bilbycast_relay_distribution_streams` | gauge | Streams currently published to the hub |
 | `bilbycast_relay_distribution_viewers` | gauge | Connected WHEP viewers across all streams |
-| `bilbycast_relay_distribution_bytes_out_total` | counter | Media bytes fanned out to viewers |
+| `bilbycast_relay_distribution_bytes_out_total` | counter | Media bytes fanned out to WHEP viewers, what goes to str0m, on every stream since the relay started |
 | `bilbycast_relay_distribution_origin_bytes` | gauge | Bytes currently held in the LL-HLS origin cache |
-| `bilbycast_relay_distribution_offpath_sessions` | counter | WHEP sessions that had an off-path datagram refused by the media source pin — a spoofed ICE reflection attempt, or a viewer whose IP changed mid-session; a multi-homed viewer's other paths are not off-path inside their grace ([Media source pin](#media-source-pin)). Counted once per session. A sum over the streams the hub holds, so it falls when a stream ends |
+| `bilbycast_relay_distribution_offpath_sessions` | counter | WHEP sessions that had an off-path datagram refused by the media source pin — a spoofed ICE reflection attempt, or a viewer whose IP changed mid-session; a multi-homed viewer's other paths are not off-path inside their grace ([Media source pin](#media-source-pin)). Counted once per session, on every stream since the relay started |
 | `bilbycast_relay_distribution_other_path_datagrams_total` | counter | Datagrams the media source pin dropped from an address with a claim to the session inside its grace, which raised no alarm — WHEP, WHIP and cascade sessions alike. Steady growth with no `offpath_sessions` is multi-homed peers; a session past its grace counts in `offpath_sessions` instead |
 | `bilbycast_relay_distribution_superseded_frames_total` | counter | Frames a live ingest published while a newer ingest held its stream, dropped ([When the stream ends](#when-the-stream-ends)). Non-zero while two publishers push one stream id |
 
 The same figures ride to the manager on the health and stats payloads'
 `distribution` object (`other_path_datagrams` and `superseded_frames` are
-additive fields there; an older manager ignores them), and the per-stream
-`StreamSnapshot` carries `offpath_sessions` too. A
+additive fields there; an older manager ignores them). A
 relay is headless: `offpath_sessions` has no other local channel, and it is the
 counter to look at first when a viewer reports going black.
+
+The four counters are the hub's (`DistributionHub`), counted once for the whole
+relay, so a restart is the only thing that resets them: none falls when a
+viewer leaves, a stream ends or another push takes it over
+([When the stream ends](#when-the-stream-ends)). Each stream keeps its own
+`bytes_out` and `offpath_sessions` beside them (`StreamState`, read in-process
+through `StreamSnapshot`; nothing exports the breakdown). Those restart with
+the stream, at a take-over and a take-back too, where the viewers of the closed
+stream end with it: one still counts into the closed stream until it has ended,
+so what it counted stays there and is not carried into the new one.
+
+**Upgrading from relay v0.20.0 or earlier.** `bytes_out_total` and
+`offpath_sessions` were a sum over the streams the hub held, so each fell when
+a stream ended: `rate()` / `increase()` read that as a counter reset, and an
+event whose stream had since ended left the figure. Both now only grow, names
+and types unchanged. An alert on the value (`offpath_sessions > 0`) used to
+clear when the stream ended; it now stays until the relay restarts, so alert on
+the increase (`increase(bilbycast_relay_distribution_offpath_sessions[5m]) > 0`).
+A panel that read `bytes_out_total` as the bytes of the streams now live shows a
+total since the relay started, as the manager's relay card ("Fanned out") does;
+take its `rate()`.
 
 ### Capability bits
 
@@ -2340,6 +2360,11 @@ as ignored at startup.
   stays there, a session that stayed up 10 s starts it over, Stop cancels a
   pending retry, a `4xx` other than `429` stops, and events from a dropped
   session are ignored.
+- **The relay-wide counters**: neither `bytes_out_total` nor
+  `offpath_sessions` falls when a viewer leaves, a stream ends, or a push takes
+  it over or back, and each is the sum over every stream there has been
+  (`distribution::hub::tests`); `/metrics` and the health and stats payloads
+  read the same (`manager::client::distribution_counter_tests`).
 - **H.264 filler**: a WHEP viewer of a stream padded with filler data
   receives every access unit without it, and an Opus frame whose first byte
   reads as a filler header untouched (`a_whep_viewer_is_sent_no_h264_filler`),
