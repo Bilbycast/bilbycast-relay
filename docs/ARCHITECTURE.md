@@ -319,6 +319,78 @@ busy port. The same holds for the viewer-distribution subsystem (not retried):
 `main` does not wait on either optional task; `src/supervise.rs` watches them
 and records a stop (relay#15).
 
+## Relay-Wide Counters
+
+Seven figures are for the whole relay since it started. None falls when a
+tunnel or a session goes, and only a restart resets them:
+
+| `GET /metrics` (counters) | JSON key | Counts |
+|---|---|---|
+| `bilbycast_relay_bytes_ingress_total` | `total_bytes_ingress` | QUIC tunnels: datagram payload bytes forwarded from the edge bound `ingress`, and TCP stream bytes forwarded from the edge that opened the stream |
+| `bilbycast_relay_bytes_egress_total` | `total_bytes_egress` | QUIC tunnels: the same the other way |
+| `bilbycast_relay_bytes_forwarded_total` | `total_bytes_forwarded` | The sum of the two |
+| `bilbycast_relay_tcp_streams_total` | `total_tcp_streams` | TCP streams opened through to the peer |
+| `bilbycast_relay_udp_datagrams_total` | `total_udp_datagrams` | QUIC datagrams forwarded |
+| `bilbycast_relay_udp_bytes_forwarded_total` | none | Native-UDP plane: bytes of the media datagrams that came from a registered side, tunnel id included |
+| `bilbycast_relay_udp_datagrams_forwarded_total` | none | Native-UDP plane: media datagrams forwarded |
+
+The JSON keys are those of `GET /api/v1/stats` and of the manager's stats
+payload (1 s); the health payload (15 s) carries `total_bytes_forwarded` only.
+Every surface reads the same figures (`TunnelRouter::totals`,
+`UdpSessionRouter::totals`).
+
+`bilbycast_relay_tcp_streams_active` (`active_tcp_streams`) is a gauge: the
+streams open on the tunnels held now. A stream outlives a tunnel that is removed
+under it; it is then out of the gauge, and the bytes it still carries are in the
+counters. A tunnel's own figures (the `tunnels` and `udp_sessions` rows, and the
+`bilbycast_relay_tunnel_*{tunnel_id=…}` series) go with it and start at 0 when
+its id is bound or registered again after it has gone. An edge that takes a side
+over from another, or a side that comes back while its peer stayed bound, keeps
+the tunnel and its figures.
+
+A datagram is counted in its own tunnel's atomics and nowhere else. A relay-wide
+atomic beside them would be one cache line written by every forwarding thread:
+measured on 24 cores, the tunnel lookup and count of one datagram (55-60 ns)
+took 13 % longer with two such atomics on one thread, and about 4 to 18 times as
+long on 8 and 16; with a cache-padded total per thread it took about 10 to 20 %
+longer. So each router keeps a `DepartedTunnels` (`stats.rs`) instead. Every
+removal goes through it: under its lock and the map's, the tunnel goes on its
+list and out of the map. A reader adds up the map, the list and what has been
+folded under the same lock, so a tunnel is in the sum once whenever the reader
+comes. One that a forwarding task still holds is kept whole, because the task
+may count into it yet; its counts are folded into one figure at the first
+removal after nothing holds it. The forward path takes no lock and does what it
+did before.
+
+**Upgrading from relay v0.20.0 or earlier.** Up to v0.20.0 each of the seven was
+a sum over the tunnels, or the native-UDP sessions, held when it was read, so it
+fell when one went: unbound, lost with its edges, removed by the manager or over
+REST, or reaped. `rate()` / `increase()` read that as a counter reset, and
+`total_bandwidth_bps` read 0 or low for the sample in which a tunnel ended. All
+seven now only grow, names, types and JSON keys unchanged. A panel or an alert
+that read a value as the traffic of the tunnels now up shows a total since the
+relay started: take its `rate()`, or sum what is held now. For the QUIC tunnels
+that is the per-tunnel series. A native-UDP session has no series of its own on
+`/metrics`; its figures are in its `udp_sessions` row (the manager's stats
+payload) or its `GET /api/v1/udp-sessions` row.
+
+On the manager, "Total Forwarded" and its neighbours on the relay's page become
+totals since the start. The Throughput column of the Flows page's relay table
+falls back to the byte total while the bandwidth reads 0, with the datagram total
+beneath. All three figures are the QUIC tunnels' only, so a relay that has
+carried QUIC tunnels and holds none shows those totals where it showed a dash:
+an idle one, and one that is busy with native-UDP sessions or bond legs alone.
+
+Pinned by `stats::tunnel_totals_tests` (a tunnel counted once wherever it is, a
+late count kept, a finished one let go, a removal that waits for a read to end
+and lists the tunnel before the map lets go of it), `tunnel_router::totals_tests`
+and `udp_relay::totals_tests` (every way out of each router, and no figure
+falling while tunnels are removed and bound again under four forwarding threads;
+the first also that a side bound before the empty tunnel is removed keeps it),
+`session::tunnel_counter_tests` (real edges, with a TCP stream that outlives its
+tunnel) and `manager::client::tunnel_counter_tests` (the four surfaces agree, and
+the bandwidth figure takes in a tunnel that ended).
+
 ## Viewer Distribution (optional role)
 
 Everything above is the opaque forwarder, and a plain `cargo build` is exactly
@@ -442,11 +514,14 @@ Security is defense-in-depth: end-to-end encryption protects payload confidentia
     - No RwLock anywhere; no lock taken per packet
 ```
 
-Three `Mutex`es exist, all off the forwarding path — do not read the bullet
-above as "`RelayStats` is lock-free in whole":
+The `Mutex`es in the relay are all off the forwarding path — do not read the
+bullet above as "`RelayStats` is lock-free in whole":
 
 | Site | Build | Cadence |
 |------|-------|---------|
 | `RelayStats::prev_sample` — the bandwidth sampler's previous reading (`stats.rs`) | every build, including the lean forwarder | the manager stats tick (1 s) and each `/api/v1/stats` request — never per datagram |
-| `OriginStore::order` — the eviction queue (`distribution/origin.rs`) | `viewer-distribution` only | per stored segment, held for queue surgery only, never across file I/O |
+| `DepartedTunnels` — what the tunnels that have left a router counted (`stats.rs`), one in each of the two routers | every build, including the lean forwarder | each tunnel or session removed, and each read of the [relay-wide counters](#relay-wide-counters): the manager's stats (1 s) and health (15 s) ticks, `/metrics` and `/api/v1/stats` — never per datagram |
+| `StreamOrigin::order` — the eviction queue of one stream (`distribution/origin.rs`) | `viewer-distribution` only | per stored segment, held for queue surgery only, never across file I/O |
+| `OriginStore::clip_admission` and `OriginStore::marks_lock` — clip admission, and writes of a stream's marks (`distribution/origin.rs`) | `viewer-distribution` only | per clip export and per marks edit, and both when a stream is removed |
+| `ViewerMetrics::inner` — the players' playback reports (`distribution/origin/metrics.rs`) | `viewer-distribution` only | per report and per telemetry tick |
 | `DistributionControl::drop_rx` — one-shot handoff of the drop-queue receiver (`distribution_control.rs`) | compiled into every build — `lib.rs` gates `distribution` but not `distribution_control`, so the non-gated manager client can hold a handle; only ever *constructed* on a distribution build | once, at subscribe |

@@ -232,13 +232,13 @@ The opaque forwarder is stateless — a restart drops connected edges, which all
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /health` | Public | Health check (always unauthenticated). Includes `udp_sessions_total` / `udp_sessions_active` for the native SRT/RIST plane, plus a `manager` object (`connected`, `disconnected_secs`, `reconnecting`) when a manager is configured — the only unauthenticated way to alert on a lost manager link. `distribution` reads `"running"` or `"stopped"` on a relay that runs (or ran) the viewer-distribution subsystem, and `udp_relay` reads `"stopped"` once the native-UDP plane has stopped: either one stopping leaves the relay forwarding and `status` at `"ok"`, so alert on these fields, not on the status code. The reason is in the log and the manager's Critical event, not here |
-| `GET /metrics` | Token | Prometheus metrics. Includes `bilbycast_relay_manager_connected` (gauge, 1 = link up, 0 = down) and `bilbycast_relay_manager_disconnected_seconds` (gauge, 0 while connected), both emitted only when a manager is configured |
+| `GET /metrics` | Token | Prometheus metrics. The relay-wide byte, stream and datagram counters only grow while the relay runs ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § Relay-Wide Counters; up to v0.20.0 they fell when a tunnel went). Includes `bilbycast_relay_manager_connected` (gauge, 1 = link up, 0 = down) and `bilbycast_relay_manager_disconnected_seconds` (gauge, 0 while connected), both emitted only when a manager is configured |
 | `GET /api/v1/tunnels` | Token | List active QUIC tunnels |
 | `DELETE /api/v1/tunnels/{id}` | Token (required) | Administrative teardown of a QUIC tunnel when the manager is unavailable. **Fail-closed**: returns `403` unless `api_token` is set |
 | `GET /api/v1/udp-sessions` | Token | List native SRT/RIST plain-UDP relay sessions |
 | `DELETE /api/v1/udp-sessions/{id}` | Token (required) | Administrative teardown of a native-UDP session. **Fail-closed** (same as the tunnel DELETE) |
 | `GET /api/v1/edges` | Token | List connected edges |
-| `GET /api/v1/stats` | Token | Bandwidth, throughput, peaks, uptime |
+| `GET /api/v1/stats` | Token | Bandwidth, the QUIC tunnels' relay-wide counters, peaks, uptime |
 
 "Token" auth means `Authorization: Bearer <api_token>` is required when `api_token` is configured. If no `api_token` is set, the read-only GETs are open, but the destructive `DELETE` routes refuse to run (return `403`) — a destructive route must never be reachable unauthenticated.
 
