@@ -7,8 +7,7 @@
 //! The relay is stateless — no authentication required. It pairs edges by
 //! tunnel ID and forwards encrypted traffic between them.
 
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +20,7 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::protocol::*;
 use crate::stats::RelayStats;
 use crate::tunnel_router::{BindResult, TunnelEndpoint, TunnelRouter};
+use crate::util::IpCounts;
 
 /// Counter for generating unique connection IDs.
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,11 +35,8 @@ pub struct SessionContext {
     /// Map of connection_id -> Connection for sending notifications.
     pub edge_connections: DashMap<String, Connection>,
     /// Per-IP connection counter — bounds the total active QUIC
-    /// connections from any single source IP (DoS mitigation). Atomic
-    /// so the increment + check is race-free across the spawn-per-
-    /// connection model. Entries are removed when their counter drops
-    /// to zero on disconnect.
-    pub connections_by_ip: DashMap<IpAddr, Arc<AtomicU32>>,
+    /// connections from any single source IP (DoS mitigation).
+    pub connections_by_ip: IpCounts,
     /// Global relay stats for peak tracking and connection counting.
     pub relay_stats: Arc<RelayStats>,
     /// Event sender for forwarding operational events to the manager.
@@ -56,18 +53,9 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
     let remote = connection.remote_address();
     let remote_ip = remote.ip();
 
-    // Per-IP connection cap — DoS mitigation. Increment first, then
-    // compare against the cap; if exceeded, decrement and reject.
-    // This is race-safe under spawn-per-connection because we never
-    // skip the decrement on rejection.
-    let ip_counter = ctx
-        .connections_by_ip
-        .entry(remote_ip)
-        .or_insert_with(|| Arc::new(AtomicU32::new(0)))
-        .clone();
-    let active = ip_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if active > ctx.max_connections_per_ip {
-        ip_counter.fetch_sub(1, Ordering::Relaxed);
+    // Per-IP connection cap — DoS mitigation. Checked and counted in one step.
+    // Every way out below this one gives the count back.
+    if let Err(active) = ctx.connections_by_ip.add(remote_ip, ctx.max_connections_per_ip) {
         tracing::warn!(
             "Rejecting QUIC connection from {remote}: per-IP cap of {} exceeded ({} active)",
             ctx.max_connections_per_ip,
@@ -111,8 +99,7 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         Err(e) => {
             tracing::warn!("Failed to accept control stream from {remote}: {e}");
             ctx.event_sender.emit_with_details(EventSeverity::Warning, category::EDGE, format!("Edge connection failed: control stream error from {}", remote), serde_json::json!({ "remote_addr": remote.to_string() }));
-            // Decrement the per-IP counter on early exit.
-            decrement_ip_counter(&ctx, &remote_ip);
+            ctx.connections_by_ip.remove(remote_ip);
             return;
         }
     };
@@ -165,7 +152,7 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
     tracing::info!("Connection '{connection_id}' disconnected from {remote}");
     ctx.event_sender.emit_with_details(EventSeverity::Info, category::EDGE, format!("Edge disconnected from {}", remote), serde_json::json!({ "remote_addr": remote.to_string() }));
     ctx.edge_connections.remove(&connection_id);
-    decrement_ip_counter(&ctx, &remote_ip);
+    ctx.connections_by_ip.remove(remote_ip);
 
     let affected = ctx.router.remove_edge(&connection_id);
     for (tunnel_id, peer_edge_id) in affected {
@@ -173,22 +160,6 @@ pub async fn handle_edge_connection(ctx: Arc<SessionContext>, connection: Connec
         ctx.event_sender.emit_with_id(EventSeverity::Warning, category::TUNNEL, "Tunnel down: edge disconnected", &tunnel_id_str);
         if let Some(peer_id) = peer_edge_id {
             notify_tunnel_down(&ctx, &peer_id, tunnel_id, "peer disconnected").await;
-        }
-    }
-}
-
-/// Decrement the per-IP connection counter, removing the map entry when
-/// it drops to zero. Safe to call exactly once per accepted-and-then-
-/// rejected or disconnected connection.
-fn decrement_ip_counter(ctx: &Arc<SessionContext>, ip: &IpAddr) {
-    if let Some(entry) = ctx.connections_by_ip.get(ip) {
-        let prev = entry.fetch_sub(1, Ordering::Relaxed);
-        // If we just dropped to zero, remove the entry. Use remove_if
-        // to avoid a TOCTOU between the load and remove.
-        if prev == 1 {
-            drop(entry);
-            ctx.connections_by_ip
-                .remove_if(ip, |_, counter| counter.load(Ordering::Relaxed) == 0);
         }
     }
 }
@@ -622,6 +593,14 @@ pub(crate) mod test_relay {
     /// The relay's address, the certificate an edge must trust to reach it,
     /// and its state.
     pub(crate) fn start_relay() -> (SocketAddr, CertificateDer<'static>, Arc<SessionContext>) {
+        start_relay_with(false, 64)
+    }
+
+    /// [`start_relay`] with its bind-auth policy and its per-IP cap.
+    pub(crate) fn start_relay_with(
+        require_bind_auth: bool,
+        max_connections_per_ip: u32,
+    ) -> (SocketAddr, CertificateDer<'static>, Arc<SessionContext>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
@@ -636,7 +615,13 @@ pub(crate) mod test_relay {
         let endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = endpoint.local_addr().unwrap();
         let (event_sender, _events) = crate::manager::event_channel();
-        let ctx = crate::server::create_session_context(Arc::new(RelayStats::new()), event_sender, false, 64, 100);
+        let ctx = crate::server::create_session_context(
+            Arc::new(RelayStats::new()),
+            event_sender,
+            require_bind_auth,
+            max_connections_per_ip,
+            100,
+        );
         let accept_ctx = ctx.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -879,5 +864,92 @@ mod tunnel_counter_tests {
         a_rx.read_to_end(1 << 16).await.unwrap();
         b_rx.read_to_end(1 << 16).await.unwrap();
         settle(&ctx, totals(4508, 80), "the stream ended").await;
+    }
+}
+
+#[cfg(test)]
+mod per_ip_cap_tests {
+    //! The cap on one address's connections, over real ones.
+    use super::test_relay::{edge, start_relay_with};
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::time::{Instant, sleep};
+
+    const HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    async fn assert_held(ctx: &SessionContext, want: Option<u32>, what: &str) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while ctx.connections_by_ip.held(HOST) != want && Instant::now() < until {
+            sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(ctx.connections_by_ip.held(HOST), want, "{what}");
+    }
+
+    #[tokio::test]
+    async fn a_full_cap_frees_up() {
+        let (relay, cert, ctx) = start_relay_with(false, 2);
+        assert_held(&ctx, None, "nobody").await;
+        // One that has not opened its control stream, as far as the relay can
+        // tell, and one that has.
+        let (_e1, silent, _s1, _r1) = edge(relay, &cert, 100).await;
+        let (_e2, talking, mut send, mut recv) = edge(relay, &cert, 100).await;
+        write_message(&mut send, &EdgeMessage::Ping).await.unwrap();
+        let pong: RelayMessage = read_message(&mut recv).await.unwrap();
+        assert!(matches!(pong, RelayMessage::Pong), "{pong:?}");
+        assert_held(&ctx, Some(2), "the cap").await;
+
+        let (_e3, refused, _s3, _r3) = edge(relay, &cert, 100).await;
+        match refused.closed().await {
+            quinn::ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.reason, "per-ip connection cap exceeded")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_held(&ctx, Some(2), "one refused").await;
+
+        silent.close(0u32.into(), b"");
+        assert_held(&ctx, Some(1), "closed before its control stream").await;
+        let (_e4, third, mut send, mut recv) = edge(relay, &cert, 100).await;
+        write_message(&mut send, &EdgeMessage::Ping).await.unwrap();
+        let pong: RelayMessage = read_message(&mut recv).await.unwrap();
+        assert!(matches!(pong, RelayMessage::Pong), "{pong:?}");
+        assert_held(&ctx, Some(2), "room for another").await;
+
+        talking.close(0u32.into(), b"");
+        assert_held(&ctx, Some(1), "closed with a session").await;
+        third.close(0u32.into(), b"");
+        assert_held(&ctx, None, "the last one closed").await;
+    }
+
+    /// Connections open and close on every thread, at a cap they never pass
+    /// between them: none is refused, and the count ends at those held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_count_ends_at_the_connections_held() {
+        let (relay, cert, ctx) = start_relay_with(false, 64);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(edge(relay, &cert, 100).await);
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for task in 0..4 {
+            let cert = cert.clone();
+            tasks.spawn(async move {
+                for round in 0..15 {
+                    let (_endpoint, connection, mut send, mut recv) = edge(relay, &cert, 100).await;
+                    if (task + round) % 2 == 0 {
+                        write_message(&mut send, &EdgeMessage::Ping).await.unwrap();
+                        let pong: RelayMessage = read_message(&mut recv).await.unwrap();
+                        assert!(matches!(pong, RelayMessage::Pong), "{pong:?}");
+                    }
+                    connection.close(0u32.into(), b"");
+                }
+            });
+        }
+        while let Some(task) = tasks.join_next().await {
+            task.unwrap();
+        }
+        assert_held(&ctx, Some(3), "the three held").await;
+        held.clear();
+        assert_held(&ctx, None, "none held").await;
     }
 }
