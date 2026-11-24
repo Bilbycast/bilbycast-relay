@@ -2079,15 +2079,12 @@ async fn execute_command(
                 .map_err(|e| format!("Invalid UUID: {e}"))?;
             let ingress_token = action["ingress_token"]
                 .as_str()
-                .ok_or("Missing ingress_token")?
-                .to_string();
+                .ok_or("Missing ingress_token")?;
             let egress_token = action["egress_token"]
                 .as_str()
-                .ok_or("Missing egress_token")?
-                .to_string();
+                .ok_or("Missing egress_token")?;
             tracing::info!("Manager command: authorize_tunnel '{tunnel_id}'");
-            ctx.router
-                .authorize_tunnel(tunnel_id, ingress_token, egress_token);
+            crate::session::authorize_tunnel(ctx, tunnel_id, ingress_token, egress_token);
             Ok(None)
         }
         "revoke_tunnel" => {
@@ -4133,6 +4130,7 @@ mod tunnel_counter_tests {
                 connection_id: format!("{direction:?}"),
                 direction,
                 connection: connection.clone(),
+                shown: None,
             });
         }
         ctx.router.route(&id, "Ingress").unwrap().stats
@@ -4155,8 +4153,8 @@ mod tunnel_counter_tests {
         let (source, destination): (SocketAddr, SocketAddr) =
             ("198.51.100.10:5000".parse().unwrap(), "203.0.113.7:6000".parse().unwrap());
         let register = |id| {
-            ctx.udp_sessions.latch(id, TunnelDirection::Egress, source, 0);
-            ctx.udp_sessions.latch(id, TunnelDirection::Ingress, destination, 0);
+            ctx.udp_sessions.latch(id, TunnelDirection::Egress, source, 0, None, None);
+            ctx.udp_sessions.latch(id, TunnelDirection::Ingress, destination, 0, None, None);
         };
         register(id);
         ctx.udp_sessions.forward_target(id, source, 700).unwrap();
@@ -4243,6 +4241,132 @@ mod tunnel_counter_tests {
             let bps = sample().await;
             // 80 000 bits in 200 ms, and no more than that.
             assert!((1..=400_000).contains(&bps), "REST {rest}, ingress {ingress}: {bps}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod authorize_tests {
+    //! `authorize_tunnel`, as the manager sends it.
+    use super::*;
+    use crate::protocol::{TunnelDirection, TunnelProtocol};
+    use crate::session::test_relay::{edge, start_relay};
+    use crate::tunnel_router::{TokenDigest, TunnelEndpoint};
+
+    #[tokio::test]
+    async fn the_command_registers_each_sides_token() {
+        let (relay, cert, ctx) = start_relay();
+        let (_endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
+        let id = Uuid::new_v4();
+        for (name, direction, shown) in [
+            ("source", TunnelDirection::Egress, Some("for egress")),
+            ("destination", TunnelDirection::Ingress, Some("for ingress")),
+            ("stranger", TunnelDirection::Ingress, None),
+        ] {
+            ctx.router.bind(id, TunnelProtocol::Udp, TunnelEndpoint {
+                edge_id: name.into(),
+                connection_id: name.into(),
+                direction,
+                connection: connection.clone(),
+                shown: shown.map(TokenDigest::of),
+            });
+        }
+        let holder = |direction| ctx.router.tunnel(&id).unwrap().side(direction).unwrap().edge_id.clone();
+        assert_eq!(holder(TunnelDirection::Ingress), "stranger");
+
+        let action = |ingress: Option<&str>, egress: Option<&str>| {
+            serde_json::json!({ "tunnel_id": id, "ingress_token": ingress, "egress_token": egress })
+        };
+        for (action, missing) in [
+            (action(None, Some("for egress")), "Missing ingress_token"),
+            (action(Some("for ingress"), None), "Missing egress_token"),
+        ] {
+            let refused = execute_command("authorize_tunnel", &action, &ctx).await;
+            assert_eq!(refused, Err(missing.to_string()));
+            assert_eq!(holder(TunnelDirection::Ingress), "stranger");
+        }
+        let action = action(Some("for ingress"), Some("for egress"));
+        assert_eq!(execute_command("authorize_tunnel", &action, &ctx).await, Ok(None));
+        assert_eq!(holder(TunnelDirection::Ingress), "destination");
+        assert_eq!(holder(TunnelDirection::Egress), "source");
+        for (direction, token) in
+            [(TunnelDirection::Ingress, "for ingress"), (TunnelDirection::Egress, "for egress")]
+        {
+            let registered = ctx.router.registered_token(&id, direction).unwrap();
+            assert!(registered.matches(&TokenDigest::of(token)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod removal_notice_tests {
+    //! What the edges of a tunnel are told when it is removed under them: what
+    //! every release tells them, and neither of the reasons that are about a
+    //! peer, by which an edge keeps to the bind it has.
+    use super::*;
+    use crate::protocol::{
+        EdgeMessage, RelayMessage, TunnelDirection, TunnelProtocol, read_message, write_message,
+    };
+    use crate::session::test_relay::{edge, start_relay};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn the_edges_of_a_removed_tunnel_are_told_that_it_was() {
+        let (relay, cert, ctx) = start_relay();
+        let token = "t".repeat(32);
+        let router = crate::api::create_router(Arc::new(crate::api::ApiState {
+            ctx: ctx.clone(),
+            relay_stats: ctx.relay_stats.clone(),
+            api_token: Some(token.clone()),
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        for by_rest in [false, true] {
+            let id = Uuid::new_v4();
+            let mut edges = Vec::new();
+            for direction in [TunnelDirection::Ingress, TunnelDirection::Egress] {
+                let mut edge = edge(relay, &cert, 100).await;
+                let bind = EdgeMessage::TunnelBind {
+                    tunnel_id: id,
+                    direction,
+                    protocol: TunnelProtocol::Udp,
+                    bind_token: None,
+                };
+                write_message(&mut edge.2, &bind).await.unwrap();
+                let _: RelayMessage = read_message(&mut edge.3).await.unwrap();
+                edges.push(edge);
+            }
+            // That the other bound.
+            edges[0].1.accept_uni().await.unwrap();
+
+            let reason = if by_rest {
+                let mut http = tokio::net::TcpStream::connect(api).await.unwrap();
+                let request = format!(
+                    "DELETE /api/v1/tunnels/{id} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                );
+                http.write_all(request.as_bytes()).await.unwrap();
+                let mut response = String::new();
+                http.read_to_string(&mut response).await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                "tunnel deleted via relay REST API"
+            } else {
+                let action = serde_json::json!({ "tunnel_id": id });
+                assert_eq!(execute_command("close_tunnel", &action, &ctx).await, Ok(None));
+                "tunnel closed by manager"
+            };
+            for edge in &edges {
+                let mut notice = edge.1.accept_uni().await.unwrap();
+                match read_message(&mut notice).await.unwrap() {
+                    RelayMessage::TunnelDown { tunnel_id, reason: told } => {
+                        assert_eq!((tunnel_id, &told[..]), (id, reason));
+                        assert!(told != crate::protocol::PEER_DISCONNECTED);
+                        assert!(told != crate::protocol::PEER_UNBOUND);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
         }
     }
 }

@@ -3,15 +3,34 @@
 
 //! Tunnel routing: pairs ingress and egress edges by tunnel ID and forwards data.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use dashmap::mapref::one::Ref;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::protocol::{TunnelDirection, TunnelProtocol};
 use crate::stats::{Counted, DepartedTunnels, TunnelStats, TunnelStatsSnapshot, TunnelTotals};
+
+/// The SHA-256 of a bind token. What a holder showed is remembered as this:
+/// 32 bytes, however long the token it sent.
+#[derive(Clone, Copy)]
+pub struct TokenDigest([u8; 32]);
+
+impl TokenDigest {
+    pub fn of(token: &str) -> Self {
+        Self(Sha256::digest(token.as_bytes()).into())
+    }
+
+    /// In constant time, as the tokens themselves would be compared.
+    pub fn matches(&self, other: &Self) -> bool {
+        crate::util::constant_time_eq(&self.0, &other.0)
+    }
+}
 
 /// A registered tunnel endpoint (one side — ingress or egress).
 pub struct TunnelEndpoint {
@@ -21,6 +40,9 @@ pub struct TunnelEndpoint {
     pub connection_id: String,
     pub direction: TunnelDirection,
     pub connection: quinn::Connection,
+    /// The token its bind showed, the right one or not: with none registered
+    /// for the tunnel, any bind may be taken.
+    pub shown: Option<TokenDigest>,
 }
 
 /// State of a tunnel as tracked by the router.
@@ -29,10 +51,74 @@ pub struct TunnelState {
     pub protocol: TunnelProtocol,
     pub ingress: Option<TunnelEndpoint>,
     pub egress: Option<TunnelEndpoint>,
+    /// The endpoints a later bind took their side over from, the one taken
+    /// over last at the end. Each is connected and has not unbound since, and
+    /// is told nothing: [`Self::give_back`] can make it the holder again.
+    displaced: Vec<TunnelEndpoint>,
     pub stats: Arc<TunnelStats>,
 }
 
 impl TunnelState {
+    fn new(tunnel_id: Uuid, protocol: TunnelProtocol) -> Self {
+        Self {
+            tunnel_id,
+            protocol,
+            ingress: None,
+            egress: None,
+            displaced: Vec::new(),
+            stats: Arc::new(TunnelStats::new()),
+        }
+    }
+
+    pub fn side(&self, direction: TunnelDirection) -> Option<&TunnelEndpoint> {
+        match direction {
+            TunnelDirection::Ingress => self.ingress.as_ref(),
+            TunnelDirection::Egress => self.egress.as_ref(),
+        }
+    }
+
+    fn side_mut(&mut self, direction: TunnelDirection) -> &mut Option<TunnelEndpoint> {
+        match direction {
+            TunnelDirection::Ingress => &mut self.ingress,
+            TunnelDirection::Egress => &mut self.egress,
+        }
+    }
+
+    /// Make `endpoint` its side's holder.
+    fn hold(&mut self, endpoint: TunnelEndpoint) {
+        let direction = endpoint.direction;
+        let same = |e: &TunnelEndpoint| {
+            e.direction == direction && e.connection_id == endpoint.connection_id
+        };
+        self.displaced.retain(|e| !same(e));
+        // A connection that binds its side again takes it from nobody.
+        if let Some(older) = self.side_mut(direction).take_if(|e| !same(e)) {
+            self.displaced.push(older);
+        }
+        *self.side_mut(direction) = Some(endpoint);
+    }
+
+    /// Make the last connection displaced from this side to have shown `token`
+    /// its holder again, unless the holder has shown it too.
+    fn give_back(&mut self, direction: TunnelDirection, token: &TokenDigest) -> Option<GivenBack> {
+        let shows = |e: &TunnelEndpoint| e.shown.is_some_and(|shown| shown.matches(token));
+        let holder = self.side(direction);
+        if holder.is_some_and(shows) {
+            return None;
+        }
+        let from = holder.map(|e| e.connection.remote_address());
+        let last = self.displaced.iter().rposition(|e| e.direction == direction && shows(e))?;
+        let endpoint = self.displaced.remove(last);
+        let given = GivenBack {
+            direction,
+            connection_id: endpoint.connection_id.clone(),
+            to: endpoint.connection.remote_address(),
+            from,
+        };
+        self.hold(endpoint);
+        Some(given)
+    }
+
     pub fn is_active(&self) -> bool {
         self.ingress.is_some() && self.egress.is_some()
     }
@@ -75,6 +161,15 @@ pub struct TunnelInfo {
     pub stats: TunnelStatsSnapshot,
 }
 
+/// A side that went back to the connection that had shown its token.
+pub struct GivenBack {
+    pub direction: TunnelDirection,
+    pub connection_id: String,
+    pub to: SocketAddr,
+    /// Who held it. Nobody, if whoever took it over has left.
+    pub from: Option<SocketAddr>,
+}
+
 /// Where data that a connection sends on a tunnel goes.
 pub struct Route {
     /// The side the sender bound.
@@ -95,9 +190,9 @@ pub enum NoRoute {
 }
 
 /// Pre-authorized bind tokens for a tunnel (set by manager via authorize_tunnel command).
-pub struct AuthorizedTunnel {
-    pub ingress_token: String,
-    pub egress_token: String,
+struct AuthorizedTunnel {
+    ingress_token: TokenDigest,
+    egress_token: TokenDigest,
 }
 
 /// The tunnel router manages all active and pending tunnels.
@@ -128,14 +223,31 @@ impl TunnelRouter {
     }
 
     /// Register expected bind tokens for a tunnel (called by manager authorize_tunnel command).
-    pub fn authorize_tunnel(&self, tunnel_id: Uuid, ingress_token: String, egress_token: String) {
-        self.authorized_tokens.insert(
-            tunnel_id,
-            AuthorizedTunnel {
-                ingress_token,
-                egress_token,
-            },
-        );
+    ///
+    /// A side bound before they came is not given up for want of its token
+    /// alone. An edge that the manager cannot reach still shows the token it
+    /// had, and one without a bind secret shows none; neither could bind again.
+    /// The holder loses its side to a bind that shows the token, and here to a
+    /// connection it took the side from that had shown it: that one is
+    /// connected, and no bind of its own will come. Returns those sides.
+    pub fn authorize_tunnel(
+        &self,
+        tunnel_id: Uuid,
+        ingress_token: &str,
+        egress_token: &str,
+    ) -> Vec<GivenBack> {
+        let ingress_token = TokenDigest::of(ingress_token);
+        let egress_token = TokenDigest::of(egress_token);
+        self.authorized_tokens.insert(tunnel_id, AuthorizedTunnel { ingress_token, egress_token });
+        // After the tokens are in. `bind` asks for them under the tunnel's
+        // lock, so one that got by without is in the tunnel by now.
+        let Some(mut state) = self.tunnels.get_mut(&tunnel_id) else {
+            return Vec::new();
+        };
+        [(TunnelDirection::Ingress, ingress_token), (TunnelDirection::Egress, egress_token)]
+            .into_iter()
+            .filter_map(|(direction, token)| state.give_back(direction, &token))
+            .collect()
     }
 
     /// Remove authorization for a tunnel.
@@ -143,39 +255,38 @@ impl TunnelRouter {
         self.authorized_tokens.remove(tunnel_id);
     }
 
+    /// The token registered for a tunnel+direction, if there is one.
+    pub fn registered_token(
+        &self,
+        tunnel_id: &Uuid,
+        direction: TunnelDirection,
+    ) -> Option<TokenDigest> {
+        self.authorized_tokens.get(tunnel_id).map(|auth| match direction {
+            TunnelDirection::Ingress => auth.ingress_token,
+            TunnelDirection::Egress => auth.egress_token,
+        })
+    }
+
     /// Verify a bind token for a tunnel+direction.
     ///
-    /// Returns `true` if the provided bind_token matches the expected token
-    /// for the given direction. When no authorization is registered for this
-    /// tunnel: permissive mode (`require_bind_auth = false`, default) returns
-    /// `true` for backwards compatibility; strict mode returns `false`.
+    /// Returns `true` if the token shown is the expected one for the given
+    /// direction. When no authorization is registered for this tunnel:
+    /// permissive mode (`require_bind_auth = false`, default) returns `true`
+    /// for backwards compatibility; strict mode returns `false`.
     pub fn verify_bind_token(
         &self,
         tunnel_id: &Uuid,
         direction: TunnelDirection,
-        bind_token: Option<&str>,
+        shown: Option<&TokenDigest>,
     ) -> bool {
-        let Some(auth) = self.authorized_tokens.get(tunnel_id) else {
-            // No authorization registered: fail-closed in strict mode,
-            // fail-open in permissive (backwards-compatible) mode.
-            return !self.require_bind_auth;
-        };
-
-        let expected = match direction {
-            TunnelDirection::Ingress => &auth.ingress_token,
-            TunnelDirection::Egress => &auth.egress_token,
-        };
-
-        let Some(provided) = bind_token else {
-            // Authorization exists but no token provided
-            return false;
-        };
-
-        // Constant-time comparison to prevent timing attacks
-        crate::util::constant_time_eq(expected.as_bytes(), provided.as_bytes())
+        match self.registered_token(tunnel_id, direction) {
+            Some(expected) => shown.is_some_and(|shown| shown.matches(&expected)),
+            None => !self.require_bind_auth,
+        }
     }
 
-    /// Bind a tunnel endpoint. Returns (was_newly_activated, peer_connection_if_active).
+    /// Bind a tunnel endpoint, if the token it shows is verified. Nothing
+    /// changes if it is not.
     ///
     /// If both sides are now bound, the tunnel becomes active.
     pub fn bind(
@@ -184,26 +295,16 @@ impl TunnelRouter {
         protocol: TunnelProtocol,
         endpoint: TunnelEndpoint,
     ) -> BindResult {
-        let direction = endpoint.direction;
-
-        let mut entry = self.tunnels.entry(tunnel_id).or_insert_with(|| TunnelState {
-            tunnel_id,
-            protocol,
-            ingress: None,
-            egress: None,
-            stats: Arc::new(TunnelStats::new()),
-        });
-
-        let state = entry.value_mut();
-
-        match direction {
-            TunnelDirection::Ingress => {
-                state.ingress = Some(endpoint);
-            }
-            TunnelDirection::Egress => {
-                state.egress = Some(endpoint);
-            }
+        let entry = self.tunnels.entry(tunnel_id);
+        // Under the tunnel's lock: see `authorize_tunnel`.
+        if !self.verify_bind_token(&tunnel_id, endpoint.direction, endpoint.shown.as_ref()) {
+            return BindResult::Refused;
         }
+        let mut state = match entry {
+            Entry::Occupied(held) => held.into_ref(),
+            Entry::Vacant(free) => free.insert(TunnelState::new(tunnel_id, protocol)),
+        };
+        state.hold(endpoint);
 
         if state.is_active() {
             BindResult::Active
@@ -215,22 +316,27 @@ impl TunnelRouter {
     /// Unbind a tunnel endpoint (edge disconnected or explicitly unbound).
     /// Uses `connection_id` for matching. Returns the peer's `connection_id` for notification.
     pub fn unbind(&self, tunnel_id: &Uuid, connection_id: &str) -> Option<String> {
-        let mut peer_connection_id = None;
+        self.release(tunnel_id, connection_id).flatten()
+    }
+
+    /// [`Self::unbind`]. `None` if the connection held no side, else the
+    /// connection that holds the other, if one does.
+    fn release(&self, tunnel_id: &Uuid, connection_id: &str) -> Option<Option<String>> {
+        let mut released = None;
 
         if let Some(mut entry) = self.tunnels.get_mut(tunnel_id) {
             let state = entry.value_mut();
+            state.displaced.retain(|e| e.connection_id != connection_id);
 
             if let Some(ref ingress) = state.ingress
                 && ingress.connection_id == connection_id {
                     state.ingress = None;
-                    peer_connection_id =
-                        state.egress.as_ref().map(|e| e.connection_id.clone());
+                    released = Some(state.egress.as_ref().map(|e| e.connection_id.clone()));
                 }
             if let Some(ref egress) = state.egress
                 && egress.connection_id == connection_id {
                     state.egress = None;
-                    peer_connection_id =
-                        state.ingress.as_ref().map(|e| e.connection_id.clone());
+                    released = Some(state.ingress.as_ref().map(|e| e.connection_id.clone()));
                 }
 
             // If both sides are gone, remove the tunnel entirely, unless one
@@ -242,7 +348,7 @@ impl TunnelRouter {
             }
         }
 
-        peer_connection_id
+        released
     }
 
     /// Forcibly and authoritatively remove a tunnel by its tunnel id.
@@ -275,32 +381,49 @@ impl TunnelRouter {
     }
 
     /// Remove all tunnel endpoints for a given edge (edge disconnected).
-    /// Uses `connection_id` for matching. Returns list of (tunnel_id, peer_connection_id).
+    /// Uses `connection_id` for matching. Returns the tunnels it held a side
+    /// of, as a list of (tunnel_id, peer_connection_id).
     pub fn remove_edge(&self, connection_id: &str) -> Vec<(Uuid, Option<String>)> {
         let mut affected = Vec::new();
 
-        // Collect tunnel IDs that this edge participates in
+        // Collect the tunnels this edge has bound
         let tunnel_ids: Vec<Uuid> = self
             .tunnels
             .iter()
             .filter(|entry| {
                 let s = entry.value();
-                s.ingress
-                    .as_ref()
-                    .is_some_and(|e| e.connection_id == connection_id)
-                    || s.egress
-                        .as_ref()
-                        .is_some_and(|e| e.connection_id == connection_id)
+                let its = |e: &TunnelEndpoint| e.connection_id == connection_id;
+                s.ingress.as_ref().is_some_and(its)
+                    || s.egress.as_ref().is_some_and(its)
+                    || s.displaced.iter().any(its)
             })
             .map(|entry| *entry.key())
             .collect();
 
         for tid in tunnel_ids {
-            let peer = self.unbind(&tid, connection_id);
-            affected.push((tid, peer));
+            if let Some(peer) = self.release(&tid, connection_id) {
+                affected.push((tid, peer));
+            }
         }
 
         affected
+    }
+
+    /// Whether `connection_id` has bound this side and not unbound it: it holds
+    /// the side, or it is remembered as the one the side was taken over from.
+    pub fn has_bound(
+        &self,
+        tunnel_id: &Uuid,
+        direction: TunnelDirection,
+        connection_id: &str,
+    ) -> bool {
+        self.tunnels.get(tunnel_id).is_some_and(|state| {
+            state
+                .side(direction)
+                .into_iter()
+                .chain(&state.displaced)
+                .any(|e| e.direction == direction && e.connection_id == connection_id)
+        })
     }
 
     /// Where data from `connection_id` on this tunnel goes. Only a connection
@@ -382,6 +505,8 @@ impl TunnelRouter {
 
 /// Result of binding a tunnel endpoint.
 pub enum BindResult {
+    /// The token shown is not the side's.
+    Refused,
     /// Tunnel is now active (both sides bound).
     Active,
     /// Waiting for the peer to bind.
@@ -396,18 +521,22 @@ mod tests {
         Uuid::new_v4()
     }
 
+    fn verify(router: &TunnelRouter, t: &Uuid, direction: TunnelDirection, token: Option<&str>) -> bool {
+        router.verify_bind_token(t, direction, token.map(TokenDigest::of).as_ref())
+    }
+
     #[test]
     fn permissive_mode_allows_unauthorized_tunnel() {
         let router = TunnelRouter::with_auth_policy(false);
-        assert!(router.verify_bind_token(&tid(), TunnelDirection::Ingress, None));
-        assert!(router.verify_bind_token(&tid(), TunnelDirection::Egress, Some("anything")));
+        assert!(verify(&router, &tid(), TunnelDirection::Ingress, None));
+        assert!(verify(&router, &tid(), TunnelDirection::Egress, Some("anything")));
     }
 
     #[test]
     fn strict_mode_rejects_unauthorized_tunnel() {
         let router = TunnelRouter::with_auth_policy(true);
-        assert!(!router.verify_bind_token(&tid(), TunnelDirection::Ingress, None));
-        assert!(!router.verify_bind_token(&tid(), TunnelDirection::Egress, Some("anything")));
+        assert!(!verify(&router, &tid(), TunnelDirection::Ingress, None));
+        assert!(!verify(&router, &tid(), TunnelDirection::Egress, Some("anything")));
     }
 
     #[test]
@@ -415,16 +544,16 @@ mod tests {
         for strict in [false, true] {
             let router = TunnelRouter::with_auth_policy(strict);
             let t = tid();
-            router.authorize_tunnel(t, "ingress-tok".into(), "egress-tok".into());
+            router.authorize_tunnel(t, "ingress-tok", "egress-tok");
 
             // Correct tokens accepted.
-            assert!(router.verify_bind_token(&t, TunnelDirection::Ingress, Some("ingress-tok")));
-            assert!(router.verify_bind_token(&t, TunnelDirection::Egress, Some("egress-tok")));
+            assert!(verify(&router, &t, TunnelDirection::Ingress, Some("ingress-tok")));
+            assert!(verify(&router, &t, TunnelDirection::Egress, Some("egress-tok")));
 
             // Wrong direction, wrong value, and missing token all rejected.
-            assert!(!router.verify_bind_token(&t, TunnelDirection::Ingress, Some("egress-tok")));
-            assert!(!router.verify_bind_token(&t, TunnelDirection::Ingress, Some("nope")));
-            assert!(!router.verify_bind_token(&t, TunnelDirection::Ingress, None));
+            assert!(!verify(&router, &t, TunnelDirection::Ingress, Some("egress-tok")));
+            assert!(!verify(&router, &t, TunnelDirection::Ingress, Some("nope")));
+            assert!(!verify(&router, &t, TunnelDirection::Ingress, None));
         }
     }
 
@@ -433,14 +562,67 @@ mod tests {
         let t = tid();
 
         let strict = TunnelRouter::with_auth_policy(true);
-        strict.authorize_tunnel(t, "a".into(), "b".into());
+        strict.authorize_tunnel(t, "a", "b");
         strict.revoke_tunnel(&t);
-        assert!(!strict.verify_bind_token(&t, TunnelDirection::Ingress, Some("a")));
+        assert!(!verify(&strict, &t, TunnelDirection::Ingress, Some("a")));
 
         let permissive = TunnelRouter::with_auth_policy(false);
-        permissive.authorize_tunnel(t, "a".into(), "b".into());
+        permissive.authorize_tunnel(t, "a", "b");
         permissive.revoke_tunnel(&t);
-        assert!(permissive.verify_bind_token(&t, TunnelDirection::Ingress, None));
+        assert!(verify(&permissive, &t, TunnelDirection::Ingress, None));
+    }
+}
+
+#[cfg(test)]
+mod displaced_tests {
+    use super::*;
+    use crate::session::test_relay::{edge, start_relay};
+
+    /// Two connections take a side from each other, and bind it again while
+    /// they have it, as often as they like: the router remembers each of them
+    /// once, and the one that has the side not as one it was taken from.
+    #[tokio::test]
+    async fn a_connection_is_remembered_once() {
+        let (relay, cert, _ctx) = start_relay();
+        let (_endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
+        let router = TunnelRouter::with_auth_policy(false);
+        let id = Uuid::new_v4();
+        let bind = |name: &str, direction| {
+            router.bind(id, TunnelProtocol::Udp, TunnelEndpoint {
+                edge_id: name.into(),
+                connection_id: name.into(),
+                direction,
+                connection: connection.clone(),
+                shown: None,
+            });
+        };
+        let displaced = || -> Vec<(String, TunnelDirection)> {
+            let state = router.tunnel(&id).unwrap();
+            state.displaced.iter().map(|e| (e.connection_id.clone(), e.direction)).collect()
+        };
+        let (ingress, egress) = (TunnelDirection::Ingress, TunnelDirection::Egress);
+        for _ in 0..3 {
+            bind("a", ingress);
+            assert_eq!(displaced(), []);
+        }
+        for _ in 0..50 {
+            bind("b", ingress);
+            assert_eq!(displaced(), [("a".into(), ingress)]);
+            bind("b", ingress);
+            assert_eq!(displaced(), [("a".into(), ingress)]);
+            bind("a", ingress);
+            assert_eq!(displaced(), [("b".into(), ingress)]);
+        }
+        // On the other side, as well as on this.
+        bind("b", egress);
+        bind("a", egress);
+        assert_eq!(displaced(), [("b".into(), ingress), ("b".into(), egress)]);
+        bind("b", egress);
+        assert_eq!(displaced(), [("b".into(), ingress), ("a".into(), egress)]);
+        router.unbind(&id, "b");
+        assert_eq!(displaced(), [("a".into(), egress)]);
+        assert!(router.remove_edge("a").len() == 1);
+        assert_eq!(router.counts(), (0, 0));
     }
 }
 
@@ -459,6 +641,7 @@ mod totals_tests {
                 connection_id: format!("{name}-{direction:?}"),
                 direction,
                 connection: connection.clone(),
+                shown: None,
             });
         }
     }

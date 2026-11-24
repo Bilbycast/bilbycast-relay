@@ -157,7 +157,9 @@ pub struct RelayConfig {
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
 
-    /// Maximum tunnel binds a single QUIC connection may establish.
+    /// Maximum tunnel sides a single QUIC connection may have bound at a
+    /// time: each counts once however often it is bound, and both sides
+    /// of one tunnel count as two.
     /// Defaults to 100 — far above any realistic edge workload.
     /// Excess `TunnelBind` messages on the same connection are
     /// rejected with `TunnelDown { reason: "per-connection tunnel
