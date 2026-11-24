@@ -426,14 +426,15 @@ dependency. Full reference: [`docs/distribution.md`](docs/distribution.md).
   (`PeerPin`). Non-zero `offpath_sessions` means a
   source-spoofed ICE reflection attempt or a viewer whose IP changed mid-session
   (that viewer goes black until it re-POSTs its WHEP offer). `superseded_frames`
-  counts frames a live ingest published while a newer one held its stream. The
-  four counters — `bytes_out`, `offpath_sessions` and those two — are relay-wide
-  and monotonic, on the hub; each `StreamState` counts into the hub's first two
-  beside its own. Up to v0.20.0 those two were a sum over the streams the hub
-  held and fell when one ended (relay#29). `StreamSnapshot`
+  counts frames a live ingest published while a newer one held its stream.
+  `bytes_out`, `offpath_sessions`, `other_path_datagrams` and
+  `superseded_frames` are relay-wide and monotonic, on the hub; each
+  `StreamState` counts into the hub's `bytes_out` and `offpath_sessions` beside
+  its own. Up to v0.20.0 `bytes_out` and `offpath_sessions` were a sum over the
+  streams the hub held and fell when one ended (relay#29). `StreamSnapshot`
   keeps a stream's own `bytes_out` / `offpath_sessions`, which restart with the
   stream, a take-over and a take-back included (`inherit` does not carry them).
-  The last two are exported as
+  `other_path_datagrams` and `superseded_frames` are exported as
   `bilbycast_relay_distribution_other_path_datagrams_total` and
   `…_superseded_frames_total`, and additive on the health and stats payloads.
   `offpath_sessions` is exported as

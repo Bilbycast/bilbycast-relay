@@ -1277,8 +1277,10 @@ mod tests {
     /// viewer — and are the sum over every stream there has been, what a
     /// viewer counts on one that has closed included.
     ///
-    /// Before, `/metrics` exported the sum over the streams the hub held as
-    /// two counters, and both fell at each of those but the first.
+    /// Until 2026-11 `/metrics` exported the sum over the streams the hub held
+    /// as two counters, so what a stream had counted left them with it: when
+    /// it ended, when a newer ingest's took its place (a take-over, or a
+    /// take-back from an older ingest), and when it went with its last viewer.
     #[test]
     fn the_relay_wide_counts_never_fall_and_sum_every_stream_there_has_been() {
         struct Watch<'a> {
