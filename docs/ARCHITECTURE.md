@@ -89,7 +89,7 @@ The relay carries three logically distinct path types, all forwarded the same op
 |  |                               |  |     DashMap<String, Conn>  |       |
 |  |   bind() -> Active|Waiting    |  |                            |       |
 |  |   unbind() -> notify peer     |  |   No shared_secret.        |       |
-|  |   get_peer_connection()       |  |   Per-IP conn cap (64),    |       |
+|  |   route() -> peer or refused  |  |   Per-IP conn cap (64),    |       |
 |  |   remove_edge() -> cleanup    |  |   per-conn tunnel cap (100)|       |
 |  +-------------------------------+  +----------------------------+       |
 |                  |                                                        |
@@ -175,7 +175,8 @@ below.
                           <---------     TunnelWaiting
 
   3a. TCP: Open bi-stream ---------->
-      Send StreamHeader              Read header, lookup peer
+      Send StreamHeader              Read header; reset if the sender
+                                       holds no side of the tunnel
                                      Open bi-stream to peer
                                      Write StreamHeader to peer
                                      tokio::join!(
@@ -184,7 +185,8 @@ below.
                                      )
 
   3b. UDP: Send datagram ----------->
-      [16B tunnel_id | payload]      Extract UUID, lookup peer
+      [16B tunnel_id | payload]      Extract UUID; drop if the sender
+                                       holds no side of the tunnel
                                      send_datagram() to peer
                                      (best-effort, drop on overflow)
 
@@ -195,6 +197,72 @@ below.
 ```
 
 No Auth/AuthOk/AuthError exchange on the control stream. Tunnel bind authentication is inline via the `bind_token` field on `TunnelBind`. The manager pre-authorizes tunnels via WebSocket `authorize_tunnel` command before edges connect. If no authorization exists for a tunnel, unauthenticated bind is allowed (backwards compatible). The Hello/HelloAck exchange is optional — it provides version awareness but does not gate access. Unknown message types are gracefully ignored via `read_message_resilient()` (returns `ParsedMessage::Unknown` instead of a deserialization error).
+
+## Who May Send into a QUIC Tunnel
+
+A connection sends into a tunnel only while it holds one of the tunnel's two
+sides, and only as that side. The side is the one its `TunnelBind` took, which
+is where its bind token was checked. `TunnelRouter::route` asks this of every
+datagram, and of every data stream when its header arrives, in the one map
+lookup that also gives the peer and the counters.
+
+| The sender | Its datagram | Its data stream |
+|---|---|---|
+| holds a side, and the other is bound | forwarded, counted as from that side | opened through to the peer, counted |
+| holds a side, and nobody holds the other | dropped, not counted | ends empty at its opener, not counted |
+| holds both sides | sent back to it, counted as from ingress | the same |
+| holds neither, or there is no such tunnel | dropped, not counted | reset and stopped with code 1: no stream is opened to anyone, nothing is counted |
+
+The last row is one answer on purpose, so that a sender cannot tell from it
+which tunnel ids are in use. It is logged at debug like a malformed datagram,
+and raises no event: a sender that goes on must not fill the log or the event
+queue.
+
+A side belongs to the connection that bound it last. Once a newer connection has
+taken it over, what the older one still sends is dropped until it binds again. A
+data stream already forwarded runs to its end, whoever holds the side by then.
+A datagram the relay handles before its sender's own bind is dropped, and so is
+one whose peer has not bound yet; nothing is queued.
+
+**Edges.** Every edge tag from v0.7.0 to v0.117.0 binds a tunnel on a connection
+opened for it, sends the tunnel's data on no other, and starts to send only
+after it has read `TunnelReady` for that tunnel (`connect_and_bind` in the
+edge's `src/tunnel/relay_client.rs`). The failback probe (since v0.21.0) opens
+another connection, to the primary relay, which carries a `Hello` and no data.
+The relay sends `TunnelReady` once both sides are in the router, so no edge
+sends before its bind. Three things an edge sends can meet the last row:
+
+- what is still in flight on a connection when the edge has bound another in its
+  place (after a failure it dials the new one at least a second later);
+- what it goes on sending after its tunnel was removed under it (`close_tunnel`,
+  the REST delete), until it binds again;
+- what it goes on sending on a side that another edge has bound since, until it
+  binds again. The relay does not tell it that its side is gone.
+
+**Upgrading from relay v0.20.0 or earlier.** Up to v0.20.0 a connection that was
+not the tunnel's bound ingress was taken for its egress, whether or not it had
+bound anything. So any QUIC connection that knew a tunnel's id could send
+datagrams to its ingress edge, and open streams to it, with no bind token even
+under `require_bind_auth`, and all of it was counted as the tunnel's own. No
+edge has to change and there is no upgrade order. What an operator may notice: a
+client of their own that sent into a tunnel without binding it no longer gets
+through; a tunnel's byte and datagram counts no longer include what such a
+client sent; an edge whose tunnel was removed under it is no longer heard by a
+receiver that bound again on its own; and where two edges bind the same side of
+a tunnel (a cloned or restored config, a spare left running), only the one that
+bound last is heard. Up to v0.20.0 an older egress edge was still forwarded to
+the ingress. Now it goes silent without notice until it binds again, and the
+newer one leaving does not bring it back. `GET /api/v1/tunnels` shows the id and
+the remote address of the edge that holds each side.
+
+Up to v0.20.0 a connection or native-UDP session that ended just as another
+began from the same address could also take that address's count below zero, and
+the relay could then refuse it (`relay_dos_suspect`) until a restart. That no
+longer happens.
+
+Pinned by `session::bound_sender_tests` (real QUIC on loopback), the counts by
+`util::ip_count_tests`, `session::per_ip_cap_tests` and
+`udp_relay::removal_race_tests`.
 
 ## Tunnel State Machine
 
@@ -257,7 +325,7 @@ No Auth/AuthOk/AuthError exchange on the control stream. Tunnel bind authenticat
        v                                                  |
   QUIC datagram ------> [Datagram Loop]              QUIC datagram
   [16B UUID|payload]     Extract tunnel_id           [16B UUID|payload]
-                         Lookup peer conn
+                         Sender bound? Peer conn
                          send_datagram() ----------->
                          (2MB buffer, drop on full)
 
@@ -294,7 +362,18 @@ tunnel).
 ```
 
 Auth reuses the QUIC path's bind-token registry (the manager's `authorize_tunnel`
-tokens), and the same per-IP session cap bounds DoS.
+tokens), and the same per-IP session cap bounds DoS. A session counts on the
+address that created it, from its first `Register` until it is removed, both
+under the session's own lock. The reaper asks again whether a session is idle as
+it removes it, so one on which a `Register` was accepted or a datagram forwarded
+in between is kept.
+
+A media datagram is taken only from the address latched in one of its session's
+two slots, and goes to the other slot; one from any other address is dropped.
+That address is all there is to know a sender by on this plane: the bind token
+is checked on `Register`, not per datagram, and a source address can be forged.
+Whoever knows a tunnel id and the address of one side can therefore send as that
+side. The AEAD between the edges is what refuses such a datagram.
 
 Two further rules bound the rendezvous, both inside `UdpSessionRouter::latch` so
 they hold for every caller. A `Register` from an address no host can own
@@ -350,9 +429,10 @@ the tunnel and its figures.
 
 A datagram is counted in its own tunnel's atomics and nowhere else. A relay-wide
 atomic beside them would be one cache line written by every forwarding thread:
-measured on 24 cores, the tunnel lookup and count of one datagram (55-60 ns)
-took 13 % longer with two such atomics on one thread, and about 4 to 18 times as
-long on 8 and 16; with a cache-padded total per thread it took about 10 to 20 %
+measured on 24 cores, the tunnel lookup and count of one datagram (55-60 ns,
+with the two map lookups it took then; 45-47 ns with the one it takes now) took
+13 % longer with two such atomics on one thread, and about 4 to 18 times as long
+on 8 and 16; with a cache-padded total per thread it took about 10 to 20 %
 longer. So each router keeps a `DepartedTunnels` (`stats.rs`) instead. Every
 removal goes through it: under its lock and the map's, the tunnel goes on its
 list and out of the map. A reader adds up the map, the list and what has been
@@ -471,6 +551,7 @@ box. See [`portal.md`](portal.md).
   | Layer 5: Tunnel Isolation                                      |
   |   - Tunnel IDs must be valid UUIDs (v4 random)                 |
   |   - Brute-force discovery infeasible (2^122 search space)      |
+  |   - Data taken only from a connection that holds a side        |
   |   - Data routed only to the bound peer (ingress <-> egress)    |
   |   - No cross-tunnel data leakage possible via TunnelRouter     |
   +---------------------------------------------------------------+

@@ -75,6 +75,25 @@ pub struct TunnelInfo {
     pub stats: TunnelStatsSnapshot,
 }
 
+/// Where data that a connection sends on a tunnel goes.
+pub struct Route {
+    /// The side the sender bound.
+    pub from: TunnelDirection,
+    /// The connection bound to the other side.
+    pub peer: quinn::Connection,
+    pub stats: Arc<TunnelStats>,
+}
+
+/// Why data that a connection sends on a tunnel goes nowhere.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NoRoute {
+    /// The sender holds neither side of the tunnel, or there is no such
+    /// tunnel. One answer for both: a sender cannot tell which ids are in use.
+    NotBound,
+    /// The sender holds one side and nobody holds the other.
+    NoPeer,
+}
+
 /// Pre-authorized bind tokens for a tunnel (set by manager via authorize_tunnel command).
 pub struct AuthorizedTunnel {
     pub ingress_token: String,
@@ -284,19 +303,30 @@ impl TunnelRouter {
         affected
     }
 
-    /// Look up a tunnel to find the peer connection for forwarding.
-    pub fn get_peer_connection(
-        &self,
-        tunnel_id: &Uuid,
-        from_direction: TunnelDirection,
-    ) -> Option<(quinn::Connection, Arc<TunnelStats>)> {
-        self.tunnels.get(tunnel_id).and_then(|entry| {
-            let state = entry.value();
-            let peer = match from_direction {
-                TunnelDirection::Ingress => state.egress.as_ref(),
-                TunnelDirection::Egress => state.ingress.as_ref(),
-            };
-            peer.map(|p| (p.connection.clone(), state.stats.clone()))
+    /// Where data from `connection_id` on this tunnel goes. Only a connection
+    /// that holds a side of the tunnel may send on it, and it sends as that
+    /// side, as ingress if it holds both. One that has bound nothing, and so
+    /// shown no token, sends nothing; nor does one whose side a newer
+    /// connection has taken over.
+    ///
+    /// Asked for every datagram, so it looks the tunnel up once.
+    pub fn route(&self, tunnel_id: &Uuid, connection_id: &str) -> Result<Route, NoRoute> {
+        let state = self.tunnels.get(tunnel_id).ok_or(NoRoute::NotBound)?;
+        let holds = |side: &Option<TunnelEndpoint>| {
+            side.as_ref().is_some_and(|e| e.connection_id == connection_id)
+        };
+        let (from, other) = if holds(&state.ingress) {
+            (TunnelDirection::Ingress, &state.egress)
+        } else if holds(&state.egress) {
+            (TunnelDirection::Egress, &state.ingress)
+        } else {
+            return Err(NoRoute::NotBound);
+        };
+        let other = other.as_ref().ok_or(NoRoute::NoPeer)?;
+        Ok(Route {
+            from,
+            peer: other.connection.clone(),
+            stats: state.stats.clone(),
         })
     }
 
@@ -433,10 +463,11 @@ mod totals_tests {
         }
     }
 
-    /// Count one datagram of `bytes` as a session forwarding it would: look
-    /// the tunnel up, send, count. The tunnel may be removed in between.
-    fn forward(router: &TunnelRouter, id: &Uuid, bytes: u64) -> bool {
-        let Some((_peer, stats)) = router.get_peer_connection(id, TunnelDirection::Ingress) else {
+    /// Count one datagram of `bytes` as the session of the ingress that `name`
+    /// bound would: look the tunnel up, send, count. The tunnel may be removed
+    /// in between.
+    fn forward(router: &TunnelRouter, id: &Uuid, name: &str, bytes: u64) -> bool {
+        let Ok(Route { stats, .. }) = router.route(id, &format!("{name}-Ingress")) else {
             return false;
         };
         pause();
@@ -482,7 +513,7 @@ mod totals_tests {
         let router = TunnelRouter::with_auth_policy(false);
         let id = Uuid::new_v4();
         bind(&router, id, "a", &connection);
-        assert!(forward(&router, &id, 10));
+        assert!(forward(&router, &id, "a", 10));
         router.unbind(&id, "a-Ingress");
 
         let wait = Duration::from_secs(10);
@@ -505,7 +536,7 @@ mod totals_tests {
             unbind.join().unwrap();
         });
         assert_eq!(router.counts(), (1, 1));
-        assert!(forward(&router, &id, 5));
+        assert!(forward(&router, &id, "b", 5));
         assert_eq!(router.list_tunnels()[0].stats.bytes_ingress, 15);
         assert_eq!(router.totals(), totals(15, 2));
     }
@@ -521,10 +552,10 @@ mod totals_tests {
         assert_eq!(router.totals(), totals(0, 0));
 
         bind(&router, id, "a", &connection);
-        assert!(forward(&router, &id, 10));
+        assert!(forward(&router, &id, "a", 10));
         assert_eq!(router.totals(), totals(10, 1));
         bind(&router, id, "b", &connection);
-        assert!(forward(&router, &id, 5));
+        assert!(forward(&router, &id, "b", 5));
         assert_eq!(router.totals(), totals(15, 2), "another edge took both sides over");
         assert_eq!(router.list_tunnels()[0].stats.bytes_ingress, 15, "of the one tunnel");
         assert!(router.remove_edge("a-Ingress").is_empty(), "the edges taken over from");
@@ -537,7 +568,7 @@ mod totals_tests {
         assert_eq!(router.totals(), totals(15, 2), "unbound");
 
         bind(&router, id, "c", &connection);
-        assert!(forward(&router, &id, 100));
+        assert!(forward(&router, &id, "c", 100));
         assert_eq!(router.list_tunnels()[0].stats.bytes_ingress, 100, "its own, from nothing");
         assert!(router.force_remove_tunnel(&id).is_some());
         assert_eq!(router.totals(), totals(115, 3), "removed by force");
@@ -545,7 +576,7 @@ mod totals_tests {
         assert_eq!(router.totals(), totals(115, 3));
 
         bind(&router, id, "d", &connection);
-        assert!(forward(&router, &id, 1000));
+        assert!(forward(&router, &id, "d", 1000));
         router.remove_edge("d-Ingress");
         router.remove_edge("d-Egress");
         assert_eq!(router.counts(), (0, 0));
@@ -569,7 +600,7 @@ mod totals_tests {
                     s.spawn(move || {
                         let mut counted = 0;
                         while !stop.load(Ordering::Relaxed) {
-                            counted += u64::from(forward(router, &id, 1316));
+                            counted += u64::from(forward(router, &id, "e", 1316));
                             pause();
                         }
                         counted

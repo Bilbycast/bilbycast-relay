@@ -21,7 +21,7 @@
 //! The existing QUIC tunnel path is untouched; this runs as a parallel task.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,7 @@ use crate::protocol::{
 };
 use crate::session::SessionContext;
 use crate::stats::{Counted, DepartedTunnels, TunnelStats, TunnelTotals};
+use crate::util::IpCounts;
 
 /// Session is reaped after this long with no register/keepalive or data.
 /// Edges re-register every ~5 s (see the edge `udp_relay_client`), so a 30 s
@@ -306,7 +307,7 @@ pub struct UdpSessionRouter {
     sessions: DashMap<Uuid, Arc<UdpSession>>,
     departed: DepartedTunnels,
     /// Per-source-IP session-creation counter (DoS mitigation).
-    sessions_by_ip: DashMap<IpAddr, Arc<AtomicU32>>,
+    sessions_by_ip: IpCounts,
     max_sessions_per_ip: u32,
 }
 
@@ -331,7 +332,7 @@ impl UdpSessionRouter {
         Self {
             sessions: DashMap::new(),
             departed: DepartedTunnels::default(),
-            sessions_by_ip: DashMap::new(),
+            sessions_by_ip: IpCounts::default(),
             max_sessions_per_ip,
         }
     }
@@ -340,8 +341,10 @@ impl UdpSessionRouter {
     ///
     /// The per-IP creation cap + counter bump + insert happen atomically under
     /// the DashMap shard entry lock, so they're counted exactly once per session
-    /// (and freed once in [`Self::remove`]). Lock order is always
-    /// `sessions` → `sessions_by_ip`, matching [`Self::remove`] — no deadlock.
+    /// (and freed once in [`Self::remove_if`]). Lock order is always
+    /// `sessions` → `sessions_by_ip`, matching [`Self::remove_if`] — no
+    /// deadlock. The entry stays locked to the end, so a session is not removed
+    /// between being found here and being marked as seen.
     pub fn latch(
         &self,
         tunnel_id: Uuid,
@@ -366,19 +369,12 @@ impl UdpSessionRouter {
 
         let ip = src.ip();
         let session = match self.sessions.entry(tunnel_id) {
-            Entry::Occupied(o) => o.get().clone(),
+            Entry::Occupied(o) => o.into_ref(),
             Entry::Vacant(v) => {
-                let counter = self
-                    .sessions_by_ip
-                    .entry(ip)
-                    .or_insert_with(|| Arc::new(AtomicU32::new(0)))
-                    .clone();
-                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if n > self.max_sessions_per_ip {
-                    counter.fetch_sub(1, Ordering::Relaxed);
+                if self.sessions_by_ip.add(ip, self.max_sessions_per_ip).is_err() {
                     return LatchResult::RejectedDosCap;
                 }
-                v.insert(Arc::new(UdpSession::new(tunnel_id, ip))).clone()
+                v.insert(Arc::new(UdpSession::new(tunnel_id, ip)))
             }
         };
         // A tunnel's two ends are two distinct edge sockets, so the two slots
@@ -516,33 +512,37 @@ impl UdpSessionRouter {
     pub fn reap_idle(&self) -> usize {
         let now = now_ms();
         let cutoff = SESSION_IDLE_TIMEOUT.as_millis() as u64;
+        let is_stale = |session: &Arc<UdpSession>| {
+            now.saturating_sub(session.last_seen_ms.load(Ordering::Relaxed)) > cutoff
+        };
         let stale: Vec<Uuid> = self
             .sessions
             .iter()
-            .filter(|e| now.saturating_sub(e.value().last_seen_ms.load(Ordering::Relaxed)) > cutoff)
+            .filter(|e| is_stale(e.value()))
             .map(|e| *e.key())
             .collect();
-        for id in &stale {
-            self.remove(id);
-        }
-        stale.len()
+        // Asked again as each is removed: one that has registered since stays.
+        stale.iter().filter(|id| self.remove_if(id, is_stale)).count()
     }
 
-    /// Force-remove a session (idle reap or REST escape hatch).
+    /// Force-remove a session (REST escape hatch or manager command).
     pub fn remove(&self, tunnel_id: &Uuid) -> bool {
-        if let Some(session) = self.departed.remove(&self.sessions, tunnel_id) {
-            if let Some(c) = self.sessions_by_ip.get(&session.creator_ip) {
-                let prev = c.fetch_sub(1, Ordering::Relaxed);
-                if prev == 1 {
-                    drop(c);
-                    self.sessions_by_ip
-                        .remove_if(&session.creator_ip, |_, v| v.load(Ordering::Relaxed) == 0);
-                }
+        self.remove_if(tunnel_id, |_| true)
+    }
+
+    /// Remove a session if it is `gone`, and give back what it counts on its
+    /// creator's address. Asked and given back under the session's entry lock,
+    /// like the rest of [`Self::latch`]'s bookkeeping: an address never counts
+    /// a session that is not in the map.
+    fn remove_if(&self, tunnel_id: &Uuid, gone: impl FnOnce(&Arc<UdpSession>) -> bool) -> bool {
+        let removed = self.departed.remove_if(&self.sessions, tunnel_id, |session| {
+            let gone = gone(session);
+            if gone {
+                self.sessions_by_ip.remove(session.creator_ip);
             }
-            true
-        } else {
-            false
-        }
+            gone
+        });
+        removed.is_some()
     }
 
     /// What every native-UDP session has counted since the relay started, the
@@ -1411,5 +1411,114 @@ mod totals_tests {
         });
         assert!(datagrams > 0 && reads > 0, "{datagrams} datagrams, {reads} reads");
         assert_eq!(r.totals(), totals(datagrams * 1316, 0, datagrams));
+    }
+}
+
+#[cfg(test)]
+mod removal_race_tests {
+    //! Sessions that are removed while others, or the same one, register.
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    const HOST: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+
+    fn latch(r: &UdpSessionRouter, t: Uuid, port: u16) -> bool {
+        let src = SocketAddr::new(HOST, port);
+        matches!(r.latch(t, TunnelDirection::Egress, src, 0), LatchResult::Ok(_))
+    }
+
+    fn make_stale(r: &UdpSessionRouter, t: Uuid) {
+        if let Some(s) = r.sessions.get(&t) {
+            s.last_seen_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The sessions of one address are created and removed on several threads
+    /// at once. Each thread holds one at a time, so a cap of one each refuses
+    /// nobody, and then the cap holds as if nothing had happened.
+    #[test]
+    fn the_per_ip_count_survives_sessions_coming_and_going() {
+        std::thread::scope(|s| {
+            // Routers side by side, for more of the rare interleavings.
+            for threads in [3, 3, 3, 4, 4, 4] {
+                s.spawn(move || {
+                    let r = &UdpSessionRouter::new(u32::from(threads));
+                    std::thread::scope(|s| {
+                        for port in 1..=threads {
+                            s.spawn(move || {
+                                let t = Uuid::new_v4();
+                                for _ in 0..150_000 {
+                                    assert!(latch(r, t, port), "refused below the cap");
+                                    assert!(r.remove(&t));
+                                }
+                            });
+                        }
+                    });
+                    assert_eq!((r.count(), r.sessions_by_ip.held(HOST)), (0, None));
+
+                    let held: Vec<Uuid> = (0..threads).map(|_| Uuid::new_v4()).collect();
+                    for (t, port) in held.iter().zip(1..) {
+                        assert!(latch(r, *t, port), "refused below the cap");
+                    }
+                    assert!(!latch(r, Uuid::new_v4(), 100), "past the cap");
+                    assert_eq!(r.sessions_by_ip.held(HOST), Some(u32::from(threads)));
+                    assert!(r.remove(&held[0]));
+                    assert!(latch(r, Uuid::new_v4(), 100), "a full cap frees up");
+                });
+            }
+        });
+    }
+
+    /// The reaper finds a session idle, and a datagram is forwarded on it
+    /// before the reaper comes to remove it.
+    #[test]
+    fn a_session_seen_again_before_it_is_reaped_stays() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        assert!(latch(&r, t, 5000));
+        make_stale(&r, t);
+        let reaped = std::thread::scope(|s| {
+            // As `forward_target` holds it: the reaper finds the session, and
+            // waits to remove it.
+            let session = r.sessions.get(&t).unwrap();
+            let reaper = s.spawn(|| r.reap_idle());
+            std::thread::sleep(Duration::from_millis(100));
+            session.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+            drop(session);
+            reaper.join().unwrap()
+        });
+        assert_eq!((reaped, r.count()), (0, 1));
+        assert_eq!(r.sessions_by_ip.held(HOST), Some(1));
+
+        make_stale(&r, t);
+        assert_eq!((r.reap_idle(), r.count()), (1, 0));
+        assert_eq!(r.sessions_by_ip.held(HOST), None);
+    }
+
+    /// An idle session registers again as fast as it can while the reaper
+    /// runs: no register is refused, though the cap is one, and each leaves a
+    /// session behind.
+    #[test]
+    fn a_session_that_registers_again_is_never_reaped() {
+        let r = &UdpSessionRouter::new(1);
+        let t = Uuid::new_v4();
+        let stop = &AtomicBool::new(false);
+        let (refused, lost) = std::thread::scope(|s| {
+            s.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    r.reap_idle();
+                }
+            });
+            let (mut refused, mut lost) = (0, 0);
+            for _ in 0..1_000_000 {
+                make_stale(r, t);
+                refused += u32::from(!latch(r, t, 5000));
+                lost += u32::from(!r.sessions.contains_key(&t));
+            }
+            stop.store(true, Ordering::Relaxed);
+            (refused, lost)
+        });
+        assert_eq!((refused, lost), (0, 0));
+        assert_eq!(r.sessions_by_ip.held(HOST), Some(1));
     }
 }

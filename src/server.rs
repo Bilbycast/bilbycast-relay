@@ -146,7 +146,7 @@ pub fn create_session_context(
             max_connections_per_ip,
         )),
         edge_connections: dashmap::DashMap::new(),
-        connections_by_ip: dashmap::DashMap::new(),
+        connections_by_ip: crate::util::IpCounts::default(),
         relay_stats,
         event_sender,
         max_connections_per_ip,
