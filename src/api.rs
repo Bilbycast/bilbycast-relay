@@ -364,7 +364,7 @@ async fn list_edges(State(state): State<Arc<ApiState>>) -> Json<EdgesResponse> {
 
 // ── /metrics (Prometheus) ──
 
-async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+pub(crate) async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     use std::fmt::Write;
     let mut out = String::with_capacity(8192);
 

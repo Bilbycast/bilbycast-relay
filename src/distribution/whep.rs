@@ -501,4 +501,34 @@ mod tests {
             2 * SC.len() + sps.len() + idr.len()
         );
     }
+
+    /// What a viewer is sent, video and audio, counts once on its stream and
+    /// once on the hub's relay-wide total.
+    #[tokio::test]
+    async fn video_and_audio_count_on_the_stream_and_the_hub() {
+        let config = |ice_lite| SessionConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_ip: None,
+            ice_lite,
+        };
+        let mut viewer = WebrtcSession::new(&config(false)).await.unwrap();
+        let mut relay = WebrtcSession::new(&config(true)).await.unwrap();
+        let (offer, _pending) = viewer.create_offer(true, true, false).unwrap();
+        let answer = relay.accept_offer(&offer).unwrap();
+        let mut mids = answer
+            .lines()
+            .filter_map(|l| l.trim_end().strip_prefix("a=mid:"))
+            .map(str0m::media::Mid::from);
+        let (video, audio) = (mids.next().unwrap(), mids.next().unwrap());
+        let (video_pt, audio_pt) = (relay.get_pt(video).unwrap(), relay.get_pt(audio).unwrap());
+
+        let hub = DistributionHub::new();
+        let sub = hub.subscribe("s1");
+        let au = EsFrame::video(0, bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]), true);
+        write_video(&mut relay, video, video_pt, &au, &sub).await;
+        assert_eq!((sub.state.bytes_out(), hub.bytes_out()), (6, 6));
+        let opus = EsFrame::audio(0, bytes::Bytes::from_static(&[0xfc, 0x01, 0x02]));
+        write_audio(&mut relay, audio, audio_pt, &opus, &sub).await;
+        assert_eq!((sub.state.bytes_out(), hub.bytes_out()), (9, 9));
+    }
 }

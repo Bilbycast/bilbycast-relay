@@ -90,6 +90,14 @@ pub struct StreamState {
     /// ([`StreamSnapshot::has_audio`]): a WHEP viewer's answer takes its
     /// audio m-line from the viewer's own offer, never from this.
     has_audio: AtomicBool,
+    // This stream's own counts, for the per-stream breakdown
+    // ([`StreamSnapshot`]). They restart with the stream: a newer ingest that
+    // takes a held stream over, and an older one that takes it back, publish
+    // into a fresh `StreamState` (or the unclaimed one viewers wait on), and
+    // the viewers of the closed one end with it. They are not carried over
+    // ([`StreamState::inherit`]): a viewer of the closed stream still counts
+    // into that one until it ends, so a copied figure would be neither
+    // stream's. Relay-wide totals are the hub's.
     viewers: AtomicU64,
     frames_in: AtomicU64,
     bytes_in: AtomicU64,
@@ -99,13 +107,19 @@ pub struct StreamState {
     /// once per session, never per datagram — a reflection attempt is a flood
     /// by construction and the alarm must not become its own amplifier.
     offpath_sessions: AtomicU64,
+    /// The hub's relay-wide totals of the two above
+    /// ([`DistributionHub::bytes_out`], [`DistributionHub::offpath_sessions`]),
+    /// counted with them, so what a viewer still counts on a stream that has
+    /// closed is in the totals too.
+    hub_bytes_out: Arc<AtomicU64>,
+    hub_offpath_sessions: Arc<AtomicU64>,
 }
 
 impl StreamState {
-    fn new(stream_id: String, owner: u64) -> Self {
+    fn new(hub: &DistributionHub, stream_id: &str, owner: u64) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(VIEWER_CHANNEL_CAPACITY);
-        Self {
-            stream_id,
+        Arc::new(Self {
+            stream_id: stream_id.to_string(),
             tx: ArcSwapOption::from_pointee(tx),
             owner: AtomicU64::new(owner),
             keyframe: ArcSwapOption::empty(),
@@ -116,7 +130,9 @@ impl StreamState {
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             offpath_sessions: AtomicU64::new(0),
-        }
+            hub_bytes_out: hub.bytes_out.clone(),
+            hub_offpath_sessions: hub.offpath_sessions.clone(),
+        })
     }
 
     pub fn stream_id(&self) -> &str {
@@ -131,6 +147,7 @@ impl StreamState {
         self.has_audio.load(Ordering::Relaxed)
     }
 
+    /// Bytes forwarded to this stream's viewers since it opened.
     pub fn bytes_out(&self) -> u64 {
         self.bytes_out.load(Ordering::Relaxed)
     }
@@ -146,20 +163,24 @@ impl StreamState {
 
     /// Count bytes actually forwarded to viewers (per-viewer SRTP output is
     /// larger; this is the pre-encryption ES accounting for the traffic-share
-    /// telemetry).
+    /// telemetry), on this stream and on the hub's total.
     pub fn add_bytes_out(&self, n: u64) {
         self.bytes_out.fetch_add(n, Ordering::Relaxed);
+        self.hub_bytes_out.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Sessions on this stream that hit the WebRTC ingress source pin.
+    /// Sessions on this stream that hit the WebRTC ingress source pin since
+    /// it opened.
     pub fn offpath_sessions(&self) -> u64 {
         self.offpath_sessions.load(Ordering::Relaxed)
     }
 
-    /// Record that one viewer session refused an off-path datagram. Called
-    /// once per session, on its first drop.
+    /// Record that one viewer session refused an off-path datagram, on this
+    /// stream and on the hub's total. Called once per session, on its first
+    /// drop.
     pub fn add_offpath_session(&self) {
         self.offpath_sessions.fetch_add(1, Ordering::Relaxed);
+        self.hub_offpath_sessions.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Publish one elementary frame, or hand it back (`Err`) when the stream
@@ -231,7 +252,8 @@ impl StreamState {
     /// so the stream's telemetry does not read audio-less until the next
     /// audio frame (a viewer's answer takes its audio from the viewer's
     /// offer, not from this). Not the keyframe: the cached one is from before
-    /// the stream was taken, so viewers start on the next.
+    /// the stream was taken, so viewers start on the next. Nor the counts,
+    /// which are the stream's own.
     fn inherit(&self, from: &StreamState) {
         self.param_sets.store(from.param_sets.load_full());
         if from.has_audio() {
@@ -485,6 +507,12 @@ pub struct DistributionHub {
     /// raise no alarm. Shared with every session (see
     /// [`DistributionHub::other_path_counter`]).
     other_path_datagrams: Arc<AtomicU64>,
+    /// Bytes forwarded to viewers on every stream there has been. Shared with
+    /// every [`StreamState`], which counts into it beside its own figure.
+    bytes_out: Arc<AtomicU64>,
+    /// Viewer sessions, on every stream there has been, that had a datagram
+    /// refused by the WebRTC ingress source pin. Shared likewise.
+    offpath_sessions: Arc<AtomicU64>,
 }
 
 impl DistributionHub {
@@ -512,7 +540,7 @@ impl DistributionHub {
     /// end leaves this stream alone.
     pub fn claim(&self, stream_id: &str) -> Publisher<'_> {
         let seq = self.claims.fetch_add(1, Ordering::Relaxed) + 1;
-        let fresh = || Arc::new(StreamState::new(stream_id.to_string(), seq));
+        let fresh = || StreamState::new(self, stream_id, seq);
         let (state, superseded) = match self.streams.entry(stream_id.to_string()) {
             Entry::Vacant(e) => (e.insert(fresh()).clone(), None),
             Entry::Occupied(mut e) => {
@@ -561,7 +589,7 @@ impl DistributionHub {
         {
             return None;
         }
-        let fresh = || Arc::new(StreamState::new(stream_id.to_string(), seq));
+        let fresh = || StreamState::new(self, stream_id, seq);
         let (state, displaced) = match self.streams.entry(stream_id.to_string()) {
             Entry::Vacant(e) => (e.insert(fresh()).clone(), None),
             Entry::Occupied(mut e) => {
@@ -614,7 +642,7 @@ impl DistributionHub {
                 None => self
                     .streams
                     .entry(stream_id.to_string())
-                    .or_insert_with(|| Arc::new(StreamState::new(stream_id.to_string(), UNCLAIMED)))
+                    .or_insert_with(|| StreamState::new(self, stream_id, UNCLAIMED))
                     .subscribe(&self.streams),
             };
             if let Some(sub) = sub {
@@ -639,6 +667,18 @@ impl DistributionHub {
     /// relay-wide.
     pub fn superseded_frames(&self) -> u64 {
         self.superseded_frames.load(Ordering::Relaxed)
+    }
+
+    /// Bytes forwarded to viewers, relay-wide, for the life of the process.
+    /// A stream that ends, or is taken over, leaves what it counted here.
+    pub fn bytes_out(&self) -> u64 {
+        self.bytes_out.load(Ordering::Relaxed)
+    }
+
+    /// Viewer sessions that hit the WebRTC ingress source pin, relay-wide,
+    /// for the life of the process, likewise.
+    pub fn offpath_sessions(&self) -> u64 {
+        self.offpath_sessions.load(Ordering::Relaxed)
     }
 
     /// Snapshot every live stream's counters for telemetry.
@@ -672,7 +712,10 @@ impl DistributionHub {
     }
 }
 
-/// Per-stream telemetry snapshot.
+/// Per-stream telemetry snapshot. Its counts are the stream's own, so they
+/// restart with it — when it ends and is published again, and when another
+/// ingest takes it over or back. The figures that never fall are the hub's
+/// ([`DistributionHub::bytes_out`], [`DistributionHub::offpath_sessions`]).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StreamSnapshot {
     pub stream_id: String,
@@ -1226,5 +1269,133 @@ mod tests {
             ],
             "behind the SPS / PPS its source sent last"
         );
+    }
+
+    /// The relay-wide bytes-out and off-path counts never fall — not when a
+    /// viewer leaves, a stream ends, a newer ingest takes one over, the older
+    /// one takes it back, or a stream no ingest ever held goes with its last
+    /// viewer — and are the sum over every stream there has been, what a
+    /// viewer counts on one that has closed included.
+    ///
+    /// Before, `/metrics` exported the sum over the streams the hub held as
+    /// two counters, and both fell at each of those but the first.
+    #[test]
+    fn the_relay_wide_counts_never_fall_and_sum_every_stream_there_has_been() {
+        struct Watch<'a> {
+            hub: &'a DistributionHub,
+            /// Every stream there has been, so far.
+            ever: Vec<Arc<StreamState>>,
+            /// What was counted, and so what the hub must read, always.
+            counted: (u64, u64),
+        }
+        impl Watch<'_> {
+            /// A viewer of `state` is sent `bytes`, and `offpath` of them hit
+            /// the source pin.
+            fn count(&mut self, state: &Arc<StreamState>, bytes: u64, offpath: u64) {
+                if !self.ever.iter().any(|s| Arc::ptr_eq(s, state)) {
+                    self.ever.push(state.clone());
+                }
+                state.add_bytes_out(bytes);
+                for _ in 0..offpath {
+                    state.add_offpath_session();
+                }
+                self.counted.0 += bytes;
+                self.counted.1 += offpath;
+                self.check("a viewer counted");
+            }
+            fn check(&self, when: &str) {
+                assert_eq!((self.hub.bytes_out(), self.hub.offpath_sessions()), self.counted, "{when}");
+                let sum = self
+                    .ever
+                    .iter()
+                    .fold((0, 0), |(b, o), s| (b + s.bytes_out(), o + s.offpath_sessions()));
+                assert_eq!(sum, self.counted, "{when}: the sum over every stream there has been");
+            }
+        }
+
+        let hub = DistributionHub::new();
+        let mut w = Watch { hub: &hub, ever: Vec::new(), counted: (0, 0) };
+        w.check("nothing counted");
+
+        let old = hub.claim("s1");
+        let viewer = hub.subscribe("s1");
+        w.count(&viewer.state, 1000, 1);
+        drop(viewer);
+        w.check("a viewer left");
+        let other = hub.claim("s2");
+        w.count(&hub.subscribe("s2").state, 70, 2);
+
+        let old_viewer = hub.subscribe("s1");
+        let new = hub.claim("s1");
+        w.check("a newer ingest took the stream over");
+        // The older stream's viewer takes what was sent before it closed.
+        w.count(&old_viewer.state, 500, 1);
+        w.count(&hub.subscribe("s1").state, 30, 1);
+
+        assert_eq!(new.end(), StreamEnd::Closed);
+        w.check("the newer ingest's stream ended");
+        old.publish(EsFrame::video(0, idr_au(), true));
+        w.check("the older ingest took the stream back");
+        w.count(&hub.subscribe("s1").state, 9, 1);
+
+        // A newer ingest displaces one that took the stream back.
+        let a = hub.claim("s3");
+        let b = hub.claim("s3");
+        assert_eq!(hub.claim("s3").end(), StreamEnd::Closed);
+        a.publish(EsFrame::video(0, idr_au(), true));
+        w.count(&hub.subscribe("s3").state, 11, 1);
+        b.publish(EsFrame::video(0, idr_au(), true));
+        w.check("a newer ingest took it back from an older one");
+        w.count(&hub.subscribe("s3").state, 13, 1);
+
+        let waiting = hub.subscribe("s4");
+        w.count(&waiting.state, 0, 1);
+        drop(waiting);
+        w.check("a stream no ingest held left with its last viewer");
+
+        drop((old, other, a, b));
+        assert_eq!(hub.stream_count(), 0);
+        w.check("every stream ended");
+        assert_eq!(w.counted, (1633, 9));
+        assert_eq!(w.ever.len(), 7, "each a stream of its own");
+    }
+
+    /// A stream's own counts are its own: they carry on over an ingest that
+    /// takes a stream viewers wait on, and start from nothing in the one a
+    /// newer ingest takes over and the one an older one takes back. A viewer
+    /// of a closed stream goes on counting into that one until it ends, so a
+    /// figure copied at the take-over would be neither stream's.
+    #[test]
+    fn a_streams_own_counts_start_again_at_a_take_over_and_a_take_back() {
+        let hub = DistributionHub::new();
+        let counts = || {
+            let snap = hub.snapshot();
+            assert_eq!(snap.len(), 1);
+            let s = &snap[0];
+            (s.frames_in, s.bytes_in, s.bytes_out, s.offpath_sessions)
+        };
+        let count = |state: &StreamState| {
+            state.add_bytes_out(100);
+            state.add_offpath_session();
+        };
+        let au = idr_au().len() as u64;
+
+        let waiting = hub.subscribe("s1");
+        waiting.state.add_offpath_session();
+        let old = hub.claim("s1");
+        assert_eq!(counts(), (0, 0, 0, 1), "the stream viewers waited on, as it was");
+        old.publish(EsFrame::video(0, idr_au(), true));
+        count(&waiting.state);
+        assert_eq!(counts(), (1, au, 100, 2));
+
+        let new = hub.claim("s1");
+        assert_eq!(counts(), (0, 0, 0, 0), "a newer ingest's stream");
+        count(&waiting.state);
+        assert_eq!(counts(), (0, 0, 0, 0), "which the closed one's viewer is not on");
+
+        assert_eq!(new.end(), StreamEnd::Closed);
+        old.publish(EsFrame::video(0, idr_au(), true));
+        assert_eq!(counts(), (1, au, 0, 0), "the stream the older ingest took back");
+        assert_eq!((hub.bytes_out(), hub.offpath_sessions()), (200, 3));
     }
 }

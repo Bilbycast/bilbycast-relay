@@ -3938,6 +3938,106 @@ mod stopped_subsystem_health_tests {
     }
 }
 
+#[cfg(all(test, feature = "viewer-distribution"))]
+mod distribution_counter_tests {
+    //! relay#29: `bilbycast_relay_distribution_bytes_out_total` and
+    //! `…_offpath_sessions` are counters, so neither falls while the relay
+    //! runs. Both fell when a stream ended (up to v0.20.0).
+    use super::*;
+    use crate::config::RelayConfig;
+    use crate::distribution::es::EsFrame;
+    use crate::distribution::hub::DistributionHub;
+    use crate::distribution::origin::{OriginConfig, OriginStore, metrics::ViewerMetrics};
+    use axum::response::IntoResponse;
+
+    /// What the telemetry tick publishes reads the same on `/metrics`, the
+    /// health payload and the stats payload, and none of it falls when a
+    /// viewer leaves, a newer push takes the stream over, the older one takes
+    /// it back, or the stream ends.
+    #[tokio::test]
+    async fn metrics_health_and_stats_agree_and_never_fall() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = OriginStore::new(OriginConfig {
+            root: dir.path().join("origin"),
+            retention: Duration::from_secs(3600),
+            max_bytes_per_stream: 1 << 30,
+            min_segments: 8,
+            min_free_bytes: 0,
+            idle_grace: Duration::from_secs(60),
+        })
+        .unwrap();
+        let viewer_metrics = ViewerMetrics::new();
+        let hub = DistributionHub::new();
+        let stats = Arc::new(RelayStats::new());
+        let (events, _rx) = crate::manager::event_channel();
+        let ctx = crate::server::create_session_context(stats.clone(), events, false, 64, 100);
+        let api = Arc::new(crate::api::ApiState {
+            ctx: ctx.clone(),
+            relay_stats: stats.clone(),
+            api_token: None,
+        });
+
+        // One tick, read on every surface: (bytes out, off-path sessions).
+        let read = async || {
+            crate::distribution::publish_telemetry(&hub, &origin, &viewer_metrics, &stats);
+            let response = crate::api::prometheus_metrics(axum::extract::State(api.clone()))
+                .await
+                .into_response();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            let metric = |name: &str| -> u64 {
+                let family = format!("bilbycast_relay_distribution_{name}");
+                assert!(text.contains(&format!("# TYPE {family} counter\n")), "{text}");
+                text.lines()
+                    .find_map(|l| l.strip_prefix(&format!("{family} ")))
+                    .unwrap_or_else(|| panic!("no {family} in {text}"))
+                    .parse()
+                    .unwrap()
+            };
+            let exported = (metric("bytes_out_total"), metric("offpath_sessions"));
+            let health = build_health_message(&ctx, &stats, &RelayConfig::default(), None);
+            for d in [
+                &health["payload"]["distribution"],
+                &build_stats_payload(&ctx, &stats)["distribution"],
+            ] {
+                let d = (d["bytes_out"].as_u64().unwrap(), d["offpath_sessions"].as_u64().unwrap());
+                assert_eq!(d, exported, "the manager reads what /metrics does");
+            }
+            exported
+        };
+        let idr = || {
+            let au: &[u8] = &[0, 0, 0, 1, 0x65, 0x88];
+            EsFrame::video(0, bytes::Bytes::from_static(au), true)
+        };
+
+        assert_eq!(read().await, (0, 0));
+        let old = hub.claim("s1");
+        let viewer = hub.subscribe("s1");
+        viewer.state.add_bytes_out(1000);
+        viewer.state.add_offpath_session();
+        assert_eq!(read().await, (1000, 1));
+        drop(viewer);
+        assert_eq!(read().await, (1000, 1), "a viewer left");
+
+        let new = hub.claim("s1");
+        assert_eq!(read().await, (1000, 1), "a newer push took the stream over");
+        let viewer = hub.subscribe("s1");
+        viewer.state.add_bytes_out(20);
+        viewer.state.add_offpath_session();
+        drop(viewer);
+        assert_eq!(read().await, (1020, 2));
+        drop(new);
+        assert_eq!(read().await, (1020, 2), "the newer push's stream ended");
+
+        old.publish(idr());
+        assert_eq!(hub.stream_count(), 1);
+        assert_eq!(read().await, (1020, 2), "the older push took the stream back");
+        drop(old);
+        assert_eq!(hub.stream_count(), 0);
+        assert_eq!(read().await, (1020, 2), "every stream ended");
+    }
+}
+
 #[cfg(test)]
 mod stopped_distribution_push_tests {
     //! relay#15 review: once the distribution subsystem has stopped, a

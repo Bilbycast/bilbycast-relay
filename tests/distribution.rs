@@ -4099,6 +4099,8 @@ async fn a_live_older_push_takes_its_stream_back_when_the_newer_one_leaves() {
         "the older push's frames are dropped and counted"
     );
     assert_eq!(state.ingests.len(), 2, "and its session left alone");
+    let sent = state.hub.bytes_out();
+    assert!(sent > 0, "what the viewer was sent is counted");
 
     // The newer push leaves, closing its connection.
     newer_stop.cancel();
@@ -4118,6 +4120,15 @@ async fn a_live_older_push_takes_its_stream_back_when_the_newer_one_leaves() {
         "a viewer that comes back plays the older push"
     );
     assert_eq!(state.hub.stream_count(), 1);
+    // What the newer push's viewer was sent is counted still, beside what the
+    // taken-back stream's is.
+    let stream = state.hub.get("both-live").unwrap();
+    assert!(
+        eventually(Duration::from_secs(5), || state.hub.bytes_out() >= sent + stream.bytes_out()).await,
+        "{} in all, {sent} before the take-back and {} since",
+        state.hub.bytes_out(),
+        stream.bytes_out()
+    );
 
     older_stop.cancel();
     cancel.cancel();
@@ -4165,8 +4176,8 @@ async fn a_live_older_push_that_leaves_first_leaves_the_newer_ones_viewers_playi
 /// dropped by the media source pin, counted on the hub's other-path counter
 /// that telemetry reports, and raise no alarm inside the grace; past it they
 /// raise the `webrtc_offpath_source` event and count on the stream's
-/// `offpath_sessions`, like any off-path source. Through the real router, so
-/// the WHEP session is wired to the counter and to the alarm.
+/// `offpath_sessions` and the hub's, like any off-path source. Through the
+/// real router, so the WHEP session is wired to the counter and to the alarm.
 ///
 /// Before, a viewer that named an address could make every datagram from it
 /// invisible: no event, no count.
@@ -4179,7 +4190,8 @@ async fn a_viewers_named_address_counts_inside_the_grace_and_alarms_past_it() {
     let cancel = CancellationToken::new();
     let (state, addr, mut events) = serve_distribution(8, &cancel).await;
     let hub = state.hub.clone();
-    let pub_cancel = cancel.clone();
+    let stop_publishing = cancel.child_token();
+    let pub_cancel = stop_publishing.clone();
     tokio::spawn(async move {
         let publisher = hub.claim("named");
         let mut tick = tokio::time::interval(Duration::from_millis(33));
@@ -4264,6 +4276,12 @@ async fn a_viewers_named_address_counts_inside_the_grace_and_alarms_past_it() {
     assert_eq!(alarms.len(), 1, "one event: {alarms:?}");
     assert_eq!(alarms[0]["source_ip"], "127.0.0.2");
     assert_eq!(alarms[0]["pinned_ip"], "127.0.0.1");
+
+    // The relay-wide count outlives the stream, which ends here.
+    assert_eq!(state.hub.offpath_sessions(), 1);
+    stop_publishing.cancel();
+    assert!(eventually(Duration::from_secs(5), || state.hub.get("named").is_none()).await);
+    assert_eq!(state.hub.offpath_sessions(), 1);
 
     cancel.cancel();
 }
