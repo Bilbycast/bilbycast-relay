@@ -5,13 +5,15 @@
 //!
 //! Each edge connects via QUIC and immediately sends tunnel bind messages.
 //! The relay is stateless — no authentication required. It pairs edges by
-//! tunnel ID and forwards encrypted traffic between them.
+//! tunnel ID and forwards encrypted traffic between them. It takes a tunnel's
+//! traffic only from the two connections bound to it, each as the side it bound
+//! ([`TunnelRouter::route`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use dashmap::DashMap;
 use quinn::Connection;
 use uuid::Uuid;
@@ -19,7 +21,7 @@ use uuid::Uuid;
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::protocol::*;
 use crate::stats::RelayStats;
-use crate::tunnel_router::{BindResult, TunnelEndpoint, TunnelRouter};
+use crate::tunnel_router::{BindResult, NoRoute, Route, TunnelEndpoint, TunnelRouter};
 use crate::util::IpCounts;
 
 /// Counter for generating unique connection IDs.
@@ -383,7 +385,14 @@ async fn handle_data_streams(
     }
 }
 
+/// The code a data stream is reset and stopped with when its opener is not
+/// bound to the tunnel it names.
+const STREAM_NOT_BOUND: u32 = 1;
+
 /// Forward a single TCP stream from one edge to the peer through the relay.
+///
+/// The opener must be bound to the tunnel when the stream's header arrives. A
+/// stream that is forwarded runs to its end, whoever holds the side by then.
 async fn forward_tcp_stream(
     ctx: &Arc<SessionContext>,
     connection_id: &str,
@@ -396,28 +405,20 @@ async fn forward_tcp_stream(
 
     tracing::debug!("TCP stream for tunnel {tunnel_id} from connection '{connection_id}'");
 
-    // Determine direction of this edge in the tunnel
-    let from_direction = {
-        let entry = ctx.router.tunnel(&tunnel_id).context("tunnel not found")?;
-        if entry
-            .ingress
-            .as_ref()
-            .is_some_and(|e| e.connection_id == connection_id)
-        {
-            TunnelDirection::Ingress
-        } else {
-            TunnelDirection::Egress
+    let Route { peer, stats, .. } = match ctx.router.route(&tunnel_id, connection_id) {
+        Ok(route) => route,
+        Err(why) => {
+            if why == NoRoute::NotBound {
+                // Only dropped, it would end at the opener like one that finished.
+                let _ = from_send.reset(STREAM_NOT_BOUND.into());
+                let _ = from_recv.stop(STREAM_NOT_BOUND.into());
+            }
+            anyhow::bail!("not forwarded on tunnel {tunnel_id}: {why:?}");
         }
     };
 
-    // Get peer connection
-    let (peer_conn, stats) = ctx
-        .router
-        .get_peer_connection(&tunnel_id, from_direction)
-        .context("peer not connected for tunnel")?;
-
     // Open a new bi-stream to the peer
-    let (mut peer_send, mut peer_recv) = peer_conn.open_bi().await?;
+    let (mut peer_send, mut peer_recv) = peer.open_bi().await?;
 
     // Write stream header to peer
     write_stream_header(&mut peer_send, &header).await?;
@@ -475,38 +476,22 @@ async fn handle_udp_datagrams(
             continue;
         };
 
-        // Determine this edge's direction in the tunnel
-        let from_direction = {
-            let Some(entry) = ctx.router.tunnel(&tunnel_id) else {
-                tracing::debug!("UDP datagram for unknown tunnel {tunnel_id} from '{connection_id}'");
+        let Route { from, peer, stats } = match ctx.router.route(&tunnel_id, connection_id) {
+            Ok(route) => route,
+            Err(why) => {
+                tracing::debug!("UDP datagram for tunnel {tunnel_id} from '{connection_id}' dropped: {why:?}");
                 continue;
-            };
-            if entry
-                .ingress
-                .as_ref()
-                .is_some_and(|e| e.connection_id == connection_id)
-            {
-                TunnelDirection::Ingress
-            } else {
-                TunnelDirection::Egress
             }
         };
 
-        // Look up peer connection and stats
-        let Some((peer_conn, stats)) = ctx.router.get_peer_connection(&tunnel_id, from_direction)
-        else {
-            tracing::debug!("No peer for UDP tunnel {tunnel_id}");
-            continue;
-        };
-
         // Forward the full datagram (with tunnel_id prefix) to the peer
-        match peer_conn.send_datagram(datagram.clone()) {
+        match peer.send_datagram(datagram.clone()) {
             Ok(()) => {
                 stats
                     .udp_datagrams_total
                     .fetch_add(1, Ordering::Relaxed);
                 let bytes = payload.len() as u64;
-                match from_direction {
+                match from {
                     TunnelDirection::Ingress => {
                         stats.bytes_ingress.fetch_add(bytes, Ordering::Relaxed);
                     }
@@ -864,6 +849,456 @@ mod tunnel_counter_tests {
         a_rx.read_to_end(1 << 16).await.unwrap();
         b_rx.read_to_end(1 << 16).await.unwrap();
         settle(&ctx, totals(4508, 80), "the stream ended").await;
+    }
+}
+
+#[cfg(test)]
+mod bound_sender_tests {
+    //! Who may send into a tunnel: a connection that holds one of its sides.
+    use super::test_relay::{edge, start_relay, start_relay_with};
+    use super::*;
+    use crate::stats::TunnelTotals;
+    use quinn::{Endpoint, ReadError, RecvStream, SendStream};
+    use rustls::pki_types::CertificateDer;
+    use std::net::SocketAddr;
+    use tokio::time::{Instant, sleep, timeout};
+    use TunnelDirection::{Egress, Ingress};
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    async fn soon<T>(what: &str, work: impl Future<Output = T>) -> T {
+        timeout(WAIT, work).await.unwrap_or_else(|_| panic!("{what} did not happen"))
+    }
+
+    struct Edge {
+        _endpoint: Endpoint,
+        connection: Connection,
+        send: SendStream,
+        recv: RecvStream,
+    }
+
+    /// A data stream, as its opener or the edge it was opened to has it.
+    type Stream = (SendStream, RecvStream);
+
+    impl Edge {
+        async fn connect(relay: SocketAddr, cert: &CertificateDer<'static>) -> Self {
+            let (_endpoint, connection, send, recv) = edge(relay, cert, 100).await;
+            Self { _endpoint, connection, send, recv }
+        }
+
+        /// Send `msg`, and wait until the relay has handled it. Returns its
+        /// answers.
+        async fn tell(&mut self, msg: &EdgeMessage) -> Vec<RelayMessage> {
+            write_message(&mut self.send, msg).await.unwrap();
+            self.settle().await
+        }
+
+        /// Wait until the relay has handled what this edge has sent it.
+        /// Returns its answers.
+        async fn settle(&mut self) -> Vec<RelayMessage> {
+            write_message(&mut self.send, &EdgeMessage::Ping).await.unwrap();
+            let mut answers = Vec::new();
+            loop {
+                match soon("an answer", read_message(&mut self.recv)).await.unwrap() {
+                    RelayMessage::Pong => return answers,
+                    answer => answers.push(answer),
+                }
+            }
+        }
+
+        async fn bind(&mut self, tunnel_id: Uuid, direction: TunnelDirection, token: Option<&str>) {
+            let answers = self
+                .tell(&EdgeMessage::TunnelBind {
+                    tunnel_id,
+                    direction,
+                    protocol: TunnelProtocol::Udp,
+                    bind_token: token.map(str::to_owned),
+                })
+                .await;
+            assert!(!matches!(answers[..], [RelayMessage::TunnelDown { .. }]), "{answers:?}");
+        }
+
+        async fn unbind(&mut self, tunnel_id: Uuid) {
+            self.tell(&EdgeMessage::TunnelUnbind { tunnel_id }).await;
+        }
+
+        /// Send a datagram, and wait until the relay has handled it.
+        async fn datagram(&mut self, id: Uuid, payload: &str) {
+            let datagram = encode_udp_datagram(&id, payload.as_bytes());
+            self.connection.send_datagram(datagram.into()).unwrap();
+            self.settle().await;
+        }
+
+        /// The next datagram to reach this edge.
+        async fn read(&self, id: Uuid) -> String {
+            let datagram = soon("a datagram", self.connection.read_datagram()).await.unwrap();
+            let (from, payload) = decode_udp_datagram(&datagram).unwrap();
+            assert_eq!(from, id);
+            String::from_utf8(payload.to_vec()).unwrap()
+        }
+
+        /// Open a data stream that begins with `payload`.
+        async fn open(&self, id: Uuid, payload: &str) -> Stream {
+            let (mut send, recv) = self.connection.open_bi().await.unwrap();
+            let header = StreamHeader { tunnel_id: id, stream_type: StreamType::Tcp };
+            write_stream_header(&mut send, &header).await.unwrap();
+            send.write_all(payload.as_bytes()).await.unwrap();
+            (send, recv)
+        }
+
+        /// The next data stream opened to this edge, which begins with `payload`.
+        async fn accept(&self, id: Uuid, payload: &str) -> Stream {
+            let (send, mut recv) = soon("a stream", self.connection.accept_bi()).await.unwrap();
+            assert_eq!(read_stream_header(&mut recv).await.unwrap().tunnel_id, id);
+            assert_reads(&mut recv, payload).await;
+            (send, recv)
+        }
+
+        /// Send a datagram and open a stream that must go nowhere, and be told
+        /// so of the stream.
+        async fn is_refused(&mut self, id: Uuid) {
+            self.datagram(id, "refused").await;
+            let (send, mut recv) = self.open(id, "refused").await;
+            let code = STREAM_NOT_BOUND.into();
+            let read = soon("an end to the stream", recv.read(&mut [0; 16])).await;
+            assert_eq!(read, Err(ReadError::Reset(code)));
+            assert_eq!(soon("a stop", send.stopped()).await, Ok(Some(code)));
+        }
+    }
+
+    async fn assert_reads(recv: &mut RecvStream, payload: &str) {
+        let mut buf = vec![0; payload.len()];
+        soon("the stream's data", recv.read_exact(&mut buf)).await.unwrap();
+        assert_eq!(buf, payload.as_bytes());
+    }
+
+    /// A datagram and a stream each way between the two ends of a tunnel. Each
+    /// edge reads the first to have reached it: one that was refused and came
+    /// through all the same would be ahead of it.
+    async fn assert_passes(id: Uuid, ingress: &mut Edge, egress: &mut Edge) {
+        ingress.datagram(id, "from ingress").await;
+        assert_eq!(egress.read(id).await, "from ingress");
+        egress.datagram(id, "from egress").await;
+        assert_eq!(ingress.read(id).await, "from egress");
+        for (opener, other) in [(&*ingress, &*egress), (&*egress, &*ingress)] {
+            let mut near = opener.open(id, "there").await;
+            let mut far = other.accept(id, "there").await;
+            far.0.write_all(b"back").await.unwrap();
+            assert_reads(&mut near.1, "back").await;
+        }
+    }
+
+    /// What `n` rounds of [`assert_passes`] count: 12 + 11 bytes of datagrams,
+    /// and of each stream 5 from its opener and 4 back.
+    fn passes(n: u64) -> TunnelTotals {
+        TunnelTotals {
+            bytes_ingress: n * (12 + 5 + 5),
+            bytes_egress: n * (11 + 4 + 4),
+            tcp_streams_total: n * 2,
+            udp_datagrams_total: n * 2,
+        }
+    }
+
+    /// Wait for the totals to reach `want`: a task counts after it has sent.
+    async fn assert_counted(ctx: &SessionContext, want: TunnelTotals, what: &str) {
+        let until = Instant::now() + WAIT;
+        while ctx.router.totals() != want && Instant::now() < until {
+            sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(ctx.router.totals(), want, "{what}");
+    }
+
+    /// A connection that knows a tunnel's id and has bound nothing sends
+    /// nothing into it, whichever of its sides are bound and whether binding
+    /// takes a token or not. The two edges that bound it send both ways.
+    #[tokio::test]
+    async fn an_unbound_connection_sends_nothing() {
+        for require_bind_auth in [false, true] {
+            let (relay, cert, ctx) = start_relay_with(require_bind_auth, 64);
+            let id = Uuid::new_v4();
+            let (ingress_token, egress_token) = match require_bind_auth {
+                true => (Some("ingress token"), Some("egress token")),
+                false => (None, None),
+            };
+            if let (Some(ingress), Some(egress)) = (ingress_token, egress_token) {
+                ctx.router.authorize_tunnel(id, ingress.into(), egress.into());
+            }
+            let mut stranger = Edge::connect(relay, &cert).await;
+            stranger.is_refused(id).await;
+
+            let mut ingress = Edge::connect(relay, &cert).await;
+            ingress.bind(id, Ingress, ingress_token).await;
+            stranger.is_refused(id).await;
+
+            let mut egress = Edge::connect(relay, &cert).await;
+            egress.bind(id, Egress, egress_token).await;
+            stranger.is_refused(id).await;
+
+            if require_bind_auth {
+                for direction in [Ingress, Egress] {
+                    let answers = stranger
+                        .tell(&EdgeMessage::TunnelBind {
+                            tunnel_id: id,
+                            direction,
+                            protocol: TunnelProtocol::Udp,
+                            bind_token: Some("wrong".into()),
+                        })
+                        .await;
+                    assert!(matches!(answers[..], [RelayMessage::TunnelDown { .. }]), "{answers:?}");
+                    stranger.is_refused(id).await;
+                }
+            }
+
+            ingress.unbind(id).await;
+            stranger.is_refused(id).await;
+            ingress.bind(id, Ingress, ingress_token).await;
+            assert_counted(&ctx, passes(0), "nothing was sent by either edge").await;
+            assert_passes(id, &mut ingress, &mut egress).await;
+            stranger.is_refused(id).await;
+            assert_passes(id, &mut ingress, &mut egress).await;
+            assert_counted(&ctx, passes(2), "what the two edges sent").await;
+        }
+    }
+
+    /// A connection bound to one tunnel sends nothing into another, whichever
+    /// side it holds of its own, and goes on sending into its own.
+    #[tokio::test]
+    async fn a_connection_bound_to_another_tunnel_sends_nothing() {
+        let (relay, cert, ctx) = start_relay();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut edges = Vec::new();
+        for (id, direction) in [(a, Ingress), (a, Egress), (b, Ingress), (b, Egress)] {
+            let mut edge = Edge::connect(relay, &cert).await;
+            edge.bind(id, direction, None).await;
+            edges.push(edge);
+        }
+        let [a_in, a_out, b_in, b_out] = &mut edges[..] else { unreachable!() };
+        for (edge, other) in [(&mut *a_in, b), (&mut *a_out, b), (&mut *b_in, a), (&mut *b_out, a)] {
+            edge.is_refused(other).await;
+            edge.is_refused(Uuid::new_v4()).await;
+        }
+        assert_counted(&ctx, passes(0), "refused").await;
+        assert_passes(a, a_in, a_out).await;
+        assert_passes(b, b_in, b_out).await;
+        assert_counted(&ctx, passes(2), "each its own").await;
+    }
+
+    /// A side that a newer connection takes over is the newer one's, to send
+    /// on and to be sent to, until the older binds it again. A stream that was
+    /// open before goes on.
+    #[tokio::test]
+    async fn a_side_that_is_taken_over_is_the_newer_connections() {
+        for side in [Ingress, Egress] {
+            let (relay, cert, ctx) = start_relay();
+            let id = Uuid::new_v4();
+            let other_side = if side == Ingress { Egress } else { Ingress };
+            let mut other = Edge::connect(relay, &cert).await;
+            other.bind(id, other_side, None).await;
+            let mut old = Edge::connect(relay, &cert).await;
+            old.bind(id, side, None).await;
+            let mut old_stream = old.open(id, "before").await;
+            let mut other_stream = other.accept(id, "before").await;
+
+            let mut new = Edge::connect(relay, &cert).await;
+            new.bind(id, side, None).await;
+            old.is_refused(id).await;
+            old_stream.0.write_all(b"after").await.unwrap();
+            assert_reads(&mut other_stream.1, "after").await;
+            other_stream.0.write_all(b"and back").await.unwrap();
+            assert_reads(&mut old_stream.1, "and back").await;
+            let kept = TunnelTotals {
+                bytes_ingress: 11,
+                bytes_egress: 8,
+                tcp_streams_total: 1,
+                udp_datagrams_total: 0,
+            };
+            assert_counted(&ctx, kept, "the stream opened before").await;
+
+            let totals = |n| TunnelTotals {
+                bytes_ingress: kept.bytes_ingress + passes(n).bytes_ingress,
+                bytes_egress: kept.bytes_egress + passes(n).bytes_egress,
+                tcp_streams_total: kept.tcp_streams_total + passes(n).tcp_streams_total,
+                udp_datagrams_total: passes(n).udp_datagrams_total,
+            };
+            let pass = async |new: &mut Edge, other: &mut Edge| match side {
+                Ingress => assert_passes(id, new, other).await,
+                Egress => assert_passes(id, other, new).await,
+            };
+            pass(&mut new, &mut other).await;
+            old.unbind(id).await;
+            pass(&mut new, &mut other).await;
+            assert_counted(&ctx, totals(2), "the newer connection's").await;
+
+            old.bind(id, side, None).await;
+            new.is_refused(id).await;
+            pass(&mut old, &mut other).await;
+            new.connection.close(0u32.into(), b"");
+            soon("the newer connection's end", async {
+                while ctx.edge_connections.len() > 2 {
+                    sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            pass(&mut old, &mut other).await;
+            assert_counted(&ctx, totals(4), "the older connection's again").await;
+        }
+    }
+
+    /// A connection sends on a tunnel from its bind to its unbind, however
+    /// often it binds, and no longer than the tunnel is held.
+    #[tokio::test]
+    async fn a_connection_sends_from_its_bind_to_its_unbind() {
+        let (relay, cert, ctx) = start_relay();
+        let id = Uuid::new_v4();
+        let mut ingress = Edge::connect(relay, &cert).await;
+        let mut egress = Edge::connect(relay, &cert).await;
+        ingress.is_refused(id).await;
+        for _ in 0..2 {
+            ingress.bind(id, Ingress, None).await;
+            egress.bind(id, Egress, None).await;
+        }
+        assert_passes(id, &mut ingress, &mut egress).await;
+
+        egress.unbind(id).await;
+        egress.is_refused(id).await;
+        egress.bind(id, Egress, None).await;
+        ingress.unbind(id).await;
+        ingress.is_refused(id).await;
+        ingress.bind(id, Ingress, None).await;
+        assert_counted(&ctx, passes(1), "refused while unbound").await;
+        assert_passes(id, &mut ingress, &mut egress).await;
+
+        // Removed by force, under two edges that know of it only if they have
+        // read its `TunnelDown`. One coming back does not let the other send.
+        ctx.router.force_remove_tunnel(&id).unwrap();
+        ingress.is_refused(id).await;
+        egress.is_refused(id).await;
+        ingress.bind(id, Ingress, None).await;
+        egress.is_refused(id).await;
+        egress.bind(id, Egress, None).await;
+        ingress.unbind(id).await;
+        ingress.bind(id, Egress, None).await;
+        egress.is_refused(id).await;
+        egress.bind(id, Ingress, None).await;
+        assert_counted(&ctx, passes(2), "refused while removed").await;
+        assert_passes(id, &mut egress, &mut ingress).await;
+        assert_counted(&ctx, passes(3), "the sides changed over").await;
+    }
+
+    /// What the relay logs, as `(level, message)`.
+    #[derive(Clone, Default)]
+    struct Log(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Log {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let meta = event.metadata();
+            if meta.target().starts_with("bilbycast_relay") {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push((*meta.level(), message.0));
+            }
+        }
+    }
+
+    /// Refusing a sender logs at debug and nothing above: one that sends on
+    /// and on must not fill the log.
+    #[tokio::test]
+    async fn refusing_a_sender_logs_at_debug() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let (relay, cert, ctx) = start_relay();
+        let id = Uuid::new_v4();
+        let mut ingress = Edge::connect(relay, &cert).await;
+        ingress.bind(id, Ingress, None).await;
+        let mut stranger = Edge::connect(relay, &cert).await;
+        stranger.settle().await;
+        let log = Log::default();
+        let guard = || tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        // A first pass registers the callsites against a subscriber: one first
+        // hit by a parallel test with none installed can cache "never"
+        // process-wide, and the next subscriber's registration rebuilds it.
+        drop({
+            let warm = guard();
+            stranger.is_refused(id).await;
+            ingress.is_refused(Uuid::new_v4()).await;
+            warm
+        });
+        let _guard = guard();
+        log.0.lock().unwrap().clear();
+        for _ in 0..20 {
+            stranger.is_refused(id).await;
+            stranger.is_refused(Uuid::new_v4()).await;
+        }
+        stranger.settle().await;
+        let log = log.0.lock().unwrap();
+        for (level, message) in log.iter() {
+            assert_eq!(*level, tracing::Level::DEBUG, "{message}");
+        }
+        for what in ["UDP datagram for tunnel", "TCP stream forwarding ended"] {
+            let refused = log.iter().filter(|(_, m)| m.starts_with(what) && m.ends_with("NotBound"));
+            assert_eq!(refused.count(), 40, "{what}: {log:#?}");
+        }
+        assert_eq!(ctx.router.totals(), passes(0));
+    }
+
+    /// One connection that binds both sides sends as ingress, to itself.
+    #[tokio::test]
+    async fn a_connection_that_holds_both_sides_sends_as_ingress() {
+        let (relay, cert, ctx) = start_relay();
+        let id = Uuid::new_v4();
+        let mut both = Edge::connect(relay, &cert).await;
+        both.bind(id, Egress, None).await;
+        both.bind(id, Ingress, None).await;
+        both.datagram(id, "to itself").await;
+        assert_eq!(both.read(id).await, "to itself");
+        let mut near = both.open(id, "there").await;
+        let mut far = both.accept(id, "there").await;
+        far.0.write_all(b"back").await.unwrap();
+        assert_reads(&mut near.1, "back").await;
+        let totals = TunnelTotals {
+            bytes_ingress: 9 + 5,
+            bytes_egress: 4,
+            tcp_streams_total: 1,
+            udp_datagrams_total: 1,
+        };
+        assert_counted(&ctx, totals, "as ingress").await;
+    }
+
+    /// A bound edge whose peer is not there sends nowhere, and its stream is
+    /// not refused: it ends as it always has, empty.
+    #[tokio::test]
+    async fn a_bound_connection_without_a_peer_is_not_refused() {
+        for side in [Ingress, Egress] {
+            let (relay, cert, ctx) = start_relay();
+            let id = Uuid::new_v4();
+            let mut alone = Edge::connect(relay, &cert).await;
+            alone.bind(id, side, None).await;
+            alone.datagram(id, "to nobody").await;
+            let (send, mut recv) = alone.open(id, "to nobody").await;
+            assert_eq!(soon("an end to the stream", recv.read(&mut [0; 16])).await, Ok(None));
+            assert_eq!(soon("a stop", send.stopped()).await, Ok(Some(0u32.into())));
+            assert_counted(&ctx, passes(0), "to nobody").await;
+
+            let mut peer = Edge::connect(relay, &cert).await;
+            match side {
+                Ingress => {
+                    peer.bind(id, Egress, None).await;
+                    assert_passes(id, &mut alone, &mut peer).await;
+                }
+                Egress => {
+                    peer.bind(id, Ingress, None).await;
+                    assert_passes(id, &mut peer, &mut alone).await;
+                }
+            }
+            assert_counted(&ctx, passes(1), "its peer is there").await;
+        }
     }
 }
 

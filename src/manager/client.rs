@@ -4135,7 +4135,7 @@ mod tunnel_counter_tests {
                 connection: connection.clone(),
             });
         }
-        ctx.router.get_peer_connection(&id, TunnelDirection::Ingress).unwrap().1
+        ctx.router.route(&id, "Ingress").unwrap().stats
     }
 
     #[tokio::test]
