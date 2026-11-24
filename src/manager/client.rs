@@ -4214,27 +4214,35 @@ mod tunnel_counter_tests {
     }
 
     /// The bandwidth figure is the growth of `total_bytes_forwarded` since the
-    /// last sample. It read 0 for a sample in which a tunnel ended, because the
-    /// total had fallen.
+    /// last sample, in the stats payload and over REST. It read 0 for a sample
+    /// in which a tunnel ended, because the total had fallen.
     #[tokio::test]
     async fn the_bandwidth_sample_takes_in_a_tunnel_that_ended() {
         let (relay, cert, ctx) = start_relay();
         let (_endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
-        for ingress in [true, false] {
+        let api = serve_api(&ctx).await;
+        for (rest, ingress) in [(false, true), (false, false), (true, true), (true, false)] {
+            let sample = async || {
+                let stats = if rest {
+                    serde_json::from_str(&get(api, "/api/v1/stats").await).unwrap()
+                } else {
+                    build_stats_payload(&ctx, &ctx.relay_stats)
+                };
+                stats["total_bandwidth_bps"].as_u64().unwrap()
+            };
             let id = Uuid::new_v4();
             let task = bind(&ctx, id, &connection);
             let bytes = if ingress { &task.bytes_ingress } else { &task.bytes_egress };
             bytes.fetch_add(1_000_000, Ordering::Relaxed);
-            build_stats_payload(&ctx, &ctx.relay_stats);
+            sample().await;
 
             bytes.fetch_add(10_000, Ordering::Relaxed);
             drop(task);
             ctx.router.force_remove_tunnel(&id).unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let stats = build_stats_payload(&ctx, &ctx.relay_stats);
-            let bps = stats["total_bandwidth_bps"].as_u64().unwrap();
+            let bps = sample().await;
             // 80 000 bits in 200 ms, and no more than that.
-            assert!((1..=400_000).contains(&bps), "{bps}");
+            assert!((1..=400_000).contains(&bps), "REST {rest}, ingress {ingress}: {bps}");
         }
     }
 }
