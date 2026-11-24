@@ -88,7 +88,7 @@ pub trait Counted {
 /// beside them would be one cache line written by every forwarding thread, so
 /// a tunnel's counts are added up here instead, once it has left the map.
 ///
-/// Both methods take the lock first and the map's second, so neither may be
+/// Every method takes the lock first and the map's second, so none may be
 /// called with a reference into the map held.
 #[derive(Default)]
 pub struct DepartedTunnels(Mutex<Departed>);
@@ -104,12 +104,24 @@ struct Departed {
 
 impl DepartedTunnels {
     /// Take a tunnel out of `held`. Every removal from a router's map goes
-    /// through here. The lock spans it, so [`Self::totals`] finds the tunnel
-    /// in `held` or in `leaving`, never in both or in neither.
+    /// through here or through [`Self::remove_if`].
     pub fn remove<T: Counted>(&self, held: &DashMap<Uuid, T>, id: &Uuid) -> Option<T> {
+        self.remove_if(held, id, |_| true)
+    }
+
+    /// Take a tunnel out of `held` if it is `gone`. That is asked under the
+    /// map's lock: nothing reaches the tunnel through the map between the
+    /// answer and the removal. The tunnel goes on `leaving` under that lock
+    /// too, and the lock here spans both, so [`Self::totals`] finds it in
+    /// `held` or in `leaving`, never in both or in neither.
+    pub fn remove_if<T: Counted>(
+        &self,
+        held: &DashMap<Uuid, T>,
+        id: &Uuid,
+        gone: impl FnOnce(&T) -> bool,
+    ) -> Option<T> {
         let mut departed = self.0.lock().unwrap();
         let Departed { finished, leaving } = &mut *departed;
-        let (_, tunnel) = held.remove(id)?;
         leaving.retain_mut(|stats| match Arc::get_mut(stats) {
             // Nothing else holds it, so nothing counts into it again.
             Some(stats) => {
@@ -118,8 +130,14 @@ impl DepartedTunnels {
             }
             None => true,
         });
-        leaving.push(tunnel.stats().clone());
-        Some(tunnel)
+        let removed = held.remove_if(id, |_, tunnel| {
+            let gone = gone(tunnel);
+            if gone {
+                leaving.push(tunnel.stats().clone());
+            }
+            gone
+        });
+        removed.map(|(_, tunnel)| tunnel)
     }
 
     /// What every tunnel that is or has been in `held` has counted.
@@ -737,41 +755,68 @@ mod tunnel_totals_tests {
         assert_eq!(departed.totals(&held), counted(1000));
     }
 
-    /// An entry that checks that the lock is held whenever its stats are asked
-    /// for.
-    struct Probe<'a> {
-        departed: &'a DepartedTunnels,
+    /// A tunnel that is not gone after all stays in the map, and nowhere else.
+    #[test]
+    fn a_tunnel_that_is_not_gone_stays() {
+        let (held, departed) = (DashMap::new(), DepartedTunnels::default());
+        let (id, stats) = add(&held);
+        count(&stats, 1);
+        assert!(departed.remove_if(&held, &id, |_| false).is_none());
+        assert_eq!((held.len(), leaving(&departed)), (1, 0));
+        assert_eq!(departed.totals(&held), counted(1));
+        assert!(departed.remove_if(&held, &id, |found| Arc::ptr_eq(found, &stats)).is_some());
+        assert_eq!((held.len(), leaving(&departed)), (0, 1));
+        assert_eq!(departed.totals(&held), counted(1));
+    }
+
+    /// An entry that checks, whenever its stats are asked for, that the lock is
+    /// held and that the map has not let go of it.
+    struct Probe {
+        departed: &'static DepartedTunnels,
+        held: &'static DashMap<Uuid, Probe>,
+        id: Uuid,
         stats: Arc<TunnelStats>,
     }
 
-    impl Counted for Probe<'_> {
+    impl Probe {
+        fn locked(&self) -> bool {
+            self.departed.0.try_lock().is_err()
+        }
+    }
+
+    impl Counted for Probe {
         fn stats(&self) -> &Arc<TunnelStats> {
-            assert!(self.departed.0.try_lock().is_err(), "counted without the lock");
+            assert!(self.locked(), "counted without the lock");
+            assert!(!self.held.try_get(&self.id).is_absent(), "counted once out of the map");
             &self.stats
         }
     }
 
-    /// The lock spans the whole of a removal and the whole of a read, so a read
-    /// never sees a tunnel half way out of the map.
+    /// A removal waits for a read to end. It then asks whether the tunnel is
+    /// gone with both locks held, and puts it on the list before the map lets
+    /// go of it: a read never sees a tunnel half way out of the map.
     #[test]
     fn the_lock_spans_a_removal_and_a_read() {
-        let departed = DepartedTunnels::default();
-        let held = DashMap::new();
+        let departed: &DepartedTunnels = Box::leak(Box::default());
+        let held: &DashMap<Uuid, Probe> = Box::leak(Box::default());
         let id = Uuid::new_v4();
         let stats = Arc::new(TunnelStats::new());
         count(&stats, 1);
-        held.insert(id, Probe { departed: &departed, stats });
-        assert_eq!(departed.totals(&held), counted(1));
+        held.insert(id, Probe { departed, held, id, stats });
+        assert_eq!(departed.totals(held), counted(1));
 
         std::thread::scope(|s| {
             let reading = departed.0.lock().unwrap();
-            let removal = s.spawn(|| departed.remove(&held, &id).is_some());
+            let removal = s.spawn(|| {
+                let gone = |probe: &Probe| probe.locked() && held.try_get(&id).is_locked();
+                departed.remove_if(held, &id, gone).is_some()
+            });
             std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(held.contains_key(&id), "a removal waits for a read to end");
+            assert!(held.try_get(&id).is_present(), "a removal waits for a read to end");
             drop(reading);
-            assert!(removal.join().unwrap());
+            assert!(removal.join().unwrap(), "asked with both locks held");
         });
-        assert_eq!(departed.totals(&held), counted(1));
+        assert_eq!(departed.totals(held), counted(1));
     }
 
     #[test]

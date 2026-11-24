@@ -37,6 +37,10 @@ impl TunnelState {
         self.ingress.is_some() && self.egress.is_some()
     }
 
+    fn is_empty(&self) -> bool {
+        self.ingress.is_none() && self.egress.is_none()
+    }
+
     pub fn status_str(&self) -> &'static str {
         match (&self.ingress, &self.egress) {
             (Some(_), Some(_)) => "active",
@@ -210,10 +214,12 @@ impl TunnelRouter {
                         state.ingress.as_ref().map(|e| e.connection_id.clone());
                 }
 
-            // If both sides are gone, remove the tunnel entirely
-            if state.ingress.is_none() && state.egress.is_none() {
+            // If both sides are gone, remove the tunnel entirely, unless one
+            // is bound again before it is removed.
+            if state.is_empty() {
                 drop(entry);
-                self.departed.remove(&self.tunnels, tunnel_id);
+                self.departed
+                    .remove_if(&self.tunnels, tunnel_id, TunnelState::is_empty);
             }
         }
 
@@ -413,6 +419,8 @@ mod totals_tests {
     use super::*;
     use crate::session::test_relay::{edge, start_relay};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
     fn bind(router: &TunnelRouter, id: Uuid, name: &str, connection: &quinn::Connection) {
         for direction in [TunnelDirection::Ingress, TunnelDirection::Egress] {
@@ -445,7 +453,61 @@ mod totals_tests {
     /// the totals, and the next. The map's lock and the totals' are unfair:
     /// without the gaps the removers starve.
     fn pause() {
-        std::thread::sleep(std::time::Duration::from_micros(1));
+        std::thread::sleep(Duration::from_micros(1));
+    }
+
+    /// An entry that keeps a read of the totals waiting, with their lock held,
+    /// until it is opened.
+    struct Gate<'a> {
+        reached: mpsc::Sender<()>,
+        open: &'a Mutex<()>,
+        stats: Arc<TunnelStats>,
+    }
+
+    impl Counted for Gate<'_> {
+        fn stats(&self) -> &Arc<TunnelStats> {
+            self.reached.send(()).unwrap();
+            drop(self.open.lock());
+            &self.stats
+        }
+    }
+
+    /// The unbind of the last side finds the tunnel empty, then waits for a
+    /// read of the totals to end before it removes it. A side bound meanwhile
+    /// keeps the tunnel, and its figures.
+    #[tokio::test]
+    async fn a_side_bound_before_the_empty_tunnel_is_removed_keeps_it() {
+        let (relay, cert, _ctx) = start_relay();
+        let (_endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
+        let router = TunnelRouter::with_auth_policy(false);
+        let id = Uuid::new_v4();
+        bind(&router, id, "a", &connection);
+        assert!(forward(&router, &id, 10));
+        router.unbind(&id, "a-Ingress");
+
+        let wait = Duration::from_secs(10);
+        let open = Mutex::new(());
+        let (reached, reading) = mpsc::channel();
+        let read = DashMap::new();
+        read.insert(id, Gate { reached, open: &open, stats: Arc::new(TunnelStats::new()) });
+        std::thread::scope(|s| {
+            let shut = open.lock().unwrap();
+            s.spawn(|| router.departed.totals(&read));
+            reading.recv_timeout(wait).unwrap();
+            let unbind = s.spawn(|| router.unbind(&id, "a-Egress"));
+            let until = Instant::now() + wait;
+            while !router.tunnel(&id).unwrap().is_empty() {
+                assert!(Instant::now() < until, "the last side was not unbound");
+                pause();
+            }
+            bind(&router, id, "b", &connection);
+            drop(shut);
+            unbind.join().unwrap();
+        });
+        assert_eq!(router.counts(), (1, 1));
+        assert!(forward(&router, &id, 5));
+        assert_eq!(router.list_tunnels()[0].stats.bytes_ingress, 15);
+        assert_eq!(router.totals(), totals(15, 2));
     }
 
     /// Every way a tunnel leaves the router, and an edge that takes its side
