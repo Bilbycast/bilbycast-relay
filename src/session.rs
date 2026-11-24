@@ -1084,8 +1084,8 @@ mod bound_sender_tests {
     }
 
     /// A side that a newer connection takes over is the newer one's, to send
-    /// on and to be sent to, until the older binds it again. A stream that was
-    /// open before goes on.
+    /// on and to be sent to, until the older binds it again: the newer one
+    /// leaving does not give it back. A stream that was open before goes on.
     #[tokio::test]
     async fn a_side_that_is_taken_over_is_the_newer_connections() {
         for side in [Ingress, Egress] {
@@ -1128,6 +1128,10 @@ mod bound_sender_tests {
             old.unbind(id).await;
             pass(&mut new, &mut other).await;
             assert_counted(&ctx, totals(2), "the newer connection's").await;
+            new.unbind(id).await;
+            old.is_refused(id).await;
+            new.bind(id, side, None).await;
+            pass(&mut new, &mut other).await;
 
             old.bind(id, side, None).await;
             new.is_refused(id).await;
@@ -1140,7 +1144,7 @@ mod bound_sender_tests {
             })
             .await;
             pass(&mut old, &mut other).await;
-            assert_counted(&ctx, totals(4), "the older connection's again").await;
+            assert_counted(&ctx, totals(5), "the older connection's again").await;
         }
     }
 

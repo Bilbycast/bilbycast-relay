@@ -224,15 +224,20 @@ data stream already forwarded runs to its end, whoever holds the side by then.
 A datagram the relay handles before its sender's own bind is dropped, and so is
 one whose peer has not bound yet; nothing is queued.
 
-**Edges.** Every edge tag from v0.7.0 to v0.117.0 opens one connection per
-tunnel, binds on it, sends on no other, and starts to send only after it has
-read `TunnelReady` for that tunnel (`connect_and_bind` in the edge's
-`src/tunnel/relay_client.rs`). The relay sends `TunnelReady` once both sides are
-in the router, so no edge sends before its bind. Two things an edge sends can
-meet the last row: what is still in flight on a connection when the edge has
-bound another in its place (after a failure it dials the new one at least a
-second later), and what it goes on sending after its tunnel was removed under it
-(`close_tunnel`, the REST delete), until it binds again.
+**Edges.** Every edge tag from v0.7.0 to v0.117.0 binds a tunnel on a connection
+opened for it, sends the tunnel's data on no other, and starts to send only
+after it has read `TunnelReady` for that tunnel (`connect_and_bind` in the
+edge's `src/tunnel/relay_client.rs`). The failback probe (since v0.21.0) opens
+another connection, to the primary relay, which carries a `Hello` and no data.
+The relay sends `TunnelReady` once both sides are in the router, so no edge
+sends before its bind. Three things an edge sends can meet the last row:
+
+- what is still in flight on a connection when the edge has bound another in its
+  place (after a failure it dials the new one at least a second later);
+- what it goes on sending after its tunnel was removed under it (`close_tunnel`,
+  the REST delete), until it binds again;
+- what it goes on sending on a side that another edge has bound since, until it
+  binds again. The relay does not tell it that its side is gone.
 
 **Upgrading from relay v0.20.0 or earlier.** Up to v0.20.0 a connection that was
 not the tunnel's bound ingress was taken for its egress, whether or not it had
@@ -242,11 +247,18 @@ under `require_bind_auth`, and all of it was counted as the tunnel's own. No
 edge has to change and there is no upgrade order. What an operator may notice: a
 client of their own that sent into a tunnel without binding it no longer gets
 through; a tunnel's byte and datagram counts no longer include what such a
-client sent; and an edge whose tunnel was removed under it is no longer heard by
-a receiver that bound again on its own. Up to v0.20.0 a connection or native-UDP
-session that ended just as another began from the same address could also take
-that address's count below zero, and the relay could then refuse it
-(`relay_dos_suspect`) until a restart. That no longer happens.
+client sent; an edge whose tunnel was removed under it is no longer heard by a
+receiver that bound again on its own; and where two edges bind the same side of
+a tunnel (a cloned or restored config, a spare left running), only the one that
+bound last is heard. Up to v0.20.0 an older egress edge was still forwarded to
+the ingress. Now it goes silent without notice until it binds again, and the
+newer one leaving does not bring it back. `GET /api/v1/tunnels` shows the id and
+the remote address of the edge that holds each side.
+
+Up to v0.20.0 a connection or native-UDP session that ended just as another
+began from the same address could also take that address's count below zero, and
+the relay could then refuse it (`relay_dos_suspect`) until a restart. That no
+longer happens.
 
 Pinned by `session::bound_sender_tests` (real QUIC on loopback), the counts by
 `util::ip_count_tests`, `session::per_ip_cap_tests` and
@@ -353,7 +365,8 @@ Auth reuses the QUIC path's bind-token registry (the manager's `authorize_tunnel
 tokens), and the same per-IP session cap bounds DoS. A session counts on the
 address that created it, from its first `Register` until it is removed, both
 under the session's own lock. The reaper asks again whether a session is idle as
-it removes it, so one that has registered or carried media since is kept.
+it removes it, so one on which a `Register` was accepted or a datagram forwarded
+in between is kept.
 
 A media datagram is taken only from the address latched in one of its session's
 two slots, and goes to the other slot; one from any other address is dropped.
