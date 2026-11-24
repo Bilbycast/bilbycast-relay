@@ -158,14 +158,14 @@ async fn relay_stats(State(state): State<Arc<ApiState>>) -> Json<RelayStatsRespo
     let (total_tunnels, active_tunnels) = state.ctx.router.counts();
     let connected_edges = state.ctx.edge_connections.len();
 
-    let totals = aggregate_tunnel_stats(&tunnel_infos);
+    let totals = state.ctx.router.totals();
 
     // Update peaks
     state
         .relay_stats
         .update_peaks(active_tunnels as u64, connected_edges as u64);
 
-    let total_forwarded = totals.bytes_ingress + totals.bytes_egress;
+    let total_forwarded = totals.bytes_forwarded();
     let bandwidth_bps = state.relay_stats.compute_bandwidth_bps(total_forwarded);
 
     Json(RelayStatsResponse {
@@ -178,7 +178,7 @@ async fn relay_stats(State(state): State<Arc<ApiState>>) -> Json<RelayStatsRespo
         total_bytes_forwarded: total_forwarded,
         total_bandwidth_bps: bandwidth_bps,
         total_tcp_streams: totals.tcp_streams_total,
-        active_tcp_streams: totals.tcp_streams_active,
+        active_tcp_streams: active_tcp_streams(&tunnel_infos),
         total_udp_datagrams: totals.udp_datagrams_total,
         peak_tunnels: state.relay_stats.peak_tunnels.load(Ordering::Relaxed),
         peak_edges: state.relay_stats.peak_edges.load(Ordering::Relaxed),
@@ -373,14 +373,14 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> im
     let edges_connected = state.ctx.edge_connections.len();
     let (total_tunnels, active_tunnels) = state.ctx.router.counts();
     let tunnels = state.ctx.router.list_tunnels();
-    let totals = aggregate_tunnel_stats(&tunnels);
+    let totals = state.ctx.router.totals();
 
     // Update peaks
     state
         .relay_stats
         .update_peaks(active_tunnels as u64, edges_connected as u64);
 
-    let total_forwarded = totals.bytes_ingress + totals.bytes_egress;
+    let total_forwarded = totals.bytes_forwarded();
 
     // ── Relay-level metrics ──
 
@@ -431,7 +431,7 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> im
 
     let _ = writeln!(out, "# HELP bilbycast_relay_tcp_streams_active Currently active TCP streams being forwarded.");
     let _ = writeln!(out, "# TYPE bilbycast_relay_tcp_streams_active gauge");
-    let _ = writeln!(out, "bilbycast_relay_tcp_streams_active {}", totals.tcp_streams_active);
+    let _ = writeln!(out, "bilbycast_relay_tcp_streams_active {}", active_tcp_streams(&tunnels));
     let _ = writeln!(out);
 
     let _ = writeln!(out, "# HELP bilbycast_relay_udp_datagrams_total Total UDP datagrams forwarded.");
@@ -457,8 +457,7 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> im
     // ── Native plain-UDP relay (SRT/RIST without QUIC) ──
     let udp_sessions = state.ctx.udp_sessions.list();
     let udp_active = udp_sessions.iter().filter(|s| s.status == "active").count();
-    let udp_bytes: u64 = udp_sessions.iter().map(|s| s.bytes_ingress + s.bytes_egress).sum();
-    let udp_datagrams: u64 = udp_sessions.iter().map(|s| s.datagrams).sum();
+    let udp_totals = state.ctx.udp_sessions.totals();
     let _ = writeln!(out, "# HELP bilbycast_relay_udp_sessions_total Native plain-UDP relay sessions (active + waiting).");
     let _ = writeln!(out, "# TYPE bilbycast_relay_udp_sessions_total gauge");
     let _ = writeln!(out, "bilbycast_relay_udp_sessions_total {}", udp_sessions.len());
@@ -469,11 +468,11 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> im
     let _ = writeln!(out);
     let _ = writeln!(out, "# HELP bilbycast_relay_udp_bytes_forwarded_total Total bytes forwarded over the native plain-UDP relay.");
     let _ = writeln!(out, "# TYPE bilbycast_relay_udp_bytes_forwarded_total counter");
-    let _ = writeln!(out, "bilbycast_relay_udp_bytes_forwarded_total {udp_bytes}");
+    let _ = writeln!(out, "bilbycast_relay_udp_bytes_forwarded_total {}", udp_totals.bytes_forwarded());
     let _ = writeln!(out);
     let _ = writeln!(out, "# HELP bilbycast_relay_udp_datagrams_forwarded_total Total datagrams forwarded over the native plain-UDP relay.");
     let _ = writeln!(out, "# TYPE bilbycast_relay_udp_datagrams_forwarded_total counter");
-    let _ = writeln!(out, "bilbycast_relay_udp_datagrams_forwarded_total {udp_datagrams}");
+    let _ = writeln!(out, "bilbycast_relay_udp_datagrams_forwarded_total {}", udp_totals.udp_datagrams_total);
     let _ = writeln!(out);
 
     // ── Viewer distribution (WHEP SFU + LL-HLS origin) ──
@@ -614,29 +613,7 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> im
 
 // ── Helpers ──
 
-/// Aggregate stats across all tunnels.
-struct AggregateTunnelStats {
-    bytes_ingress: u64,
-    bytes_egress: u64,
-    tcp_streams_total: u64,
-    tcp_streams_active: u64,
-    udp_datagrams_total: u64,
-}
-
-fn aggregate_tunnel_stats(tunnels: &[TunnelInfo]) -> AggregateTunnelStats {
-    let mut agg = AggregateTunnelStats {
-        bytes_ingress: 0,
-        bytes_egress: 0,
-        tcp_streams_total: 0,
-        tcp_streams_active: 0,
-        udp_datagrams_total: 0,
-    };
-    for t in tunnels {
-        agg.bytes_ingress += t.stats.bytes_ingress;
-        agg.bytes_egress += t.stats.bytes_egress;
-        agg.tcp_streams_total += t.stats.tcp_streams_total;
-        agg.tcp_streams_active += t.stats.tcp_streams_active;
-        agg.udp_datagrams_total += t.stats.udp_datagrams_total;
-    }
-    agg
+/// TCP streams open now, on the tunnels held now.
+fn active_tcp_streams(tunnels: &[TunnelInfo]) -> u64 {
+    tunnels.iter().map(|t| t.stats.tcp_streams_active).sum()
 }

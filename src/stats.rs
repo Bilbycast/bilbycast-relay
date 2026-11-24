@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use dashmap::DashMap;
 use serde::Serialize;
+use uuid::Uuid;
 
 /// Per-tunnel stats tracked atomically.
 pub struct TunnelStats {
@@ -49,6 +51,89 @@ pub struct TunnelStatsSnapshot {
     pub tcp_streams_active: u64,
     pub udp_datagrams_total: u64,
     pub uptime_secs: u64,
+}
+
+/// What all the tunnels a router has held since the relay started have
+/// counted. No figure falls while the relay runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TunnelTotals {
+    pub bytes_ingress: u64,
+    pub bytes_egress: u64,
+    pub tcp_streams_total: u64,
+    pub udp_datagrams_total: u64,
+}
+
+impl TunnelTotals {
+    pub fn bytes_forwarded(&self) -> u64 {
+        self.bytes_ingress + self.bytes_egress
+    }
+
+    fn add(&mut self, stats: &TunnelStats) {
+        self.bytes_ingress += stats.bytes_ingress.load(Ordering::Relaxed);
+        self.bytes_egress += stats.bytes_egress.load(Ordering::Relaxed);
+        self.tcp_streams_total += stats.tcp_streams_total.load(Ordering::Relaxed);
+        self.udp_datagrams_total += stats.udp_datagrams_total.load(Ordering::Relaxed);
+    }
+}
+
+/// An entry of a router's map, and the stats it counts into.
+pub trait Counted {
+    fn stats(&self) -> &Arc<TunnelStats>;
+}
+
+/// The counts of the tunnels that have left a router's map. With the counts of
+/// those still in it they make the router's [`TunnelTotals`].
+///
+/// A datagram is counted in its own tunnel's atomics only. A relay-wide atomic
+/// beside them would be one cache line written by every forwarding thread, so
+/// a tunnel's counts are added up here instead, once it has left the map.
+///
+/// Both methods take the lock first and the map's second, so neither may be
+/// called with a reference into the map held.
+#[derive(Default)]
+pub struct DepartedTunnels(Mutex<Departed>);
+
+#[derive(Default)]
+struct Departed {
+    /// The sum of the tunnels nothing holds any more.
+    finished: TunnelTotals,
+    /// The tunnels a forwarding task may still hold. One that looked its
+    /// tunnel up before it left the map counts into it afterwards.
+    leaving: Vec<Arc<TunnelStats>>,
+}
+
+impl DepartedTunnels {
+    /// Take a tunnel out of `held`. Every removal from a router's map goes
+    /// through here. The lock spans it, so [`Self::totals`] finds the tunnel
+    /// in `held` or in `leaving`, never in both or in neither.
+    pub fn remove<T: Counted>(&self, held: &DashMap<Uuid, T>, id: &Uuid) -> Option<T> {
+        let mut departed = self.0.lock().unwrap();
+        let Departed { finished, leaving } = &mut *departed;
+        let (_, tunnel) = held.remove(id)?;
+        leaving.retain_mut(|stats| match Arc::get_mut(stats) {
+            // Nothing else holds it, so nothing counts into it again.
+            Some(stats) => {
+                finished.add(stats);
+                false
+            }
+            None => true,
+        });
+        leaving.push(tunnel.stats().clone());
+        Some(tunnel)
+    }
+
+    /// What every tunnel that is or has been in `held` has counted.
+    pub fn totals<T: Counted>(&self, held: &DashMap<Uuid, T>) -> TunnelTotals {
+        let departed = self.0.lock().unwrap();
+        let mut totals = departed.finished;
+        for stats in &departed.leaving {
+            totals.add(stats);
+        }
+        for tunnel in held {
+            totals.add(tunnel.stats());
+        }
+        totals
+    }
 }
 
 /// Bandwidth sample for throughput estimation.
@@ -521,6 +606,184 @@ impl RelayStats {
         prev.timestamp = now;
 
         bps
+    }
+}
+
+#[cfg(test)]
+mod tunnel_totals_tests {
+    use super::*;
+
+    impl Counted for Arc<TunnelStats> {
+        fn stats(&self) -> &Arc<TunnelStats> {
+            self
+        }
+    }
+
+    /// Count `n` on a tunnel, weighted so that no two counters, and no two
+    /// sums of them, can be taken for each other.
+    fn count(stats: &TunnelStats, n: u64) {
+        stats.bytes_ingress.fetch_add(n, Ordering::Relaxed);
+        stats.bytes_egress.fetch_add(100 * n, Ordering::Relaxed);
+        stats.tcp_streams_total.fetch_add(10_000 * n, Ordering::Relaxed);
+        stats.udp_datagrams_total.fetch_add(1_000_000 * n, Ordering::Relaxed);
+        // Not a total: a gauge of the streams open now.
+        stats.tcp_streams_active.fetch_add(7, Ordering::Relaxed);
+    }
+
+    /// The totals of tunnels on which `n` was counted in all.
+    fn counted(n: u64) -> TunnelTotals {
+        TunnelTotals {
+            bytes_ingress: n,
+            bytes_egress: 100 * n,
+            tcp_streams_total: 10_000 * n,
+            udp_datagrams_total: 1_000_000 * n,
+        }
+    }
+
+    fn add(held: &DashMap<Uuid, Arc<TunnelStats>>) -> (Uuid, Arc<TunnelStats>) {
+        let (id, stats) = (Uuid::new_v4(), Arc::new(TunnelStats::new()));
+        held.insert(id, stats.clone());
+        (id, stats)
+    }
+
+    fn leaving(departed: &DepartedTunnels) -> usize {
+        departed.0.lock().unwrap().leaving.len()
+    }
+
+    #[test]
+    fn bytes_forwarded_are_both_directions() {
+        assert_eq!(counted(3).bytes_forwarded(), 303);
+    }
+
+    /// Every tunnel is in the totals once, wherever it is: in the map, out of
+    /// it and still held by a forwarding task, or out of it and held by none.
+    #[test]
+    fn a_tunnel_is_counted_once_wherever_it_is() {
+        let (held, departed) = (DashMap::new(), DepartedTunnels::default());
+        assert_eq!(departed.totals(&held), counted(0));
+
+        let (a, a_stats) = add(&held);
+        let (b, b_stats) = add(&held);
+        let (c, c_stats) = add(&held);
+        count(&a_stats, 1);
+        count(&b_stats, 2);
+        count(&c_stats, 4);
+        assert_eq!(departed.totals(&held), counted(7), "all three in the map");
+
+        drop(departed.remove(&held, &a).unwrap());
+        assert_eq!((held.len(), leaving(&departed)), (2, 1));
+        assert_eq!(departed.totals(&held), counted(7), "one left, still held");
+
+        drop(a_stats);
+        drop(departed.remove(&held, &b).unwrap());
+        assert_eq!((held.len(), leaving(&departed)), (1, 1), "the first is folded in");
+        assert_eq!(departed.totals(&held), counted(7), "one folded in, one leaving, one in the map");
+
+        drop(b_stats);
+        drop(departed.remove(&held, &c).unwrap());
+        drop(c_stats);
+        assert_eq!(departed.totals(&held), counted(7), "none in the map");
+        assert_eq!(departed.totals(&held), counted(7), "reading folds nothing in twice");
+    }
+
+    /// What a task counts after its tunnel left the map is kept, whatever
+    /// else leaves meanwhile and whoever holds the tunnel longest.
+    #[test]
+    fn a_count_after_the_tunnel_left_is_kept() {
+        let (held, departed) = (DashMap::new(), DepartedTunnels::default());
+        let (id, task) = add(&held);
+        let other_task = task.clone();
+        count(&task, 1);
+        drop(departed.remove(&held, &id).unwrap());
+
+        count(&task, 2);
+        assert_eq!(departed.totals(&held), counted(3));
+        for _ in 0..3 {
+            let (id, _) = add(&held);
+            departed.remove(&held, &id).unwrap();
+            count(&task, 1);
+        }
+        assert_eq!(departed.totals(&held), counted(6), "others left meanwhile");
+
+        drop(task);
+        let (id, _) = add(&held);
+        departed.remove(&held, &id).unwrap();
+        count(&other_task, 10);
+        assert_eq!(departed.totals(&held), counted(16), "the last holder counted last");
+        drop(other_task);
+        let (id, _) = add(&held);
+        departed.remove(&held, &id).unwrap();
+        assert_eq!(departed.totals(&held), counted(16), "folded in");
+    }
+
+    /// A tunnel nothing holds any more is let go at the next removal, so a
+    /// relay whose totals nobody reads keeps none of the tunnels it has had.
+    #[test]
+    fn a_finished_tunnel_is_let_go_without_a_reader() {
+        let (held, departed) = (DashMap::new(), DepartedTunnels::default());
+        let (id, task) = add(&held);
+        departed.remove(&held, &id).unwrap();
+        for _ in 0..1000 {
+            let (id, stats) = add(&held);
+            count(&stats, 1);
+            drop(stats);
+            departed.remove(&held, &id).unwrap();
+        }
+        assert_eq!(leaving(&departed), 2, "the one a task holds, and the last to leave");
+        drop(task);
+        let (id, _) = add(&held);
+        departed.remove(&held, &id).unwrap();
+        assert_eq!(leaving(&departed), 1);
+        assert_eq!(departed.totals(&held), counted(1000));
+    }
+
+    /// An entry that checks that the lock is held whenever its stats are asked
+    /// for.
+    struct Probe<'a> {
+        departed: &'a DepartedTunnels,
+        stats: Arc<TunnelStats>,
+    }
+
+    impl Counted for Probe<'_> {
+        fn stats(&self) -> &Arc<TunnelStats> {
+            assert!(self.departed.0.try_lock().is_err(), "counted without the lock");
+            &self.stats
+        }
+    }
+
+    /// The lock spans the whole of a removal and the whole of a read, so a read
+    /// never sees a tunnel half way out of the map.
+    #[test]
+    fn the_lock_spans_a_removal_and_a_read() {
+        let departed = DepartedTunnels::default();
+        let held = DashMap::new();
+        let id = Uuid::new_v4();
+        let stats = Arc::new(TunnelStats::new());
+        count(&stats, 1);
+        held.insert(id, Probe { departed: &departed, stats });
+        assert_eq!(departed.totals(&held), counted(1));
+
+        std::thread::scope(|s| {
+            let reading = departed.0.lock().unwrap();
+            let removal = s.spawn(|| departed.remove(&held, &id).is_some());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(held.contains_key(&id), "a removal waits for a read to end");
+            drop(reading);
+            assert!(removal.join().unwrap());
+        });
+        assert_eq!(departed.totals(&held), counted(1));
+    }
+
+    #[test]
+    fn removing_a_tunnel_that_is_not_there_changes_nothing() {
+        let (held, departed) = (DashMap::new(), DepartedTunnels::default());
+        let (id, stats) = add(&held);
+        count(&stats, 1);
+        assert!(departed.remove(&held, &Uuid::new_v4()).is_none());
+        assert!(departed.remove(&held, &id).is_some());
+        assert!(departed.remove(&held, &id).is_none(), "it left once");
+        assert_eq!(leaving(&departed), 1);
+        assert_eq!(departed.totals(&held), counted(1));
     }
 }
 

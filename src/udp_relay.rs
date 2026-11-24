@@ -38,7 +38,7 @@ use crate::protocol::{
     UdpRelayControl, TUNNEL_PROTOCOL_VERSION,
 };
 use crate::session::SessionContext;
-use crate::stats::TunnelStats;
+use crate::stats::{Counted, DepartedTunnels, TunnelStats, TunnelTotals};
 
 /// Session is reaped after this long with no register/keepalive or data.
 /// Edges re-register every ~5 s (see the edge `udp_relay_client`), so a 30 s
@@ -275,6 +275,12 @@ impl UdpSession {
     }
 }
 
+impl Counted for Arc<UdpSession> {
+    fn stats(&self) -> &Arc<TunnelStats> {
+        &self.stats
+    }
+}
+
 /// Serializable native-UDP session info for the REST API.
 #[derive(Debug, Serialize)]
 pub struct UdpSessionInfo {
@@ -295,7 +301,10 @@ pub struct UdpSessionInfo {
 /// registry (the manager already pushes per-tunnel HMAC tokens via
 /// `authorize_tunnel`), so no new manager machinery is needed.
 pub struct UdpSessionRouter {
+    /// A session leaves the map through `departed`, which keeps what it
+    /// counted.
     sessions: DashMap<Uuid, Arc<UdpSession>>,
+    departed: DepartedTunnels,
     /// Per-source-IP session-creation counter (DoS mitigation).
     sessions_by_ip: DashMap<IpAddr, Arc<AtomicU32>>,
     max_sessions_per_ip: u32,
@@ -321,6 +330,7 @@ impl UdpSessionRouter {
     pub fn new(max_sessions_per_ip: u32) -> Self {
         Self {
             sessions: DashMap::new(),
+            departed: DepartedTunnels::default(),
             sessions_by_ip: DashMap::new(),
             max_sessions_per_ip,
         }
@@ -520,7 +530,7 @@ impl UdpSessionRouter {
 
     /// Force-remove a session (idle reap or REST escape hatch).
     pub fn remove(&self, tunnel_id: &Uuid) -> bool {
-        if let Some((_, session)) = self.sessions.remove(tunnel_id) {
+        if let Some(session) = self.departed.remove(&self.sessions, tunnel_id) {
             if let Some(c) = self.sessions_by_ip.get(&session.creator_ip) {
                 let prev = c.fetch_sub(1, Ordering::Relaxed);
                 if prev == 1 {
@@ -533,6 +543,12 @@ impl UdpSessionRouter {
         } else {
             false
         }
+    }
+
+    /// What every native-UDP session has counted since the relay started, the
+    /// ones that have gone included.
+    pub fn totals(&self) -> TunnelTotals {
+        self.departed.totals(&self.sessions)
     }
 
     pub fn count(&self) -> usize {
@@ -1260,5 +1276,140 @@ mod slot_holddown_tests {
             grace < SESSION_IDLE_TIMEOUT.as_millis() as u64,
             "must expire before the session is reaped"
         );
+    }
+}
+
+#[cfg(test)]
+mod totals_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn source(host: u8) -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, host], 5000))
+    }
+
+    fn destination(host: u8) -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, host], 6000))
+    }
+
+    /// Register both sides from hosts of their own, the source first.
+    fn register(r: &UdpSessionRouter, t: Uuid, host: u8) {
+        r.latch(t, TunnelDirection::Egress, source(host), 0);
+        r.latch(t, TunnelDirection::Ingress, destination(host), 0);
+    }
+
+    /// Make a session idle for longer than the reaper lets it be.
+    fn make_stale(r: &UdpSessionRouter, t: Uuid) {
+        if let Some(s) = r.sessions.get(&t) {
+            s.last_seen_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn totals(bytes_ingress: u64, bytes_egress: u64, udp_datagrams_total: u64) -> TunnelTotals {
+        TunnelTotals { bytes_ingress, bytes_egress, tcp_streams_total: 0, udp_datagrams_total }
+    }
+
+    /// A gap between one forward, or one read of the totals, and the next. The
+    /// map's lock and the totals' are unfair: without it the removers starve.
+    fn pause() {
+        std::thread::sleep(std::time::Duration::from_micros(1));
+    }
+
+    /// Neither the reaper nor the REST delete moves the totals, and a session
+    /// registered again under its id counts on from them while its own figures
+    /// start again.
+    #[test]
+    fn a_session_that_goes_leaves_the_totals() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        assert_eq!(r.totals(), totals(0, 0, 0));
+        register(&r, t, 1);
+        assert!(r.forward_target(t, source(1), 1000).is_some());
+        assert!(r.forward_target(t, destination(1), 50).is_some());
+        assert_eq!(r.totals(), totals(50, 1000, 2));
+
+        make_stale(&r, t);
+        assert_eq!(r.reap_idle(), 1);
+        assert_eq!(r.count(), 0);
+        assert_eq!(r.totals(), totals(50, 1000, 2), "reaped");
+
+        register(&r, t, 1);
+        assert_eq!(r.totals(), totals(50, 1000, 2), "registered again");
+        assert!(r.forward_target(t, source(1), 7).is_some());
+        let own = r.list().remove(0);
+        assert_eq!((own.bytes_ingress, own.bytes_egress, own.datagrams), (0, 7, 1));
+        assert_eq!(r.totals(), totals(50, 1007, 3));
+
+        assert!(r.remove(&t));
+        assert!(!r.remove(&t));
+        assert_eq!(r.count(), 0);
+        assert_eq!(r.totals(), totals(50, 1007, 3), "deleted");
+    }
+
+    /// Four threads forward on two sessions that are deleted, or reaped, and
+    /// registered again under them as fast as they can be, while another reads
+    /// the totals: no figure falls, and at the end each is what was counted.
+    #[test]
+    fn the_totals_never_fall_under_concurrent_removal() {
+        let r = &UdpSessionRouter::new(64);
+        // One is only ever deleted and the other only ever reaped: a reap
+        // takes every stale session there is.
+        let deleted = (Uuid::new_v4(), 1);
+        let reaped = (Uuid::new_v4(), 2);
+        let stop = &AtomicBool::new(false);
+        let (datagrams, reads) = std::thread::scope(|s| {
+            let writers: Vec<_> = [deleted, reaped, deleted, reaped]
+                .into_iter()
+                .map(|(t, host)| {
+                    s.spawn(move || {
+                        // The side that registers last, so a datagram is
+                        // counted and forwarded, or neither.
+                        let from = destination(host);
+                        let mut counted = 0;
+                        while !stop.load(Ordering::Relaxed) {
+                            counted += u64::from(r.forward_target(t, from, 1316).is_some());
+                            pause();
+                        }
+                        counted
+                    })
+                })
+                .collect();
+            let removers = [
+                s.spawn(move || {
+                    for _ in 0..20_000 {
+                        register(r, deleted.0, deleted.1);
+                        r.remove(&deleted.0);
+                    }
+                }),
+                s.spawn(move || {
+                    for _ in 0..20_000 {
+                        register(r, reaped.0, reaped.1);
+                        make_stale(r, reaped.0);
+                        r.reap_idle();
+                    }
+                }),
+            ];
+            let reader = s.spawn(move || {
+                let (mut last, mut reads) = (TunnelTotals::default(), 0);
+                while !stop.load(Ordering::Relaxed) {
+                    let now = r.totals();
+                    assert!(now.bytes_ingress >= last.bytes_ingress, "{now:?} after {last:?}");
+                    assert!(
+                        now.udp_datagrams_total >= last.udp_datagrams_total,
+                        "{now:?} after {last:?}"
+                    );
+                    (last, reads) = (now, reads + 1);
+                    pause();
+                }
+                reads
+            });
+            let removed: Vec<_> = removers.into_iter().map(|r| r.join()).collect();
+            stop.store(true, Ordering::Relaxed);
+            removed.into_iter().for_each(|r| r.unwrap());
+            let datagrams: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+            (datagrams, reader.join().unwrap())
+        });
+        assert!(datagrams > 0 && reads > 0, "{datagrams} datagrams, {reads} reads");
+        assert_eq!(r.totals(), totals(datagrams * 1316, 0, datagrams));
     }
 }

@@ -326,7 +326,7 @@ async fn handle_control_stream(
                             TunnelDirection::Ingress => TunnelDirection::Egress,
                             TunnelDirection::Egress => TunnelDirection::Ingress,
                         };
-                        if let Some(entry) = ctx.router.tunnels_ref().get(&tunnel_id) {
+                        if let Some(entry) = ctx.router.tunnel(&tunnel_id) {
                             let peer_connection_id = match peer_dir {
                                 TunnelDirection::Egress => {
                                     entry.egress.as_ref().map(|e| e.connection_id.clone())
@@ -427,11 +427,7 @@ async fn forward_tcp_stream(
 
     // Determine direction of this edge in the tunnel
     let from_direction = {
-        let entry = ctx
-            .router
-            .tunnels_ref()
-            .get(&tunnel_id)
-            .context("tunnel not found")?;
+        let entry = ctx.router.tunnel(&tunnel_id).context("tunnel not found")?;
         if entry
             .ingress
             .as_ref()
@@ -510,7 +506,7 @@ async fn handle_udp_datagrams(
 
         // Determine this edge's direction in the tunnel
         let from_direction = {
-            let Some(entry) = ctx.router.tunnels_ref().get(&tunnel_id) else {
+            let Some(entry) = ctx.router.tunnel(&tunnel_id) else {
                 tracing::debug!("UDP datagram for unknown tunnel {tunnel_id} from '{connection_id}'");
                 continue;
             };
@@ -616,16 +612,16 @@ pub(crate) async fn notify_tunnel_down(
 }
 
 #[cfg(test)]
-mod notify_tests {
-    //! Notifications from one edge's session to another, through the real
-    //! session code over QUIC on loopback.
+pub(crate) mod test_relay {
+    //! A relay running the real session code over QUIC on loopback, and edges
+    //! to reach it.
     use super::*;
     use rustls::pki_types::CertificateDer;
     use std::net::SocketAddr;
 
-    /// A relay running the real session code, and the certificate an edge
-    /// must trust to reach it.
-    fn start_relay() -> (SocketAddr, CertificateDer<'static>) {
+    /// The relay's address, the certificate an edge must trust to reach it,
+    /// and its state.
+    pub(crate) fn start_relay() -> (SocketAddr, CertificateDer<'static>, Arc<SessionContext>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
@@ -641,9 +637,10 @@ mod notify_tests {
         let addr = endpoint.local_addr().unwrap();
         let (event_sender, _events) = crate::manager::event_channel();
         let ctx = crate::server::create_session_context(Arc::new(RelayStats::new()), event_sender, false, 64, 100);
+        let accept_ctx = ctx.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
-                let ctx = ctx.clone();
+                let ctx = accept_ctx.clone();
                 tokio::spawn(async move {
                     if let Ok(connection) = incoming.await {
                         handle_edge_connection(ctx, connection).await;
@@ -651,13 +648,13 @@ mod notify_tests {
                 });
             }
         });
-        (addr, cert_der)
+        (addr, cert_der, ctx)
     }
 
     /// An edge's endpoint, connection and control stream. It allows the relay
     /// `uni_streams` streams of the relay's own, which is what notifications
     /// arrive on.
-    async fn edge(
+    pub(crate) async fn edge(
         relay: SocketAddr,
         cert: &CertificateDer<'static>,
         uni_streams: u32,
@@ -680,13 +677,20 @@ mod notify_tests {
         let (send, recv) = connection.open_bi().await.unwrap();
         (endpoint, connection, send, recv)
     }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    //! Notifications from one edge's session to another.
+    use super::test_relay::{edge, start_relay};
+    use super::*;
 
     /// An edge that has stopped taking streams but still answers keep-alives
     /// held the relay's notification to it for ever — and with it the control
     /// loop of the edge whose bind set it off, which answered nothing more.
     #[tokio::test]
     async fn an_edge_that_takes_no_streams_does_not_hold_up_its_peer() {
-        let (relay, cert) = start_relay();
+        let (relay, cert, _ctx) = start_relay();
         let tunnel_id = Uuid::new_v4();
         let bind = |direction| EdgeMessage::TunnelBind {
             tunnel_id,
@@ -713,5 +717,167 @@ mod notify_tests {
             .expect("the control loop is still held by the notification")
             .unwrap();
         assert!(matches!(pong, RelayMessage::Pong), "{pong:?}");
+    }
+}
+
+#[cfg(test)]
+mod tunnel_counter_tests {
+    //! The relay-wide counters, fed by real edges.
+    use super::test_relay::{edge, start_relay};
+    use super::*;
+    use crate::stats::TunnelTotals;
+    use tokio::time::{Instant, sleep, timeout};
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn bind(tunnel_id: Uuid, direction: TunnelDirection, protocol: TunnelProtocol) -> EdgeMessage {
+        EdgeMessage::TunnelBind { tunnel_id, direction, protocol, bind_token: None }
+    }
+
+    /// Send `msg` and wait until the relay has handled it.
+    async fn send_and_settle(
+        send: &mut quinn::SendStream,
+        recv: &mut quinn::RecvStream,
+        msg: &EdgeMessage,
+    ) {
+        write_message(send, msg).await.unwrap();
+        write_message(send, &EdgeMessage::Ping).await.unwrap();
+        loop {
+            if let RelayMessage::Pong = read_message(recv).await.unwrap() {
+                return;
+            }
+        }
+    }
+
+    /// Wait for the totals to reach `want`: a task counts after it has sent.
+    async fn settle(ctx: &SessionContext, want: TunnelTotals, what: &str) {
+        let until = Instant::now() + WAIT;
+        while ctx.router.totals() != want && Instant::now() < until {
+            sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(ctx.router.totals(), want, "{what}");
+    }
+
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let until = Instant::now() + WAIT;
+        while !done() {
+            assert!(Instant::now() < until, "{what}");
+            sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Datagrams through a tunnel that is unbound, bound again under its id,
+    /// removed by force, and lost with its edges: each leaves the totals as
+    /// they were, and the tunnel's own figures start again.
+    #[tokio::test]
+    async fn datagram_totals_outlive_the_tunnel() {
+        let (relay, cert, ctx) = start_relay();
+        let (_e1, ingress, mut in_tx, mut in_rx) = edge(relay, &cert, 100).await;
+        let (_e2, egress, mut out_tx, mut out_rx) = edge(relay, &cert, 100).await;
+        let id = Uuid::new_v4();
+        let udp = TunnelProtocol::Udp;
+        let totals = |bytes_ingress, bytes_egress, udp_datagrams_total| TunnelTotals {
+            bytes_ingress,
+            bytes_egress,
+            tcp_streams_total: 0,
+            udp_datagrams_total,
+        };
+        let row = || {
+            let rows = ctx.router.list_tunnels();
+            assert_eq!(rows.len(), 1);
+            (rows[0].stats.bytes_ingress, rows[0].stats.bytes_egress, rows[0].stats.udp_datagrams_total)
+        };
+
+        send_and_settle(&mut in_tx, &mut in_rx, &bind(id, TunnelDirection::Ingress, udp)).await;
+        send_and_settle(&mut out_tx, &mut out_rx, &bind(id, TunnelDirection::Egress, udp)).await;
+        ingress.send_datagram(encode_udp_datagram(&id, &[1; 100]).into()).unwrap();
+        timeout(WAIT, egress.read_datagram()).await.unwrap().unwrap();
+        egress.send_datagram(encode_udp_datagram(&id, &[2; 30]).into()).unwrap();
+        timeout(WAIT, ingress.read_datagram()).await.unwrap().unwrap();
+        settle(&ctx, totals(100, 30, 2), "one datagram each way").await;
+        assert_eq!(row(), (100, 30, 2));
+
+        let unbind = EdgeMessage::TunnelUnbind { tunnel_id: id };
+        send_and_settle(&mut out_tx, &mut out_rx, &unbind).await;
+        assert_eq!(ctx.router.counts(), (1, 0));
+        assert_eq!(ctx.router.totals(), totals(100, 30, 2), "one side unbound");
+        send_and_settle(&mut in_tx, &mut in_rx, &unbind).await;
+        assert_eq!(ctx.router.counts(), (0, 0));
+        assert_eq!(ctx.router.totals(), totals(100, 30, 2), "both sides unbound");
+
+        send_and_settle(&mut in_tx, &mut in_rx, &bind(id, TunnelDirection::Ingress, udp)).await;
+        send_and_settle(&mut out_tx, &mut out_rx, &bind(id, TunnelDirection::Egress, udp)).await;
+        assert_eq!(ctx.router.totals(), totals(100, 30, 2), "bound again");
+        assert_eq!(row(), (0, 0, 0), "the tunnel's own figures start again");
+        ingress.send_datagram(encode_udp_datagram(&id, &[3; 7]).into()).unwrap();
+        timeout(WAIT, egress.read_datagram()).await.unwrap().unwrap();
+        settle(&ctx, totals(107, 30, 3), "a datagram on the second tunnel").await;
+        assert_eq!(row(), (7, 0, 1));
+
+        assert_eq!(ctx.router.force_remove_tunnel(&id).map(|peers| peers.len()), Some(2));
+        assert_eq!(ctx.router.counts(), (0, 0));
+        assert_eq!(ctx.router.totals(), totals(107, 30, 3), "removed by force");
+
+        send_and_settle(&mut in_tx, &mut in_rx, &bind(id, TunnelDirection::Ingress, udp)).await;
+        send_and_settle(&mut out_tx, &mut out_rx, &bind(id, TunnelDirection::Egress, udp)).await;
+        egress.send_datagram(encode_udp_datagram(&id, &[4; 1000]).into()).unwrap();
+        timeout(WAIT, ingress.read_datagram()).await.unwrap().unwrap();
+        settle(&ctx, totals(107, 1030, 4), "a datagram on the third tunnel").await;
+        ingress.close(0u32.into(), b"");
+        egress.close(0u32.into(), b"");
+        wait_for("both edges gone", || ctx.router.counts() == (0, 0)).await;
+        assert_eq!(ctx.router.totals(), totals(107, 1030, 4), "lost with its edges");
+    }
+
+    /// A TCP stream outlives the tunnel it was opened on: what it carries
+    /// after the tunnel was removed is in the totals, and it is out of the
+    /// gauge of the streams open on the tunnels held now.
+    #[tokio::test]
+    async fn a_stream_counts_after_its_tunnel_is_removed() {
+        let (relay, cert, ctx) = start_relay();
+        let (_e1, ingress, mut in_tx, mut in_rx) = edge(relay, &cert, 100).await;
+        let (_e2, egress, mut out_tx, mut out_rx) = edge(relay, &cert, 100).await;
+        let id = Uuid::new_v4();
+        let tcp = TunnelProtocol::Tcp;
+        let totals = |bytes_ingress, bytes_egress| TunnelTotals {
+            bytes_ingress,
+            bytes_egress,
+            tcp_streams_total: 1,
+            udp_datagrams_total: 0,
+        };
+        let active = || -> u64 {
+            ctx.router.list_tunnels().iter().map(|t| t.stats.tcp_streams_active).sum()
+        };
+
+        send_and_settle(&mut in_tx, &mut in_rx, &bind(id, TunnelDirection::Ingress, tcp)).await;
+        send_and_settle(&mut out_tx, &mut out_rx, &bind(id, TunnelDirection::Egress, tcp)).await;
+        let (mut a_tx, mut a_rx) = ingress.open_bi().await.unwrap();
+        let header = StreamHeader { tunnel_id: id, stream_type: StreamType::Tcp };
+        write_stream_header(&mut a_tx, &header).await.unwrap();
+        a_tx.write_all(&[1; 500]).await.unwrap();
+        let (mut b_tx, mut b_rx) = timeout(WAIT, egress.accept_bi()).await.unwrap().unwrap();
+        read_stream_header(&mut b_rx).await.unwrap();
+        b_tx.write_all(&[2; 60]).await.unwrap();
+        settle(&ctx, totals(500, 60), "before the tunnel is removed").await;
+        assert_eq!(active(), 1);
+
+        ctx.router.force_remove_tunnel(&id).unwrap();
+        assert_eq!(ctx.router.totals(), totals(500, 60), "the tunnel is removed");
+        assert_eq!(active(), 0, "no tunnel is held");
+        a_tx.write_all(&[3; 4000]).await.unwrap();
+        b_tx.write_all(&[4; 20]).await.unwrap();
+        settle(&ctx, totals(4500, 80), "counted after the tunnel was removed").await;
+
+        // Another removal folds in the tunnels nothing holds any more: not
+        // this one, while its stream runs.
+        let other = Uuid::new_v4();
+        send_and_settle(&mut in_tx, &mut in_rx, &bind(other, TunnelDirection::Ingress, tcp)).await;
+        ctx.router.force_remove_tunnel(&other).unwrap();
+        a_tx.write_all(&[5; 8]).await.unwrap();
+        a_tx.finish().unwrap();
+        b_tx.finish().unwrap();
+        a_rx.read_to_end(1 << 16).await.unwrap();
+        b_rx.read_to_end(1 << 16).await.unwrap();
+        settle(&ctx, totals(4508, 80), "the stream ended").await;
     }
 }

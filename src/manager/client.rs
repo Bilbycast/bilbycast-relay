@@ -1113,18 +1113,14 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
     let (total_tunnels, active_tunnels) = ctx.router.counts();
     let connected_edges = ctx.edge_connections.len();
 
-    let total_bytes_ingress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_ingress).sum();
-    let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
-    let total_bytes_forwarded = total_bytes_ingress + total_bytes_egress;
-    let total_tcp_streams: u64 = tunnel_infos.iter().map(|t| t.stats.tcp_streams_total).sum();
+    let totals = ctx.router.totals();
     let active_tcp_streams: u64 = tunnel_infos.iter().map(|t| t.stats.tcp_streams_active).sum();
-    let total_udp_datagrams: u64 = tunnel_infos.iter().map(|t| t.stats.udp_datagrams_total).sum();
 
     // Update peaks
     relay_stats.update_peaks(active_tunnels as u64, connected_edges as u64);
 
     // Compute current throughput
-    let total_bandwidth_bps = relay_stats.compute_bandwidth_bps(total_bytes_forwarded);
+    let total_bandwidth_bps = relay_stats.compute_bandwidth_bps(totals.bytes_forwarded());
 
     // Build edges list
     let edges: Vec<serde_json::Value> = ctx
@@ -1147,13 +1143,13 @@ fn build_stats_payload(ctx: &SessionContext, relay_stats: &RelayStats) -> serde_
         "connected_edges": connected_edges,
         "active_tunnels": active_tunnels,
         "total_tunnels": total_tunnels,
-        "total_bytes_ingress": total_bytes_ingress,
-        "total_bytes_egress": total_bytes_egress,
-        "total_bytes_forwarded": total_bytes_forwarded,
+        "total_bytes_ingress": totals.bytes_ingress,
+        "total_bytes_egress": totals.bytes_egress,
+        "total_bytes_forwarded": totals.bytes_forwarded(),
         "total_bandwidth_bps": total_bandwidth_bps,
-        "total_tcp_streams": total_tcp_streams,
+        "total_tcp_streams": totals.tcp_streams_total,
         "active_tcp_streams": active_tcp_streams,
-        "total_udp_datagrams": total_udp_datagrams,
+        "total_udp_datagrams": totals.udp_datagrams_total,
         "peak_tunnels": relay_stats.peak_tunnels.load(std::sync::atomic::Ordering::Relaxed),
         "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
         "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
@@ -1632,9 +1628,6 @@ fn build_health_message(
     distribution_control: Option<&Arc<DistributionControl>>,
 ) -> serde_json::Value {
     let (total_tunnels, active_tunnels) = ctx.router.counts();
-    let tunnel_infos = ctx.router.list_tunnels();
-    let total_bytes_ingress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_ingress).sum();
-    let total_bytes_egress: u64 = tunnel_infos.iter().map(|t| t.stats.bytes_egress).sum();
 
     // Capability bits the manager UI gates on. "udp-relay" => native SRT/RIST
     // (no-QUIC) tunnels, withdrawn if the plane stopped (relay#15).
@@ -1666,7 +1659,7 @@ fn build_health_message(
         "connected_edges": ctx.edge_connections.len(),
         "active_tunnels": active_tunnels,
         "total_tunnels": total_tunnels,
-        "total_bytes_forwarded": total_bytes_ingress + total_bytes_egress,
+        "total_bytes_forwarded": ctx.router.totals().bytes_forwarded(),
         "peak_tunnels": relay_stats.peak_tunnels.load(std::sync::atomic::Ordering::Relaxed),
         "peak_edges": relay_stats.peak_edges.load(std::sync::atomic::Ordering::Relaxed),
         "connections_total": relay_stats.connections_total.load(std::sync::atomic::Ordering::Relaxed),
@@ -4035,6 +4028,214 @@ mod distribution_counter_tests {
         drop(old);
         assert_eq!(hub.stream_count(), 0);
         assert_eq!(read().await, (1020, 2), "every stream ended");
+    }
+}
+
+#[cfg(test)]
+mod tunnel_counter_tests {
+    //! The relay-wide tunnel counters never fall, and read the same on
+    //! `/metrics`, `/api/v1/stats`, the health payload and the stats payload.
+    //! Up to v0.20.0 each was a sum over the tunnels, or the native-UDP
+    //! sessions, held when it was read.
+    use super::*;
+    use crate::config::RelayConfig;
+    use crate::protocol::{TunnelDirection, TunnelProtocol};
+    use crate::session::test_relay::{edge, start_relay};
+    use crate::stats::TunnelStats;
+    use crate::tunnel_router::TunnelEndpoint;
+    use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use uuid::Uuid;
+
+    /// What the surfaces carry between them. `active_tcp_streams` is the one
+    /// gauge here.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    struct Read {
+        bytes_ingress: u64,
+        bytes_egress: u64,
+        tcp_streams: u64,
+        active_tcp_streams: u64,
+        datagrams: u64,
+        native_bytes: u64,
+        native_datagrams: u64,
+    }
+
+    /// Serve the REST API on loopback.
+    async fn serve_api(ctx: &Arc<SessionContext>) -> SocketAddr {
+        let router = crate::api::create_router(Arc::new(crate::api::ApiState {
+            ctx: ctx.clone(),
+            relay_stats: ctx.relay_stats.clone(),
+            api_token: None,
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        addr
+    }
+
+    async fn get(api: SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(api).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        response.split_once("\r\n\r\n").unwrap().1.to_string()
+    }
+
+    /// One metric family's only sample, once its type is checked.
+    fn metric(text: &str, name: &str, kind: &str) -> u64 {
+        let family = format!("bilbycast_relay_{name}");
+        assert!(text.contains(&format!("# TYPE {family} {kind}\n")), "{family}: {text}");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{family} ")))
+            .unwrap_or_else(|| panic!("no {family} in {text}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// Read every surface, and check that they agree.
+    async fn read(ctx: &SessionContext, api: SocketAddr) -> Read {
+        let text = get(api, "/metrics").await;
+        let counter = |name| metric(&text, name, "counter");
+        let read = Read {
+            bytes_ingress: counter("bytes_ingress_total"),
+            bytes_egress: counter("bytes_egress_total"),
+            tcp_streams: counter("tcp_streams_total"),
+            active_tcp_streams: metric(&text, "tcp_streams_active", "gauge"),
+            datagrams: counter("udp_datagrams_total"),
+            native_bytes: counter("udp_bytes_forwarded_total"),
+            native_datagrams: counter("udp_datagrams_forwarded_total"),
+        };
+        let forwarded = read.bytes_ingress + read.bytes_egress;
+        assert_eq!(counter("bytes_forwarded_total"), forwarded);
+
+        let rest: serde_json::Value = serde_json::from_str(&get(api, "/api/v1/stats").await).unwrap();
+        for stats in [&rest, &build_stats_payload(ctx, &ctx.relay_stats)] {
+            assert_eq!(stats["total_bytes_ingress"], read.bytes_ingress, "{stats}");
+            assert_eq!(stats["total_bytes_egress"], read.bytes_egress, "{stats}");
+            assert_eq!(stats["total_bytes_forwarded"], forwarded, "{stats}");
+            assert_eq!(stats["total_tcp_streams"], read.tcp_streams, "{stats}");
+            assert_eq!(stats["active_tcp_streams"], read.active_tcp_streams, "{stats}");
+            assert_eq!(stats["total_udp_datagrams"], read.datagrams, "{stats}");
+        }
+        let health = build_health_message(ctx, &ctx.relay_stats, &RelayConfig::default(), None);
+        assert_eq!(health["payload"]["total_bytes_forwarded"], forwarded, "{health}");
+        read
+    }
+
+    /// Bind both sides of a tunnel, and look it up as a forwarding task does.
+    fn bind(ctx: &SessionContext, id: Uuid, connection: &quinn::Connection) -> Arc<TunnelStats> {
+        for direction in [TunnelDirection::Ingress, TunnelDirection::Egress] {
+            ctx.router.bind(id, TunnelProtocol::Tcp, TunnelEndpoint {
+                edge_id: "edge".into(),
+                connection_id: format!("{direction:?}"),
+                direction,
+                connection: connection.clone(),
+            });
+        }
+        ctx.router.get_peer_connection(&id, TunnelDirection::Ingress).unwrap().1
+    }
+
+    #[tokio::test]
+    async fn every_surface_agrees_and_no_counter_falls() {
+        let (relay, cert, ctx) = start_relay();
+        let (_endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
+        let api = serve_api(&ctx).await;
+        assert_eq!(read(&ctx, api).await, Read::default());
+
+        let id = Uuid::new_v4();
+        let task = bind(&ctx, id, &connection);
+        task.bytes_ingress.fetch_add(1000, Ordering::Relaxed);
+        task.bytes_egress.fetch_add(20, Ordering::Relaxed);
+        task.tcp_streams_total.fetch_add(3, Ordering::Relaxed);
+        task.tcp_streams_active.fetch_add(2, Ordering::Relaxed);
+        task.udp_datagrams_total.fetch_add(5, Ordering::Relaxed);
+        let (source, destination): (SocketAddr, SocketAddr) =
+            ("198.51.100.10:5000".parse().unwrap(), "203.0.113.7:6000".parse().unwrap());
+        let register = |id| {
+            ctx.udp_sessions.latch(id, TunnelDirection::Egress, source, 0);
+            ctx.udp_sessions.latch(id, TunnelDirection::Ingress, destination, 0);
+        };
+        register(id);
+        ctx.udp_sessions.forward_target(id, source, 700).unwrap();
+        ctx.udp_sessions.forward_target(id, destination, 1).unwrap();
+        let mut want = Read {
+            bytes_ingress: 1000,
+            bytes_egress: 20,
+            tcp_streams: 3,
+            active_tcp_streams: 2,
+            datagrams: 5,
+            native_bytes: 701,
+            native_datagrams: 2,
+        };
+        assert_eq!(read(&ctx, api).await, want);
+
+        ctx.router.force_remove_tunnel(&id).unwrap();
+        assert!(ctx.udp_sessions.remove(&id));
+        want.active_tcp_streams = 0;
+        assert_eq!(read(&ctx, api).await, want, "the tunnel and the session are gone");
+
+        task.bytes_ingress.fetch_add(4, Ordering::Relaxed);
+        task.bytes_egress.fetch_add(8, Ordering::Relaxed);
+        task.udp_datagrams_total.fetch_add(1, Ordering::Relaxed);
+        want.bytes_ingress += 4;
+        want.bytes_egress += 8;
+        want.datagrams += 1;
+        assert_eq!(read(&ctx, api).await, want, "counted after the tunnel had gone");
+
+        let next = bind(&ctx, id, &connection);
+        next.bytes_ingress.fetch_add(50, Ordering::Relaxed);
+        next.tcp_streams_total.fetch_add(1, Ordering::Relaxed);
+        next.tcp_streams_active.fetch_add(1, Ordering::Relaxed);
+        register(id);
+        ctx.udp_sessions.forward_target(id, source, 9).unwrap();
+        want.bytes_ingress += 50;
+        want.tcp_streams += 1;
+        want.active_tcp_streams = 1;
+        want.native_bytes += 9;
+        want.native_datagrams += 1;
+        assert_eq!(read(&ctx, api).await, want, "bound and registered again");
+        let text = get(api, "/metrics").await;
+        assert!(
+            text.contains(&format!(
+                "bilbycast_relay_tunnel_bytes_ingress{{tunnel_id=\"{id}\",protocol=\"tcp\"}} 50\n"
+            )),
+            "a tunnel's own series is its own: {text}"
+        );
+
+        drop((task, next));
+        ctx.router.unbind(&id, "Ingress");
+        ctx.router.unbind(&id, "Egress");
+        assert!(ctx.udp_sessions.remove(&id));
+        want.active_tcp_streams = 0;
+        assert_eq!(read(&ctx, api).await, want, "gone again, and nothing holds either");
+    }
+
+    /// The bandwidth figure is the growth of `total_bytes_forwarded` since the
+    /// last sample. It read 0 for a sample in which a tunnel ended, because the
+    /// total had fallen.
+    #[tokio::test]
+    async fn the_bandwidth_sample_takes_in_a_tunnel_that_ended() {
+        let (relay, cert, ctx) = start_relay();
+        let (_endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
+        for ingress in [true, false] {
+            let id = Uuid::new_v4();
+            let task = bind(&ctx, id, &connection);
+            let bytes = if ingress { &task.bytes_ingress } else { &task.bytes_egress };
+            bytes.fetch_add(1_000_000, Ordering::Relaxed);
+            build_stats_payload(&ctx, &ctx.relay_stats);
+
+            bytes.fetch_add(10_000, Ordering::Relaxed);
+            drop(task);
+            ctx.router.force_remove_tunnel(&id).unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let stats = build_stats_payload(&ctx, &ctx.relay_stats);
+            let bps = stats["total_bandwidth_bps"].as_u64().unwrap();
+            // 80 000 bits in 200 ms, and no more than that.
+            assert!((1..=400_000).contains(&bps), "{bps}");
+        }
     }
 }
 
