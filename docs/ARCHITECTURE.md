@@ -341,7 +341,10 @@ configured. The relay tells the edge that its side was removed, and one after
 v0.117.0 binds it again about a second later. Under `require_bind_auth` that is
 refused. Otherwise it is taken, as any bind of the tunnel is then: with both
 edges out of the manager's reach the deleted tunnel carries media again, and a
-stranger may take a side of it, until `delete_tunnel` reaches them.
+stranger may take a side of it, until `delete_tunnel` reaches them. The manager
+drops it from its queue after 24 h. An edge that comes back later keeps the
+tunnel, reported in an Info event, unless the manager's
+`tunnel_orphan_auto_cleanup` setting is on, which has it deleted.
 
 `DELETE /api/v1/tunnels/{id}` removes a tunnel that the manager still has, and
 its edges bind it again in the same way. So it takes the tokens away only under
