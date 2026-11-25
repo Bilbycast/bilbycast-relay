@@ -274,13 +274,13 @@ The relay holds the bind tokens in memory only, so after a restart it has none
 until the manager has sent them again, and by then the edges are usually back.
 With `require_bind_auth: false` any bind and any `Register` is taken meanwhile.
 The relay remembers what each showed (the SHA-256 of its token, compared in
-constant time), on every holder of a side and on every connection a side was
-taken over from. When `authorize_tunnel` comes:
+constant time), on every holder of a side and on each connection that a bind
+without its token took a side from. When `authorize_tunnel` comes:
 
 | The side's holder | What happens |
 |---|---|
 | has shown the token now registered | nothing: it keeps the side, and is told nothing |
-| has not, and took the side (directly or through others) from a connection that has and has not unbound or left since | that connection holds the side again, at once; the last one to have bound, if there are several. The same if the side is empty because the one that took it has left |
+| has not, and took the side (directly or through others) from a connection that has and has not unbound or left since | that connection holds the side again, at once. The same if the side is empty because the one that took it has left, or the whole tunnel is: the relay keeps the tunnel, in no list and no count, for as long as it remembers such a connection |
 | has not, and no such connection is there | nothing, until an edge binds with the token and takes the side as any bind does |
 
 `TunnelRouter::authorize_tunnel` does this, and `bind` verifies a token under the
@@ -288,6 +288,13 @@ same lock, so a bind that races the tokens is either refused or undone. The edge
 that has its side back needs to do nothing and need not be new: its connection,
 the streams it has open and its next datagram simply go through. It is told how
 the tunnel stands now. Each raises a Warning `relay_unproven_holder_replaced`.
+
+A connection is not remembered if it showed no token, which nothing would give
+the side back to, nor once another binds the side with the token it showed. That
+one is the same edge on a newer connection, or a second edge with the same
+configuration, and the older one does not have the side again when it leaves. So
+of a side and a token one connection is remembered at most, and none on a tunnel
+whose tokens were there before its binds and have not changed since.
 
 On the native-UDP plane an edge sends its token every 5 s, so the rule is in
 `UdpSessionRouter::latch`: a `Register` that shows the registered token takes the
@@ -308,7 +315,7 @@ from a stranger:
 | the 30 s retry of a push that failed | `authorize_tunnel` | the same |
 | apply a Bonded Link | `authorize_tunnel` to each relay, then the edges' inputs and outputs. An edit keeps each leg's secret | nobody |
 | release or roll back a Bonded Link | the edges' part, then `revoke_tunnel` | does not matter: nothing is registered |
-| delete a tunnel | `delete_tunnel` to each edge, `revoke_tunnel`, `close_tunnel`, and all three again within 30 s from its queue | does not matter: the side is removed |
+| delete a tunnel | `delete_tunnel` to each edge, `revoke_tunnel`, `close_tunnel`, and all three again within 30 s from its queue | anyone, until an edge it cannot reach has its `delete_tunnel`: see below |
 
 Every edge since v0.7.0 sends the token of the bind secret it has, with every
 bind and every `Register`, and none if it has no secret. So the rule waits for
@@ -329,8 +336,25 @@ as it is. Binds and registers after it are refused under `require_bind_auth` and
 taken without a token otherwise. The manager sends it alone only where the edges
 have already dropped the leg, and with `close_tunnel` where a tunnel is deleted.
 
+An edge that the manager cannot reach when it deletes a tunnel still has it
+configured. The relay tells the edge that its side was removed, and one after
+v0.117.0 binds it again about a second later. Under `require_bind_auth` that is
+refused. Otherwise it is taken, as any bind of the tunnel is then: with both
+edges out of the manager's reach the deleted tunnel carries media again, and a
+stranger may take a side of it, until `delete_tunnel` reaches them.
+
+`DELETE /api/v1/tunnels/{id}` removes a tunnel that the manager still has, and
+its edges bind it again in the same way. So it takes the tokens away only under
+`require_bind_auth`, where that has the edges refused until the manager
+authorizes the tunnel again. Otherwise the tokens stay, and an edge that has not
+the right one is refused as a stranger is. Up to v0.20.0 it always took them
+away: on such a relay with `require_bind_auth: false`, an edge after v0.117.0 is
+back about a second later with nothing to keep a stranger from taking its side,
+until the relay next connects to the manager or the tunnel is edited.
+
 Pinned by `session::shown_token_tests` (real QUIC on loopback),
-`udp_relay::shown_token_tests` and `manager::client::authorize_tests`.
+`tunnel_router::displaced_tests`, `udp_relay::shown_token_tests`,
+`manager::client::authorize_tests` and `removal_notice_tests`.
 
 ## What an Edge Is Told
 
@@ -342,7 +366,7 @@ relay opens for it, one message each (`notify_edge`):
 |---|---|---|
 | the other side bound | the peer | `TunnelReady` |
 | the other side's connection ended, or unbound | the peer | `TunnelDown`, reason `peer disconnected` or `peer unbound` |
-| the tunnel was removed | both sides | `TunnelDown`, reason `tunnel closed by manager` (`close_tunnel`) or `tunnel deleted via relay REST API` |
+| the tunnel was removed | both sides, and the connections the relay remembers a side was taken from | `TunnelDown`, reason `tunnel closed by manager` (`close_tunnel`) or `tunnel deleted via relay REST API`; to all at once |
 | a side was given back | the edge that has it, and its peer | `TunnelReady`, or `TunnelDown` with `peer disconnected` to the edge if nobody holds the other side |
 | a side was taken over by another bind | nobody | none: two edges of one configuration would take it from each other for ever |
 
@@ -366,17 +390,18 @@ relay: after 128 comings and goings of its peer each further one, and each
 `close_tunnel`, took `NOTIFY_TIMEOUT` (5 s) to give up. That bound is still
 needed for those edges.
 
-Pinned by `session::notice_order_tests`, `session::notify_tests` and
-`manager::client::removal_notice_tests`.
+Pinned by `session::notice_order_tests`, `session::notify_tests`,
+`session::removed_tests` and `manager::client::removal_notice_tests`.
 
 ## The Per-Connection Cap
 
 `max_tunnels_per_connection` (default 100) bounds the sides a connection has
 bound and not unbound. A side counts once however often it is bound, and both
 sides of one tunnel count as two. A side that another connection has taken over
-counts for both: the router remembers who it was taken from. An unbind gives
-back what the connection had of that tunnel and nothing else, and a tunnel
-removed by force gives back its sides. A refused bind does not count. The
+counts for the older one too while the router remembers it as one the side can
+[go back to](#tokens-that-come-after-the-binds). An unbind gives back what the
+connection had of that tunnel and nothing else, and a tunnel removed by force
+gives back its sides. A refused bind does not count. The
 session keeps the sides the connection has asked for, and asks the router which
 of them it still has once there are as many as the cap. So neither ever holds
 more than the cap for one connection.
