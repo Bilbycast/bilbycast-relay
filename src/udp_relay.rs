@@ -39,6 +39,7 @@ use crate::protocol::{
 };
 use crate::session::SessionContext;
 use crate::stats::{Counted, DepartedTunnels, TunnelStats, TunnelTotals};
+use crate::tunnel_router::TokenDigest;
 use crate::util::IpCounts;
 
 /// Session is reaped after this long with no register/keepalive or data.
@@ -238,6 +239,11 @@ pub struct UdpSession {
     /// `last_seen_ms`, which either side refreshes.
     ingress_media_ms: AtomicU64,
     egress_media_ms: AtomicU64,
+    /// The token shown by the `Register` that latched each slot, the right one
+    /// or not: with none registered for the tunnel, any is taken. Read and
+    /// written under the session's entry lock.
+    ingress_shown: Option<TokenDigest>,
+    egress_shown: Option<TokenDigest>,
     /// Source IP that created the session (for per-IP DoS accounting).
     creator_ip: IpAddr,
     pub stats: Arc<TunnelStats>,
@@ -255,6 +261,8 @@ impl UdpSession {
             egress_sock: AtomicUsize::new(usize::MAX),
             ingress_media_ms: AtomicU64::new(0),
             egress_media_ms: AtomicU64::new(0),
+            ingress_shown: None,
+            egress_shown: None,
             creator_ip,
             stats: Arc::new(TunnelStats::new()),
             last_seen_ms: AtomicU64::new(now_ms()),
@@ -276,7 +284,7 @@ impl UdpSession {
     }
 }
 
-impl Counted for Arc<UdpSession> {
+impl Counted for UdpSession {
     fn stats(&self) -> &Arc<TunnelStats> {
         &self.stats
     }
@@ -304,7 +312,7 @@ pub struct UdpSessionInfo {
 pub struct UdpSessionRouter {
     /// A session leaves the map through `departed`, which keeps what it
     /// counted.
-    sessions: DashMap<Uuid, Arc<UdpSession>>,
+    sessions: DashMap<Uuid, UdpSession>,
     departed: DepartedTunnels,
     /// Per-source-IP session-creation counter (DoS mitigation).
     sessions_by_ip: IpCounts,
@@ -315,6 +323,10 @@ pub struct UdpSessionRouter {
 pub enum LatchResult {
     /// Session updated; `bool` = both slots now latched (media may flow).
     Ok(bool),
+    /// As [`Self::Ok`], and the slot was taken from the address that held it:
+    /// one that is carrying media, and has not shown the registered token as
+    /// this `Register` did.
+    TookOver { ready: bool, held_by: SocketAddr },
     /// Per-IP session cap exceeded — registration dropped.
     RejectedDosCap,
     /// The slot is latched to a different IP that is currently carrying media.
@@ -339,6 +351,9 @@ impl UdpSessionRouter {
 
     /// Latch (or refresh) an edge's source address into its tunnel slot.
     ///
+    /// `shown` is the token its `Register` showed, and `registered` the one the
+    /// manager has registered for the slot, if it has.
+    ///
     /// The per-IP creation cap + counter bump + insert happen atomically under
     /// the DashMap shard entry lock, so they're counted exactly once per session
     /// (and freed once in [`Self::remove_if`]). Lock order is always
@@ -351,6 +366,8 @@ impl UdpSessionRouter {
         direction: TunnelDirection,
         src: SocketAddr,
         sock_idx: usize,
+        shown: Option<TokenDigest>,
+        registered: Option<TokenDigest>,
     ) -> LatchResult {
         use dashmap::mapref::entry::Entry;
 
@@ -368,13 +385,13 @@ impl UdpSessionRouter {
         }
 
         let ip = src.ip();
-        let session = match self.sessions.entry(tunnel_id) {
+        let mut session = match self.sessions.entry(tunnel_id) {
             Entry::Occupied(o) => o.into_ref(),
             Entry::Vacant(v) => {
                 if self.sessions_by_ip.add(ip, self.max_sessions_per_ip).is_err() {
                     return LatchResult::RejectedDosCap;
                 }
-                v.insert(Arc::new(UdpSession::new(tunnel_id, ip)))
+                v.insert(UdpSession::new(tunnel_id, ip))
             }
         };
         // A tunnel's two ends are two distinct edge sockets, so the two slots
@@ -406,29 +423,51 @@ impl UdpSessionRouter {
         // rotation and an edge restart on the same host are all legitimate and
         // all keep the IP. A slot that has never carried media stays
         // last-writer-wins, so first contact is byte-identical to before.
-        let (cur_slot, media_ms) = match direction {
-            TunnelDirection::Ingress => (&session.ingress, &session.ingress_media_ms),
-            TunnelDirection::Egress => (&session.egress, &session.egress_media_ms),
+        let session = &mut *session;
+        let (cur_slot, cur_sock, media_ms, cur_shown) = match direction {
+            TunnelDirection::Ingress => (
+                &session.ingress,
+                &session.ingress_sock,
+                &session.ingress_media_ms,
+                &mut session.ingress_shown,
+            ),
+            TunnelDirection::Egress => (
+                &session.egress,
+                &session.egress_sock,
+                &session.egress_media_ms,
+                &mut session.egress_shown,
+            ),
         };
+        let mut held_by = None;
         if let Some(cur) = cur_slot.load()
             && cur.ip() != src.ip()
             && slot_is_protected(media_ms.load(Ordering::Relaxed), mono_ms())
         {
-            return LatchResult::RejectedSlotHeld;
+            // Unless this edge shows the slot's token and the holder has not:
+            // it got the slot while there was none to show. Its `Register`s are
+            // refused now, and its media alone would hold the slot for as long
+            // as it goes on. A holder that has shown the token keeps the slot,
+            // and so does any holder until an edge comes that shows it.
+            let shows_registered = |token: Option<TokenDigest>| {
+                token.zip(registered).is_some_and(|(token, registered)| token.matches(&registered))
+            };
+            if shows_registered(*cur_shown) || !shows_registered(shown) {
+                return LatchResult::RejectedSlotHeld;
+            }
+            // The media that protected the slot was not this edge's.
+            media_ms.store(0, Ordering::Relaxed);
+            held_by = Some(cur);
         }
 
-        match direction {
-            TunnelDirection::Ingress => {
-                session.ingress.store(src);
-                session.ingress_sock.store(sock_idx, Ordering::Relaxed);
-            }
-            TunnelDirection::Egress => {
-                session.egress.store(src);
-                session.egress_sock.store(sock_idx, Ordering::Relaxed);
-            }
-        }
+        cur_slot.store(src);
+        cur_sock.store(sock_idx, Ordering::Relaxed);
+        *cur_shown = shown;
         session.last_seen_ms.store(now_ms(), Ordering::Relaxed);
-        LatchResult::Ok(session.both_latched())
+        let ready = session.both_latched();
+        match held_by {
+            Some(held_by) => LatchResult::TookOver { ready, held_by },
+            None => LatchResult::Ok(ready),
+        }
     }
 
     /// Resolve the forwarding target for a media datagram arriving from `src`
@@ -512,7 +551,7 @@ impl UdpSessionRouter {
     pub fn reap_idle(&self) -> usize {
         let now = now_ms();
         let cutoff = SESSION_IDLE_TIMEOUT.as_millis() as u64;
-        let is_stale = |session: &Arc<UdpSession>| {
+        let is_stale = |session: &UdpSession| {
             now.saturating_sub(session.last_seen_ms.load(Ordering::Relaxed)) > cutoff
         };
         let stale: Vec<Uuid> = self
@@ -534,7 +573,7 @@ impl UdpSessionRouter {
     /// creator's address. Asked and given back under the session's entry lock,
     /// like the rest of [`Self::latch`]'s bookkeeping: an address never counts
     /// a session that is not in the map.
-    fn remove_if(&self, tunnel_id: &Uuid, gone: impl FnOnce(&Arc<UdpSession>) -> bool) -> bool {
+    fn remove_if(&self, tunnel_id: &Uuid, gone: impl FnOnce(&UdpSession) -> bool) -> bool {
         let removed = self.departed.remove_if(&self.sessions, tunnel_id, |session| {
             let gone = gone(session);
             if gone {
@@ -774,10 +813,8 @@ async fn handle_control(
             }
 
             // Reuse the QUIC path's bind-token authorization registry.
-            if !ctx
-                .router
-                .verify_bind_token(&tunnel_id, direction, bind_token.as_deref())
-            {
+            let shown = bind_token.as_deref().map(TokenDigest::of);
+            if !ctx.router.verify_bind_token(&tunnel_id, direction, shown.as_ref()) {
                 tracing::warn!(
                     "native-UDP register rejected for tunnel {tunnel_id} from {src}: invalid bind_token"
                 );
@@ -791,8 +828,30 @@ async fn handle_control(
                 return;
             }
 
-            match ctx.udp_sessions.latch(tunnel_id, direction, src, sock_idx) {
-                LatchResult::Ok(ready) => {
+            let registered = ctx.router.registered_token(&tunnel_id, direction);
+            let latched =
+                ctx.udp_sessions.latch(tunnel_id, direction, src, sock_idx, shown, registered);
+            if let LatchResult::TookOver { held_by, .. } = latched {
+                tracing::warn!(
+                    "native-UDP tunnel {tunnel_id}: {src} showed the {direction:?} slot's token, \
+                     which {held_by} held without"
+                );
+                ctx.event_sender.emit_with_id_and_details(
+                    EventSeverity::Warning,
+                    category::TUNNEL,
+                    "Native-UDP slot taken over by the edge that showed its token",
+                    &tunnel_id.to_string(),
+                    serde_json::json!({
+                        "error_code": "relay_unproven_holder_replaced",
+                        "transport": "udp",
+                        "direction": format!("{direction:?}"),
+                        "remote_addr": src.to_string(),
+                        "held_by": held_by.to_string(),
+                    }),
+                );
+            }
+            match latched {
+                LatchResult::Ok(ready) | LatchResult::TookOver { ready, .. } => {
                     // Ack so the edge confirms the relay is alive (failover) and
                     // learns when both sides are present.
                     if let Ok(bytes) =
@@ -890,11 +949,11 @@ mod tests {
 
         // Only one side latched → not ready, no forwarding target. Egress
         // dialed relay socket 0, ingress dialed socket 1 (multi-port relay).
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, src, 0), LatchResult::Ok(false)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, src, 0, None, None), LatchResult::Ok(false)));
         assert!(r.forward_target(t, src, 100).is_none());
 
         // Both latched → ready.
-        assert!(matches!(r.latch(t, TunnelDirection::Ingress, dst, 1), LatchResult::Ok(true)));
+        assert!(matches!(r.latch(t, TunnelDirection::Ingress, dst, 1, None, None), LatchResult::Ok(true)));
 
         // Source-side datagram forwards to the destination side via the socket
         // the destination dialed (1), and vice versa via socket 0.
@@ -913,8 +972,8 @@ mod tests {
         let t = Uuid::new_v4();
         let src = v4(5000); // source/egress side, dialed relay socket 2
         let dst = v4(6000); // destination/ingress side, dialed relay socket 0
-        r.latch(t, TunnelDirection::Egress, src, 2);
-        r.latch(t, TunnelDirection::Ingress, dst, 0);
+        r.latch(t, TunnelDirection::Egress, src, 2, None, None);
+        r.latch(t, TunnelDirection::Ingress, dst, 0, None, None);
         // src→dst egresses from the socket dst dialed (0)…
         assert_eq!(r.forward_target(t, src, 1), Some((dst, 0)));
         // …and dst→src egresses from the socket src dialed (2).
@@ -932,11 +991,11 @@ mod tests {
         let r = UdpSessionRouter::new(64);
         let t = Uuid::new_v4();
         let dst = v4(6000);
-        r.latch(t, TunnelDirection::Ingress, dst, 0);
-        r.latch(t, TunnelDirection::Egress, v4(5000), 0);
+        r.latch(t, TunnelDirection::Ingress, dst, 0, None, None);
+        r.latch(t, TunnelDirection::Egress, v4(5000), 0, None, None);
         assert_eq!(r.forward_target(t, v4(5000), 1), Some((dst, 0)));
         // Egress edge's NAT rebinds to a new port; re-register relatches it.
-        r.latch(t, TunnelDirection::Egress, v4(5001), 0);
+        r.latch(t, TunnelDirection::Egress, v4(5001), 0, None, None);
         assert!(r.forward_target(t, v4(5000), 1).is_none());
         assert_eq!(r.forward_target(t, v4(5001), 1), Some((dst, 0)));
     }
@@ -947,15 +1006,15 @@ mod tests {
         let ip = Ipv4Addr::new(10, 0, 0, 9);
         // Three distinct tunnels from the same IP: third is rejected.
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0, None, None),
             LatchResult::Ok(_)
         ));
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0, None, None),
             LatchResult::Ok(_)
         ));
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 3), 0),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 3), 0, None, None),
             LatchResult::RejectedDosCap
         ));
     }
@@ -965,7 +1024,7 @@ mod tests {
         let r = UdpSessionRouter::new(1);
         let t = Uuid::new_v4();
         let ip = Ipv4Addr::new(10, 0, 0, 1);
-        r.latch(t, TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0);
+        r.latch(t, TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0, None, None);
         // Force it stale.
         r.sessions
             .get(&t)
@@ -976,7 +1035,7 @@ mod tests {
         assert_eq!(r.count(), 0);
         // IP quota was freed → a new session from the same IP succeeds.
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0, None, None),
             LatchResult::Ok(_)
         ));
     }
@@ -1018,11 +1077,11 @@ mod slot_holddown_tests {
         let real = addr("198.51.100.10", 5000);
         let attacker = addr("203.0.113.7", 5000);
 
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, real, 0), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, real, 0, None, None), LatchResult::Ok(_)));
         mark_media(&r, t, TunnelDirection::Egress);
 
         assert!(matches!(
-            r.latch(t, TunnelDirection::Egress, attacker, 0),
+            r.latch(t, TunnelDirection::Egress, attacker, 0, None, None),
             LatchResult::RejectedSlotHeld
         ));
         assert_eq!(
@@ -1041,10 +1100,10 @@ mod slot_holddown_tests {
         let before = addr("198.51.100.10", 5000);
         let after = addr("198.51.100.10", 41234);
 
-        r.latch(t, TunnelDirection::Egress, before, 0);
+        r.latch(t, TunnelDirection::Egress, before, 0, None, None);
         mark_media(&r, t, TunnelDirection::Egress);
 
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, after, 0), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, after, 0, None, None), LatchResult::Ok(_)));
         assert_eq!(slot_addr(&r, t, TunnelDirection::Egress), Some(after));
     }
 
@@ -1058,9 +1117,9 @@ mod slot_holddown_tests {
         let first = addr("198.51.100.10", 5000);
         let second = addr("203.0.113.7", 5000);
 
-        r.latch(t, TunnelDirection::Egress, first, 0);
+        r.latch(t, TunnelDirection::Egress, first, 0, None, None);
         // No media ever forwarded on this slot.
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, second, 0), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, second, 0, None, None), LatchResult::Ok(_)));
         assert_eq!(slot_addr(&r, t, TunnelDirection::Egress), Some(second));
     }
 
@@ -1095,11 +1154,11 @@ mod slot_holddown_tests {
     fn holddown_is_per_slot_not_per_session() {
         let r = UdpSessionRouter::new(64);
         let t = Uuid::new_v4();
-        r.latch(t, TunnelDirection::Egress, addr("198.51.100.10", 5000), 0);
+        r.latch(t, TunnelDirection::Egress, addr("198.51.100.10", 5000), 0, None, None);
         mark_media(&r, t, TunnelDirection::Egress);
 
         assert!(matches!(
-            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.9", 6000), 0),
+            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.9", 6000), 0, None, None),
             LatchResult::Ok(_)
         ));
     }
@@ -1162,7 +1221,7 @@ mod slot_holddown_tests {
             let t = Uuid::new_v4();
             let src: SocketAddr = bad.parse().unwrap();
             assert!(
-                matches!(r.latch(t, TunnelDirection::Egress, src, 0), LatchResult::RejectedInvalidSource),
+                matches!(r.latch(t, TunnelDirection::Egress, src, 0, None, None), LatchResult::RejectedInvalidSource),
                 "{bad} must be refused by latch, not merely by the predicate"
             );
             assert_eq!(
@@ -1186,10 +1245,10 @@ mod slot_holddown_tests {
         // The relay's own advertised dial address, as an attacker would spoof it.
         let relay_self = addr("111.118.193.172", 7400);
 
-        assert!(matches!(r.latch(t, TunnelDirection::Ingress, relay_self, 0), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Ingress, relay_self, 0, None, None), LatchResult::Ok(_)));
         assert!(
             matches!(
-                r.latch(t, TunnelDirection::Egress, relay_self, 0),
+                r.latch(t, TunnelDirection::Egress, relay_self, 0, None, None),
                 LatchResult::RejectedInvalidSource
             ),
             "the opposite slot must refuse an address the other slot already holds"
@@ -1210,7 +1269,7 @@ mod slot_holddown_tests {
         // Drive the router into the degenerate state directly, bypassing
         // `latch`'s refusal — this asserts the drop holds regardless of HOW
         // both slots came to hold one address.
-        r.latch(t, TunnelDirection::Ingress, addr("198.51.100.10", 5000), 0);
+        r.latch(t, TunnelDirection::Ingress, addr("198.51.100.10", 5000), 0, None, None);
         let s = r.sessions.get(&t).expect("session exists");
         s.ingress.store(relay_self);
         s.egress.store(relay_self);
@@ -1242,7 +1301,7 @@ mod slot_holddown_tests {
         let contributor = addr("198.51.100.10", 5000);
 
         assert!(matches!(
-            r.latch(t, TunnelDirection::Ingress, contributor, 0),
+            r.latch(t, TunnelDirection::Ingress, contributor, 0, None, None),
             LatchResult::Ok(false) // peer not latched: session is "waiting"
         ));
         // Media arrives with no egress peer yet — nothing to forward to…
@@ -1259,7 +1318,7 @@ mod slot_holddown_tests {
 
         // And the hold-down actually refuses the spoofed move.
         assert!(matches!(
-            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.7", 5000), 0),
+            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.7", 5000), 0, None, None),
             LatchResult::RejectedSlotHeld
         ));
         assert_eq!(slot_addr(&r, t, TunnelDirection::Ingress), Some(contributor));
@@ -1280,6 +1339,259 @@ mod slot_holddown_tests {
 }
 
 #[cfg(test)]
+mod shown_token_tests {
+    //! Tokens that come after the registers they are for.
+    use super::*;
+    use crate::manager::events::Event;
+    use crate::session::test_relay::start_relay_capped;
+    use TunnelDirection::{Egress, Ingress};
+
+    fn addr(host: u8, port: u16) -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, host], port))
+    }
+
+    fn token(text: &str) -> Option<TokenDigest> {
+        Some(TokenDigest::of(text))
+    }
+
+    /// A router in which `src` registered on `direction`, showing `shown` with
+    /// nothing registered, and is sending.
+    fn held(t: Uuid, direction: TunnelDirection, src: SocketAddr, shown: Option<TokenDigest>) -> UdpSessionRouter {
+        let r = UdpSessionRouter::new(64);
+        assert!(matches!(r.latch(t, direction, src, 0, shown, None), LatchResult::Ok(false)));
+        assert!(r.forward_target(t, src, 1316).is_none());
+        r
+    }
+
+    fn slot(r: &UdpSessionRouter, t: Uuid, direction: TunnelDirection) -> (Option<SocketAddr>, u64, usize) {
+        let s = r.sessions.get(&t).unwrap();
+        let (slot, media_ms, sock) = match direction {
+            Ingress => (&s.ingress, &s.ingress_media_ms, &s.ingress_sock),
+            Egress => (&s.egress, &s.egress_media_ms, &s.egress_sock),
+        };
+        (slot.load(), media_ms.load(Ordering::Relaxed), sock.load(Ordering::Relaxed))
+    }
+
+    /// The edge that shows the registered token has the slot from a holder that
+    /// is sending and has not shown it, at once, and what the holder still
+    /// sends goes nowhere. The edge earns its protection for itself.
+    #[test]
+    fn the_token_takes_the_slot_from_a_holder_that_has_not_shown_it() {
+        for direction in [Ingress, Egress] {
+            let other = if direction == Ingress { Egress } else { Ingress };
+            for shown in [None, token("wrong")] {
+                let t = Uuid::new_v4();
+                let (stranger, real, peer) = (addr(1, 5000), addr(2, 6000), addr(3, 7000));
+                let r = held(t, direction, stranger, shown);
+                assert!(matches!(r.latch(t, other, peer, 1, None, None), LatchResult::Ok(true)));
+                assert_eq!(r.forward_target(t, peer, 1), Some((stranger, 0)));
+
+                // Not while no token is registered, nor to one that shows none.
+                for (shown, registered) in
+                    [(token("right"), None), (None, token("right")), (token("wrong"), token("right"))]
+                {
+                    let latched = r.latch(t, direction, real, 2, shown, registered);
+                    assert!(matches!(latched, LatchResult::RejectedSlotHeld));
+                    assert_eq!(r.forward_target(t, peer, 1), Some((stranger, 0)));
+                }
+                let latched = r.latch(t, direction, real, 2, token("right"), token("right"));
+                assert!(matches!(
+                    latched,
+                    LatchResult::TookOver { ready: true, held_by } if held_by == stranger
+                ));
+                assert_eq!(slot(&r, t, direction), (Some(real), 0, 2));
+                assert_eq!(r.forward_target(t, stranger, 1316), None);
+                assert_eq!(r.forward_target(t, peer, 1), Some((real, 2)));
+                assert_eq!(r.forward_target(t, real, 1), Some((peer, 1)));
+                let third = addr(4, 8000);
+                let latched = r.latch(t, direction, third, 3, token("right"), token("right"));
+                assert!(matches!(latched, LatchResult::RejectedSlotHeld));
+            }
+        }
+    }
+
+    /// With nobody on the other side the tunnel is not ready, whoever has the
+    /// slot.
+    #[test]
+    fn a_slot_taken_over_is_ready_when_the_other_side_is_there() {
+        let t = Uuid::new_v4();
+        let r = held(t, Ingress, addr(1, 5000), None);
+        let latched = r.latch(t, Ingress, addr(2, 6000), 0, token("right"), token("right"));
+        assert!(matches!(latched, LatchResult::TookOver { ready: false, .. }));
+    }
+
+    /// A holder that has shown the token keeps its slot while it sends, whoever
+    /// else shows it, and whether it did before or after the token came.
+    #[test]
+    fn a_holder_that_has_shown_the_token_keeps_the_slot() {
+        let (real, replayed) = (addr(1, 5000), addr(2, 6000));
+        for registered_at_first in [None, token("right")] {
+            let t = Uuid::new_v4();
+            let r = UdpSessionRouter::new(64);
+            r.latch(t, Egress, real, 0, token("right"), registered_at_first);
+            r.forward_target(t, real, 1);
+            for _ in 0..3 {
+                let latched = r.latch(t, Egress, replayed, 0, token("right"), token("right"));
+                assert!(matches!(latched, LatchResult::RejectedSlotHeld));
+                assert_eq!(slot(&r, t, Egress).0, Some(real));
+                assert!(matches!(
+                    r.latch(t, Egress, real, 0, token("right"), token("right")),
+                    LatchResult::Ok(false)
+                ));
+            }
+        }
+        // Shown by a later register of its own, with none at first.
+        let t = Uuid::new_v4();
+        let r = held(t, Egress, real, None);
+        r.latch(t, Egress, real, 0, token("right"), None);
+        let latched = r.latch(t, Egress, replayed, 0, token("right"), token("right"));
+        assert!(matches!(latched, LatchResult::RejectedSlotHeld));
+    }
+
+    /// What counts as shown is what the register that holds the slot showed for
+    /// it: not one for the other slot, nor one that was refused.
+    #[test]
+    fn a_token_shown_for_another_slot_or_refused_does_not_count() {
+        let t = Uuid::new_v4();
+        let (stranger, real) = (addr(1, 5000), addr(2, 6000));
+        let r = held(t, Egress, stranger, None);
+        assert!(matches!(
+            r.latch(t, Ingress, addr(1, 5001), 0, token("right"), None),
+            LatchResult::Ok(true)
+        ));
+        let refused = r.latch(t, Egress, addr(3, 7000), 0, token("right"), None);
+        assert!(matches!(refused, LatchResult::RejectedSlotHeld));
+        let latched = r.latch(t, Egress, real, 0, token("right"), token("right"));
+        assert!(matches!(latched, LatchResult::TookOver { .. }));
+
+        // Nor one shown by whoever had the slot before.
+        let t = Uuid::new_v4();
+        r.latch(t, Egress, real, 0, token("right"), None);
+        r.latch(t, Egress, stranger, 0, None, None);
+        r.forward_target(t, stranger, 1);
+        let latched = r.latch(t, Egress, real, 0, token("right"), token("right"));
+        assert!(matches!(latched, LatchResult::TookOver { .. }));
+    }
+
+    /// The token registered now is the one that counts: the holder of the one
+    /// before a rotation is not cut off until an edge comes with the new one.
+    #[test]
+    fn the_token_that_counts_is_the_one_registered_now() {
+        let t = Uuid::new_v4();
+        let (old, new) = (addr(1, 5000), addr(2, 6000));
+        let r = held(t, Egress, old, token("before"));
+        let refused = r.latch(t, Egress, new, 0, token("before"), token("before"));
+        assert!(matches!(refused, LatchResult::RejectedSlotHeld));
+        r.forward_target(t, old, 1);
+        assert_eq!(slot(&r, t, Egress).0, Some(old));
+        let latched = r.latch(t, Egress, new, 0, token("after"), token("after"));
+        assert!(matches!(latched, LatchResult::TookOver { .. }));
+    }
+
+    /// A datagram of the native plane, sent from its own address.
+    async fn socket(host: u8) -> UdpSocket {
+        UdpSocket::bind(SocketAddr::from(([127, 0, 0, host], 0))).await.unwrap()
+    }
+
+    async fn register(sock: &UdpSocket, relay: SocketAddr, t: Uuid, direction: TunnelDirection, token: Option<&str>) -> Option<bool> {
+        let msg = encode_udp_control(&UdpRelayControl::Register {
+            tunnel_id: t,
+            direction,
+            bind_token: token.map(str::to_owned),
+            protocol_version: TUNNEL_PROTOCOL_VERSION,
+        });
+        sock.send_to(&msg.unwrap(), relay).await.unwrap();
+        let mut buf = [0; 2048];
+        loop {
+            let read = tokio::time::timeout(Duration::from_millis(300), sock.recv(&mut buf));
+            let n = read.await.ok()?.unwrap();
+            if let Some(UdpRelayControl::Ack { ready, tunnel_id }) = try_decode_udp_control(&buf[..n]) {
+                assert_eq!(tunnel_id, t);
+                return Some(ready);
+            }
+        }
+    }
+
+    async fn send(sock: &UdpSocket, relay: SocketAddr, t: Uuid, payload: &str) {
+        let datagram = crate::protocol::encode_udp_datagram(&t, payload.as_bytes());
+        sock.send_to(&datagram, relay).await.unwrap();
+    }
+
+    /// The payloads of the media that reaches `sock`.
+    async fn read(sock: &UdpSocket) -> Vec<String> {
+        let mut buf = [0; 2048];
+        let mut all = Vec::new();
+        while let Ok(n) = tokio::time::timeout(Duration::from_millis(300), sock.recv(&mut buf)).await {
+            let data = &buf[..n.unwrap()];
+            if try_decode_udp_control(data).is_none() {
+                let (_, payload) = decode_udp_datagram(data).unwrap();
+                all.push(String::from_utf8(payload.to_vec()).unwrap());
+            }
+        }
+        all
+    }
+
+    /// Over sockets and the plane's own receive loop: a stranger has a side
+    /// while no token is registered and goes on sending, and the edge's
+    /// registers are refused. When the token comes its next register has the
+    /// side, and is acked; the stranger's are refused.
+    #[tokio::test]
+    async fn an_edge_kept_out_by_a_stranger_gets_in_when_its_token_comes() {
+        let (_, _, ctx, mut events) = start_relay_capped(false, 64, 100);
+        let config = RelayConfig {
+            udp_relay_addrs: Some(vec!["127.0.0.1:0".into()]),
+            ..RelayConfig::default()
+        };
+        let sockets = bind_udp_relay(&config).unwrap();
+        let relay = sockets[0].local_addr().unwrap();
+        tokio::spawn(serve_udp_relay(sockets, ctx.clone()));
+
+        let t = Uuid::new_v4();
+        let (stranger, real, peer) = (socket(3).await, socket(2).await, socket(4).await);
+        assert_eq!(register(&peer, relay, t, Egress, Some("egress")).await, Some(false));
+        assert_eq!(register(&stranger, relay, t, Ingress, None).await, Some(true));
+        send(&stranger, relay, t, "from the stranger").await;
+        assert_eq!(read(&peer).await, ["from the stranger"]);
+        assert_eq!(register(&real, relay, t, Ingress, Some("ingress")).await, None);
+        send(&peer, relay, t, "to whom").await;
+        assert_eq!(read(&stranger).await, ["to whom"]);
+        assert_eq!(read(&real).await, [""; 0]);
+
+        ctx.router.authorize_tunnel(t, "ingress", "egress");
+        send(&stranger, relay, t, "still there").await;
+        assert_eq!(read(&peer).await, ["still there"]);
+        assert_eq!(register(&stranger, relay, t, Ingress, None).await, None);
+        assert_eq!(register(&real, relay, t, Ingress, Some("ingress")).await, Some(true));
+        send(&stranger, relay, t, "refused").await;
+        send(&real, relay, t, "from the edge").await;
+        assert_eq!(read(&peer).await, ["from the edge"]);
+        send(&peer, relay, t, "to the edge").await;
+        assert_eq!(read(&real).await, ["to the edge"]);
+        assert_eq!(read(&stranger).await, [""; 0]);
+        assert_eq!(register(&stranger, relay, t, Ingress, None).await, None);
+        assert_eq!(register(&real, relay, t, Ingress, Some("ingress")).await, Some(true));
+        assert_eq!(register(&peer, relay, t, Egress, Some("egress")).await, Some(true));
+
+        let raised: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| event.message.starts_with("Native-UDP slot taken over"))
+            .collect();
+        assert_eq!(raised.len(), 1);
+        assert_eq!((raised[0].severity, raised[0].category.as_str()), (EventSeverity::Warning, category::TUNNEL));
+        assert_eq!(raised[0].flow_id, Some(t.to_string()));
+        assert_eq!(
+            raised[0].details,
+            Some(serde_json::json!({
+                "error_code": "relay_unproven_holder_replaced",
+                "transport": "udp",
+                "direction": "Ingress",
+                "remote_addr": real.local_addr().unwrap().to_string(),
+                "held_by": stranger.local_addr().unwrap().to_string(),
+            }))
+        );
+    }
+}
+
+#[cfg(test)]
 mod totals_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
@@ -1294,8 +1606,8 @@ mod totals_tests {
 
     /// Register both sides from hosts of their own, the source first.
     fn register(r: &UdpSessionRouter, t: Uuid, host: u8) {
-        r.latch(t, TunnelDirection::Egress, source(host), 0);
-        r.latch(t, TunnelDirection::Ingress, destination(host), 0);
+        r.latch(t, TunnelDirection::Egress, source(host), 0, None, None);
+        r.latch(t, TunnelDirection::Ingress, destination(host), 0, None, None);
     }
 
     /// Make a session idle for longer than the reaper lets it be.
@@ -1424,7 +1736,7 @@ mod removal_race_tests {
 
     fn latch(r: &UdpSessionRouter, t: Uuid, port: u16) -> bool {
         let src = SocketAddr::new(HOST, port);
-        matches!(r.latch(t, TunnelDirection::Egress, src, 0), LatchResult::Ok(_))
+        matches!(r.latch(t, TunnelDirection::Egress, src, 0, None, None), LatchResult::Ok(_))
     }
 
     fn make_stale(r: &UdpSessionRouter, t: Uuid) {

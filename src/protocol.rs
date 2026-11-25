@@ -80,7 +80,10 @@ pub enum RelayMessage {
     #[serde(rename = "tunnel_waiting")]
     TunnelWaiting { tunnel_id: Uuid },
 
-    /// Tunnel went down (peer disconnected or unbound).
+    /// On the control stream: the bind this answers was refused. On a stream
+    /// of its own: the other side is gone ([`PEER_DISCONNECTED`],
+    /// [`PEER_UNBOUND`]), or with any other reason the side of the edge this is
+    /// sent to was removed, and takes a bind to hold again.
     #[serde(rename = "tunnel_down")]
     TunnelDown { tunnel_id: Uuid, reason: String },
 
@@ -98,6 +101,13 @@ pub enum RelayMessage {
     },
 }
 
+/// The reasons of a [`RelayMessage::TunnelDown`] that is about the other side of
+/// the tunnel. The edge it is sent to still holds its own. Edges tell the two
+/// apart by these, so they stay as every release has them.
+pub const PEER_DISCONNECTED: &str = "peer disconnected";
+/// See [`PEER_DISCONNECTED`].
+pub const PEER_UNBOUND: &str = "peer unbound";
+
 /// Direction of this edge's role in the tunnel.
 ///
 /// This is the *edge/relay-internal* perspective, which is the OPPOSITE of the
@@ -110,7 +120,7 @@ pub enum RelayMessage {
 /// forwards between the two bound endpoints — so these labels are purely the
 /// slot names used for pairing and reporting (`ingress_edge_id` is the
 /// receiver edge, `egress_edge_id` is the source edge).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TunnelDirection {
     /// Ingress (destination side): relay → this edge → local device. This edge
     /// RECEIVES tunnel traffic and forwards it to a local consumer.
