@@ -228,8 +228,12 @@ peer has not bound yet; nothing is queued.
 **Edges.** Every edge tag from v0.7.0 to v0.117.0 binds a tunnel on a connection
 opened for it, sends the tunnel's data on no other, and starts to send only
 after it has read `TunnelReady` for that tunnel (`connect_and_bind` in the
-edge's `src/tunnel/relay_client.rs`). The failback probe (since v0.21.0) opens
-another connection, to the primary relay, which carries a `Hello` and no data.
+edge's `src/tunnel/relay_client.rs`). The failback probe (edges v0.21.0 to
+v0.117.0) opens another connection, to the primary relay, which carries a `Hello`
+and no data. An edge after v0.117.0 binds a QUIC tunnel that has two relays on
+both, each on a connection of its own, while it waits for its peer or is on its
+backup. It sends the tunnel's data on the connection it has moved to, after
+`TunnelReady` there, and unbinds the other.
 The relay sends `TunnelReady` once both sides are in the router, so no edge
 sends before its bind. Three things an edge sends can meet the last row:
 
@@ -240,8 +244,10 @@ sends before its bind. Three things an edge sends can meet the last row:
   second later; one up to v0.117.0 does not read that it was removed, and binds
   again only with a new connection;
 - what it goes on sending on a side that another edge has bound since, until it
-  binds again. The relay does not tell it that its side is gone, and no edge
-  binds again of its own accord.
+  binds again. The relay does not tell it that its side is gone, and an edge binds
+  again of its own accord only if it is after v0.117.0 and has two relays: once a
+  minute while it waits for its peer, with an unbind first, and when it has let go
+  of its connection to the other relay.
 
 **Upgrading from relay v0.20.0 or earlier.** Up to v0.20.0 a connection that was
 not the tunnel's bound ingress was taken for its egress, whether or not it had

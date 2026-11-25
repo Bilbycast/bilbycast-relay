@@ -84,7 +84,7 @@ configured — discards events silently and counts nothing.
 |----------|---------|---------|---------|
 | info | Tunnel active (both sides bound) | Both ingress and egress edges have bound | `{ direction }` |
 | info | Tunnel waiting: {direction} side bound | Only one side has bound, waiting for peer | `{ direction }` |
-| info | Tunnel unbound by edge | Edge sent TunnelUnbind | |
+| info | Tunnel unbound by edge | Edge sent TunnelUnbind. Followed at once by `Tunnel waiting`, and once a minute, it is an edge after v0.117.0 with two relays whose peer is away: it binds its side again, and nothing is wrong | |
 | warning | Tunnel bind rejected: invalid token | HMAC-SHA256 bind token verification failed | `{ remote_addr }` |
 | warning | Tunnel bind rejected: per-connection cap exceeded | `TunnelBind` rejected — per-connection tunnel-bind cap (`max_tunnels_per_connection`, default 100) reached on this connection: it has `active_binds` sides bound, and this is another. DoS mitigation; relay replies `TunnelDown { reason: "per-connection tunnel limit exceeded" }` | `{ error_code: "relay_dos_suspect", remote_addr, active_binds, cap }` |
 | warning | Tunnel down: edge disconnected | Edge QUIC connection lost, affecting bound tunnel | |
