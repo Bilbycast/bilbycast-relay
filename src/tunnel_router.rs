@@ -45,15 +45,22 @@ pub struct TunnelEndpoint {
     pub shown: Option<TokenDigest>,
 }
 
+impl TunnelEndpoint {
+    fn has_shown(&self, token: &TokenDigest) -> bool {
+        self.shown.is_some_and(|shown| shown.matches(token))
+    }
+}
+
 /// State of a tunnel as tracked by the router.
 pub struct TunnelState {
     pub tunnel_id: Uuid,
     pub protocol: TunnelProtocol,
     pub ingress: Option<TunnelEndpoint>,
     pub egress: Option<TunnelEndpoint>,
-    /// The endpoints a later bind took their side over from, the one taken
-    /// over last at the end. Each is connected and has not unbound since, and
-    /// is told nothing: [`Self::give_back`] can make it the holder again.
+    /// The endpoints that showed a token and lost their side to a bind without
+    /// it. Of a side and a token there is one at most: nobody who has shown
+    /// the token has had the side since. Each is connected and has not unbound,
+    /// and is told nothing: [`Self::give_back`] can make it the holder again.
     displaced: Vec<TunnelEndpoint>,
     pub stats: Arc<TunnelStats>,
 }
@@ -84,36 +91,36 @@ impl TunnelState {
         }
     }
 
-    /// Make `endpoint` its side's holder.
+    /// Make `endpoint` its side's holder, and remember whom it takes the side
+    /// from. Not one that showed no token, which nothing would give the side
+    /// back to, nor one that showed the same. That is the edge's own older
+    /// connection, or another edge's with the same configuration: the side is
+    /// the newer one's, and no other's once that one has left.
     fn hold(&mut self, endpoint: TunnelEndpoint) {
         let direction = endpoint.direction;
-        let same = |e: &TunnelEndpoint| {
-            e.direction == direction && e.connection_id == endpoint.connection_id
-        };
-        self.displaced.retain(|e| !same(e));
-        // A connection that binds its side again takes it from nobody.
-        if let Some(older) = self.side_mut(direction).take_if(|e| !same(e)) {
-            self.displaced.push(older);
-        }
+        let older = self.side_mut(direction).take();
+        self.displaced.extend(older);
+        self.displaced.retain(|e| {
+            e.direction != direction
+                || e.connection_id != endpoint.connection_id
+                    && e.shown.is_some_and(|token| !endpoint.has_shown(&token))
+        });
         *self.side_mut(direction) = Some(endpoint);
     }
 
-    /// Make the last connection displaced from this side to have shown `token`
-    /// its holder again, unless the holder has shown it too.
+    /// Make the connection displaced from this side that has shown `token` its
+    /// holder again. There is none if the holder has shown it too.
     fn give_back(&mut self, direction: TunnelDirection, token: &TokenDigest) -> Option<GivenBack> {
-        let shows = |e: &TunnelEndpoint| e.shown.is_some_and(|shown| shown.matches(token));
-        let holder = self.side(direction);
-        if holder.is_some_and(shows) {
-            return None;
-        }
-        let from = holder.map(|e| e.connection.remote_address());
-        let last = self.displaced.iter().rposition(|e| e.direction == direction && shows(e))?;
-        let endpoint = self.displaced.remove(last);
+        let at = self
+            .displaced
+            .iter()
+            .position(|e| e.direction == direction && e.has_shown(token))?;
+        let endpoint = self.displaced.remove(at);
         let given = GivenBack {
             direction,
             connection_id: endpoint.connection_id.clone(),
             to: endpoint.connection.remote_address(),
-            from,
+            from: self.side(direction).map(|e| e.connection.remote_address()),
         };
         self.hold(endpoint);
         Some(given)
@@ -123,8 +130,13 @@ impl TunnelState {
         self.ingress.is_some() && self.egress.is_some()
     }
 
+    fn is_held(&self) -> bool {
+        self.ingress.is_some() || self.egress.is_some()
+    }
+
+    /// Nobody holds a side, and there is nobody to give one back to.
     fn is_empty(&self) -> bool {
-        self.ingress.is_none() && self.egress.is_none()
+        !self.is_held() && self.displaced.is_empty()
     }
 
     pub fn status_str(&self) -> &'static str {
@@ -250,9 +262,14 @@ impl TunnelRouter {
             .collect()
     }
 
-    /// Remove authorization for a tunnel.
+    /// Remove authorization for a tunnel. Binds of it are refused from then on
+    /// if [`Self::requires_bind_auth`], and otherwise taken from anyone.
     pub fn revoke_tunnel(&self, tunnel_id: &Uuid) {
         self.authorized_tokens.remove(tunnel_id);
+    }
+
+    pub fn requires_bind_auth(&self) -> bool {
+        self.require_bind_auth
     }
 
     /// The token registered for a tunnel+direction, if there is one.
@@ -339,8 +356,8 @@ impl TunnelRouter {
                     released = Some(state.ingress.as_ref().map(|e| e.connection_id.clone()));
                 }
 
-            // If both sides are gone, remove the tunnel entirely, unless one
-            // is bound again before it is removed.
+            // Remove a tunnel with nobody left, unless a side is bound again
+            // before it is removed.
             if state.is_empty() {
                 drop(entry);
                 self.departed
@@ -357,8 +374,9 @@ impl TunnelRouter {
     /// `connection_id`, this drops the entire tunnel entry in one shot
     /// regardless of how many sides are currently bound. Returns `None` if no
     /// such tunnel exists, or `Some(connection_ids)` listing every endpoint
-    /// that was still bound when it was removed — so the caller can notify those
-    /// peers with `TunnelDown` (matching connection-loss cleanup semantics).
+    /// that was still bound when it was removed, and those displaced, whose own
+    /// binds go with it — so the caller can notify them with `TunnelDown`
+    /// (matching connection-loss cleanup semantics).
     ///
     /// This is the teardown primitive shared by the manager WS `close_tunnel`
     /// command and the REST `DELETE /api/v1/tunnels/{id}` escape hatch. It
@@ -369,14 +387,8 @@ impl TunnelRouter {
     /// message.
     pub fn force_remove_tunnel(&self, tunnel_id: &Uuid) -> Option<Vec<String>> {
         self.departed.remove(&self.tunnels, tunnel_id).map(|state| {
-            let mut affected = Vec::new();
-            if let Some(ingress) = state.ingress {
-                affected.push(ingress.connection_id);
-            }
-            if let Some(egress) = state.egress {
-                affected.push(egress.connection_id);
-            }
-            affected
+            let held = state.ingress.into_iter().chain(state.egress);
+            held.chain(state.displaced).map(|e| e.connection_id).collect()
         })
     }
 
@@ -409,8 +421,8 @@ impl TunnelRouter {
         affected
     }
 
-    /// Whether `connection_id` has bound this side and not unbound it: it holds
-    /// the side, or it is remembered as the one the side was taken over from.
+    /// Whether the router has a bind of this side by `connection_id`: it holds
+    /// the side, or it is remembered as one the side was taken over from.
     pub fn has_bound(
         &self,
         tunnel_id: &Uuid,
@@ -453,10 +465,12 @@ impl TunnelRouter {
         })
     }
 
-    /// Get info for all tunnels (for REST API).
+    /// Get info for all tunnels (for REST API), but those of which nobody
+    /// holds a side.
     pub fn list_tunnels(&self) -> Vec<TunnelInfo> {
         self.tunnels
             .iter()
+            .filter(|entry| entry.is_held())
             .map(|entry| {
                 let s = entry.value();
                 TunnelInfo {
@@ -491,14 +505,14 @@ impl TunnelRouter {
         self.departed.totals(&self.tunnels)
     }
 
-    /// Count of tunnels in each state.
+    /// Count of tunnels, as [`Self::list_tunnels`] has them, and of the active
+    /// ones.
     pub fn counts(&self) -> (usize, usize) {
-        let total = self.tunnels.len();
-        let active = self
-            .tunnels
-            .iter()
-            .filter(|e| e.value().is_active())
-            .count();
+        let (mut total, mut active) = (0, 0);
+        for tunnel in &self.tunnels {
+            total += usize::from(tunnel.is_held());
+            active += usize::from(tunnel.is_active());
+        }
         (total, active)
     }
 }
@@ -577,52 +591,231 @@ mod tests {
 mod displaced_tests {
     use super::*;
     use crate::session::test_relay::{edge, start_relay};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use TunnelDirection::{Egress, Ingress};
+
+    /// A connection, whoever it is said to be.
+    async fn connection() -> (quinn::Endpoint, quinn::Connection) {
+        let (relay, cert, _ctx) = start_relay();
+        let (endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
+        (endpoint, connection)
+    }
+
+    fn bind(
+        router: &TunnelRouter,
+        connection: &quinn::Connection,
+        id: Uuid,
+        name: &str,
+        direction: TunnelDirection,
+        shown: Option<&str>,
+    ) -> BindResult {
+        router.bind(id, TunnelProtocol::Udp, TunnelEndpoint {
+            edge_id: name.into(),
+            connection_id: name.into(),
+            direction,
+            connection: connection.clone(),
+            shown: shown.map(TokenDigest::of),
+        })
+    }
+
+    /// Who holds the ingress side, if it is held.
+    fn holder(router: &TunnelRouter, id: &Uuid) -> Option<String> {
+        router.tunnel(id)?.ingress.as_ref().map(|e| e.connection_id.clone())
+    }
 
     /// Two connections take a side from each other, and bind it again while
     /// they have it, as often as they like: the router remembers each of them
     /// once, and the one that has the side not as one it was taken from.
     #[tokio::test]
     async fn a_connection_is_remembered_once() {
-        let (relay, cert, _ctx) = start_relay();
-        let (_endpoint, connection, _send, _recv) = edge(relay, &cert, 100).await;
+        let (_endpoint, connection) = connection().await;
         let router = TunnelRouter::with_auth_policy(false);
         let id = Uuid::new_v4();
         let bind = |name: &str, direction| {
-            router.bind(id, TunnelProtocol::Udp, TunnelEndpoint {
-                edge_id: name.into(),
-                connection_id: name.into(),
-                direction,
-                connection: connection.clone(),
-                shown: None,
-            });
+            bind(&router, &connection, id, name, direction, Some(name));
         };
         let displaced = || -> Vec<(String, TunnelDirection)> {
             let state = router.tunnel(&id).unwrap();
             state.displaced.iter().map(|e| (e.connection_id.clone(), e.direction)).collect()
         };
-        let (ingress, egress) = (TunnelDirection::Ingress, TunnelDirection::Egress);
         for _ in 0..3 {
-            bind("a", ingress);
+            bind("a", Ingress);
             assert_eq!(displaced(), []);
         }
         for _ in 0..50 {
-            bind("b", ingress);
-            assert_eq!(displaced(), [("a".into(), ingress)]);
-            bind("b", ingress);
-            assert_eq!(displaced(), [("a".into(), ingress)]);
-            bind("a", ingress);
-            assert_eq!(displaced(), [("b".into(), ingress)]);
+            bind("b", Ingress);
+            assert_eq!(displaced(), [("a".into(), Ingress)]);
+            bind("b", Ingress);
+            assert_eq!(displaced(), [("a".into(), Ingress)]);
+            bind("a", Ingress);
+            assert_eq!(displaced(), [("b".into(), Ingress)]);
         }
         // On the other side, as well as on this.
-        bind("b", egress);
-        bind("a", egress);
-        assert_eq!(displaced(), [("b".into(), ingress), ("b".into(), egress)]);
-        bind("b", egress);
-        assert_eq!(displaced(), [("b".into(), ingress), ("a".into(), egress)]);
+        bind("b", Egress);
+        bind("a", Egress);
+        assert_eq!(displaced(), [("b".into(), Ingress), ("b".into(), Egress)]);
+        bind("b", Egress);
+        assert_eq!(displaced(), [("b".into(), Ingress), ("a".into(), Egress)]);
         router.unbind(&id, "b");
-        assert_eq!(displaced(), [("a".into(), egress)]);
+        assert_eq!(displaced(), [("a".into(), Egress)]);
         assert!(router.remove_edge("a").len() == 1);
-        assert_eq!(router.counts(), (0, 0));
+        assert!(router.tunnel(&id).is_none());
+    }
+
+    /// Only one that showed a token is remembered, and only until the side is
+    /// bound with the same.
+    #[tokio::test]
+    async fn one_connection_is_remembered_for_a_token() {
+        let (_endpoint, connection) = connection().await;
+        let router = TunnelRouter::with_auth_policy(false);
+        let id = Uuid::new_v4();
+        let after = |name: &str, shown: Option<&str>| -> Vec<String> {
+            bind(&router, &connection, id, name, Ingress, shown);
+            let state = router.tunnel(&id).unwrap();
+            let displaced = state.displaced.iter().filter(|e| e.direction == Ingress);
+            displaced.map(|e| e.connection_id.clone()).collect()
+        };
+        assert!(after("no token", None).is_empty());
+        assert!(after("old", Some("old")).is_empty(), "it showed none");
+        assert_eq!(after("first", Some("token")), ["old"]);
+        assert_eq!(after("second", Some("token")), ["old"], "the same as it");
+        assert_eq!(after("stranger", None), ["old", "second"]);
+        assert_eq!(after("another stranger", None), ["old", "second"]);
+        assert_eq!(after("third", Some("token")), ["old"], "the same as the second");
+        // The same token shown for the other side is another's.
+        bind(&router, &connection, id, "other side", Egress, Some("old"));
+        assert_eq!(after("stranger", None), ["old", "third"]);
+
+        // The token it has shown is the one of its last bind.
+        assert_eq!(after("third", Some("newer")), ["old"]);
+        assert_eq!(after("stranger", None), ["old", "third"]);
+        assert!(router.authorize_tunnel(id, "token", "old").is_empty());
+        assert_eq!(holder(&router, &id).as_deref(), Some("stranger"));
+        assert_eq!(router.authorize_tunnel(id, "newer", "old").len(), 1);
+        assert_eq!(holder(&router, &id).as_deref(), Some("third"));
+        // It took the side from one with a token that may count yet.
+        assert_eq!(router.authorize_tunnel(id, "old", "old").len(), 1);
+        assert_eq!(holder(&router, &id).as_deref(), Some("old"));
+        assert_eq!(router.authorize_tunnel(id, "newer", "old").len(), 1);
+        assert_eq!(holder(&router, &id).as_deref(), Some("third"));
+    }
+
+    /// While nobody holds a side of it, a tunnel is kept for the connections
+    /// its sides were taken from, with what it has counted, and is in no list.
+    #[tokio::test]
+    async fn a_tunnel_is_kept_for_those_it_can_go_back_to() {
+        let (_endpoint, connection) = connection().await;
+        let router = TunnelRouter::with_auth_policy(false);
+        let id = Uuid::new_v4();
+        let sides = [(Ingress, "for ingress"), (Egress, "for egress")];
+        let taken = || {
+            for (direction, token) in sides {
+                bind(&router, &connection, id, token, direction, Some(token));
+                bind(&router, &connection, id, "stranger", direction, None);
+            }
+            let stats = router.route(&id, "stranger").unwrap().stats;
+            stats.bytes_ingress.fetch_add(10, Ordering::Relaxed);
+            assert_eq!((router.counts(), router.list_tunnels().len()), ((1, 1), 1));
+            router.remove_edge("stranger");
+            assert_eq!((router.counts(), router.list_tunnels().len()), ((0, 0), 0));
+            assert!(router.tunnel(&id).is_some());
+        };
+        taken();
+        assert_eq!(router.authorize_tunnel(id, "for ingress", "for egress").len(), 2);
+        assert_eq!((router.counts(), router.list_tunnels().len()), ((1, 1), 1));
+        assert_eq!(router.list_tunnels()[0].stats.bytes_ingress, 10);
+        router.revoke_tunnel(&id);
+
+        // They leave it one by one, and the last takes it along.
+        taken();
+        assert!(router.unbind(&id, "for ingress").is_none());
+        assert!(router.tunnel(&id).is_some());
+        assert!(router.remove_edge("for egress").is_empty());
+        assert!(router.tunnel(&id).is_none());
+
+        // Removed by force, it is gone, and they are told.
+        taken();
+        assert_eq!(router.force_remove_tunnel(&id), Some(vec!["for ingress".into(), "for egress".into()]));
+        assert!(router.tunnel(&id).is_none());
+        assert!(router.authorize_tunnel(id, "for ingress", "for egress").is_empty());
+        assert_eq!(router.totals().bytes_ingress, 30);
+    }
+
+    /// A bind looks for the tokens with the tunnel locked, and they are there
+    /// before `authorize_tunnel` looks at the tunnel. Both have to wait for the
+    /// lock here: were the one or the other the other way around, the bind
+    /// would be taken after the side was given back.
+    #[tokio::test]
+    async fn a_bind_that_waits_for_the_tunnel_sees_the_tokens() {
+        let (_endpoint, connection) = connection().await;
+        let router = TunnelRouter::with_auth_policy(false);
+        let id = Uuid::new_v4();
+        bind(&router, &connection, id, "real", Ingress, Some("token"));
+        std::thread::scope(|s| {
+            let locked = router.tunnel(&id).unwrap();
+            let (asking, asks) = mpsc::channel();
+            let (router, connection) = (&router, &connection);
+            let stranger = s.spawn(move || {
+                asking.send(()).unwrap();
+                bind(router, connection, id, "stranger", Ingress, None)
+            });
+            asks.recv().unwrap();
+            // Time for it to come to the lock.
+            std::thread::sleep(Duration::from_millis(100));
+            let given = s.spawn(move || router.authorize_tunnel(id, "token", "another"));
+            let until = Instant::now() + Duration::from_secs(10);
+            while router.registered_token(&id, Ingress).is_none() {
+                assert!(Instant::now() < until, "the tokens wait for the tunnel");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(locked);
+            assert!(matches!(stranger.join().unwrap(), BindResult::Refused));
+            assert!(given.join().unwrap().is_empty());
+        });
+        assert_eq!(holder(&router, &id).as_deref(), Some("real"));
+    }
+
+    /// The two at once, a little earlier or later against each other each time:
+    /// whichever is first, the connection that showed the token has the side
+    /// after both. The gap there would be is short, and met now and then only:
+    /// the test above has it every time.
+    #[tokio::test]
+    async fn a_bind_that_races_the_tokens_does_not_keep_the_side() {
+        const ROUNDS: usize = 20_000;
+        let (_endpoint, connection) = connection().await;
+        let router = TunnelRouter::with_auth_policy(false);
+        let ids: Vec<Uuid> = (0..ROUNDS).map(|_| Uuid::new_v4()).collect();
+        for id in &ids {
+            bind(&router, &connection, *id, "real", Ingress, Some("token"));
+        }
+        // Meet the other thread at a round, and go on some moments later.
+        let reached = AtomicUsize::new(0);
+        let meet = |round: usize, moments: usize| {
+            reached.fetch_add(1, Ordering::SeqCst);
+            while reached.load(Ordering::SeqCst) < 2 * (round + 1) {
+                std::thread::yield_now();
+            }
+            for _ in 0..moments {
+                std::hint::spin_loop();
+            }
+        };
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for (round, id) in ids.iter().enumerate() {
+                    meet(round, round % 64);
+                    router.authorize_tunnel(*id, "token", "another");
+                }
+            });
+            for (round, id) in ids.iter().enumerate() {
+                meet(round, round / 64 % 64);
+                bind(&router, &connection, *id, "stranger", Ingress, None);
+            }
+        });
+        for (round, id) in ids.iter().enumerate() {
+            assert_eq!(holder(&router, id).as_deref(), Some("real"), "round {round}");
+        }
     }
 }
 

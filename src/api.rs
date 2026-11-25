@@ -213,11 +213,12 @@ async fn list_tunnels(State(state): State<Arc<ApiState>>) -> Json<TunnelsRespons
 /// when no token is set. When a token *is* set the middleware has already
 /// verified the Bearer token before this handler runs.
 ///
-/// Semantics match a user-initiated delete: **revoke** the bind authorization
-/// (so a reconnecting edge can't immediately re-bind) **and** force-remove the
-/// live tunnel entry (so it stops showing in `waiting_ingress` / forwarding).
-/// Reuses the same `revoke_tunnel` + `force_remove_tunnel` primitives as the WS
-/// `close_tunnel`/`revoke_tunnel` commands so behaviour is identical.
+/// Force-removes the live tunnel entry (so it stops showing in
+/// `waiting_ingress` / forwarding). Its edges are told, and bind it again if
+/// they still have it configured. With `require_bind_auth` the bind
+/// authorization is **revoked** first, so that bind is refused until the
+/// manager authorizes the tunnel again. Without it the authorization stays:
+/// it is what refuses anyone else, and revoking it would let them in instead.
 async fn delete_tunnel(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -248,19 +249,14 @@ async fn delete_tunnel(
     };
 
     // Block re-bind first, then drop the live entry.
-    state.ctx.router.revoke_tunnel(&tunnel_id);
+    if state.ctx.router.requires_bind_auth() {
+        state.ctx.router.revoke_tunnel(&tunnel_id);
+    }
     match state.ctx.router.force_remove_tunnel(&tunnel_id) {
         Some(affected) => {
             let peers_notified = affected.len();
-            for connection_id in affected {
-                crate::session::notify_tunnel_down(
-                    &state.ctx,
-                    &connection_id,
-                    tunnel_id,
-                    "tunnel deleted via relay REST API",
-                )
-                .await;
-            }
+            let reason = "tunnel deleted via relay REST API";
+            crate::session::notify_removed(&state.ctx, affected, tunnel_id, reason).await;
             tracing::info!("REST: deleted tunnel '{tunnel_id}' ({peers_notified} peer(s) notified)");
             (
                 StatusCode::OK,

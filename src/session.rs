@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::Result;
 use dashmap::DashMap;
 use quinn::Connection;
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::manager::events::{EventSender, EventSeverity, category};
@@ -184,8 +185,8 @@ async fn handle_control_stream(
     // The sides this connection has asked for, for the DoS cap
     // (`RelayConfig::max_tunnels_per_connection`). It has bound no others. Once
     // there are as many as the cap, those it was refused, has unbound or lost
-    // with their tunnel are taken out. A side that another connection took over
-    // is not: the router remembers whose it was. So neither this nor what the
+    // with their tunnel are taken out, and those another connection took over,
+    // but for the ones the router remembers it had. So neither this nor what the
     // router holds for the connection is ever larger than the cap.
     let mut bound: HashSet<(Uuid, TunnelDirection)> = HashSet::new();
 
@@ -574,23 +575,27 @@ async fn notify_peer_gone(ctx: &Arc<SessionContext>, edge_id: &str, tunnel_id: U
     notify_edge(ctx, edge_id, &msg, || !is_active(ctx, &tunnel_id)).await;
 }
 
-/// Send a TunnelDown notification to an edge whose own side was removed. The
-/// `reason` is not one of those that are about its peer.
+/// Send a TunnelDown notification to the edges whose own bind of a tunnel went
+/// with it. The `reason` is not one of those that are about a peer.
 ///
-/// `edge_id` here is the `edge_connections` key, i.e. the endpoint's
-/// `connection_id` (the value returned by `TunnelRouter::force_remove_tunnel`).
-/// Best effort, as [`notify_edge`] says.
-pub(crate) async fn notify_tunnel_down(
+/// `edges` are `edge_connections` keys, i.e. the `connection_id`s returned by
+/// `TunnelRouter::force_remove_tunnel`. They are told all at once: there may be
+/// any number, and each best effort, as [`notify_edge`] says.
+pub(crate) async fn notify_removed(
     ctx: &Arc<SessionContext>,
-    edge_id: &str,
+    edges: Vec<String>,
     tunnel_id: Uuid,
-    reason: &str,
+    reason: &'static str,
 ) {
-    let msg = RelayMessage::TunnelDown {
-        tunnel_id,
-        reason: reason.to_string(),
-    };
-    notify_edge(ctx, edge_id, &msg, || true).await;
+    let mut told = JoinSet::new();
+    for edge in edges {
+        let ctx = ctx.clone();
+        told.spawn(async move {
+            let msg = RelayMessage::TunnelDown { tunnel_id, reason: reason.to_string() };
+            notify_edge(&ctx, &edge, &msg, || true).await;
+        });
+    }
+    told.join_all().await;
 }
 
 /// Register a tunnel's bind tokens, and report the sides that change hands by
@@ -780,6 +785,63 @@ mod notify_tests {
             .expect("the control loop is still held by the notification")
             .unwrap();
         assert!(matches!(pong, RelayMessage::Pong), "{pong:?}");
+    }
+}
+
+#[cfg(test)]
+mod removed_tests {
+    //! Who is told that a tunnel was removed.
+    use super::bound_sender_tests::Edge;
+    use super::test_relay::start_relay;
+    use super::*;
+    use tokio::time::Instant;
+    use TunnelDirection::{Egress, Ingress};
+
+    /// Every connection whose bind went with it, the ones the side was taken
+    /// from too. Those that take no streams hold up neither the others nor the
+    /// caller, however many there are.
+    #[tokio::test]
+    async fn every_edge_that_had_bound_it_is_told_at_once() {
+        let (relay, cert, ctx) = start_relay();
+        let id = Uuid::new_v4();
+        let mut deaf = Vec::new();
+        for n in 0..4 {
+            let mut edge = Edge::connect_taking(relay, &cert, 0).await;
+            edge.bind(id, Ingress, Some(&format!("token {n}"))).await;
+            deaf.push(edge);
+        }
+        let mut displaced = Edge::connect(relay, &cert).await;
+        displaced.bind(id, Ingress, Some("token")).await;
+        let mut holder = Edge::connect(relay, &cert).await;
+        holder.bind(id, Ingress, None).await;
+        // It has unbound, so it has nothing to lose.
+        let mut unbound = Edge::connect(relay, &cert).await;
+        unbound.bind(id, Egress, Some("token")).await;
+        assert!(holder.notice().await.is_some(), "that the other side bound");
+        unbound.unbind(id).await;
+        assert!(holder.notice().await.is_some(), "and left");
+
+        let edges = ctx.router.force_remove_tunnel(&id).unwrap();
+        assert_eq!(edges.len(), 6);
+        let since = Instant::now();
+        let told = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { notify_removed(&ctx, edges, id, "a reason").await }
+        });
+        for edge in [&displaced, &holder] {
+            match edge.notice().await {
+                Some(RelayMessage::TunnelDown { tunnel_id, reason }) => {
+                    assert_eq!((tunnel_id, &reason[..]), (id, "a reason"));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(!told.is_finished());
+        told.await.unwrap();
+        let took = since.elapsed();
+        assert!(took >= NOTIFY_TIMEOUT && took < NOTIFY_TIMEOUT * 2, "{took:?}");
+        let notice = tokio::time::timeout(Duration::from_millis(100), unbound.connection.accept_uni());
+        assert!(notice.await.is_err(), "it has nothing to be told");
     }
 }
 
@@ -1444,7 +1506,7 @@ mod shown_token_tests {
     use super::*;
     use crate::manager::events::Event;
     use tokio::sync::mpsc;
-    use tokio::time::{Instant, sleep};
+    use tokio::time::sleep;
     use TunnelDirection::{Egress, Ingress};
 
     const INGRESS: &str = "ingress token";
@@ -1722,6 +1784,126 @@ mod shown_token_tests {
         }
     }
 
+    /// Both sides are empty when the token comes: the stranger had both, or one
+    /// and the edge on the other has left as well. The tunnel is in no list
+    /// meanwhile, and nothing passes. Then each edge that showed its token has
+    /// its side back, and one that has to bind again finds it there.
+    #[tokio::test]
+    async fn a_tunnel_left_empty_goes_back_too() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum By {
+            Unbind,
+            Disconnect,
+            TheOther,
+        }
+        for (side, token, other_side, other_token) in SIDES {
+            for by in [By::Unbind, By::Disconnect, By::TheOther] {
+                let (relay, cert, ctx, mut events) = start_relay_capped(false, 64, 100);
+                let id = Uuid::new_v4();
+                let mut other = Edge::connect(relay, &cert).await;
+                other.bind(id, other_side, Some(other_token)).await;
+                let mut real = Edge::connect(relay, &cert).await;
+                real.bind(id, side, Some(token)).await;
+                let mut stranger = Edge::connect(relay, &cert).await;
+                stranger.bind(id, side, None).await;
+                if by == By::TheOther {
+                    other.connection.close(0u32.into(), b"");
+                    soon("the other's end", async {
+                        while ctx.router.counts() == (1, 1) {
+                            sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await;
+                } else {
+                    stranger.bind(id, other_side, None).await;
+                }
+                match by {
+                    By::Disconnect => {
+                        stranger.connection.close(0u32.into(), b"");
+                        gone(&ctx, 2).await;
+                        soon("the stranger's end", async {
+                            while ctx.router.counts() != (0, 0) {
+                                sleep(Duration::from_millis(2)).await;
+                            }
+                        })
+                        .await;
+                    }
+                    _ => stranger.unbind(id).await,
+                }
+                assert_eq!((ctx.router.counts(), ctx.router.list_tunnels().len()), ((0, 0), 0));
+                real.is_refused(id).await;
+                let mut back = 2;
+                if by == By::TheOther {
+                    back = 1;
+                    other = Edge::connect(relay, &cert).await;
+                    other.bind(id, other_side, Some(other_token)).await;
+                } else {
+                    other.is_refused(id).await;
+                }
+
+                authorize(&ctx, id);
+                passes(id, side, &mut real, &mut other).await;
+                assert_eq!((ctx.router.counts(), ctx.router.list_tunnels().len()), ((1, 1), 1));
+                let told = given_back(&mut events);
+                assert_eq!(told.len(), back, "{by:?}: {told:?}");
+                assert!(told.iter().all(|t| t["held_by"].is_null()), "{told:?}");
+
+                // Nothing is kept of it once its edges have left.
+                real.unbind(id).await;
+                other.unbind(id).await;
+                assert!(ctx.router.tunnel(&id).is_none());
+            }
+        }
+    }
+
+    /// Two edges of one configuration: the newer one took the side with the
+    /// token the older had shown, and leaves. The side is not the older one's
+    /// again, whether the tokens came before the binds or after, and whoever
+    /// took it from the newer one meanwhile.
+    #[tokio::test]
+    async fn a_side_is_not_given_back_to_an_edge_that_its_own_token_took_it_from() {
+        for (side, token, other_side, other_token) in SIDES {
+            for (strict, with_stranger) in [(true, false), (false, false), (false, true)] {
+                for by_unbind in [true, false] {
+                    let (relay, cert, ctx, mut events) = start_relay_capped(strict, 64, 100);
+                    let id = Uuid::new_v4();
+                    if strict {
+                        authorize(&ctx, id);
+                    }
+                    let mut other = Edge::connect(relay, &cert).await;
+                    other.bind(id, other_side, Some(other_token)).await;
+                    let mut older = Edge::connect(relay, &cert).await;
+                    older.bind(id, side, Some(token)).await;
+                    let mut newer = Edge::connect(relay, &cert).await;
+                    newer.bind(id, side, Some(token)).await;
+                    let mut stranger = Edge::connect(relay, &cert).await;
+                    if with_stranger {
+                        stranger.bind(id, side, None).await;
+                    }
+                    match by_unbind {
+                        true => newer.unbind(id).await,
+                        false => {
+                            newer.connection.close(0u32.into(), b"");
+                            gone(&ctx, 3).await;
+                            // Its end is handled after it has left `edge_connections`.
+                            sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                    for _ in 0..2 {
+                        authorize(&ctx, id);
+                        older.is_refused(id).await;
+                        assert_eq!(given_back(&mut events).len(), 0);
+                    }
+                    if with_stranger {
+                        passes(id, side, &mut stranger, &mut other).await;
+                    }
+                    older.bind(id, side, Some(token)).await;
+                    passes(id, side, &mut older, &mut other).await;
+                }
+            }
+        }
+    }
+
     /// An edge that has its side back with nobody on the other is told so: it
     /// was not when the other left.
     #[tokio::test]
@@ -1817,53 +1999,12 @@ mod shown_token_tests {
             assert_passes(id, &mut ingress, &mut egress).await;
         }
     }
-
-    /// A stranger's bind and the token's coming race. Whichever is first, the
-    /// edge that showed the token has the side after both.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_bind_that_races_the_token_does_not_keep_the_side() {
-        let (relay, cert, ctx) = start_relay();
-        let mut real = Edge::connect(relay, &cert).await;
-        let mut stranger = Edge::connect(relay, &cert).await;
-        real.settle().await;
-        let real_id = relayed(&ctx, &real.connection).0;
-        let (mut first, mut second) = (0, 0);
-        for _ in 0..400 {
-            let id = Uuid::new_v4();
-            real.bind(id, Ingress, Some(INGRESS)).await;
-            let ctx = &ctx;
-            let (refused, ()) = tokio::join!(
-                stranger.ask(id, Ingress, None),
-                async {
-                    // About as long as the bind is on its way.
-                    let until = Instant::now() + Duration::from_micros(random_micros());
-                    while Instant::now() < until {
-                        tokio::task::yield_now().await;
-                    }
-                    authorize(ctx, id);
-                }
-            );
-            if refused.is_some() { second += 1 } else { first += 1 }
-            let tunnel = ctx.router.tunnel(&id).unwrap();
-            assert_eq!(tunnel.ingress.as_ref().unwrap().connection_id, real_id);
-            drop(tunnel);
-            real.unbind(id).await;
-            stranger.unbind(id).await;
-        }
-        assert!(first > 0 && second > 0, "the bind was first {first} times and the token {second}");
-    }
-
-    /// Anything from 0 to 400 µs, by the clock.
-    fn random_micros() -> u64 {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-        u64::from(now.subsec_nanos()) / 100 % 400
-    }
 }
 
 #[cfg(test)]
 mod tunnel_cap_tests {
     //! The cap on one connection's tunnels.
-    use super::bound_sender_tests::Edge;
+    use super::bound_sender_tests::{Edge, soon};
     use super::test_relay::{relayed, start_relay_capped};
     use super::*;
     use TunnelDirection::{Egress, Ingress};
@@ -1944,29 +2085,38 @@ mod tunnel_cap_tests {
         assert_eq!(ask(&mut edge, id, Ingress).await.as_deref(), FULL);
     }
 
-    /// A side that another connection has taken over counts for both: the
-    /// router remembers who had it. Each gives its own back.
+    /// A side that another connection has taken over counts for both while the
+    /// router remembers who had it, whatever becomes of the other: that is for
+    /// as long as it can go back. Each gives its own back.
     #[tokio::test]
-    async fn a_side_taken_over_counts_until_it_is_unbound() {
+    async fn a_side_taken_over_counts_while_it_can_go_back() {
         let (relay, cert, _ctx, _events) = start_relay_capped(false, 64, 1);
-        let id = Uuid::new_v4();
-        let mut old = Edge::connect(relay, &cert).await;
-        old.bind(id, Ingress, None).await;
-        let mut new = Edge::connect(relay, &cert).await;
-        new.bind(id, Ingress, None).await;
-        for edge in [&mut old, &mut new] {
-            assert_eq!(ask(edge, Uuid::new_v4(), Ingress).await.as_deref(), FULL);
-            edge.unbind(id).await;
-            edge.bind(Uuid::new_v4(), Ingress, None).await;
+        for (shown, by, counts) in [
+            (Some("token"), None, true),
+            (Some("token"), Some("another"), true),
+            (Some("token"), Some("token"), false),
+            (None, None, false),
+            (None, Some("token"), false),
+        ] {
+            for the_newer_leaves in [false, true] {
+                let id = Uuid::new_v4();
+                let mut old = Edge::connect(relay, &cert).await;
+                old.bind(id, Ingress, shown).await;
+                let mut new = Edge::connect(relay, &cert).await;
+                new.bind(id, Ingress, by).await;
+                assert_eq!(ask(&mut new, Uuid::new_v4(), Ingress).await.as_deref(), FULL);
+                if the_newer_leaves {
+                    new.unbind(id).await;
+                    new.bind(Uuid::new_v4(), Ingress, None).await;
+                }
+                if counts {
+                    assert_eq!(ask(&mut old, Uuid::new_v4(), Ingress).await.as_deref(), FULL);
+                    old.unbind(id).await;
+                }
+                old.bind(Uuid::new_v4(), Ingress, None).await;
+                assert_eq!(ask(&mut old, Uuid::new_v4(), Ingress).await.as_deref(), FULL);
+            }
         }
-        // Taken over, and gone with the tunnel when the newer one leaves it.
-        let id = Uuid::new_v4();
-        let mut old = Edge::connect(relay, &cert).await;
-        old.bind(id, Ingress, None).await;
-        let mut new = Edge::connect(relay, &cert).await;
-        new.bind(id, Ingress, None).await;
-        new.unbind(id).await;
-        old.bind(Uuid::new_v4(), Ingress, None).await;
     }
 
     /// A tunnel removed by force gives its sides back, to both edges.
@@ -2016,7 +2166,8 @@ mod tunnel_cap_tests {
                     let (id, side) = sides[random(sides.len())];
                     let held = sides.iter().filter(|(id, side)| has(id, *side)).count();
                     let room = has(&id, side) || held < CAP as usize;
-                    let answer = edges[at].ask(id, side, None).await;
+                    let shown = [None, Some("a"), Some("b"), Some("c")][random(4)];
+                    let answer = edges[at].ask(id, side, shown).await;
                     assert_eq!(answer.is_none(), room, "{held} bound: {answer:?}");
                     if room { taken += 1 } else { refused += 1 }
                 }
@@ -2027,6 +2178,16 @@ mod tunnel_cap_tests {
             }
         }
         assert!(taken > 200 && refused > 100, "{taken} taken, {refused} refused");
+        // Nothing is kept for connections that have left.
+        for edge in &edges {
+            edge.connection.close(0u32.into(), b"");
+        }
+        soon("the end of every tunnel", async {
+            while ids.iter().any(|id| ctx.router.tunnel(id).is_some()) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
     }
 }
 
