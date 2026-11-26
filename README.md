@@ -174,7 +174,7 @@ that lands entitled viewers in it — see [`docs/portal.md`](docs/portal.md).
     "public_ip": "203.0.113.10",
     "public_base_url": "https://relay.example.com",
     "ingest_addrs": ["0.0.0.0:4486", "[::]:4486"],
-    "token_secret": "<64 hex chars, shared with the manager>",
+    "token_secret": "<64 hex chars: this relay's own key, pushed by the manager>",
     "require_viewer_token": false,
     "require_ingest_token": true,
     "max_viewers_per_ip": 256,
@@ -250,7 +250,8 @@ The opaque forwarder is stateless — a restart drops connected edges, which all
 | End-to-end | ChaCha20-Poly1305 between edges (relay sees only ciphertext) |
 | REST API | Optional Bearer token authentication |
 | Tunnel binding | Optional per-tunnel HMAC-SHA256 bind tokens (managed via manager). Only a connection that has bound a side of a QUIC tunnel can send into it |
-| Config read-back | The manager's `get_config` shows every credential the relay holds (API token, registration token, node secret, distribution token secret, cascade upstream tokens, and a credential carried in a manager or cascade URL) as `***REDACTED***` |
+| Distribution tokens | Short-lived HMAC tokens verified with this relay's own key, which the manager generates per relay — a token minted for one relay does not verify on another. During the manager's move to per-relay keys the old installation-wide key is also accepted until a deadline (`previous_token_secret` / `previous_token_until`), and every use of it is reported (`legacy_token_accepted`, `distribution.legacy_tokens`) |
+| Config read-back | The manager's `get_config` shows every credential the relay holds (API token, registration token, node secret, distribution token keys, cascade upstream tokens, and a credential carried in a manager or cascade URL) as `***REDACTED***` |
 | ALPN | `bilbycast-relay` protocol enforced |
 
 ## Testing

@@ -18,9 +18,15 @@ and the optional [`mail`](#rewriting-authelias-email-mail) block gives it an
 SMTP relay key — both described below.)
 
 * **It does not sign tokens.** It asks the manager to mint one, and the manager
-  re-checks the entitlement before it does. A public-facing VPS holding the key
-  that signs every viewer credential would make a compromise there a compromise
-  of every feed on every relay.
+  re-checks the entitlement before it does, so what a viewer may watch is
+  decided by the manager on every mint and never by anything on the VPS. The
+  relay process beside it does hold a key — that relay's own, which the
+  manager generates per relay and signs that relay's tokens with — so a
+  compromise of the box reaches the feeds on that relay, not every relay of
+  the installation. (Before per-relay keys every relay held the one
+  installation-wide key, and it did; during the manager's grace a relay may
+  still hold that old key as `previous_token_secret`, until the deadline — see
+  `docs/distribution.md`, "The previous key, during the manager's grace".)
 * **It does not hold entitlements.** It asks the manager on each page load.
   Withdrawing someone's access therefore takes effect on their next click,
   rather than on the next successful push to a box that might be unreachable.

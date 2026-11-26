@@ -602,8 +602,11 @@ streams, and the served window then probed 0 of 43 missing.
 ## Access tokens
 
 Short-lived, stateless HMAC-SHA256 tokens (same pattern as `authorize_tunnel`
-bind tokens, plus an expiry). The manager mints them with a shared 64-hex
-`token_secret`; the relay validates statelessly (no DB):
+bind tokens, plus an expiry). The manager mints them with **this relay's own**
+64-hex `token_secret`, which it generates for this relay and pushes to it alone
+(`configure_distribution`); the relay validates statelessly (no DB). Edges,
+players, the portal and cascades carry tokens and never hold a key, so a token
+minted for one relay does not verify on another:
 
 ```
 token  = "{exp}.{hex_hmac}"                        — one stream
@@ -646,6 +649,82 @@ scope  ∈ { "viewer", "ingest" }   (only viewer tokens take the list form)
   player reads `?token=` off the `/watch/{stream}` URL and forwards it as a
   Bearer header; `/whep` accepts the query form directly too, as a convenience
   for CLI and link-share clients.
+
+### The previous key, during the manager's grace
+
+Until the manager moved to per-relay keys, every relay of an installation
+verified with one shared key, so anyone who held it — or a token from it — could
+reach any stream on any relay. A manager that moves its relays onto keys of
+their own gives the tokens already handed out a **grace**: for each relay that
+existed when it started, it pushes the relay's own key as `token_secret` and the
+old shared key as `previous_token_secret`, with the unix second the grace ends
+as `previous_token_until`:
+
+```jsonc
+{
+  "type": "configure_distribution",
+  "token_secret": "<this relay's own key, 64 hex>",
+  "previous_token_secret": "<the old installation-wide key, 64 hex>",
+  "previous_token_until": 1800000000
+}
+```
+
+- **Every check tries the relay's own key first**, and the previous key only
+  when that refuses the token and only while now is before
+  `previous_token_until`. A relay that holds no previous key, and every token
+  minted under its own key during the grace, costs one HMAC as before; there is
+  no lock on the request path. A token the previous key admits is treated
+  exactly as it was — the `-proxy` widening of a viewer token, the multi-stream
+  form, an ingest token exact — on every gated surface: WHIP, WHEP, the QUIC
+  ingest, segment PUTs, origin reads, the clip routes, the marks list and the
+  playback reports.
+- **`previous_token_until`**: `0`, or any time already past, clears the
+  previous key (that is how the manager ends the grace, and how it says a relay
+  has none: an older relay ignores the field, a newer one clears). A value more
+  than 31 days ahead is refused. A value that would set a key needs one, in the
+  same push or already held; `previous_token_secret` with no
+  `previous_token_until` beside it is refused rather than guessed at.
+- **`previous_token_secret`** is 64 hex, or `"***REDACTED***"` meaning the key
+  this relay holds (which is what `get_config` shows for it). Both keys are
+  parsed with the rest of the push, so a refusal applies nothing, live or on
+  disk.
+- **Every use of the previous key is reported**, so the manager can name what
+  stops working at the deadline: per stream and scope, a Warning
+  `legacy_token_accepted` the first time each is seen, and on the health
+  message, while a previous key is held and live:
+
+  ```jsonc
+  "distribution": {
+    "legacy_tokens": {
+      "until": 1800000000,
+      "entries": [ { "stream": "match-feed", "scope": "ingest", "count": 1842, "last_unix": 1799990000 } ],
+      "overflow": 0
+    }
+  }
+  ```
+
+  At most 256 entries are kept; past that a use is only counted in `overflow`,
+  and one more event (`overflow: true`) says so, so whoever holds the old key
+  cannot grow the registry or the event queue. The count belongs to the key: it
+  is kept while the same key stays held, a moved deadline included, and starts
+  afresh when the key is cleared or another is pushed.
+- **On disk**: the pair is written to `config.json` only while
+  `previous_token_until` is ahead, and a relay that starts after it has passed
+  drops the key. An older relay binary ignores both fields, so a downgraded
+  relay keeps its own key and loses the grace.
+- **What the report cannot see**: a WHIP push or a cascade pull that stays
+  connected through the whole grace presents its token once, when it connects.
+  If that was before the relay held a previous key, it appears only in the
+  manager's own scan, never here — and it is refused when it next reconnects
+  after the deadline.
+- The capability bit **`token-keyring`** says a relay understands these keys
+  ([Capability bits](#capability-bits)). A relay without it acks the push and
+  ignores them, so the manager keeps signing that relay's tokens with the old
+  key until its deadline and then cuts it over.
+
+Whoever controls a relay box holds that relay's key and can sign for every
+stream on it; that is the trust boundary, and it is now one relay wide rather
+than one installation wide.
 
 ### What `require_viewer_token` does *not* cover
 
@@ -1898,10 +1977,10 @@ take its `rate()`.
 
 ### Capability bits
 
-The same health payload carries a `capabilities` array of up to three strings.
+The same health payload carries a `capabilities` array of up to four strings.
 `udp-relay` belongs to the opaque forwarder: the manager (v0.89.0+) refuses a
 native-UDP tunnel or a relayed bond leg through a relay whose capabilities lack
-it (422 `relay_lacks_udp_plane`). The two distribution bits gate the
+it (422 `relay_lacks_udp_plane`). The three distribution bits gate the
 distribution pushes.
 
 | Bit | Set when | What it gates |
@@ -1909,6 +1988,7 @@ distribution pushes.
 | `udp-relay` | `udp_relay_enabled` (default true) and the plane is running — withdrawn while its bind is failing (`udp_relay_error` on health) | The native SRT/RIST plain-UDP plane — unrelated to distribution |
 | `viewer-distribution` | the subsystem has published a telemetry sample, and has not stopped since (`distribution_error` on health) | The WHEP SFU + LL-HLS/CMAF origin surfaces |
 | `origin-policy` | same condition as `viewer-distribution` | That this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` arrived later (v0.13.0) and is not covered by the bit, nor gated on it |
+| `token-keyring` | same condition as `viewer-distribution` | That this build understands `previous_token_secret` / `previous_token_until`: it verifies with its own key first and the previous one until its deadline, and reports `distribution.legacy_tokens` ([The previous key](#the-previous-key-during-the-managers-grace)). The manager moves a relay that has never acknowledged its own key onto it only on a connection whose health carries this bit; one without it is sent the old key until the deadline |
 
 The last one exists because the failure it prevents is silent. A relay that
 predates those keys advertises `viewer-distribution` exactly the same, and
@@ -1920,7 +2000,7 @@ storage policy: the DVR reconciler, and the Configure-distribution API handler,
 which returns `409` with `error_code: relay_lacks_origin_policy`. An operator
 who hits that message is being told to upgrade the relay.
 
-Both distribution bits appear only once `RelayStats::distribution_snapshot()`
+All three distribution bits appear only once `RelayStats::distribution_snapshot()`
 returns a sample — that is, once the subsystem is actually running, not merely
 once the feature is compiled in — which matches the `/metrics` series above.
 
@@ -2051,7 +2131,7 @@ A `-distribution` binary **starts the subsystem by default** (opt out with
 closed) until configured. In a managed deployment you don't hand-edit
 `config.json` at all: from the manager's relay detail page, the **Configure
 distribution** panel pushes the public IP/URL, auth gates, and cascade sources
-(and the shared token secret) over the WS `configure_distribution` command. The
+(and this relay's token key) over the WS `configure_distribution` command. The
 relay applies them to a live runtime cell **and persists them to `config.json`**,
 so they survive a restart; the manager also re-pushes on reconnect.
 
@@ -2070,7 +2150,7 @@ See `../../testbed/configs/relay-distribution.json`:
     "public_base_url": "https://relay.example.com",
     "portal_url": "https://viewer.example.com",
     "ingest_addrs": ["0.0.0.0:4486", "[::]:4486"],
-    "token_secret": "<64 hex chars, shared with the manager>",
+    "token_secret": "<64 hex chars: this relay's own key, pushed by the manager>",
     "require_viewer_token": false,
     "require_origin_token": false,
     "require_ingest_token": true,
@@ -2088,17 +2168,22 @@ See `../../testbed/configs/relay-distribution.json`:
 - `public_ip` is advertised as the ICE host candidate in every WHEP answer — set
   it to the relay's reachable IP or viewers off the relay's host/LAN can't
   connect the media socket.
-- `token_secret` must be the **same** 64-hex value the manager holds so its
-  minted tokens validate.
-  The relay never reports it back: `get_config` shows a set secret as
+- `token_secret` is this relay's own key: the manager generates it for this
+  relay and pushes it, and signs every token for this relay with it, so there
+  is nothing to set by hand in a managed deployment. (A standalone relay with
+  no manager uses whatever 64-hex key the operator mints its tokens with.)
+  During the manager's grace the file may also hold `previous_token_secret`
+  and `previous_token_until`, written only while the grace is ahead — see
+  [The previous key](#the-previous-key-during-the-managers-grace).
+  The relay never reports either key back: `get_config` shows a set secret as
   `"***REDACTED***"` (and each cascade source's `token` likewise, plus a
   `?token=` or userinfo inside its `upstream_whep_url`), because the manager
   serves a node's config to anyone with View on it. `get_config` reads the
   config the relay started with, so a secret first pushed after start shows as
   absent until the next restart. The marker pushed back on
-  `configure_distribution` keeps the current value: a `token_secret` of
-  `"***REDACTED***"` leaves the secret as it is and applies the rest of the
-  push, and a cascade source carrying the marker (in `token` or its URL) gets
+  `configure_distribution` keeps the current value: a `token_secret` (or
+  `previous_token_secret`) of `"***REDACTED***"` leaves that key as it is and
+  applies the rest of the push, and a cascade source carrying the marker (in `token` or its URL) gets
   the real URL and token of the source the relay runs for that `local_stream`
   whose redacted URL is the one pushed — or, when there is none, the push is
   refused rather than pulling upstream with the marker as its credential.
@@ -2282,7 +2367,7 @@ as ignored at startup.
 | `cascade.rs` | Relay-to-relay: WHEP-client pull from an upstream relay → local hub |
 | `ingest.rs` | QUIC ES ingest (future lower-overhead edge path) |
 | `origin.rs` | LL-HLS/CMAF HTTP origin; manifests in memory, segments on disk, age- and size-bounded |
-| `token.rs` | Short-lived HMAC token mint/verify (viewer + ingest scopes) |
+| `token.rs` | Short-lived HMAC token mint/verify (viewer + ingest scopes), and the `Keyring` — this relay's key, then the previous one until its deadline — every gated surface verifies through (`TokenKeys` in `mod.rs`); the count of what the previous key admits is `src/distribution_control/legacy.rs`, always compiled because the health builder reads it |
 | `webrtc/` | Vendored str0m session wrapper (str0m does the RFC 6184 packetizing) |
 | `player.html` | Built-in browser WHEP player (live only); reconnects with a back-off. Its jsdom suite is `tests/player_page.test.cjs` |
 | `dvr.html` | Browser DVR player — main + all-intra proxy, jog / shuttle / reverse |
@@ -2347,6 +2432,19 @@ as ignored at startup.
   superseded, what an ingest's end reports, and an unclaimed stream leaving
   with its last viewer, raced against a claim on three threads
   (`distribution::hub::tests`).
+- **The previous key, through the real router**: segment PUTs and WHEP offers
+  carrying tokens signed with the previous key are admitted while its grace
+  lasts, raise one `legacy_token_accepted` each per stream and scope, and are
+  counted on what health reports; a token signed with the relay's own key is
+  not counted, a token from a key the relay does not hold is refused, and once
+  `previous_token_until` has passed the old tokens are refused `401` / `403`
+  (`previous_key_tokens_are_admitted_and_counted_until_their_deadline`); old
+  tokens for 300 streams leave 256 entries, an overflow count and 257 events
+  (`previous_key_tokens_for_300_streams_stay_bounded`); the QUIC ingest takes
+  a previous-key token with the key read from the config file, as a restarted
+  relay has it (`quic_ingest_admits_a_previous_key_token_and_reports_it`).
+  The keyring's own rules are `distribution::token::tests`, and the push's
+  parsing, refusals and persistence are in `manager::client`'s tests.
 - **The media source pin's grace, through the real router**: a WHEP viewer's
   datagrams from another address it named count on the other-path counter and
   raise nothing for the first 64, then raise one `webrtc_offpath_source` event
