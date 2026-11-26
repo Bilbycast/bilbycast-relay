@@ -258,11 +258,45 @@ pub(crate) const PEER_LIVE_MS: u64 = 16_000;
 /// How often an edge re-registers: the edge's `KEEPALIVE_INTERVAL`.
 const EDGE_REGISTER_INTERVAL_MS: u64 = 5_000;
 
-/// The most `live_ms` an `Ack` reports: seven days. An edge after v0.117.0
-/// drops an `Ack` whose `live_ms` is larger as malformed, so a tunnel live for
-/// longer than a week reports this rather than lose its `Ack`s; the edge only
-/// asks whether its pair has been live for 60 s.
+/// The most `live_ms` an `Ack` reports: seven days, the ceiling an edge after
+/// v0.117.0 reads it at (`MAX_LIVE_MS` in bilbycast-edge's
+/// `tunnel/udp_relay_client.rs`, which takes a larger value as seven days).
+/// The edge only asks whether its pair has been live for 60 s.
 const MAX_LIVE_MS: u64 = 604_800_000;
+
+/// The most `Ack`s one slot is sent in a second. An edge registers a slot
+/// once a second at its fastest, adds one on each of its sockets when it moves
+/// and one or two when it checks a move first: four a second is more than any
+/// edge asks of a slot. Every `Ack` now carries more than the smallest
+/// `Register` that earns one, so the relay would otherwise reflect more at a
+/// forged source than that source sent; with the cap, what one address can
+/// have sent at it is `max_connections_per_ip` sessions, two slots each, at
+/// four `Ack`s of under 200 bytes a second. An edge whose `Register` the cap
+/// leaves unanswered asks again, as for one lost.
+const ACKS_PER_SLOT_PER_SECOND: u32 = 4;
+
+/// One slot's `Ack`s in the second that is running.
+#[derive(Debug, Default)]
+struct AckBudget {
+    /// Monotonic ms at which the second began.
+    second_from: u64,
+    sent: u32,
+}
+
+impl AckBudget {
+    /// Whether one more `Ack` may go at `now`, counting it if so.
+    fn take(&mut self, now: u64) -> bool {
+        if self.sent == 0 || now.saturating_sub(self.second_from) >= 1_000 {
+            self.second_from = now;
+            self.sent = 0;
+        }
+        if self.sent >= ACKS_PER_SLOT_PER_SECOND {
+            return false;
+        }
+        self.sent += 1;
+        true
+    }
+}
 
 const _: () = assert!(PEER_LIVE_MS >= 3 * EDGE_REGISTER_INTERVAL_MS);
 const _: () = assert!(PEER_LIVE_MS < SESSION_IDLE_TIMEOUT.as_millis() as u64);
@@ -308,6 +342,10 @@ pub struct UdpSession {
     /// written under the session's entry lock.
     ingress_shown: Option<TokenDigest>,
     egress_shown: Option<TokenDigest>,
+    /// Each slot's `Ack`s this second ([`ACKS_PER_SLOT_PER_SECOND`]). Read and
+    /// written under the session's entry lock.
+    ingress_acks: AckBudget,
+    egress_acks: AckBudget,
     /// Source IP that created the session (for per-IP DoS accounting).
     creator_ip: IpAddr,
     pub stats: Arc<TunnelStats>,
@@ -332,6 +370,8 @@ impl UdpSession {
             live_since_ms: AtomicU64::new(0),
             ingress_shown: None,
             egress_shown: None,
+            ingress_acks: AckBudget::default(),
+            egress_acks: AckBudget::default(),
             creator_ip,
             stats: Arc::new(TunnelStats::new()),
             last_seen_ms: AtomicU64::new(now_ms()),
@@ -678,6 +718,22 @@ impl UdpSessionRouter {
         match held_by {
             Some(held_by) => LatchResult::TookOver { readiness, held_by },
             None => LatchResult::Ok(readiness),
+        }
+    }
+
+    /// Whether the `Register` just latched on `tunnel_id`'s `direction` slot is
+    /// answered: at most [`ACKS_PER_SLOT_PER_SECOND`] a second, whoever sent
+    /// them.
+    fn take_ack(&self, tunnel_id: &Uuid, direction: TunnelDirection) -> bool {
+        self.take_ack_at(tunnel_id, direction, mono_ms())
+    }
+
+    /// [`Self::take_ack`] at the monotonic millisecond `now`.
+    fn take_ack_at(&self, tunnel_id: &Uuid, direction: TunnelDirection, now: u64) -> bool {
+        let Some(mut session) = self.sessions.get_mut(tunnel_id) else { return false };
+        match direction {
+            TunnelDirection::Ingress => session.ingress_acks.take(now),
+            TunnelDirection::Egress => session.egress_acks.take(now),
         }
     }
 
@@ -1135,7 +1191,12 @@ async fn handle_control(
                     // Ack so the edge confirms the relay is alive (failover),
                     // learns when both sides are present, and — an edge after
                     // v0.117.0 — whether its peer is heard here, to meet it on
-                    // whichever relay both reach.
+                    // whichever relay both reach. Past the slot's few a second
+                    // nothing is sent, and nothing said: the source may be
+                    // forged, and the edge asks again.
+                    if !ctx.udp_sessions.take_ack(&tunnel_id, direction) {
+                        return;
+                    }
                     let ack = UdpRelayControl::Ack {
                         tunnel_id,
                         ready: readiness.latched,
@@ -2003,8 +2064,8 @@ mod liveness_tests {
         assert_eq!(register(&r, t, Ingress, false, T + 48_001).live_ms, 1_000);
     }
 
-    /// An edge drops an `Ack` whose `live_ms` is over seven days, so a tunnel
-    /// live for longer reports seven days rather than lose its `Ack`s.
+    /// A tunnel live for longer than seven days reports seven days, the most
+    /// an edge reads (it takes more as seven days).
     #[test]
     fn live_ms_stops_at_seven_days() {
         let r = UdpSessionRouter::new(64);
@@ -2142,6 +2203,59 @@ mod liveness_tests {
         }
         assert_eq!(ctx.udp_sessions.list()[0].status, "standby");
         assert_eq!(ctx.udp_sessions.active_count(), 0);
+    }
+
+    /// A slot is answered at most four times a second, whoever registers it,
+    /// and each slot on its own. Every `Ack` carries more than the smallest
+    /// `Register` that earns one, so unbounded the relay reflected more at a
+    /// forged source than it was sent.
+    #[test]
+    fn acks_are_capped_per_slot_per_second() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        register(&r, t, Egress, false, T);
+        let answered = (0..10).filter(|_| r.take_ack_at(&t, Egress, T)).count();
+        assert_eq!(answered, ACKS_PER_SLOT_PER_SECOND as usize);
+        assert!(!r.take_ack_at(&t, Egress, T + 999));
+        assert!(r.take_ack_at(&t, Ingress, T + 999), "the other slot has its own");
+        assert!(r.take_ack_at(&t, Egress, T + 1_000), "and the next second its four again");
+        assert!(!r.take_ack_at(&Uuid::new_v4(), Egress, T), "no session, no Ack");
+    }
+
+    /// Over the plane's own receive loop: ten `Register`s at once on one slot
+    /// earn four `Ack`s.
+    #[tokio::test]
+    async fn a_burst_of_registers_is_answered_four_times() {
+        let (_, _, ctx, _events) = start_relay_capped(false, 64, 100);
+        let config = RelayConfig {
+            udp_relay_addrs: Some(vec!["127.0.0.1:0".into()]),
+            ..RelayConfig::default()
+        };
+        let sockets = bind_udp_relay(&config).unwrap();
+        let relay = sockets[0].local_addr().unwrap();
+        tokio::spawn(serve_udp_relay(sockets, ctx.clone()));
+        let t = Uuid::new_v4();
+        let edge = socket(1).await;
+        let register = encode_udp_control(&UdpRelayControl::Register {
+            tunnel_id: t,
+            direction: Egress,
+            bind_token: None,
+            protocol_version: TUNNEL_PROTOCOL_VERSION,
+            seq: None,
+            standby: None,
+        })
+        .unwrap();
+        for _ in 0..10 {
+            edge.send_to(&register, relay).await.unwrap();
+        }
+        let mut buf = [0; 2048];
+        let mut acks = 0;
+        while let Ok(n) = tokio::time::timeout(Duration::from_millis(300), edge.recv(&mut buf)).await {
+            if let Some(UdpRelayControl::Ack { .. }) = try_decode_udp_control(&buf[..n.unwrap()]) {
+                acks += 1;
+            }
+        }
+        assert_eq!(acks, ACKS_PER_SLOT_PER_SECOND);
     }
 
     /// The reaper clears a slot whose edge has gone — nothing from it for

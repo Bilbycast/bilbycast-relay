@@ -546,8 +546,8 @@ The relay now says more, and leaves the edges' decisions to them:
   slots heard and either there was no stretch or this slot had a break (it was not
   heard, or was just taken over), and cleared when a `Register` finds the other
   slot unheard. `live_ms` on the `Ack` is the time since, at most seven days
-  (`MAX_LIVE_MS`: an edge drops an `Ack` reporting more as malformed); edges fail
-  back to the primary only once their pair has been live there for 60 s.
+  (`MAX_LIVE_MS`, the ceiling an edge reads it at: it takes more as seven days);
+  edges fail back to the primary only once their pair has been live there for 60 s.
 - **Which relay.** `relay_id` is 32 lowercase hex characters, new each time the
   relay process starts. Two configured addresses that answer with one id are one
   relay, and an id that changes is a restart. `seq` echoes the `Register`'s own
@@ -571,6 +571,17 @@ The relay now says more, and leaves the edges' decisions to them:
   `require_bind_auth` is on, only a `Register` showing the right one gets that
   far). The ids are collected with the map's iterator, which is dropped
   before each session is taken with `get_mut` and asked again under its lock.
+- **How many `Ack`s.** One slot is answered at most four times a second
+  (`ACKS_PER_SLOT_PER_SECOND`), whoever registers it; past that a `Register`
+  still latches and refreshes the slot but gets no `Ack`, and nothing is said.
+  An edge asks a slot once a second at its fastest, with a `Register` on each
+  socket when it moves and one or two more when it checks a move first, and an
+  edge whose `Register` goes unanswered asks again. Every `Ack` now carries more
+  than the smallest `Register` that earns one (one with no token, against a
+  tunnel no token is registered for, without `require_bind_auth`), so without a
+  cap a forged source address was sent more than it sent; with it, what one
+  address can be sent is its `max_connections_per_ip` sessions, two slots each,
+  at four `Ack`s of under 200 bytes a second.
 
 All four `Ack` fields and both `Register` fields are optional on the wire, so
 every pairing of versions reads the other's messages. An edge that gets an `Ack`
