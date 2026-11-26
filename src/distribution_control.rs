@@ -4,8 +4,9 @@
 //! Runtime, manager-overridable distribution config.
 //!
 //! The bootstrap distribution config comes from the relay's `config.json`, but
-//! the manager owns the operational policy — the shared token secret, the
-//! auth gates, the advertised public IP / base URL, and the cascade sources —
+//! the manager owns the operational policy — this relay's token key (and, for
+//! a bounded grace, the previous one), the auth gates, the advertised public
+//! IP / base URL, and the cascade sources —
 //! and pushes them over the WS `configure_distribution` command so an operator
 //! never hand-edits the relay's config. This module is the shared cell both
 //! sides read/write: the manager-client command handler calls
@@ -23,11 +24,62 @@ use arc_swap::ArcSwap;
 use tokio::sync::watch;
 
 use crate::config::{CascadeSource, DistributionConfig};
+use crate::manager::events::EventSender;
+
+pub mod legacy;
+
+use self::legacy::{LegacyTokens, LegacyTokensReport, Scope};
+
+/// How far ahead a pushed `previous_token_until` may lie: 31 days, a day past
+/// the longest grace the manager gives (30 days).
+pub const MAX_PREVIOUS_AHEAD_SECS: u64 = 31 * 24 * 60 * 60;
+
+/// Now, in unix seconds.
+pub fn now_unix() -> u64 {
+    crate::stats::now_epoch_ms() / 1000
+}
+
+/// The id of a key: the first 16 hex of SHA-256 over a fixed label and the
+/// key's hex — the manager's `key_id_of`, byte for byte, so the id this relay
+/// reports for the key it holds is the one the manager names it by. It names
+/// a key without revealing it.
+pub fn key_id_of(key_hex: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("bilbycast:distribution-key-id:v1:{key_hex}").as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `distribution.token_key` on the health message: which keys this relay
+/// verifies with now, by id. The manager compares it with what the relay
+/// should hold and pushes again when they differ — a relay restored from an
+/// old `config.json`, or one whose last push was overtaken by another, is put
+/// right on the next pass instead of verifying with a key the manager no
+/// longer signs with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TokenKeyReport {
+    /// The id of `token_secret`.
+    pub key_id: String,
+    /// The id of the previous key, while it is held and its `until` is ahead.
+    pub previous_key_id: Option<String>,
+    /// Until when the previous key is accepted (unix seconds); 0 when none is.
+    pub previous_until: u64,
+}
 
 /// The subset of distribution config the manager can change at runtime.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeDistConfig {
+    /// This relay's key: what every viewer and ingest token it accepts is
+    /// verified with first. Its own, generated per relay by the manager.
     pub token_secret: Option<String>,
+    /// The key this relay verified with before `token_secret`, held only for
+    /// the grace the manager gives while it moves relays off the one
+    /// installation-wide key. Tried only when `token_secret` refuses a token,
+    /// and only while now is below `previous_token_until`.
+    pub previous_token_secret: Option<String>,
+    /// Unix seconds; 0 when no previous key is held.
+    pub previous_token_until: u64,
+    /// What the previous key has admitted, for as long as that key is held.
+    pub legacy_tokens: Arc<LegacyTokens>,
     pub require_viewer_token: bool,
     /// Gate `GET /origin/...` as well as WHEP. Default false — see
     /// [`crate::config::DistributionConfig::require_origin_token`].
@@ -55,9 +107,19 @@ pub struct RuntimeDistConfig {
 
 impl RuntimeDistConfig {
     /// Derive from the static config, with an optional `public_ip` override.
+    ///
+    /// A previous key whose `until` has passed (or that has none) is dropped:
+    /// the grace it was given is over, whatever the file says.
     pub fn from_config(cfg: &DistributionConfig, public_ip: Option<IpAddr>) -> Self {
+        let previous = match (&cfg.previous_token_secret, cfg.previous_token_until) {
+            (Some(secret), Some(until)) if until > now_unix() => Some((secret.clone(), until)),
+            _ => None,
+        };
         Self {
             token_secret: cfg.token_secret.clone(),
+            previous_token_until: previous.as_ref().map_or(0, |(_, until)| *until),
+            previous_token_secret: previous.map(|(secret, _)| secret),
+            legacy_tokens: Arc::default(),
             require_viewer_token: cfg.require_viewer_token,
             require_origin_token: cfg.require_origin_token,
             require_ingest_token: cfg.require_ingest_token,
@@ -65,6 +127,50 @@ impl RuntimeDistConfig {
             public_base_url: cfg.public_base_url.clone(),
             portal_url: cfg.portal_url.clone(),
         }
+    }
+
+    /// The keys tokens are verified with: `None` when the relay holds no key
+    /// at all, and every gated surface then fails closed as it always has.
+    /// The previous key rides along with its `until`, which the verifier
+    /// checks on every use, so an expired one is never tried however long it
+    /// stays held.
+    #[cfg(feature = "viewer-distribution")]
+    pub fn keyring(&self) -> Option<crate::distribution::token::Keyring<'_>> {
+        Some(crate::distribution::token::Keyring {
+            current: self.token_secret.as_deref()?,
+            previous: self
+                .previous_token_secret
+                .as_deref()
+                .map(|previous| (previous, self.previous_token_until)),
+        })
+    }
+
+    /// Count a request the previous key admitted, raising
+    /// `legacy_token_accepted` the first time its stream and scope is seen.
+    pub fn note_previous_key(&self, events: &EventSender, stream: &str, scope: Scope) {
+        self.legacy_tokens.note(events, stream, scope, self.previous_token_until);
+    }
+
+    /// `distribution.legacy_tokens` for the health message: present only
+    /// while a previous key is held and has not expired.
+    pub fn legacy_tokens_report(&self, now: u64) -> Option<LegacyTokensReport> {
+        (self.previous_token_secret.is_some() && self.previous_token_until > now)
+            .then(|| self.legacy_tokens.report(self.previous_token_until))
+    }
+
+    /// `distribution.token_key` for the health message: present while the
+    /// relay holds a key at all.
+    pub fn token_key_report(&self, now: u64) -> Option<TokenKeyReport> {
+        let current = self.token_secret.as_deref()?;
+        let previous = self
+            .previous_token_secret
+            .as_deref()
+            .filter(|_| self.previous_token_until > now);
+        Some(TokenKeyReport {
+            key_id: key_id_of(current),
+            previous_key_id: previous.map(key_id_of),
+            previous_until: if previous.is_some() { self.previous_token_until } else { 0 },
+        })
     }
 }
 
@@ -229,10 +335,33 @@ impl DistributionControl {
 
     /// Apply a partial manager update: any `Some` field overrides; `None`
     /// leaves the current value. Booleans are always applied.
+    ///
+    /// The previous key carries its registry of what it admitted with it:
+    /// kept while the same key stays held (a new `until` included), and
+    /// started afresh when the key is cleared, replaced, or pushed again after
+    /// it had lapsed — what an old count said belongs to the grace it was made
+    /// in.
     pub fn apply(&self, update: DistUpdate) {
         let cur = self.load();
+        let (previous_token_secret, previous_token_until, legacy_tokens) = match update.previous {
+            None => (
+                cur.previous_token_secret.clone(),
+                cur.previous_token_until,
+                cur.legacy_tokens.clone(),
+            ),
+            Some(None) => (None, 0, Arc::default()),
+            Some(Some((secret, until))) => {
+                let same_live_key = cur.previous_token_secret.as_deref() == Some(secret.as_str())
+                    && cur.previous_token_until > now_unix();
+                let seen = if same_live_key { cur.legacy_tokens.clone() } else { Arc::default() };
+                (Some(secret), until, seen)
+            }
+        };
         let next = RuntimeDistConfig {
             token_secret: update.token_secret.or_else(|| cur.token_secret.clone()),
+            previous_token_secret,
+            previous_token_until,
+            legacy_tokens,
             require_viewer_token: update.require_viewer_token.unwrap_or(cur.require_viewer_token),
             require_origin_token: update.require_origin_token.unwrap_or(cur.require_origin_token),
             require_ingest_token: update.require_ingest_token.unwrap_or(cur.require_ingest_token),
@@ -259,6 +388,11 @@ impl DistributionControl {
 #[derive(Debug, Default, Clone)]
 pub struct DistUpdate {
     pub token_secret: Option<String>,
+    /// The previous key and its `until`: `None` leaves what is held,
+    /// `Some(None)` clears it, `Some(Some(..))` sets it. Already validated and
+    /// resolved (a redaction marker replaced by the held key) by the command
+    /// handler.
+    pub previous: Option<Option<(String, u64)>>,
     pub require_viewer_token: Option<bool>,
     pub require_origin_token: Option<bool>,
     pub require_ingest_token: Option<bool>,
@@ -297,6 +431,9 @@ mod tests {
     fn base() -> RuntimeDistConfig {
         RuntimeDistConfig {
             token_secret: Some("aa".into()),
+            previous_token_secret: None,
+            previous_token_until: 0,
+            legacy_tokens: Arc::default(),
             require_viewer_token: false,
             require_origin_token: false,
             require_ingest_token: true,
@@ -323,6 +460,117 @@ mod tests {
         assert!(g.require_ingest_token);
         assert_eq!(g.public_base_url.as_deref(), Some("https://r"));
         assert_eq!(g.portal_url.as_deref(), Some("https://portal.example"));
+    }
+
+    /// A previous key on disk is taken up while its `until` is ahead, and
+    /// dropped once it has passed or when it has none.
+    #[test]
+    fn from_config_drops_a_previous_key_whose_until_has_passed() {
+        let key = "bb".repeat(32);
+        let at = |until: Option<u64>| {
+            RuntimeDistConfig::from_config(
+                &DistributionConfig {
+                    previous_token_secret: Some(key.clone()),
+                    previous_token_until: until,
+                    ..Default::default()
+                },
+                None,
+            )
+        };
+        let live = at(Some(now_unix() + 600));
+        assert_eq!(live.previous_token_secret.as_deref(), Some(key.as_str()));
+        assert!(live.previous_token_until > now_unix());
+        for gone in [at(Some(now_unix() - 1)), at(Some(0)), at(None)] {
+            assert!(gone.previous_token_secret.is_none());
+            assert_eq!(gone.previous_token_until, 0);
+            assert!(gone.legacy_tokens_report(now_unix()).is_none());
+        }
+    }
+
+    /// What the previous key admitted stays with that key: kept across a
+    /// push that leaves it or moves its `until`, started afresh when it is
+    /// cleared or replaced.
+    #[test]
+    fn the_legacy_registry_lives_and_dies_with_its_previous_key() {
+        let (events, _rx) = crate::manager::events::event_channel();
+        let c = DistributionControl::new(base(), vec![]);
+        let until = now_unix() + 600;
+        let set = |key: &str, until: u64| DistUpdate {
+            previous: Some(Some((key.to_string(), until))),
+            ..Default::default()
+        };
+        let listed = |c: &DistributionControl| {
+            c.load().legacy_tokens_report(now_unix()).map(|r| r.entries.len())
+        };
+
+        c.apply(set("k1", until));
+        c.load().note_previous_key(&events, "show", Scope::Viewer);
+        assert_eq!(listed(&c), Some(1));
+
+        c.apply(DistUpdate { require_viewer_token: Some(true), ..Default::default() });
+        assert_eq!(listed(&c), Some(1), "a push that leaves the key keeps its count");
+        c.apply(set("k1", until + 60));
+        assert_eq!(listed(&c), Some(1), "a new until for the same key keeps its count");
+        assert_eq!(c.load().previous_token_until, until + 60);
+
+        c.apply(set("k2", until));
+        assert_eq!(listed(&c), Some(0), "another key starts its own count");
+
+        c.load().note_previous_key(&events, "show", Scope::Ingest);
+        c.apply(DistUpdate { previous: Some(None), ..Default::default() });
+        let rt = c.load();
+        assert!(rt.previous_token_secret.is_none());
+        assert_eq!(rt.previous_token_until, 0);
+        assert_eq!(listed(&c), None, "no key held, nothing reported");
+        c.apply(set("k2", until));
+        assert_eq!(listed(&c), Some(0), "the cleared registry is gone for good");
+    }
+
+    /// Reported only while a key is held and live.
+    #[test]
+    fn legacy_tokens_are_reported_only_while_the_previous_key_is_live() {
+        let mut rt = base();
+        assert!(rt.legacy_tokens_report(now_unix()).is_none());
+        rt.previous_token_secret = Some("cc".repeat(32));
+        rt.previous_token_until = now_unix() + 60;
+        let report = rt.legacy_tokens_report(now_unix()).expect("held and live");
+        assert_eq!(report.until, rt.previous_token_until);
+        assert!(rt.legacy_tokens_report(rt.previous_token_until).is_none(), "at until, gone");
+    }
+
+    /// The id the relay reports for a key is the manager's own `key_id_of`:
+    /// the same vectors pin it on both sides.
+    #[test]
+    fn a_key_id_matches_the_managers() {
+        assert_eq!(
+            key_id_of("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"),
+            "35502dabf9d7d53a"
+        );
+        assert_eq!(
+            key_id_of("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"),
+            "0f44205bdd1b60de"
+        );
+    }
+
+    /// Which keys the relay holds, by id: the previous one only while it is
+    /// still accepted.
+    #[test]
+    fn the_key_report_names_what_the_relay_verifies_with() {
+        let mut rt = base();
+        let now = now_unix();
+        assert_eq!(
+            rt.token_key_report(now),
+            Some(TokenKeyReport { key_id: key_id_of("aa"), previous_key_id: None, previous_until: 0 })
+        );
+        rt.previous_token_secret = Some("cc".repeat(32));
+        rt.previous_token_until = now + 60;
+        let report = rt.token_key_report(now).expect("a key");
+        assert_eq!(report.previous_key_id, Some(key_id_of(&"cc".repeat(32))));
+        assert_eq!(report.previous_until, now + 60);
+        let lapsed = rt.token_key_report(now + 60).expect("a key");
+        assert_eq!((lapsed.previous_key_id, lapsed.previous_until), (None, 0), "at until, gone");
+        rt.token_secret = None;
+        assert!(rt.token_key_report(now).is_none(), "no key, no report");
     }
 
     #[tokio::test]

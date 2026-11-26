@@ -216,6 +216,9 @@ pub struct RelayStats {
     /// reads it, and the 1 s stats tick and `/metrics` would otherwise copy
     /// every report to read five counters.
     pub distribution_viewer_metrics: arc_swap::ArcSwap<ViewerMetricsSnapshot>,
+    /// The streams an ingest publishes into the hub, for the health message
+    /// only, like the players' reports above.
+    pub distribution_live_streams: arc_swap::ArcSwap<LiveStreams>,
     /// Viewer sessions that had a datagram refused by the WebRTC ingress
     /// source pin (`webrtc::session::PeerPin`). One per session, not per
     /// datagram. Non-zero means a source-spoofed ICE reflection attempt, or a
@@ -263,6 +266,35 @@ pub struct OriginStreamUsage {
     /// Whether a per-stream retention override is in force, so the operator
     /// can tell a deliberately long window from a drifted one.
     pub policy_overridden: bool,
+}
+
+/// At most this many hub streams are named on the health message; the rest
+/// are counted ([`LiveStreams::overflow`]).
+pub const MAX_LIVE_STREAMS: usize = 1024;
+
+/// One stream an ingest publishes into the hub: a WHIP push, a QUIC ES
+/// ingest or a cascade pull.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LiveStream {
+    pub stream: String,
+    /// Seconds since it last took a frame.
+    pub idle_secs: u64,
+}
+
+/// `distribution.live_streams` and `distribution.live_streams_overflow` on
+/// the health message.
+///
+/// The manager decides who may claim a stream name on the relay from it: a
+/// name live here that no group holds is the relay owner's to give, because
+/// the newest push of a name takes its viewers. A relay that names fewer than
+/// it has (`overflow` > 0) has the manager treat every name it does not list
+/// as possibly live.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct LiveStreams {
+    /// Sorted by name, at most [`MAX_LIVE_STREAMS`].
+    pub streams: Vec<LiveStream>,
+    /// How many more there are.
+    pub overflow: u64,
 }
 
 /// What one viewer's player reported about its own playback, as the relay
@@ -444,6 +476,7 @@ impl RelayStats {
             distribution_viewer_metrics: arc_swap::ArcSwap::from_pointee(
                 ViewerMetricsSnapshot::default(),
             ),
+            distribution_live_streams: arc_swap::ArcSwap::from_pointee(LiveStreams::default()),
             distribution_offpath_sessions: AtomicU64::new(0),
             distribution_other_path_datagrams: AtomicU64::new(0),
             distribution_superseded_frames: AtomicU64::new(0),
@@ -494,6 +527,17 @@ impl RelayStats {
     /// The players' reports last published, shared rather than copied.
     pub fn viewer_metrics(&self) -> std::sync::Arc<ViewerMetricsSnapshot> {
         self.distribution_viewer_metrics.load_full()
+    }
+
+    /// Publish the streams an ingest publishes into the hub (called by the
+    /// subsystem on its telemetry tick).
+    pub fn set_live_streams(&self, live: LiveStreams) {
+        self.distribution_live_streams.store(std::sync::Arc::new(live));
+    }
+
+    /// The hub's live streams last published, shared rather than copied.
+    pub fn live_streams(&self) -> std::sync::Arc<LiveStreams> {
+        self.distribution_live_streams.load_full()
     }
 
     /// Snapshot the distribution telemetry. Returns `None` when the subsystem
