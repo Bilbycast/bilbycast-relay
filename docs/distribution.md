@@ -723,9 +723,13 @@ as `previous_token_until`:
 - The capability bit **`token-keyring`** says a relay understands these keys
   ([Capability bits](#capability-bits)). A relay without it acks the push and
   ignores them, so the manager keeps signing that relay's tokens with the old
-  key until its deadline and then cuts it over. This is only for a relay that
-  existed when the manager started the move, before the deadline: every other
-  relay is signed for with its own key from the start.
+  key until its deadline and then cuts it over. That is why the manager starts
+  the move only once every distribution relay's last health carries the bit:
+  until then every relay verifies with the old key alone, as before. A relay
+  that never carries it holds the move until a super admin starts it without
+  that relay, which is then the one cut over at the deadline. This is only for
+  a relay that existed when the manager started the move, before the
+  deadline: every other relay is signed for with its own key from the start.
 - **Which keys it holds** rides health while it holds one, by id, never the
   key — `key_id` is the first 16 hex of SHA-256 over
   `"bilbycast:distribution-key-id:v1:" + key_hex`, the manager's own
@@ -2016,7 +2020,7 @@ nobody holds.
 | `udp-peer-liveness` | same condition as `udp-relay` (after v0.20.0) | That the plane's `Ack`s carry `peer_live`, `live_ms`, `relay_id` and `seq`, and a departed slot is cleared — what lets edges after v0.117.0 follow their peer between a tunnel's two relays and fail back together. Gates nothing: the manager's tunnel modal shows a note for a relay without it (`docs/ARCHITECTURE.md` § Liveness, Standby and Slot Clearing) |
 | `viewer-distribution` | the subsystem has published a telemetry sample, and has not stopped since (`distribution_error` on health) | The WHEP SFU + LL-HLS/CMAF origin surfaces |
 | `origin-policy` | same condition as `viewer-distribution` | That this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` arrived later (v0.13.0) and is not covered by the bit, nor gated on it |
-| `token-keyring` | same condition as `viewer-distribution` | That this build understands `previous_token_secret` / `previous_token_until`: it verifies with its own key first and the previous one until its deadline, and reports `distribution.legacy_tokens` and `distribution.token_key` ([The previous key](#the-previous-key-during-the-managers-grace)). The manager moves a relay that existed when its move started, and has never acknowledged its own key, onto it during the grace only on a connection whose health carries this bit; one without it is sent the old key until the deadline |
+| `token-keyring` | same condition as `viewer-distribution` | That this build understands `previous_token_secret` / `previous_token_until`: it verifies with its own key first and the previous one until its deadline, and reports `distribution.legacy_tokens` and `distribution.token_key` ([The previous key](#the-previous-key-during-the-managers-grace)). The manager starts its move off the old key only once every distribution relay's last health carries this bit, and moves a relay that existed when the move started, and has never acknowledged its own key, onto it during the grace only on a connection whose health carries it; one without it (a super admin can start the move without such a relay) is sent the old key until the deadline |
 | `live-streams` | same condition as `viewer-distribution` | That health names every stream an ingest publishes into the hub — `distribution.live_streams: [{stream, idle_secs}]` (a WHIP push, a QUIC ES ingest, a cascade; never a name only viewers opened), sorted, at most 1024, the rest counted in `distribution.live_streams_overflow`. The manager reads it beside `origin_streams` as what is live on the relay: a live name nobody holds is the relay owner's to claim, since the newest push of a name takes its viewers. Without the bit, or with an overflow, the manager cannot tell a free name from a live one, so only the relay's owner group claims a name nobody holds |
 
 The last one exists because the failure it prevents is silent. A relay that
