@@ -251,11 +251,29 @@ pub struct DistributionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest_addrs: Option<Vec<String>>,
 
-    /// Shared HMAC-SHA256 secret (64 hex chars) the manager also gives the
-    /// edge + viewers, used to validate short-lived ingest / viewer tokens.
-    /// When unset, token checks are disabled (P0 / dev).
+    /// This relay's HMAC-SHA256 key (64 hex chars), which the manager
+    /// generates for this relay alone and pushes on `configure_distribution`;
+    /// every short-lived ingest / viewer token the relay accepts is verified
+    /// with it. The manager signs with it and nobody else holds it: the edge
+    /// and the viewers carry tokens, never the key. Every token-gated surface
+    /// fails closed while it is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_secret: Option<String>,
+
+    /// The key this relay verified with before `token_secret` — the old
+    /// installation-wide one — held for the grace the manager gives while it
+    /// moves its relays onto keys of their own. Tried only when
+    /// `token_secret` refuses a token, and only until `previous_token_until`.
+    /// Written here only while that is still ahead; an older relay binary
+    /// ignores both keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_token_secret: Option<String>,
+
+    /// When the previous key stops being accepted, unix seconds. Read at
+    /// startup only with `previous_token_secret`; a value already passed
+    /// drops the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_token_until: Option<u64>,
 
     /// Require a valid signed viewer token on every WHEP request. Default
     /// false (public streams). Set true for token-gated distribution.
@@ -393,6 +411,8 @@ impl Default for DistributionConfig {
             portal_url: None,
             ingest_addrs: None,
             token_secret: None,
+            previous_token_secret: None,
+            previous_token_until: None,
             require_viewer_token: false,
             require_origin_token: false,
             require_ingest_token: true,
@@ -502,6 +522,12 @@ impl DistributionConfig {
         if let Some(ref secret) = self.token_secret
             && (secret.len() != 64 || !secret.chars().all(|c| c.is_ascii_hexdigit())) {
                 anyhow::bail!("distribution.token_secret must be exactly 64 hex chars (32 bytes)");
+            }
+        if let Some(ref secret) = self.previous_token_secret
+            && (secret.len() != 64 || !secret.chars().all(|c| c.is_ascii_hexdigit())) {
+                anyhow::bail!(
+                    "distribution.previous_token_secret must be exactly 64 hex chars (32 bytes)"
+                );
             }
         // NB: token gates (`require_viewer_token` / `require_ingest_token`)
         // may be on with no `token_secret` in config — the manager pushes the
@@ -1247,6 +1273,9 @@ impl DistributionConfig {
             portal_url: _,
             ingest_addrs: _,
             token_secret,
+            previous_token_secret,
+            // A unix second, not a credential.
+            previous_token_until: _,
             require_viewer_token: _,
             require_origin_token: _,
             require_ingest_token: _,
@@ -1260,6 +1289,7 @@ impl DistributionConfig {
             cascade_sources,
         } = self;
         redact(token_secret);
+        redact(previous_token_secret);
         for source in cascade_sources {
             source.redact_secrets();
         }
@@ -1376,6 +1406,8 @@ mod tests {
     const REGISTRATION_TOKEN: &str = "planted-registration-token";
     const NODE_SECRET: &str = "planted-node-secret";
     const TOKEN_SECRET: &str = "5ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7";
+    const PREVIOUS_TOKEN_SECRET: &str =
+        "01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e";
     const CASCADE_TOKEN_A: &str = "planted-cascade-token-a";
     const CASCADE_TOKEN_B: &str = "planted-cascade-token-b";
     const CASCADE_URL_TOKEN: &str = "planted-cascade-url-token";
@@ -1390,6 +1422,7 @@ mod tests {
         REGISTRATION_TOKEN,
         NODE_SECRET,
         TOKEN_SECRET,
+        PREVIOUS_TOKEN_SECRET,
         CASCADE_TOKEN_A,
         CASCADE_TOKEN_B,
         CASCADE_URL_TOKEN,
@@ -1408,6 +1441,7 @@ mod tests {
         "/manager/registration_token",
         "/manager/node_secret",
         "/distribution/token_secret",
+        "/distribution/previous_token_secret",
         "/distribution/cascade_sources/0/token",
         "/distribution/cascade_sources/1/token",
     ];
@@ -1490,6 +1524,8 @@ mod tests {
                 portal_url: Some("https://portal.example.com".into()),
                 ingest_addrs: Some(vec!["0.0.0.0:4486".into()]),
                 token_secret: Some(TOKEN_SECRET.into()),
+                previous_token_secret: Some(PREVIOUS_TOKEN_SECRET.into()),
+                previous_token_until: Some(1_900_000_000),
                 require_viewer_token: true,
                 require_origin_token: true,
                 require_ingest_token: true,
@@ -1601,8 +1637,10 @@ mod tests {
             for (path, shown) in URL_PATHS {
                 assert_eq!(redacted.pointer(path).and_then(|v| v.as_str()), Some(*shown), "{path}");
             }
-            // Numbers and booleans come through untouched as well.
+            // Numbers and booleans come through untouched as well — the
+            // previous key's `until` among them: a time, not a credential.
             assert_eq!(redacted["distribution"]["require_viewer_token"], true);
+            assert_eq!(redacted["distribution"]["previous_token_until"], 1_900_000_000u64);
             assert_eq!(redacted["max_connections_per_ip"], 64);
         }
     }
@@ -1633,7 +1671,8 @@ mod tests {
     #[test]
     fn credential_names_are_recognised_by_whole_word() {
         for name in [
-            "token", "api_token", "token_secret", "node_secret", "registration_token",
+            "token", "api_token", "token_secret", "previous_token_secret", "node_secret",
+            "registration_token",
             "access_token", "password", "passphrase", "psk", "bearer", "auth", "auth_token",
             "hmac", "hmac_key", "key", "stream_key", "apikey", "sig", "Signature", "X-Api-Key",
         ] {
@@ -1699,6 +1738,7 @@ mod tests {
         manager.node_secret = None;
         let dist = config.distribution.as_mut().unwrap();
         dist.token_secret = None;
+        dist.previous_token_secret = None;
         dist.cascade_sources[1].token = None;
 
         let out = config.redacted_json();
@@ -1707,6 +1747,7 @@ mod tests {
             "/manager/registration_token",
             "/manager/node_secret",
             "/distribution/token_secret",
+            "/distribution/previous_token_secret",
             "/distribution/cascade_sources/1/token",
         ] {
             assert!(out.pointer(path).is_none(), "{path} is unset and must stay absent: {out}");
@@ -1731,6 +1772,38 @@ mod tests {
             }
             assert!(!on_disk.contains(REDACTED));
         }
+    }
+
+    #[test]
+    fn a_previous_token_secret_must_be_64_hex() {
+        let mut d = DistributionConfig {
+            previous_token_secret: Some("not-hex".into()),
+            previous_token_until: Some(1_900_000_000),
+            ..Default::default()
+        };
+        let err = d.validate().unwrap_err().to_string();
+        assert!(err.contains("distribution.previous_token_secret"), "got {err}");
+        d.previous_token_secret = Some("ab".repeat(32));
+        assert!(d.validate().is_ok());
+    }
+
+    /// The pair is written only while set, so a config without it reads the
+    /// same to an older relay, and one with it round-trips.
+    #[test]
+    fn the_previous_key_round_trips_and_is_absent_when_unset() {
+        let none = serde_json::to_value(DistributionConfig::default()).unwrap();
+        assert!(none.get("previous_token_secret").is_none());
+        assert!(none.get("previous_token_until").is_none());
+
+        let d = DistributionConfig {
+            previous_token_secret: Some("ab".repeat(32)),
+            previous_token_until: Some(1_900_000_000),
+            ..Default::default()
+        };
+        let back: DistributionConfig =
+            serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back.previous_token_secret, d.previous_token_secret);
+        assert_eq!(back.previous_token_until, Some(1_900_000_000));
     }
 
     #[test]

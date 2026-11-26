@@ -3,16 +3,31 @@
 
 //! Short-lived, stateless HMAC tokens for the distribution plane.
 //!
-//! The manager mints these (same shared `token_secret` it distributes to the
-//! relay, the edge, and viewers) and the relay validates them **statelessly**
-//! — no DB, no per-token state — mirroring the `authorize_tunnel` HMAC bind
-//! pattern used on the opaque forwarder, but with an added expiry so a leaked
-//! viewer link stops working.
+//! The manager mints these with **this relay's own key**, `token_secret`,
+//! which it generates per relay and pushes to this relay alone on
+//! `configure_distribution`; the edge and the viewers only carry the tokens,
+//! never the key. The relay validates them **statelessly** — no DB, no
+//! per-token state — mirroring the `authorize_tunnel` HMAC bind pattern used
+//! on the opaque forwarder, but with an added expiry so a leaked viewer link
+//! stops working. Because the key is the relay's own, a token minted for one
+//! relay does not verify on another.
 //!
 //! Token format: `{exp}.{hmac_hex}` where
 //! `hmac = HMAC-SHA256(secret, "{scope}:{stream}:{exp}")`, `exp` is a unix
 //! timestamp (seconds), and `secret` is the 64-hex `token_secret` decoded to
 //! 32 bytes. Scope is `viewer` or `ingest`.
+//!
+//! **The previous key.** Until a manager moved its relays onto keys of their
+//! own, every relay of an installation verified with one shared key. For a
+//! bounded grace the manager also pushes that key as `previous_token_secret`
+//! with the unix second it stops at (`previous_token_until`), so the tokens
+//! already handed out keep working while they are re-minted. A [`Keyring`]
+//! holds both: the current key is tried first, and the previous one only when
+//! the current one refuses and only before its `until` — so a relay on its own
+//! key alone does exactly one verification, and so does any token minted
+//! under the current key during the grace. Which key admitted a token comes
+//! back as [`KeyUsed`], for the relay to report what still depends on the old
+//! one.
 
 use anyhow::{anyhow, bail, Result};
 use hmac::{Hmac, KeyInit, Mac};
@@ -230,6 +245,65 @@ pub fn verify_ingest_token(secret_hex: &str, stream: &str, token: &str) -> Resul
 /// surface does with either kind of token.
 pub fn accepted_ingest_token(secret_hex: &str, stream: &str, token: &str) -> Result<Signature> {
     verify(secret_hex, SCOPE_INGEST, stream, token)
+}
+
+/// The keys a relay verifies with: its own, and for a bounded time the one it
+/// verified with before (see the module doc).
+#[derive(Clone, Copy, Debug)]
+pub struct Keyring<'a> {
+    /// This relay's key, `token_secret`. Always tried, and tried first.
+    pub current: &'a str,
+    /// The previous key and the unix second it stops being tried at
+    /// (`previous_token_until`). Tried only after the current key refused a
+    /// token, and only while `now < until`.
+    pub previous: Option<(&'a str, u64)>,
+}
+
+/// Which key of a [`Keyring`] admitted a token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyUsed {
+    Current,
+    /// The previous key: a credential that stops working at its `until`.
+    Previous,
+}
+
+impl Keyring<'_> {
+    /// Run `check` under the current key, and only if that refuses, under the
+    /// previous one while it is live. When both refuse, the current key's
+    /// error is the one returned: that is the key the token should have been
+    /// minted with, and a message about the old one would mislead.
+    fn verify_with(&self, check: impl Fn(&str) -> Result<Signature>) -> Result<(Signature, KeyUsed)> {
+        let refused = match check(self.current) {
+            Ok(signature) => return Ok((signature, KeyUsed::Current)),
+            Err(e) => e,
+        };
+        match self.previous {
+            Some((previous, until)) if now_unix() < until => check(previous)
+                .map(|signature| (signature, KeyUsed::Previous))
+                .map_err(|_| refused),
+            _ => Err(refused),
+        }
+    }
+}
+
+/// [`verify_viewer_token`] under a [`Keyring`]. The rendition widening and the
+/// multi-stream form apply under either key exactly as under one.
+pub fn verify_viewer_token_with(
+    keys: &Keyring<'_>,
+    stream: &str,
+    token: &str,
+) -> Result<(Signature, KeyUsed)> {
+    keys.verify_with(|secret| verify_viewer_token(secret, stream, token))
+}
+
+/// [`accepted_ingest_token`] under a [`Keyring`]. Exact under either key: an
+/// ingest token is never widened.
+pub fn accepted_ingest_token_with(
+    keys: &Keyring<'_>,
+    stream: &str,
+    token: &str,
+) -> Result<(Signature, KeyUsed)> {
+    keys.verify_with(|secret| accepted_ingest_token(secret, stream, token))
 }
 
 /// Mint a viewer token (used by tests / manager-side parity checks).
@@ -515,6 +589,98 @@ mod tests {
         assert_eq!(verify_viewer_token(SECRET, "show-proxy", &tok).unwrap(), signature);
         let other = mint_viewer_token(SECRET, "show", exp + 1).unwrap();
         assert_ne!(verify_viewer_token(SECRET, "show", &other).unwrap(), signature);
+    }
+
+    // ── The keyring: a relay's own key, and the previous one for a while ──
+
+    const PREVIOUS: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    fn ring(previous: Option<(&'static str, u64)>) -> Keyring<'static> {
+        Keyring { current: SECRET, previous }
+    }
+
+    /// The previous key admits every kind of token while it is live, and says
+    /// it was the one that did.
+    #[test]
+    fn the_previous_key_admits_viewer_multi_and_ingest_tokens_while_live() {
+        let exp = now_unix() + 300;
+        let keys = ring(Some((PREVIOUS, now_unix() + 60)));
+
+        let viewer = mint_viewer_token(PREVIOUS, "show", exp).unwrap();
+        let (signature, used) = verify_viewer_token_with(&keys, "show", &viewer).unwrap();
+        assert_eq!(used, KeyUsed::Previous);
+        assert_eq!(signature, verify_viewer_token(PREVIOUS, "show", &viewer).unwrap());
+
+        let multi = mint_viewer_token_multi(PREVIOUS, &["alpha", "bravo"], exp).unwrap();
+        for stream in ["alpha", "bravo"] {
+            assert_eq!(verify_viewer_token_with(&keys, stream, &multi).unwrap().1, KeyUsed::Previous);
+        }
+        assert!(verify_viewer_token_with(&keys, "charlie", &multi).is_err());
+
+        let ingest = mint_ingest_token(PREVIOUS, "show", exp).unwrap();
+        assert_eq!(accepted_ingest_token_with(&keys, "show", &ingest).unwrap().1, KeyUsed::Previous);
+    }
+
+    /// Past its `until`, cleared, or never pushed, the previous key admits
+    /// nothing — and the current key goes on admitting what it always did.
+    #[test]
+    fn the_previous_key_admits_nothing_after_until_when_cleared_or_absent() {
+        let exp = now_unix() + 300;
+        let old = mint_viewer_token(PREVIOUS, "show", exp).unwrap();
+        let old_ingest = mint_ingest_token(PREVIOUS, "show", exp).unwrap();
+        for keys in [
+            ring(Some((PREVIOUS, now_unix()))),
+            ring(Some((PREVIOUS, now_unix() - 1))),
+            ring(Some((PREVIOUS, 0))),
+            ring(None),
+        ] {
+            assert!(verify_viewer_token_with(&keys, "show", &old).is_err(), "{keys:?}");
+            assert!(accepted_ingest_token_with(&keys, "show", &old_ingest).is_err(), "{keys:?}");
+            let own = mint_viewer_token(SECRET, "show", exp).unwrap();
+            assert_eq!(verify_viewer_token_with(&keys, "show", &own).unwrap().1, KeyUsed::Current);
+        }
+    }
+
+    /// A token both keys admit is the current key's: only a previous-key
+    /// acceptance is reported as one that stops working at the deadline.
+    #[test]
+    fn the_current_key_wins_when_both_match() {
+        let exp = now_unix() + 300;
+        let keys = Keyring { current: SECRET, previous: Some((SECRET, now_unix() + 60)) };
+        let tok = mint_viewer_token(SECRET, "show", exp).unwrap();
+        assert_eq!(verify_viewer_token_with(&keys, "show", &tok).unwrap().1, KeyUsed::Current);
+        let ingest = mint_ingest_token(SECRET, "show", exp).unwrap();
+        assert_eq!(accepted_ingest_token_with(&keys, "show", &ingest).unwrap().1, KeyUsed::Current);
+
+        let keys = ring(Some((PREVIOUS, now_unix() + 60)));
+        let own = mint_viewer_token(SECRET, "show", exp).unwrap();
+        assert_eq!(verify_viewer_token_with(&keys, "show", &own).unwrap().1, KeyUsed::Current);
+    }
+
+    /// The previous key widens a viewer token to its derived renditions
+    /// exactly as the current key does, and widens an ingest token not at all.
+    #[test]
+    fn the_previous_key_widens_viewer_tokens_and_not_ingest_tokens() {
+        let exp = now_unix() + 300;
+        let keys = ring(Some((PREVIOUS, now_unix() + 60)));
+        let viewer = mint_viewer_token(PREVIOUS, "show", exp).unwrap();
+        assert_eq!(verify_viewer_token_with(&keys, "show-proxy", &viewer).unwrap().1, KeyUsed::Previous);
+        let proxy = mint_viewer_token(PREVIOUS, "show-proxy", exp).unwrap();
+        assert!(verify_viewer_token_with(&keys, "show", &proxy).is_err());
+        let ingest = mint_ingest_token(PREVIOUS, "show", exp).unwrap();
+        assert!(accepted_ingest_token_with(&keys, "show-proxy", &ingest).is_err());
+    }
+
+    /// When both keys refuse, the error is the current key's.
+    #[test]
+    fn a_token_neither_key_admits_reports_the_current_keys_refusal() {
+        let exp = now_unix() + 300;
+        let keys = ring(Some((PREVIOUS, now_unix() + 60)));
+        // Under the previous key this one is refused for its list; under the
+        // current key for its signature.
+        let multi = mint_viewer_token_multi(PREVIOUS, &["alpha", "bravo"], exp).unwrap();
+        let err = verify_viewer_token_with(&keys, "charlie", &multi).unwrap_err().to_string();
+        assert_eq!(err, "signature mismatch");
     }
 
     /// Cross-crate parity: this exact vector is asserted identically in

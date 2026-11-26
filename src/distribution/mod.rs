@@ -43,7 +43,8 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
 use crate::config::DistributionConfig;
-use crate::distribution_control::DistributionControl;
+use crate::distribution_control::legacy::Scope;
+use crate::distribution_control::{DistributionControl, RuntimeDistConfig};
 use crate::manager::events::EventSender;
 
 use self::hub::DistributionHub;
@@ -701,11 +702,11 @@ async fn whip_ingest_offer(
     // Ingest is a write surface — token-gate it unless explicitly disabled.
     let rt = st.control.load();
     if rt.require_ingest_token {
-        let Some(ref secret) = rt.token_secret else {
+        let Some(keys) = TokenKeys::of(&rt, &st.events) else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "ingest token gate misconfigured").into_response();
         };
         let ok = bearer(&headers)
-            .map(|t| token::verify_ingest_token(secret, &stream_id, &t).is_ok())
+            .map(|t| keys.ingest(&stream_id, &t).is_ok())
             .unwrap_or(false);
         if !ok {
             return (StatusCode::UNAUTHORIZED, "ingest token required").into_response();
@@ -916,7 +917,7 @@ pub(super) fn accepted_viewer_token(
     query: Option<&str>,
 ) -> Result<token::Signature, Response> {
     let rt = st.control.load();
-    let Some(ref secret) = rt.token_secret else {
+    let Some(keys) = TokenKeys::of(&rt, &st.events) else {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "token gate misconfigured").into_response());
     };
     let Some(tok) = bearer(headers).or_else(|| token_from_query(query)) else {
@@ -926,8 +927,52 @@ pub(super) fn accepted_viewer_token(
         )
             .into_response());
     };
-    token::verify_viewer_token(secret, stream_id, &tok)
+    keys.viewer(stream_id, &tok)
         .map_err(|e| (StatusCode::FORBIDDEN, format!("viewer token rejected: {e}")).into_response())
+}
+
+/// The keys every token-gated surface verifies with — this relay's own and,
+/// during the manager's grace, the previous one — and where to report a token
+/// only the previous one admits.
+///
+/// The one place a site checks a token, so none can verify under the current
+/// key alone and leave a credential that stops working at the deadline out of
+/// the report. Built from one runtime snapshot (`DistributionControl::load`,
+/// lock-free), so both keys and the registry they are counted in belong to
+/// the same push.
+pub(crate) struct TokenKeys<'a> {
+    keys: token::Keyring<'a>,
+    rt: &'a RuntimeDistConfig,
+    events: &'a EventSender,
+}
+
+impl<'a> TokenKeys<'a> {
+    /// `None` when the relay holds no key at all: the surface then fails
+    /// closed, exactly as it did with no `token_secret`.
+    pub(crate) fn of(rt: &'a RuntimeDistConfig, events: &'a EventSender) -> Option<Self> {
+        Some(Self { keys: rt.keyring()?, rt, events })
+    }
+
+    /// A viewer token for `stream` (widened to a derived rendition's source,
+    /// as [`token::verify_viewer_token`] is).
+    pub(crate) fn viewer(&self, stream: &str, tok: &str) -> anyhow::Result<token::Signature> {
+        let (signature, used) = token::verify_viewer_token_with(&self.keys, stream, tok)?;
+        self.note(used, stream, Scope::Viewer);
+        Ok(signature)
+    }
+
+    /// An ingest token for exactly `stream`.
+    pub(crate) fn ingest(&self, stream: &str, tok: &str) -> anyhow::Result<token::Signature> {
+        let (signature, used) = token::accepted_ingest_token_with(&self.keys, stream, tok)?;
+        self.note(used, stream, Scope::Ingest);
+        Ok(signature)
+    }
+
+    fn note(&self, used: token::KeyUsed, stream: &str, scope: Scope) {
+        if used == token::KeyUsed::Previous {
+            self.rt.note_previous_key(self.events, stream, scope);
+        }
+    }
 }
 
 /// Minimal built-in WHEP player page.

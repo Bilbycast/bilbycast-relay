@@ -1321,6 +1321,77 @@ fn parse_cascade_sources(
     Ok(sources)
 }
 
+/// `previous_token_secret` / `previous_token_until` from a push, resolved
+/// against what the relay holds (`held`) into the update
+/// [`DistributionControl::apply`] takes: `None` leaves the previous key as it
+/// is, `Some(None)` clears it, `Some(Some((key, until)))` sets it.
+///
+/// - `previous_token_secret` is 64 hex, or the redaction marker, which means
+///   the key this relay holds.
+/// - `previous_token_until` is unix seconds. `0`, or anything not after
+///   `now`, clears the key (an older relay ignores the field, which is why the
+///   manager says "clear" with a number rather than by leaving the key out).
+///   One more than [`MAX_PREVIOUS_AHEAD_SECS`] ahead is refused, so a slip
+///   cannot keep the old key alive for years.
+/// - An `until` that sets a key needs one: in the push, or held. A key with
+///   no `until` beside it is refused rather than guessed at.
+///
+/// Reads `held`; applies nothing, so a refusal here refuses the whole push.
+///
+/// [`MAX_PREVIOUS_AHEAD_SECS`]: crate::distribution_control::MAX_PREVIOUS_AHEAD_SECS
+fn parse_previous_key(
+    action: &serde_json::Value,
+    held: &crate::distribution_control::RuntimeDistConfig,
+    now: u64,
+) -> Result<Option<Option<(String, u64)>>, String> {
+    use crate::distribution_control::MAX_PREVIOUS_AHEAD_SECS;
+    // `Some(None)` is the marker: whatever key is held.
+    let key: Option<Option<String>> = match action.get("previous_token_secret") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if crate::config::is_redaction_marker(s) => Some(None),
+        Some(serde_json::Value::String(s)) => {
+            if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("previous_token_secret must be exactly 64 hex chars".to_string());
+            }
+            Some(Some(s.clone()))
+        }
+        Some(_) => return Err("previous_token_secret must be a string".to_string()),
+    };
+    let until = match action.get("previous_token_until") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or_else(|| {
+            "previous_token_until must be unix seconds, a whole number from 0".to_string()
+        })?),
+    };
+    let Some(until) = until else {
+        return match key {
+            Some(Some(_)) => {
+                Err("previous_token_secret needs previous_token_until in the same push".to_string())
+            }
+            // Absent, or the marker alone: keep what is held, as it is.
+            _ => Ok(None),
+        };
+    };
+    if until <= now {
+        return Ok(Some(None));
+    }
+    if until > now.saturating_add(MAX_PREVIOUS_AHEAD_SECS) {
+        return Err(format!(
+            "previous_token_until {until} is more than {} days ahead",
+            MAX_PREVIOUS_AHEAD_SECS / 86_400
+        ));
+    }
+    let key = match key {
+        Some(Some(key)) => key,
+        Some(None) | None => held.previous_token_secret.clone().ok_or_else(|| {
+            "previous_token_until with no previous_token_secret in the push, and this relay \
+             holds none"
+                .to_string()
+        })?,
+    };
+    Ok(Some(Some((key, until))))
+}
+
 /// Apply a manager `configure_distribution` command onto the runtime control
 /// cell (secret / gates / public IP+URL / storage policy / cascade sources).
 /// Partial: only the fields present in the action are changed.
@@ -1357,6 +1428,8 @@ fn apply_configure_distribution(
         }
         update.token_secret = Some(s.to_string());
     }
+    update.previous =
+        parse_previous_key(action, &control.load(), crate::distribution_control::now_unix())?;
     if let Some(b) = action.get("require_viewer_token").and_then(|v| v.as_bool()) {
         update.require_viewer_token = Some(b);
     }
@@ -1581,6 +1654,17 @@ fn persist_distribution_config(
             .get_or_insert_with(crate::config::DistributionConfig::default);
         dcfg.enabled = true;
         dcfg.token_secret = rt.token_secret.clone();
+        // The previous key only while its grace is still ahead: one that has
+        // lapsed is never tried again, and a file that kept it would hold the
+        // old installation-wide key for no use at all.
+        let (previous, until) = match &rt.previous_token_secret {
+            Some(key) if rt.previous_token_until > crate::distribution_control::now_unix() => {
+                (Some(key.clone()), Some(rt.previous_token_until))
+            }
+            _ => (None, None),
+        };
+        dcfg.previous_token_secret = previous;
+        dcfg.previous_token_until = until;
         dcfg.require_viewer_token = rt.require_viewer_token;
         // The origin gate persists alongside its two siblings. Omitting it
         // made it the only gate that did not survive a restart — and because
@@ -1650,6 +1734,12 @@ fn build_health_message(
         // the manager refuse instead of reporting a success it cannot see is
         // false.
         capabilities.push("origin-policy");
+        // "token-keyring" => this build understands `previous_token_secret` /
+        // `previous_token_until`: it verifies with its own key first and the
+        // previous one until its deadline. An older relay acks those keys and
+        // ignores them, so the manager signs with the previous key until it
+        // has seen this bit and the relay's ack of its own key.
+        capabilities.push("token-keyring");
     }
 
     let mut payload = serde_json::json!({
@@ -1722,6 +1812,15 @@ fn build_health_message(
             // not as viewers who stopped reporting.
             "viewer_metrics_streams": viewers.streams,
         });
+        // While the relay still accepts the previous key: which streams it
+        // has admitted tokens for, so the manager can name what will stop
+        // working at the deadline. Present only then; additive, as above.
+        if let Some(report) = distribution_control
+            .and_then(|c| c.load().legacy_tokens_report(crate::distribution_control::now_unix()))
+        {
+            payload["distribution"]["legacy_tokens"] =
+                serde_json::to_value(report).unwrap_or_default();
+        }
     }
     // Advertised viewer base URL — the runtime (manager-pushed) value wins over
     // the config bootstrap so the manager's relay card + viewer links track the
@@ -2770,6 +2869,277 @@ mod redaction_tests {
         configure_distribution(Some(&control), &startup, &path, &accepted).expect("accepted");
         assert_eq!(control.load().token_secret.as_deref(), Some(NEW_SECRET));
         assert_eq!(on_disk().as_deref(), Some(NEW_SECRET));
+    }
+
+    // ── The previous key (`previous_token_secret` / `previous_token_until`) ──
+
+    const PREVIOUS: &str = "01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e01d5ec7e";
+    const OWN: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// The manager's grace push: the relay's own key, and the old one until
+    /// the deadline. Both land, and `until: 0` (or any time already past)
+    /// clears the old one again.
+    #[test]
+    fn the_previous_key_lands_with_its_until_and_until_zero_clears_it() {
+        let control = control_with(
+            &DistributionConfig { token_secret: Some(TOKEN_SECRET.into()), ..Default::default() },
+            vec![],
+        );
+        let until = crate::distribution_control::now_unix() + 3600;
+        push(
+            &control,
+            serde_json::json!({
+                "type": "configure_distribution",
+                "token_secret": OWN,
+                "previous_token_secret": PREVIOUS,
+                "previous_token_until": until,
+            }),
+        )
+        .expect("the grace push is accepted");
+        let rt = control.load();
+        assert_eq!(rt.token_secret.as_deref(), Some(OWN));
+        assert_eq!(rt.previous_token_secret.as_deref(), Some(PREVIOUS));
+        assert_eq!(rt.previous_token_until, until);
+
+        // A push that names neither leaves the previous key as it is.
+        push(
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "require_viewer_token": true }),
+        )
+        .unwrap();
+        assert_eq!(control.load().previous_token_secret.as_deref(), Some(PREVIOUS));
+
+        for clear in [
+            serde_json::json!({
+                "type": "configure_distribution",
+                "token_secret": OWN,
+                "previous_token_until": 0,
+            }),
+            serde_json::json!({
+                "type": "configure_distribution",
+                "previous_token_secret": PREVIOUS,
+                "previous_token_until": crate::distribution_control::now_unix() - 1,
+            }),
+        ] {
+            push(&control, serde_json::json!({
+                "type": "configure_distribution",
+                "previous_token_secret": PREVIOUS,
+                "previous_token_until": until,
+            }))
+            .unwrap();
+            push(&control, clear.clone()).expect("a clear is accepted");
+            let rt = control.load();
+            assert!(rt.previous_token_secret.is_none(), "{clear}");
+            assert_eq!(rt.previous_token_until, 0, "{clear}");
+            assert_eq!(rt.token_secret.as_deref(), Some(OWN), "{clear}");
+        }
+    }
+
+    /// The marker is the key this relay holds: with an `until` it moves the
+    /// deadline of that key, alone it changes nothing.
+    #[test]
+    fn a_redacted_previous_key_keeps_the_one_the_relay_holds() {
+        let now = crate::distribution_control::now_unix();
+        let control = control_with(
+            &DistributionConfig {
+                token_secret: Some(OWN.into()),
+                previous_token_secret: Some(PREVIOUS.into()),
+                previous_token_until: Some(now + 600),
+                ..Default::default()
+            },
+            vec![],
+        );
+        push(
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "previous_token_secret": REDACTED }),
+        )
+        .expect("the marker alone keeps the key");
+        assert_eq!(control.load().previous_token_until, now + 600);
+
+        push(
+            &control,
+            serde_json::json!({
+                "type": "configure_distribution",
+                "previous_token_secret": REDACTED,
+                "previous_token_until": now + 1200,
+            }),
+        )
+        .expect("the marker with an until moves the held key's deadline");
+        let rt = control.load();
+        assert_eq!(rt.previous_token_secret.as_deref(), Some(PREVIOUS));
+        assert_eq!(rt.previous_token_until, now + 1200);
+
+        // An `until` alone does the same.
+        push(
+            &control,
+            serde_json::json!({ "type": "configure_distribution", "previous_token_until": now + 900 }),
+        )
+        .unwrap();
+        assert_eq!(control.load().previous_token_until, now + 900);
+    }
+
+    /// A previous key the relay cannot use as pushed refuses the whole push,
+    /// and leaves the old secret live and on disk — the same all-or-nothing
+    /// as every other key of `configure_distribution`.
+    #[test]
+    fn a_previous_key_the_relay_cannot_use_refuses_the_whole_push() {
+        let now = crate::distribution_control::now_unix();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.json");
+        let startup = RelayConfig {
+            distribution: Some(DistributionConfig {
+                token_secret: Some(TOKEN_SECRET.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&startup).unwrap()).unwrap();
+        let control = control_with(startup.distribution.as_ref().unwrap(), vec![]);
+        let on_disk = || -> DistributionConfig {
+            let c: RelayConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            c.distribution.unwrap()
+        };
+
+        for (previous, reason) in [
+            (
+                serde_json::json!({
+                    "previous_token_secret": PREVIOUS,
+                    "previous_token_until": now + crate::distribution_control::MAX_PREVIOUS_AHEAD_SECS + 60,
+                }),
+                "days ahead",
+            ),
+            (
+                serde_json::json!({ "previous_token_secret": "not-hex", "previous_token_until": now + 600 }),
+                "previous_token_secret must be exactly 64 hex chars",
+            ),
+            (
+                serde_json::json!({ "previous_token_secret": "zz".repeat(32), "previous_token_until": 0 }),
+                "previous_token_secret must be exactly 64 hex chars",
+            ),
+            (
+                serde_json::json!({ "previous_token_until": now + 600 }),
+                "this relay holds none",
+            ),
+            (
+                serde_json::json!({ "previous_token_secret": REDACTED, "previous_token_until": now + 600 }),
+                "this relay holds none",
+            ),
+            (
+                serde_json::json!({ "previous_token_secret": PREVIOUS }),
+                "needs previous_token_until",
+            ),
+            (
+                serde_json::json!({ "previous_token_secret": PREVIOUS, "previous_token_until": -5 }),
+                "previous_token_until must be unix seconds",
+            ),
+            (
+                serde_json::json!({ "previous_token_secret": PREVIOUS, "previous_token_until": "soon" }),
+                "previous_token_until must be unix seconds",
+            ),
+            (
+                serde_json::json!({ "previous_token_secret": 7, "previous_token_until": now + 600 }),
+                "previous_token_secret must be a string",
+            ),
+        ] {
+            let mut action = serde_json::json!({
+                "type": "configure_distribution",
+                "token_secret": OWN,
+                "require_viewer_token": true,
+            });
+            for (k, v) in previous.as_object().unwrap() {
+                action[k] = v.clone();
+            }
+            let err = configure_distribution(Some(&control), &startup, &path, &action)
+                .expect_err("the push is refused whole");
+            assert!(err.contains(reason), "{action}: {err}");
+            let rt = control.load();
+            assert_eq!(rt.token_secret.as_deref(), Some(TOKEN_SECRET), "{err}: the old secret stays live");
+            assert!(rt.previous_token_secret.is_none(), "{err}");
+            assert!(!rt.require_viewer_token, "{err}: the gate in the refused push is not applied");
+            let disk = on_disk();
+            assert_eq!(disk.token_secret.as_deref(), Some(TOKEN_SECRET), "{err}: and on disk");
+            assert!(disk.previous_token_secret.is_none() && disk.previous_token_until.is_none());
+        }
+    }
+
+    /// The pair is written to `config.json` while the grace is ahead and read
+    /// back at the next start; a key whose `until` has passed is neither
+    /// written nor taken up.
+    #[test]
+    fn the_previous_key_persists_only_while_its_grace_is_ahead() {
+        let now = crate::distribution_control::now_unix();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.json");
+        let startup = RelayConfig {
+            distribution: Some(DistributionConfig {
+                token_secret: Some(TOKEN_SECRET.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&startup).unwrap()).unwrap();
+        let control = control_with(startup.distribution.as_ref().unwrap(), vec![]);
+        let on_disk = || -> DistributionConfig {
+            let c: RelayConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            c.distribution.unwrap()
+        };
+
+        configure_distribution(
+            Some(&control),
+            &startup,
+            &path,
+            &serde_json::json!({
+                "type": "configure_distribution",
+                "token_secret": OWN,
+                "previous_token_secret": PREVIOUS,
+                "previous_token_until": now + 600,
+            }),
+        )
+        .unwrap();
+        let disk = on_disk();
+        assert_eq!(disk.previous_token_secret.as_deref(), Some(PREVIOUS));
+        assert_eq!(disk.previous_token_until, Some(now + 600));
+        let restarted = RuntimeDistConfig::from_config(&disk, None);
+        assert_eq!(restarted.previous_token_secret.as_deref(), Some(PREVIOUS));
+        assert_eq!(restarted.previous_token_until, now + 600);
+
+        // The grace runs out while the relay holds the key; the next persist
+        // leaves it out of the file.
+        control.apply(crate::distribution_control::DistUpdate {
+            previous: Some(Some((PREVIOUS.into(), now - 1))),
+            ..Default::default()
+        });
+        persist_distribution_config(Some(&control), &startup, &path);
+        let disk = on_disk();
+        assert!(disk.previous_token_secret.is_none() && disk.previous_token_until.is_none());
+        assert_eq!(disk.token_secret.as_deref(), Some(OWN), "the relay's own key stays");
+
+        // And a file that still holds a lapsed one is not taken up from.
+        let stale = DistributionConfig {
+            previous_token_secret: Some(PREVIOUS.into()),
+            previous_token_until: Some(now - 1),
+            ..disk
+        };
+        assert!(RuntimeDistConfig::from_config(&stale, None).previous_token_secret.is_none());
+    }
+
+    /// `get_config` shows a held previous key as the marker, like the current
+    /// one, and its `until` as it is.
+    #[test]
+    fn get_config_redacts_the_previous_key() {
+        let config = RelayConfig {
+            distribution: Some(DistributionConfig {
+                token_secret: Some(TOKEN_SECRET.into()),
+                previous_token_secret: Some(PREVIOUS.into()),
+                previous_token_until: Some(1_900_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = build_config_response(&config);
+        assert!(!response.to_string().contains(PREVIOUS));
+        assert_eq!(response["payload"]["distribution"]["previous_token_secret"], REDACTED);
+        assert_eq!(response["payload"]["distribution"]["previous_token_until"], 1_900_000_000u64);
     }
 
     /// A pushed cascade list that config load would refuse is refused whole:
@@ -3870,11 +4240,56 @@ mod stopped_subsystem_health_tests {
         let p = health(&stats, &config);
         assert_eq!(
             capabilities(&p),
-            ["udp-relay", "viewer-distribution", "origin-policy"]
+            ["udp-relay", "viewer-distribution", "origin-policy", "token-keyring"]
         );
         assert!(p.get("distribution_error").is_none());
         assert!(p.get("udp_relay_error").is_none());
         assert!(p.get("distribution").is_some());
+    }
+
+    /// `distribution.legacy_tokens` rides health while the relay holds a live
+    /// previous key, whether or not anything has used it yet, and is absent
+    /// otherwise.
+    #[test]
+    fn legacy_tokens_ride_health_only_while_a_previous_key_is_live() {
+        use crate::distribution_control::legacy::Scope;
+        use crate::distribution_control::{DistUpdate, DistributionControl, RuntimeDistConfig, now_unix};
+
+        let stats = Arc::new(RelayStats::new());
+        stats.set_distribution(0, 0, 0, 0, 0, Vec::new());
+        let config = RelayConfig::default();
+        let control = DistributionControl::new(
+            RuntimeDistConfig::from_config(&crate::config::DistributionConfig::default(), None),
+            vec![],
+        );
+        let health_with = |control: &Arc<DistributionControl>| {
+            let (events, _rx) = crate::manager::event_channel();
+            let ctx = crate::server::create_session_context(stats.clone(), events, false, 64, 100);
+            build_health_message(&ctx, &stats, &config, Some(control))["payload"].clone()
+        };
+        assert!(health_with(&control)["distribution"].get("legacy_tokens").is_none());
+
+        let until = now_unix() + 3600;
+        control.apply(DistUpdate {
+            previous: Some(Some(("ab".repeat(32), until))),
+            ..Default::default()
+        });
+        let p = health_with(&control);
+        assert_eq!(
+            p["distribution"]["legacy_tokens"],
+            serde_json::json!({ "until": until, "entries": [], "overflow": 0 })
+        );
+
+        let (events, _rx) = crate::manager::event_channel();
+        control.load().note_previous_key(&events, "feed", Scope::Viewer);
+        control.load().note_previous_key(&events, "feed", Scope::Viewer);
+        let entry = &health_with(&control)["distribution"]["legacy_tokens"]["entries"][0];
+        assert_eq!(entry["stream"], "feed");
+        assert_eq!(entry["scope"], "viewer");
+        assert_eq!(entry["count"], 2);
+
+        control.apply(DistUpdate { previous: Some(None), ..Default::default() });
+        assert!(health_with(&control)["distribution"].get("legacy_tokens").is_none());
     }
 
     /// The source pin's other-path drops and the frames dropped while a

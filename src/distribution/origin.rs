@@ -3524,16 +3524,14 @@ fn require_clip_credential(
     query: Option<&str>,
 ) -> Result<ClipCredential, Response> {
     let rt = st.control.load();
-    let Some(ref secret) = rt.token_secret else {
+    let Some(keys) = super::TokenKeys::of(&rt, &st.events) else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "clip access is unconfigured on this relay",
         )
             .into_response());
     };
-    if let Some(signature) = super::bearer(headers)
-        .and_then(|t| token::accepted_ingest_token(secret, stream, &t).ok())
-    {
+    if let Some(signature) = super::bearer(headers).and_then(|t| keys.ingest(stream, &t).ok()) {
         return Ok(ClipCredential::new(CredentialKind::Ingest, &signature));
     }
     super::accepted_viewer_token(st, stream, headers, query)
@@ -3558,17 +3556,14 @@ fn require_clip_ingest(
     headers: &HeaderMap,
 ) -> Result<(), Response> {
     let rt = st.control.load();
-    let Some(ref secret) = rt.token_secret else {
+    let Some(keys) = super::TokenKeys::of(&rt, &st.events) else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "clip access is unconfigured on this relay",
         )
             .into_response());
     };
-    if super::bearer(headers)
-        .and_then(|t| token::verify_ingest_token(secret, stream, &t).ok())
-        .is_some()
-    {
+    if super::bearer(headers).and_then(|t| keys.ingest(stream, &t).ok()).is_some() {
         return Ok(());
     }
     Err((StatusCode::UNAUTHORIZED, "ingest token required").into_response())
@@ -3595,10 +3590,8 @@ fn check_origin_read(
     if !rt.require_origin_token {
         return Ok(());
     }
-    let ingest_ok = rt.token_secret.as_ref().is_some_and(|secret| {
-        super::bearer(headers)
-            .and_then(|t| token::verify_ingest_token(secret, stream, &t).ok())
-            .is_some()
+    let ingest_ok = super::TokenKeys::of(&rt, &st.events).is_some_and(|keys| {
+        super::bearer(headers).and_then(|t| keys.ingest(stream, &t).ok()).is_some()
     });
     if ingest_ok {
         return Ok(());
@@ -4007,7 +4000,7 @@ async fn origin_put(
     // (runtime, manager-overridable).
     let rt = st.control.load();
     if rt.require_ingest_token {
-        if let Some(ref secret) = rt.token_secret {
+        if let Some(keys) = super::TokenKeys::of(&rt, &st.events) {
             // Header-only is correct here: the CMAF uploader is the edge
             // (`bilbycast-edge/src/engine/cmaf/upload.rs` sets
             // `Authorization: Bearer`), never a browser. This used to call a
@@ -4016,9 +4009,8 @@ async fn origin_put(
             // empty-value policy disagreed with the shared one. One credential
             // parser, one policy.
             let tok = super::bearer(&headers);
-            match tok.and_then(|t| token::verify_ingest_token(secret, &stream, &t).ok()) {
-                Some(()) => {}
-                None => return (StatusCode::UNAUTHORIZED, "ingest token required").into_response(),
+            if tok.and_then(|t| keys.ingest(&stream, &t).ok()).is_none() {
+                return (StatusCode::UNAUTHORIZED, "ingest token required").into_response();
             }
         } else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "ingest token gate misconfigured").into_response();

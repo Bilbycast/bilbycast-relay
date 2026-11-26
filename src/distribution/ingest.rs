@@ -39,7 +39,6 @@ use crate::manager::events::{category, EventSender, EventSeverity};
 
 use super::es::{EsFrame, EsKind, MAX_FRAME_BYTES};
 use super::hub::{DistributionHub, Publisher, StreamEnd};
-use super::token;
 
 /// ALPN for the distribution ingest QUIC endpoint.
 pub const ALPN_DISTRIBUTION: &[u8] = b"bilbycast-distribution";
@@ -202,14 +201,13 @@ async fn handle_ingest_stream(
     // 2. Token gate (runtime, manager-overridable).
     let rt = control.load();
     if rt.require_ingest_token {
-        let Some(ref secret) = rt.token_secret else {
+        let Some(keys) = super::TokenKeys::of(&rt, &events) else {
             bail!("ingest token required but no token_secret configured");
         };
         let Some(ref tok) = hello.token else {
             bail!("ingest token required but none supplied");
         };
-        token::verify_ingest_token(secret, &stream_id, tok)
-            .context("ingest token rejected")?;
+        keys.ingest(&stream_id, tok).context("ingest token rejected")?;
     }
 
     tracing::info!("distribution ingest for stream '{stream_id}' opened (has_audio={})", hello.has_audio);

@@ -409,6 +409,84 @@ async fn ingest_rejects_missing_token_when_required() {
     drop(conn);
 }
 
+/// The QUIC ingest takes a token signed with the previous key while its grace
+/// lasts — the key here comes from the config file, as a restarted relay has
+/// it — and reports it.
+#[tokio::test]
+async fn quic_ingest_admits_a_previous_key_token_and_reports_it() {
+    use bilbycast_relay::manager::events::EventSeverity;
+
+    const OWN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OLD: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let now = unix_now();
+    let hub = Arc::new(DistributionHub::new());
+    let (events, mut event_rx) = event_channel();
+    let cancel = CancellationToken::new();
+    let config = DistributionConfig {
+        require_ingest_token: true,
+        token_secret: Some(OWN.to_string()),
+        previous_token_secret: Some(OLD.to_string()),
+        previous_token_until: Some(now + 3600),
+        ..Default::default()
+    };
+
+    let server_cfg = ingest::build_ingest_server_config().unwrap();
+    let server = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let control = DistributionControl::new(RuntimeDistConfig::from_config(&config, None), vec![]);
+    let accept_hub = hub.clone();
+    let accept_cancel = cancel.clone();
+    let accept_control = control.clone();
+    tokio::spawn(async move {
+        ingest::accept_loop(server, accept_control, accept_hub, events, accept_cancel).await;
+    });
+
+    let mut sub = hub.subscribe("legacy-feed");
+    let client = make_ingest_client();
+    let conn = client.connect(server_addr, "bilbycast-distribution").unwrap().await.unwrap();
+    let mut uni = conn.open_uni().await.unwrap();
+    uni.write_all(&encode_hello(&IngestHello {
+        v: 1,
+        stream: "legacy-feed".into(),
+        token: Some(token::mint_ingest_token(OLD, "legacy-feed", now + 300).unwrap()),
+        has_audio: false,
+    }))
+    .await
+    .unwrap();
+    uni.write_all(&encode_frame(&EsFrame::video(0, idr_au(), true))).await.unwrap();
+
+    let frame = recv_timeout(&mut sub.rx).await;
+    assert_eq!(frame.pts_90k, 0, "a previous-key ingest delivers");
+    let raised = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let e = event_rx.recv().await.expect("the event channel stays open");
+            if e.details.as_ref().is_some_and(|d| d["error_code"] == "legacy_token_accepted") {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("the previous key's use is reported");
+    assert_eq!(raised.severity, EventSeverity::Warning);
+    let details = raised.details.unwrap();
+    assert_eq!(details["stream"], "legacy-feed");
+    assert_eq!(details["scope"], "ingest");
+    assert_eq!(details["until"], now + 3600);
+    let report = control.load().legacy_tokens_report(unix_now()).expect("held and live");
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].count, 1);
+
+    cancel.cancel();
+    drop(conn);
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 /// PT-111 regression: a client (ice_lite=false) building an offer WITH audio
 /// must not panic. An earlier level-5.1 H.264 workaround reused PT 111 — Opus's
 /// PT — as an RTX slot, and str0m panicked "Pt locked multiple times: 111".
@@ -3422,6 +3500,196 @@ async fn failed_offers_never_exhaust_the_per_ip_viewer_cap() {
     })
     .await
     .expect("a deleted viewer gave its slot back");
+
+    cancel.cancel();
+}
+
+// ── The previous key, through the real router ──
+
+const OWN_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+const OLD_KEY: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+/// One HTTP/1.1 request with an optional Bearer token; the status, or 0 when
+/// the connection closed without one.
+async fn status_of(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: &[u8],
+) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let auth = bearer.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(body).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Every `legacy_token_accepted` event raised so far.
+fn legacy_events(
+    rx: &mut tokio::sync::mpsc::Receiver<bilbycast_relay::manager::events::Event>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if let Some(d) = e.details
+            && d["error_code"] == "legacy_token_accepted"
+        {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// A distribution node holding its own key and, until `until`, the old one,
+/// with every token gate on.
+async fn serve_in_grace(
+    until: u64,
+    cancel: &CancellationToken,
+) -> (
+    Arc<bilbycast_relay::distribution::DistributionState>,
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<bilbycast_relay::manager::events::Event>,
+) {
+    use bilbycast_relay::distribution_control::DistUpdate;
+
+    let (state, addr, events) = serve_distribution(256, cancel).await;
+    state.control.apply(DistUpdate {
+        token_secret: Some(OWN_KEY.into()),
+        previous: Some(Some((OLD_KEY.into(), until))),
+        require_viewer_token: Some(true),
+        require_ingest_token: Some(true),
+        require_origin_token: Some(true),
+        ..Default::default()
+    });
+    (state, addr, events)
+}
+
+/// The grace: an origin PUT and a WHEP offer carrying tokens signed with the
+/// previous key are admitted, each kind raises one event however often it is
+/// used, the relay's health counts every use, and a token signed with the
+/// relay's own key is not counted at all. Once the previous key's `until` has
+/// passed, the same tokens are refused.
+#[tokio::test]
+async fn previous_key_tokens_are_admitted_and_counted_until_their_deadline() {
+    use bilbycast_relay::distribution_control::DistUpdate;
+    use bilbycast_relay::distribution_control::legacy::Scope;
+
+    let cancel = CancellationToken::new();
+    let now = unix_now();
+    let (state, addr, mut events) = serve_in_grace(now + 3600, &cancel).await;
+    let exp = now + 600;
+    let old_ingest = token::mint_ingest_token(OLD_KEY, "feed", exp).unwrap();
+    let old_viewer = token::mint_viewer_token(OLD_KEY, "feed", exp).unwrap();
+
+    for i in 0..2 {
+        let path = format!("/origin/feed/seg-0000{i}.m4s");
+        assert_eq!(status_of(addr, "PUT", &path, Some(&old_ingest), b"abcd").await, 201, "{path}");
+    }
+    for _ in 0..2 {
+        // Through the gate; the bogus offer is then refused by str0m.
+        assert_eq!(status_of(addr, "POST", "/whep/feed", Some(&old_viewer), b"v=0\r\n").await, 400);
+    }
+
+    let raised = legacy_events(&mut events);
+    assert_eq!(raised.len(), 2, "one event per stream and scope: {raised:?}");
+    let mut scopes: Vec<&str> = raised.iter().map(|d| d["scope"].as_str().unwrap()).collect();
+    scopes.sort_unstable();
+    assert_eq!(scopes, ["ingest", "viewer"]);
+    assert!(raised.iter().all(|d| d["stream"] == "feed" && d["until"] == now + 3600));
+
+    let counts = |state: &bilbycast_relay::distribution::DistributionState| {
+        state
+            .control
+            .load()
+            .legacy_tokens_report(unix_now())
+            .expect("a live previous key is reported")
+            .entries
+            .into_iter()
+            .map(|e| (e.stream, e.scope, e.count))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![("feed".to_string(), Scope::Ingest, 2), ("feed".to_string(), Scope::Viewer, 2)];
+    assert_eq!(counts(&state), expected);
+
+    // The relay's own key: admitted, and not counted.
+    let own_ingest = token::mint_ingest_token(OWN_KEY, "feed", exp).unwrap();
+    let own_viewer = token::mint_viewer_token(OWN_KEY, "feed", exp).unwrap();
+    assert_eq!(status_of(addr, "PUT", "/origin/feed/seg-00002.m4s", Some(&own_ingest), b"abcd").await, 201);
+    assert_eq!(status_of(addr, "POST", "/whep/feed", Some(&own_viewer), b"v=0\r\n").await, 400);
+    assert_eq!(status_of(addr, "GET", "/origin/feed/seg-00002.m4s", Some(&own_viewer), b"").await, 200);
+    assert_eq!(counts(&state), expected, "a current-key token is not a legacy one");
+    assert!(legacy_events(&mut events).is_empty());
+
+    // A token minted for another relay — under a key this one does not hold —
+    // is refused like any forgery.
+    let foreign = "1111111111111111111111111111111111111111111111111111111111111111";
+    let foreign_viewer = token::mint_viewer_token(foreign, "feed", exp).unwrap();
+    assert_eq!(status_of(addr, "POST", "/whep/feed", Some(&foreign_viewer), b"v=0\r\n").await, 403);
+
+    // The deadline: the previous key's `until` passes.
+    let until = unix_now() + 1;
+    state.control.apply(DistUpdate { previous: Some(Some((OLD_KEY.into(), until))), ..Default::default() });
+    while unix_now() < until {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        status_of(addr, "PUT", "/origin/feed/seg-00003.m4s", Some(&old_ingest), b"abcd").await,
+        401,
+        "an old ingest token after the deadline"
+    );
+    assert_eq!(
+        status_of(addr, "POST", "/whep/feed", Some(&old_viewer), b"v=0\r\n").await,
+        403,
+        "an old viewer token after the deadline"
+    );
+    assert_eq!(
+        status_of(addr, "GET", "/origin/feed/seg-00000.m4s", Some(&old_viewer), b"").await,
+        403,
+        "an old viewer token on the origin after the deadline"
+    );
+    assert!(
+        state.control.load().legacy_tokens_report(unix_now()).is_none(),
+        "nothing is reported once the key has lapsed"
+    );
+    assert!(legacy_events(&mut events).is_empty());
+
+    cancel.cancel();
+}
+
+/// Whoever holds the old key cannot grow what the relay keeps, or what it
+/// sends the manager: past 256 streams an acceptance is counted, not listed,
+/// and one more event says so.
+#[tokio::test]
+async fn previous_key_tokens_for_300_streams_stay_bounded() {
+    let cancel = CancellationToken::new();
+    let now = unix_now();
+    let (state, addr, mut events) = serve_in_grace(now + 3600, &cancel).await;
+    for i in 0..300 {
+        let stream = format!("s{i}");
+        let tok = token::mint_viewer_token(OLD_KEY, &stream, now + 600).unwrap();
+        // Admitted by the origin gate; there is nothing to serve.
+        let path = format!("/origin/{stream}/seg-00000.m4s");
+        assert_eq!(status_of(addr, "GET", &path, Some(&tok), b"").await, 404, "{path}");
+    }
+    let report = state.control.load().legacy_tokens_report(unix_now()).unwrap();
+    assert_eq!(report.entries.len(), 256);
+    assert_eq!(report.overflow, 44);
+    let raised = legacy_events(&mut events);
+    assert_eq!(raised.len(), 257, "one per listed stream, and one at the first overflow");
+    assert_eq!(raised.iter().filter(|d| d["overflow"] == true).count(), 1);
 
     cancel.cancel();
 }
