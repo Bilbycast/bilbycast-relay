@@ -672,8 +672,11 @@ as `previous_token_until`:
 - **Every check tries the relay's own key first**, and the previous key only
   when that refuses the token and only while now is before
   `previous_token_until`. A relay that holds no previous key, and every token
-  minted under its own key during the grace, costs one HMAC as before; there is
-  no lock on the request path. A token the previous key admits is treated
+  minted under its own key during the grace, costs one HMAC per check as
+  before; there is no lock on the request path. A surface that takes either an
+  ingest or a viewer token — a gated origin read, the clip routes — checks the
+  Bearer as an ingest token first, and during the grace under both keys, so a
+  viewer token there costs one HMAC more while a previous key is held. A token the previous key admits is treated
   exactly as it was — the `-proxy` widening of a viewer token, the multi-stream
   form, an ingest token exact — on every gated surface: WHIP, WHEP, the QUIC
   ingest, segment PUTs, origin reads, the clip routes, the marks list and the
@@ -720,7 +723,24 @@ as `previous_token_until`:
 - The capability bit **`token-keyring`** says a relay understands these keys
   ([Capability bits](#capability-bits)). A relay without it acks the push and
   ignores them, so the manager keeps signing that relay's tokens with the old
-  key until its deadline and then cuts it over.
+  key until its deadline and then cuts it over. This is only for a relay that
+  existed when the manager started the move, before the deadline: every other
+  relay is signed for with its own key from the start.
+- **Which keys it holds** rides health while it holds one, by id, never the
+  key — `key_id` is the first 16 hex of SHA-256 over
+  `"bilbycast:distribution-key-id:v1:" + key_hex`, the manager's own
+  derivation, so the manager can see the relay verifies with the key it signs
+  with and push again when it does not (a `config.json` restored from before
+  the move, a write of it that failed, a push overtaken by another):
+
+  ```jsonc
+  "distribution": {
+    "token_key": { "key_id": "35502dabf9d7d53a", "previous_key_id": "0f44205bdd1b60de", "previous_until": 1800000000 }
+  }
+  ```
+
+  `previous_key_id` is null and `previous_until` 0 once no previous key is
+  held, or its `until` has passed.
 
 Whoever controls a relay box holds that relay's key and can sign for every
 stream on it; that is the trust boundary, and it is now one relay wide rather
@@ -1977,7 +1997,7 @@ take its `rate()`.
 
 ### Capability bits
 
-The same health payload carries a `capabilities` array of up to four strings.
+The same health payload carries a `capabilities` array of up to five strings.
 `udp-relay` belongs to the opaque forwarder: the manager (v0.89.0+) refuses a
 native-UDP tunnel or a relayed bond leg through a relay whose capabilities lack
 it (422 `relay_lacks_udp_plane`). The three distribution bits gate the
@@ -1988,7 +2008,8 @@ distribution pushes.
 | `udp-relay` | `udp_relay_enabled` (default true) and the plane is running — withdrawn while its bind is failing (`udp_relay_error` on health) | The native SRT/RIST plain-UDP plane — unrelated to distribution |
 | `viewer-distribution` | the subsystem has published a telemetry sample, and has not stopped since (`distribution_error` on health) | The WHEP SFU + LL-HLS/CMAF origin surfaces |
 | `origin-policy` | same condition as `viewer-distribution` | That this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` arrived later (v0.13.0) and is not covered by the bit, nor gated on it |
-| `token-keyring` | same condition as `viewer-distribution` | That this build understands `previous_token_secret` / `previous_token_until`: it verifies with its own key first and the previous one until its deadline, and reports `distribution.legacy_tokens` ([The previous key](#the-previous-key-during-the-managers-grace)). The manager moves a relay that has never acknowledged its own key onto it only on a connection whose health carries this bit; one without it is sent the old key until the deadline |
+| `token-keyring` | same condition as `viewer-distribution` | That this build understands `previous_token_secret` / `previous_token_until`: it verifies with its own key first and the previous one until its deadline, and reports `distribution.legacy_tokens` and `distribution.token_key` ([The previous key](#the-previous-key-during-the-managers-grace)). The manager moves a relay that existed when its move started, and has never acknowledged its own key, onto it during the grace only on a connection whose health carries this bit; one without it is sent the old key until the deadline |
+| `live-streams` | same condition as `viewer-distribution` | That health names every stream an ingest publishes into the hub — `distribution.live_streams: [{stream, idle_secs}]` (a WHIP push, a QUIC ES ingest, a cascade; never a name only viewers opened), sorted, at most 1024, the rest counted in `distribution.live_streams_overflow`. The manager reads it beside `origin_streams` as what is live on the relay: a live name nobody holds is the relay owner's to claim, since the newest push of a name takes its viewers. Without the bit, or with an overflow, the manager cannot tell a free name from a live one, so only the relay's owner group claims a name nobody holds |
 
 The last one exists because the failure it prevents is silent. A relay that
 predates those keys advertises `viewer-distribution` exactly the same, and
