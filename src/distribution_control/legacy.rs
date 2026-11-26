@@ -116,10 +116,13 @@ impl LegacyTokens {
                     EventSeverity::Warning,
                     category::DISTRIBUTION,
                     format!(
-                        "A {} token for stream '{stream}' was accepted under the previous \
+                        "{} token for stream '{stream}' was accepted under the previous \
                          distribution key, which this relay accepts only until {until} (unix); \
                          it stops working then unless it is issued again",
-                        scope.as_str()
+                        match scope {
+                            Scope::Viewer => "A viewer",
+                            Scope::Ingest => "An ingest",
+                        }
                     ),
                     serde_json::json!({
                         "error_code": "legacy_token_accepted",
@@ -223,7 +226,10 @@ mod tests {
         assert_eq!(details["stream"], "show");
         assert_eq!(details["scope"], "viewer");
         assert_eq!(details["until"], 2_000_000_000u64);
-        assert_eq!(rx.try_recv().unwrap().details.unwrap()["scope"], "ingest");
+        assert!(first.message.starts_with("A viewer token for stream 'show'"), "{}", first.message);
+        let ingest = rx.try_recv().unwrap();
+        assert!(ingest.message.starts_with("An ingest token for stream 'show'"), "{}", ingest.message);
+        assert_eq!(ingest.details.unwrap()["scope"], "ingest");
         assert!(rx.try_recv().is_err(), "a second use raises nothing");
 
         let report = seen.report(2_000_000_000);

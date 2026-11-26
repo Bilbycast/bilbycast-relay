@@ -102,6 +102,10 @@ pub struct StreamState {
     frames_in: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// When this stream last took a frame (or was made, before its first),
+    /// in unix milliseconds: how long it has been idle, for the names the
+    /// relay reports live ([`DistributionHub::live_streams`]).
+    last_frame_ms: AtomicU64,
     /// Viewer sessions on this stream that had a datagram refused by the
     /// WebRTC ingress source pin (see `webrtc::session::PeerPin`). Counted
     /// once per session, never per datagram — a reflection attempt is a flood
@@ -129,6 +133,7 @@ impl StreamState {
             frames_in: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
+            last_frame_ms: AtomicU64::new(crate::stats::now_epoch_ms()),
             offpath_sessions: AtomicU64::new(0),
             hub_bytes_out: hub.bytes_out.clone(),
             hub_offpath_sessions: hub.offpath_sessions.clone(),
@@ -203,6 +208,7 @@ impl StreamState {
 
         self.frames_in.fetch_add(1, Ordering::Relaxed);
         self.bytes_in.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+        self.last_frame_ms.store(crate::stats::now_epoch_ms(), Ordering::Relaxed);
 
         if frame.kind == EsKind::AudioOpus {
             self.has_audio.store(true, Ordering::Relaxed);
@@ -701,6 +707,29 @@ impl DistributionHub {
             .collect()
     }
 
+    /// The streams an ingest publishes — a WHIP push, a QUIC ES ingest or a
+    /// cascade pull, never one only viewers are waiting on — sorted by name,
+    /// at most `cap` of them, and how many more there are. The manager reads
+    /// a name live here as it does one the origin takes segments for: a
+    /// group other than the relay's owner may not claim it while nobody
+    /// holds it, because the newest push of a name takes its viewers.
+    pub fn live_streams(&self, cap: usize) -> crate::stats::LiveStreams {
+        let now = crate::stats::now_epoch_ms();
+        let mut streams: Vec<crate::stats::LiveStream> = self
+            .streams
+            .iter()
+            .filter(|e| e.value().owner.load(Ordering::Acquire) != UNCLAIMED)
+            .map(|e| crate::stats::LiveStream {
+                stream: e.key().clone(),
+                idle_secs: now.saturating_sub(e.value().last_frame_ms.load(Ordering::Relaxed)) / 1000,
+            })
+            .collect();
+        streams.sort_by(|a, b| a.stream.cmp(&b.stream));
+        let overflow = streams.len().saturating_sub(cap) as u64;
+        streams.truncate(cap);
+        crate::stats::LiveStreams { streams, overflow }
+    }
+
     /// Total viewers across all streams.
     pub fn total_viewers(&self) -> u64 {
         self.streams.iter().map(|e| e.value().viewer_count()).sum()
@@ -913,6 +942,33 @@ mod tests {
     /// A viewer that subscribes as its stream closes ends with the stream —
     /// or lands on its successor — rather than on a closed channel nothing
     /// would ever end.
+    /// What the manager reads as live on the hub: every stream an ingest
+    /// holds, each with how long since its last frame — and never a name
+    /// only a viewer opened, which anyone may do for any name.
+    #[test]
+    fn the_live_streams_are_the_ones_an_ingest_holds() {
+        let hub = DistributionHub::new();
+        let _b = hub.claim("b");
+        let a = hub.claim("a");
+        let _waiting = hub.subscribe("viewer-only");
+        a.publish(EsFrame { kind: EsKind::AudioOpus, data: Bytes::from_static(&[1]), pts_90k: 0, keyframe: false });
+        let live = hub.live_streams(16);
+        let names: Vec<&str> = live.streams.iter().map(|s| s.stream.as_str()).collect();
+        assert_eq!(names, ["a", "b"], "sorted, and not the name only a viewer opened");
+        assert_eq!(live.overflow, 0);
+        assert!(live.streams.iter().all(|s| s.idle_secs < 5), "{:?}", live.streams);
+        // Aged: idle from its last frame.
+        hub.get("b").unwrap().last_frame_ms.store(crate::stats::now_epoch_ms() - 300_000, Ordering::Relaxed);
+        let live = hub.live_streams(16);
+        assert!(live.streams[1].idle_secs >= 299, "{:?}", live.streams);
+        // Past the cap, the rest are counted.
+        let live = hub.live_streams(1);
+        assert_eq!((live.streams.len(), live.overflow), (1, 1));
+        // An ingest that ends is no longer live.
+        drop(a);
+        assert_eq!(hub.live_streams(16).streams.len(), 1);
+    }
+
     #[test]
     fn a_closed_stream_takes_no_new_viewers() {
         let hub = DistributionHub::new();

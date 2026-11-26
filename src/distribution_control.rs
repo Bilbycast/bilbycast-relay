@@ -39,6 +39,32 @@ pub fn now_unix() -> u64 {
     crate::stats::now_epoch_ms() / 1000
 }
 
+/// The id of a key: the first 16 hex of SHA-256 over a fixed label and the
+/// key's hex — the manager's `key_id_of`, byte for byte, so the id this relay
+/// reports for the key it holds is the one the manager names it by. It names
+/// a key without revealing it.
+pub fn key_id_of(key_hex: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("bilbycast:distribution-key-id:v1:{key_hex}").as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `distribution.token_key` on the health message: which keys this relay
+/// verifies with now, by id. The manager compares it with what the relay
+/// should hold and pushes again when they differ — a relay restored from an
+/// old `config.json`, or one whose last push was overtaken by another, is put
+/// right on the next pass instead of verifying with a key the manager no
+/// longer signs with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TokenKeyReport {
+    /// The id of `token_secret`.
+    pub key_id: String,
+    /// The id of the previous key, while it is held and its `until` is ahead.
+    pub previous_key_id: Option<String>,
+    /// Until when the previous key is accepted (unix seconds); 0 when none is.
+    pub previous_until: u64,
+}
+
 /// The subset of distribution config the manager can change at runtime.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeDistConfig {
@@ -130,6 +156,21 @@ impl RuntimeDistConfig {
     pub fn legacy_tokens_report(&self, now: u64) -> Option<LegacyTokensReport> {
         (self.previous_token_secret.is_some() && self.previous_token_until > now)
             .then(|| self.legacy_tokens.report(self.previous_token_until))
+    }
+
+    /// `distribution.token_key` for the health message: present while the
+    /// relay holds a key at all.
+    pub fn token_key_report(&self, now: u64) -> Option<TokenKeyReport> {
+        let current = self.token_secret.as_deref()?;
+        let previous = self
+            .previous_token_secret
+            .as_deref()
+            .filter(|_| self.previous_token_until > now);
+        Some(TokenKeyReport {
+            key_id: key_id_of(current),
+            previous_key_id: previous.map(key_id_of),
+            previous_until: if previous.is_some() { self.previous_token_until } else { 0 },
+        })
     }
 }
 
@@ -495,6 +536,41 @@ mod tests {
         let report = rt.legacy_tokens_report(now_unix()).expect("held and live");
         assert_eq!(report.until, rt.previous_token_until);
         assert!(rt.legacy_tokens_report(rt.previous_token_until).is_none(), "at until, gone");
+    }
+
+    /// The id the relay reports for a key is the manager's own `key_id_of`:
+    /// the same vectors pin it on both sides.
+    #[test]
+    fn a_key_id_matches_the_managers() {
+        assert_eq!(
+            key_id_of("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"),
+            "35502dabf9d7d53a"
+        );
+        assert_eq!(
+            key_id_of("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"),
+            "0f44205bdd1b60de"
+        );
+    }
+
+    /// Which keys the relay holds, by id: the previous one only while it is
+    /// still accepted.
+    #[test]
+    fn the_key_report_names_what_the_relay_verifies_with() {
+        let mut rt = base();
+        let now = now_unix();
+        assert_eq!(
+            rt.token_key_report(now),
+            Some(TokenKeyReport { key_id: key_id_of("aa"), previous_key_id: None, previous_until: 0 })
+        );
+        rt.previous_token_secret = Some("cc".repeat(32));
+        rt.previous_token_until = now + 60;
+        let report = rt.token_key_report(now).expect("a key");
+        assert_eq!(report.previous_key_id, Some(key_id_of(&"cc".repeat(32))));
+        assert_eq!(report.previous_until, now + 60);
+        let lapsed = rt.token_key_report(now + 60).expect("a key");
+        assert_eq!((lapsed.previous_key_id, lapsed.previous_until), (None, 0), "at until, gone");
+        rt.token_secret = None;
+        assert!(rt.token_key_report(now).is_none(), "no key, no report");
     }
 
     #[tokio::test]

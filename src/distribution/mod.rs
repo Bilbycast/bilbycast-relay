@@ -530,6 +530,7 @@ pub(crate) fn publish_telemetry(
             .collect(),
     );
     stats.set_distribution_drops(hub.other_path_datagrams(), hub.superseded_frames());
+    stats.set_live_streams(hub.live_streams(crate::stats::MAX_LIVE_STREAMS));
     // The players' own reports ride the same tick; the health builder reads
     // the published copy.
     stats.set_viewer_metrics(viewer_metrics.snapshot());

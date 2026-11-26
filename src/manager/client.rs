@@ -1737,9 +1737,18 @@ fn build_health_message(
         // "token-keyring" => this build understands `previous_token_secret` /
         // `previous_token_until`: it verifies with its own key first and the
         // previous one until its deadline. An older relay acks those keys and
-        // ignores them, so the manager signs with the previous key until it
-        // has seen this bit and the relay's ack of its own key.
+        // ignores them, so a relay that already existed when the manager
+        // started moving relays off the shared key is signed for with the
+        // shared key, until the deadline, until the manager has seen this bit
+        // and the relay's ack of its own key. Every other relay is signed for
+        // with its own key from the start.
         capabilities.push("token-keyring");
+        // "live-streams" => `distribution.live_streams` names every stream an
+        // ingest publishes into the hub (a WHIP push, a QUIC ES ingest, a
+        // cascade). Without it the manager cannot tell a name live on the hub
+        // from a free one, so it lets only the relay's owner group claim a
+        // name nobody holds.
+        capabilities.push("live-streams");
     }
 
     let mut payload = serde_json::json!({
@@ -1821,6 +1830,19 @@ fn build_health_message(
             payload["distribution"]["legacy_tokens"] =
                 serde_json::to_value(report).unwrap_or_default();
         }
+        // Every stream an ingest publishes into the hub, and how long since
+        // its last frame: what the manager reads as live there, beside
+        // `origin_streams` for the origin (see "live-streams" above).
+        let live = relay_stats.live_streams();
+        payload["distribution"]["live_streams"] = serde_json::to_value(&live.streams).unwrap_or_default();
+        payload["distribution"]["live_streams_overflow"] = serde_json::json!(live.overflow);
+        // Which keys this relay verifies with, by id, so the manager can see
+        // it holds the key it signs with and push again when it does not.
+        if let Some(report) = distribution_control
+            .and_then(|c| c.load().token_key_report(crate::distribution_control::now_unix()))
+        {
+            payload["distribution"]["token_key"] = serde_json::to_value(report).unwrap_or_default();
+        }
     }
     // Advertised viewer base URL — the runtime (manager-pushed) value wins over
     // the config bootstrap so the manager's relay card + viewer links track the
@@ -1859,7 +1881,8 @@ fn rotated_secret(action: &serde_json::Value) -> Result<&str, String> {
 /// On the manager, reading a node's config needs only View on it, so anything
 /// this carries in clear is handed to every user a relay is shared with — and
 /// `distribution.token_secret` is the key the manager signs every viewer and
-/// ingest token with, installation-wide.
+/// ingest token for this relay with (and `previous_token_secret`, during the
+/// grace, the old installation-wide one).
 fn build_config_response(relay_config: &RelayConfig) -> serde_json::Value {
     serde_json::json!({
         "type": "config_response",
@@ -4240,7 +4263,7 @@ mod stopped_subsystem_health_tests {
         let p = health(&stats, &config);
         assert_eq!(
             capabilities(&p),
-            ["udp-relay", "viewer-distribution", "origin-policy", "token-keyring"]
+            ["udp-relay", "viewer-distribution", "origin-policy", "token-keyring", "live-streams"]
         );
         assert!(p.get("distribution_error").is_none());
         assert!(p.get("udp_relay_error").is_none());
@@ -4290,6 +4313,49 @@ mod stopped_subsystem_health_tests {
 
         control.apply(DistUpdate { previous: Some(None), ..Default::default() });
         assert!(health_with(&control)["distribution"].get("legacy_tokens").is_none());
+    }
+
+    /// The hub's live streams ride health, named and bounded, and so does
+    /// the id of each key the relay verifies with — never a key.
+    #[test]
+    fn live_streams_and_the_key_ids_ride_health() {
+        use crate::distribution_control::{DistUpdate, DistributionControl, RuntimeDistConfig, key_id_of, now_unix};
+
+        let stats = Arc::new(RelayStats::new());
+        stats.set_distribution(0, 0, 0, 0, 0, Vec::new());
+        stats.set_live_streams(crate::stats::LiveStreams {
+            streams: vec![crate::stats::LiveStream { stream: "feed".into(), idle_secs: 3 }],
+            overflow: 2,
+        });
+        let config = RelayConfig::default();
+        let p = health(&stats, &config);
+        assert_eq!(p["distribution"]["live_streams"], serde_json::json!([{"stream": "feed", "idle_secs": 3}]));
+        assert_eq!(p["distribution"]["live_streams_overflow"], 2);
+        assert!(p["distribution"].get("token_key").is_none(), "no control, no key");
+
+        let own = "ab".repeat(32);
+        let previous = "cd".repeat(32);
+        let control = DistributionControl::new(
+            RuntimeDistConfig::from_config(&crate::config::DistributionConfig::default(), None),
+            vec![],
+        );
+        let until = now_unix() + 3600;
+        control.apply(DistUpdate {
+            token_secret: Some(own.clone()),
+            previous: Some(Some((previous.clone(), until))),
+            ..Default::default()
+        });
+        let (events, _rx) = crate::manager::event_channel();
+        let ctx = crate::server::create_session_context(stats.clone(), events, false, 64, 100);
+        let p = build_health_message(&ctx, &stats, &config, Some(&control))["payload"].clone();
+        assert_eq!(
+            p["distribution"]["token_key"],
+            serde_json::json!({
+                "key_id": key_id_of(&own), "previous_key_id": key_id_of(&previous), "previous_until": until,
+            })
+        );
+        let text = p.to_string();
+        assert!(!text.contains(&own) && !text.contains(&previous), "a key reached health: {text}");
     }
 
     /// The source pin's other-path drops and the frames dropped while a
