@@ -504,8 +504,10 @@ tunnel).
   ====================      ==============             ===================
 
   Register (nil-UUID) ----> latch post-NAT src addr  <---- Register (nil-UUID)
-        <----------------- Ack { ready }  ----------------->
-        (re-sent ~every 5s; missed Acks => relay dead => failover)
+  { seq, standby }          stamp the slot's seen_ms        { seq, standby }
+        <---- Ack { ready, peer_live, live_ms, relay_id, seq } ---->
+        (re-sent ~every 5s; missed Acks => relay dead => failover;
+         peer_live => is the other side heard here, so meet it here)
 
   [16B tunnel_id|AEAD] ---> forward_target():         [16B tunnel_id|AEAD]
                             verbatim send to the
@@ -515,9 +517,79 @@ tunnel).
   Control plane (Register/Ack) is multiplexed on the SAME socket using the
   reserved nil (all-zero) UUID prefix; real tunnel IDs are random v4 UUIDs.
   Relay holds no media key — it forwards ciphertext verbatim.
-  Idle sessions (no register/data for 30s) are reaped.
+  Idle sessions (no register/data for 30s) are reaped; in a session that stays,
+  a slot with nothing from it for 30s is cleared.
   A Register does NOT always latch — see the admission rules below.
 ```
+
+### Liveness, Standby and Slot Clearing
+
+A relayed native tunnel may name a primary and a backup relay. Each edge reaches
+its relays on its own paths, so one edge can lose the primary while the other
+still reaches it. Up to relay v0.20.0 nothing on this plane told an edge where
+its peer was: `ready` says both slots hold an address, and a slot, once latched,
+stayed latched for as long as the session lived — its peer's `Register`s kept the
+session alive. An edge that failed over to the backup therefore left its slot on
+the primary latched, its peer read `ready` there for good, and the two stayed
+split, each forwarding into a relay the other no longer read.
+
+The relay now says more, and leaves the edges' decisions to them:
+
+- **Heard.** Each slot keeps two monotonic stamps: `seen_ms`, the last `Register`
+  accepted on it, and `media_ms`, the last media datagram forwarded from its
+  latched address (the stamp the hold-down already used; the per-datagram path is
+  unchanged). A slot is *heard* while the later of the two is under
+  `PEER_LIVE_MS` (16 s, three register intervals, so two lost `Register`s in a row
+  do not make a peer look gone) old. Every `Ack` carries `peer_live`: whether the
+  *opposite* slot is heard.
+- **How long.** The session keeps `live_since_ms`, set when a `Register` finds both
+  slots heard and either there was no stretch or this slot had a break (it was not
+  heard, or was just taken over), and cleared when a `Register` finds the other
+  slot unheard. `live_ms` on the `Ack` is the time since, at most seven days
+  (`MAX_LIVE_MS`, the ceiling an edge reads it at: it takes more as seven days);
+  edges fail back to the primary only once their pair has been live there for 60 s.
+- **Which relay.** `relay_id` is 32 lowercase hex characters, new each time the
+  relay process starts. Two configured addresses that answer with one id are one
+  relay, and an id that changes is a restart. `seq` echoes the `Register`'s own
+  counter, which lets the edge match an `Ack` to its `Register` (for RTT, and to
+  ignore one it never asked for).
+- **Standby.** An edge after v0.117.0 keeps registering on a relay its media does
+  not go through, so its peer can find it there, and marks those `Register`s
+  `standby: true`. A session whose two slots are both heard and both standing by
+  is listed `"standby"` and is not counted in `udp_sessions_active`; one edge
+  sending here is enough to count. The status goes by heard slots, not latched
+  ones: `active`, `standby`, `waiting_ingress` / `waiting_egress` (only the side
+  not named is heard), `empty`.
+- **Clearing.** The reaper (every 10 s), after it removes whole idle sessions,
+  clears each slot nothing has come from — `Register` or media — for 30 s
+  (`SESSION_IDLE_TIMEOUT`) in a session the other side keeps alive: its address,
+  socket, both stamps, the token it showed and its standby flag, and the session's
+  `live_since_ms`. The peer's next `Ack` then says `ready: false`, which is also
+  what an edge up to v0.117.0 reads; media to the departed edge stops being
+  forwarded. A cleared slot is empty again, so the next `Register` latches it as
+  at first contact (where a token is registered for the slot, or
+  `require_bind_auth` is on, only a `Register` showing the right one gets that
+  far). The ids are collected with the map's iterator, which is dropped
+  before each session is taken with `get_mut` and asked again under its lock.
+- **How many `Ack`s.** One slot is answered at most four times a second
+  (`ACKS_PER_SLOT_PER_SECOND`), whoever registers it; past that a `Register`
+  still latches and refreshes the slot but gets no `Ack`, and nothing is said.
+  An edge asks a slot once a second at its fastest, with a `Register` on each
+  socket when it moves and one or two more when it checks a move first, and an
+  edge whose `Register` goes unanswered asks again. Every `Ack` now carries more
+  than the smallest `Register` that earns one (one with no token, against a
+  tunnel no token is registered for, without `require_bind_auth`), so without a
+  cap a forged source address was sent more than it sent; with it, what one
+  address can be sent is its `max_connections_per_ip` sessions, two slots each,
+  at four `Ack`s of under 200 bytes a second.
+
+All four `Ack` fields and both `Register` fields are optional on the wire, so
+every pairing of versions reads the other's messages. An edge that gets an `Ack`
+without `peer_live` knows the relay is older and keeps the older rules for it:
+move only when the relay stops answering, never back. `TUNNEL_PROTOCOL_VERSION`
+stays 2: no type is new, and no field changed its meaning. The `udp-peer-liveness`
+capability bit, beside `udp-relay`, tells the manager the same. No relay event is
+new: a move is the edges' to report, and each raises its own.
 
 Auth reuses the QUIC path's bind-token registry (the manager's `authorize_tunnel`
 tokens), and the same per-IP session cap bounds DoS. A session counts on the
@@ -553,11 +625,11 @@ stamp, so on a one-way path only the transmitting end's slot is protected — th
 hold-down raises the cost of a takeover, `require_bind_auth: true` is the control.
 
 Bind failures on `:4434` are non-fatal — the relay logs, raises a Critical
-`relay_udp_plane_stopped` event, drops the `udp-relay` capability, and continues
-QUIC-only while it retries the bind, so an upgrade never bricks a relay over a
-busy port. The same holds for the viewer-distribution subsystem (not retried):
-`main` does not wait on either optional task; `src/supervise.rs` watches them
-and records a stop (relay#15).
+`relay_udp_plane_stopped` event, drops the `udp-relay` and `udp-peer-liveness`
+capabilities, and continues QUIC-only while it retries the bind, so an upgrade
+never bricks a relay over a busy port. The same holds for the viewer-distribution
+subsystem (not retried): `main` does not wait on either optional task;
+`src/supervise.rs` watches them and records a stop (relay#15).
 
 ## Relay-Wide Counters
 

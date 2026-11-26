@@ -91,6 +91,8 @@ struct HealthResponse {
     active_tunnels: usize,
     /// Native plain-UDP relay sessions (SRT/RIST without QUIC).
     udp_sessions_total: usize,
+    /// Those with both sides heard in the last 16 s and not both standing by
+    /// (`UdpSessionRouter::active_count`); up to v0.20.0, both sides latched.
     udp_sessions_active: usize,
     /// Manager-link state. Omitted when no manager is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -454,11 +456,11 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<ApiState>>) -> im
     let udp_sessions = state.ctx.udp_sessions.list();
     let udp_active = udp_sessions.iter().filter(|s| s.status == "active").count();
     let udp_totals = state.ctx.udp_sessions.totals();
-    let _ = writeln!(out, "# HELP bilbycast_relay_udp_sessions_total Native plain-UDP relay sessions (active + waiting).");
+    let _ = writeln!(out, "# HELP bilbycast_relay_udp_sessions_total Native plain-UDP relay sessions (active, standby, waiting and empty).");
     let _ = writeln!(out, "# TYPE bilbycast_relay_udp_sessions_total gauge");
     let _ = writeln!(out, "bilbycast_relay_udp_sessions_total {}", udp_sessions.len());
     let _ = writeln!(out);
-    let _ = writeln!(out, "# HELP bilbycast_relay_udp_sessions_active Native plain-UDP relay sessions with both sides latched.");
+    let _ = writeln!(out, "# HELP bilbycast_relay_udp_sessions_active Native plain-UDP relay sessions with both sides heard in the last 16 s, not both standing by.");
     let _ = writeln!(out, "# TYPE bilbycast_relay_udp_sessions_active gauge");
     let _ = writeln!(out, "bilbycast_relay_udp_sessions_active {udp_active}");
     let _ = writeln!(out);

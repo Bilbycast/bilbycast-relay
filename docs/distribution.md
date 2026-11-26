@@ -1898,15 +1898,16 @@ take its `rate()`.
 
 ### Capability bits
 
-The same health payload carries a `capabilities` array of up to three strings.
-`udp-relay` belongs to the opaque forwarder: the manager (v0.89.0+) refuses a
-native-UDP tunnel or a relayed bond leg through a relay whose capabilities lack
-it (422 `relay_lacks_udp_plane`). The two distribution bits gate the
-distribution pushes.
+The same health payload carries a `capabilities` array of up to four strings.
+`udp-relay` and `udp-peer-liveness` belong to the opaque forwarder: the manager
+(v0.89.0+) refuses a native-UDP tunnel or a relayed bond leg through a relay
+whose capabilities lack `udp-relay` (422 `relay_lacks_udp_plane`). The two
+distribution bits gate the distribution pushes.
 
 | Bit | Set when | What it gates |
 |---|---|---|
 | `udp-relay` | `udp_relay_enabled` (default true) and the plane is running — withdrawn while its bind is failing (`udp_relay_error` on health) | The native SRT/RIST plain-UDP plane — unrelated to distribution |
+| `udp-peer-liveness` | same condition as `udp-relay` (after v0.20.0) | That the plane's `Ack`s carry `peer_live`, `live_ms`, `relay_id` and `seq`, and a departed slot is cleared — what lets edges after v0.117.0 follow their peer between a tunnel's two relays and fail back together. Gates nothing: the manager's tunnel modal shows a note for a relay without it (`docs/ARCHITECTURE.md` § Liveness, Standby and Slot Clearing) |
 | `viewer-distribution` | the subsystem has published a telemetry sample, and has not stopped since (`distribution_error` on health) | The WHEP SFU + LL-HLS/CMAF origin surfaces |
 | `origin-policy` | same condition as `viewer-distribution` | That this build understands `require_origin_token`, `origin_policy` and `origin_stream_policies` on `configure_distribution` — the three keys the manager checks for before it pushes. `drop_origin_streams` arrived later (v0.13.0) and is not covered by the bit, nor gated on it |
 
