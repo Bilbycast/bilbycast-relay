@@ -740,7 +740,12 @@ as `previous_token_until`:
   ```
 
   `previous_key_id` is null and `previous_until` 0 once no previous key is
-  held, or its `until` has passed.
+  held, or its `until` has passed. A relay still holds a lapsed previous key
+  — in memory until a push clears it or the relay restarts, and in
+  `config.json` until a push rewrites the file — though by its own clock it
+  verifies with it no longer. So the manager does not read the report as the
+  key gone: past its deadline it sends the push that clears it until it has
+  that push's acknowledgement.
 
 Whoever controls a relay box holds that relay's key and can sign for every
 stream on it; that is the trust boundary, and it is now one relay wide rather
