@@ -21,7 +21,7 @@
 //! The existing QUIC tunnel path is untouched; this runs as a parallel task.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,9 @@ use crate::stats::{Counted, DepartedTunnels, TunnelStats, TunnelTotals};
 use crate::tunnel_router::TokenDigest;
 use crate::util::IpCounts;
 
-/// Session is reaped after this long with no register/keepalive or data.
+/// Session is reaped after this long with no register/keepalive or data, and a
+/// slot of a session that stays is cleared after this long with nothing from
+/// its own address ([`UdpSessionRouter::reap_idle`]).
 /// Edges re-register every ~5 s (see the edge `udp_relay_client`), so a 30 s
 /// idle window tolerates a few missed keepalives (cellular/satellite handover)
 /// without tearing a live session down.
@@ -121,6 +123,12 @@ impl AtomicAddr {
     fn is_set(&self) -> bool {
         self.family.load(Ordering::Acquire) != 0
     }
+
+    /// Unset the address. The data path reads the family first (`Acquire`),
+    /// so it sees either the whole old address or none.
+    fn clear(&self) {
+        self.family.store(0, Ordering::Release);
+    }
 }
 
 /// Now in epoch-millis (saturating).
@@ -149,6 +157,23 @@ fn mono_ms() -> u64 {
 /// slot is deliberately unprotected — see the hold-down comment in `latch`.
 fn slot_is_protected(last_media_ms: u64, now_ms: u64) -> bool {
     last_media_ms != 0 && now_ms.saturating_sub(last_media_ms) < SLOT_TAKEOVER_GRACE_MS
+}
+
+/// Has a slot been *heard* in the last [`PEER_LIVE_MS`]: a `Register` accepted
+/// from it at `seen_ms`, or media forwarded from its latched address at
+/// `media_ms`? `0` is never, for either stamp.
+///
+/// Pure, like [`slot_is_protected`], so its boundary is tested without a 16 s
+/// sleep. A stamp in the future saturates to "just heard".
+fn slot_heard(seen_ms: u64, media_ms: u64, now_ms: u64) -> bool {
+    let last = seen_ms.max(media_ms);
+    last != 0 && now_ms.saturating_sub(last) < PEER_LIVE_MS
+}
+
+/// Has a latched slot been silent long enough to be cleared: nothing from it,
+/// `Register` or media, for longer than [`SESSION_IDLE_TIMEOUT`]?
+fn slot_departed(seen_ms: u64, media_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(seen_ms.max(media_ms)) > SESSION_IDLE_TIMEOUT.as_millis() as u64
 }
 
 /// Is `src` an address a real edge could have reached us from, and that we can
@@ -218,6 +243,24 @@ fn is_latchable_source(src: SocketAddr) -> bool {
 /// Invariant: register cadence (5 s) < this < `SESSION_IDLE_TIMEOUT` (30 s).
 const SLOT_TAKEOVER_GRACE_MS: u64 = 12_000;
 
+/// How long a slot stays *heard* after its last accepted `Register` or the
+/// last media forwarded from its address ([`slot_heard`]). The `Ack`'s
+/// `peer_live` says whether the opposite slot is heard, and a session's status
+/// and [`UdpSessionRouter::active_count`] count heard slots.
+///
+/// Three register intervals, so two lost `Register`s in a row do not make a
+/// peer look gone, and well inside the 30 s idle reap, so an edge learns its
+/// peer has gone before the relay clears the slot. The edge mirrors this value
+/// (`RELAY_PEER_LIVE_MS` in `bilbycast-edge/src/tunnel/native_meet.rs`) to
+/// time its own decisions: change both.
+pub(crate) const PEER_LIVE_MS: u64 = 16_000;
+
+/// How often an edge re-registers: the edge's `KEEPALIVE_INTERVAL`.
+const EDGE_REGISTER_INTERVAL_MS: u64 = 5_000;
+
+const _: () = assert!(PEER_LIVE_MS >= 3 * EDGE_REGISTER_INTERVAL_MS);
+const _: () = assert!(PEER_LIVE_MS < SESSION_IDLE_TIMEOUT.as_millis() as u64);
+
 /// A native-UDP relay session: two latched edge addresses paired by tunnel UUID.
 pub struct UdpSession {
     pub tunnel_id: Uuid,
@@ -239,6 +282,21 @@ pub struct UdpSession {
     /// `last_seen_ms`, which either side refreshes.
     ingress_media_ms: AtomicU64,
     egress_media_ms: AtomicU64,
+    /// Monotonic ms of the last `Register` accepted on each slot. `0` = never.
+    /// With `*_media_ms` it says whether the slot is heard ([`slot_heard`]):
+    /// what the `Ack`'s `peer_live`, the session's status and the reaper's
+    /// slot clearing go by. Written under the session's entry lock.
+    ingress_seen_ms: AtomicU64,
+    egress_seen_ms: AtomicU64,
+    /// The `standby` flag of the `Register` that last latched each slot: that
+    /// edge's media goes through the tunnel's other relay, and it registers
+    /// here only to be found. Written under the session's entry lock.
+    ingress_standby: AtomicBool,
+    egress_standby: AtomicBool,
+    /// Monotonic ms since which both slots have been heard without a break, as
+    /// `Register`s observe it; `0` = not both heard. The `Ack`'s `live_ms`.
+    /// Read and written under the session's entry lock.
+    live_since_ms: AtomicU64,
     /// The token shown by the `Register` that latched each slot, the right one
     /// or not: with none registered for the tunnel, any is taken. Read and
     /// written under the session's entry lock.
@@ -261,6 +319,11 @@ impl UdpSession {
             egress_sock: AtomicUsize::new(usize::MAX),
             ingress_media_ms: AtomicU64::new(0),
             egress_media_ms: AtomicU64::new(0),
+            ingress_seen_ms: AtomicU64::new(0),
+            egress_seen_ms: AtomicU64::new(0),
+            ingress_standby: AtomicBool::new(false),
+            egress_standby: AtomicBool::new(false),
+            live_since_ms: AtomicU64::new(0),
             ingress_shown: None,
             egress_shown: None,
             creator_ip,
@@ -270,17 +333,78 @@ impl UdpSession {
         }
     }
 
+    /// Both slots hold an address: the `Ack`'s `ready`, whose meaning edges up
+    /// to v0.117.0 depend on. A slot that has gone quiet still counts until
+    /// the reaper clears it.
     fn both_latched(&self) -> bool {
         self.ingress.is_set() && self.egress.is_set()
     }
 
-    fn status_str(&self) -> &'static str {
-        match (self.ingress.is_set(), self.egress.is_set()) {
+    /// One slot's address, its stamps and its standby flag.
+    fn side(&self, direction: TunnelDirection) -> (&AtomicAddr, &AtomicU64, &AtomicU64, &AtomicBool) {
+        match direction {
+            TunnelDirection::Ingress => {
+                (&self.ingress, &self.ingress_seen_ms, &self.ingress_media_ms, &self.ingress_standby)
+            }
+            TunnelDirection::Egress => {
+                (&self.egress, &self.egress_seen_ms, &self.egress_media_ms, &self.egress_standby)
+            }
+        }
+    }
+
+    /// The slot holds an address and has been heard in the last [`PEER_LIVE_MS`].
+    fn heard(&self, direction: TunnelDirection, now: u64) -> bool {
+        let (addr, seen, media, _) = self.side(direction);
+        addr.is_set() && slot_heard(seen.load(Ordering::Relaxed), media.load(Ordering::Relaxed), now)
+    }
+
+    /// The slot holds an address that nothing has come from for longer than
+    /// [`SESSION_IDLE_TIMEOUT`].
+    fn departed(&self, direction: TunnelDirection, now: u64) -> bool {
+        let (addr, seen, media, _) = self.side(direction);
+        addr.is_set() && slot_departed(seen.load(Ordering::Relaxed), media.load(Ordering::Relaxed), now)
+    }
+
+    /// Empty a slot, as if no edge had ever latched it: no address, socket,
+    /// stamps, token or standby flag. The two slots are no longer both heard.
+    /// Taken with `&mut`, so under the session's entry lock.
+    fn clear_slot(&mut self, direction: TunnelDirection) {
+        let (addr, seen, media, standby) = self.side(direction);
+        addr.clear();
+        seen.store(0, Ordering::Relaxed);
+        media.store(0, Ordering::Relaxed);
+        standby.store(false, Ordering::Relaxed);
+        let (sock, shown) = match direction {
+            TunnelDirection::Ingress => (&self.ingress_sock, &mut self.ingress_shown),
+            TunnelDirection::Egress => (&self.egress_sock, &mut self.egress_shown),
+        };
+        sock.store(usize::MAX, Ordering::Relaxed);
+        *shown = None;
+        self.live_since_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// The session as `/api/v1/udp-sessions` lists it, by which slots are heard
+    /// rather than which are latched: a slot whose edge has moved to the other
+    /// relay stays latched for up to 30 s, and `"active"` would have said media
+    /// was flowing here. `"active"`: both heard, and not both edges standing by
+    /// here, so media may be flowing through this relay.
+    fn status_str(&self, now: u64) -> &'static str {
+        let standby = |direction| self.side(direction).3.load(Ordering::Relaxed);
+        match (self.heard(TunnelDirection::Ingress, now), self.heard(TunnelDirection::Egress, now)) {
+            (true, true) if standby(TunnelDirection::Ingress) && standby(TunnelDirection::Egress) => "standby",
             (true, true) => "active",
             (true, false) => "waiting_egress",
             (false, true) => "waiting_ingress",
             (false, false) => "empty",
         }
+    }
+}
+
+/// The opposite slot of a tunnel.
+fn opposite(direction: TunnelDirection) -> TunnelDirection {
+    match direction {
+        TunnelDirection::Ingress => TunnelDirection::Egress,
+        TunnelDirection::Egress => TunnelDirection::Ingress,
     }
 }
 
@@ -317,16 +441,32 @@ pub struct UdpSessionRouter {
     /// Per-source-IP session-creation counter (DoS mitigation).
     sessions_by_ip: IpCounts,
     max_sessions_per_ip: u32,
+    /// This process's `relay_id` on every `Ack`: 32 lowercase hex characters,
+    /// new at each start, so an edge can tell one relay at two addresses from
+    /// two relays, and a restarted relay from the one before.
+    relay_id: String,
+}
+
+/// What an `Ack` reports of the tunnel, as the `Register` it answers left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Readiness {
+    /// Both slots hold an address: the `Ack`'s `ready`.
+    pub latched: bool,
+    /// The opposite slot was heard in the last [`PEER_LIVE_MS`]: `peer_live`.
+    pub peer_live: bool,
+    /// How long both slots have been heard without a break, as `Register`s
+    /// observed it; `0` when `peer_live` is false: `live_ms`.
+    pub live_ms: u64,
 }
 
 /// Outcome of latching a registration.
 pub enum LatchResult {
-    /// Session updated; `bool` = both slots now latched (media may flow).
-    Ok(bool),
+    /// Session updated; what the `Ack` reports.
+    Ok(Readiness),
     /// As [`Self::Ok`], and the slot was taken from the address that held it:
     /// one that is carrying media, and has not shown the registered token as
     /// this `Register` did.
-    TookOver { ready: bool, held_by: SocketAddr },
+    TookOver { readiness: Readiness, held_by: SocketAddr },
     /// Per-IP session cap exceeded — registration dropped.
     RejectedDosCap,
     /// The slot is latched to a different IP that is currently carrying media.
@@ -346,28 +486,65 @@ impl UdpSessionRouter {
             departed: DepartedTunnels::default(),
             sessions_by_ip: IpCounts::default(),
             max_sessions_per_ip,
+            relay_id: Uuid::new_v4().simple().to_string(),
         }
+    }
+
+    /// The `relay_id` this process puts on every `Ack`.
+    pub fn relay_id(&self) -> &str {
+        &self.relay_id
     }
 
     /// Latch (or refresh) an edge's source address into its tunnel slot.
     ///
-    /// `shown` is the token its `Register` showed, and `registered` the one the
-    /// manager has registered for the slot, if it has.
+    /// `standby` is the `Register`'s own flag: this edge's media goes through
+    /// the tunnel's other relay. `shown` is the token its `Register` showed,
+    /// and `registered` the one the manager has registered for the slot, if it
+    /// has.
     ///
     /// The per-IP creation cap + counter bump + insert happen atomically under
     /// the DashMap shard entry lock, so they're counted exactly once per session
     /// (and freed once in [`Self::remove_if`]). Lock order is always
     /// `sessions` → `sessions_by_ip`, matching [`Self::remove_if`] — no
     /// deadlock. The entry stays locked to the end, so a session is not removed
-    /// between being found here and being marked as seen.
+    /// between being found here and being marked as seen, and the slot's
+    /// stamps, its standby flag and the session's `live_since_ms` change
+    /// together.
+    ///
+    /// What is returned is what the `Ack` reports ([`Readiness`]): whether both
+    /// slots are latched, whether the opposite one is heard, and for how long
+    /// both have been.
+    // One parameter per thing a `Register` carries or the caller knows about
+    // it; a struct to hold them would be built at the one production call.
+    #[allow(clippy::too_many_arguments)]
     pub fn latch(
         &self,
         tunnel_id: Uuid,
         direction: TunnelDirection,
         src: SocketAddr,
         sock_idx: usize,
+        standby: bool,
         shown: Option<TokenDigest>,
         registered: Option<TokenDigest>,
+    ) -> LatchResult {
+        self.latch_at(tunnel_id, direction, src, sock_idx, standby, shown, registered, mono_ms())
+    }
+
+    /// [`Self::latch`] at the monotonic millisecond `now`, the clock every
+    /// stamp it reads and writes is on — so a test can age a slot without
+    /// sleeping. The session's wall-clock `last_seen_ms` stays on the wall
+    /// clock, as the whole-session reap reads it.
+    #[allow(clippy::too_many_arguments)]
+    fn latch_at(
+        &self,
+        tunnel_id: Uuid,
+        direction: TunnelDirection,
+        src: SocketAddr,
+        sock_idx: usize,
+        standby: bool,
+        shown: Option<TokenDigest>,
+        registered: Option<TokenDigest>,
+        now: u64,
     ) -> LatchResult {
         use dashmap::mapref::entry::Entry;
 
@@ -424,24 +601,32 @@ impl UdpSessionRouter {
         // all keep the IP. A slot that has never carried media stays
         // last-writer-wins, so first contact is byte-identical to before.
         let session = &mut *session;
-        let (cur_slot, cur_sock, media_ms, cur_shown) = match direction {
+        // Asked before anything below changes the slot: a slot never latched,
+        // cleared by the reaper or silent for `PEER_LIVE_MS` starts a new
+        // stretch of being heard.
+        let was_heard = session.heard(direction, now);
+        let (cur_slot, cur_sock, media_ms, seen_ms, cur_standby, cur_shown) = match direction {
             TunnelDirection::Ingress => (
                 &session.ingress,
                 &session.ingress_sock,
                 &session.ingress_media_ms,
+                &session.ingress_seen_ms,
+                &session.ingress_standby,
                 &mut session.ingress_shown,
             ),
             TunnelDirection::Egress => (
                 &session.egress,
                 &session.egress_sock,
                 &session.egress_media_ms,
+                &session.egress_seen_ms,
+                &session.egress_standby,
                 &mut session.egress_shown,
             ),
         };
         let mut held_by = None;
         if let Some(cur) = cur_slot.load()
             && cur.ip() != src.ip()
-            && slot_is_protected(media_ms.load(Ordering::Relaxed), mono_ms())
+            && slot_is_protected(media_ms.load(Ordering::Relaxed), now)
         {
             // Unless this edge shows the slot's token and the holder has not:
             // it got the slot while there was none to show. Its `Register`s are
@@ -462,11 +647,30 @@ impl UdpSessionRouter {
         cur_slot.store(src);
         cur_sock.store(sock_idx, Ordering::Relaxed);
         *cur_shown = shown;
+        seen_ms.store(now, Ordering::Relaxed);
+        cur_standby.store(standby, Ordering::Relaxed);
         session.last_seen_ms.store(now_ms(), Ordering::Relaxed);
-        let ready = session.both_latched();
+
+        // Both slots have been heard without a break since `live_since_ms`. The
+        // stretch ends when the other slot is not heard now, and starts again
+        // when this one had a break: it was not heard, or it was just taken
+        // from another edge, which is not the one that was heard.
+        let peer_live = session.heard(opposite(direction), now);
+        let live_since = match session.live_since_ms.load(Ordering::Relaxed) {
+            _ if !peer_live => 0,
+            0 => now,
+            _ if !was_heard || held_by.is_some() => now,
+            since => since,
+        };
+        session.live_since_ms.store(live_since, Ordering::Relaxed);
+        let readiness = Readiness {
+            latched: session.both_latched(),
+            peer_live,
+            live_ms: if peer_live { now.saturating_sub(live_since) } else { 0 },
+        };
         match held_by {
-            Some(held_by) => LatchResult::TookOver { ready, held_by },
-            None => LatchResult::Ok(ready),
+            Some(held_by) => LatchResult::TookOver { readiness, held_by },
+            None => LatchResult::Ok(readiness),
         }
     }
 
@@ -546,9 +750,59 @@ impl UdpSessionRouter {
         Some((target, target_sock))
     }
 
-    /// Remove sessions idle longer than [`SESSION_IDLE_TIMEOUT`]. Returns the
-    /// count reaped.
+    /// Remove sessions idle longer than [`SESSION_IDLE_TIMEOUT`], then clear
+    /// each slot of the sessions that stay which has been silent that long.
+    /// Returns the count of sessions reaped.
     pub fn reap_idle(&self) -> usize {
+        self.reap_idle_at(mono_ms())
+    }
+
+    /// [`Self::reap_idle`] with slots judged at the monotonic millisecond
+    /// `now`; whole sessions are judged on the wall clock, as before.
+    fn reap_idle_at(&self, now: u64) -> usize {
+        let reaped = self.reap_idle_sessions();
+        self.clear_departed_slots(now);
+        reaped
+    }
+
+    /// Clear each slot that holds an address nothing has come from, `Register`
+    /// or media, for longer than [`SESSION_IDLE_TIMEOUT`], in a session the
+    /// other slot keeps alive.
+    ///
+    /// Without this, an edge that moved to the tunnel's other relay left its
+    /// slot here latched for as long as its peer kept registering, and `ready`
+    /// went on saying both sides were present. A cleared slot is empty again:
+    /// any `Register` latches it, as at first contact, and the slot's next
+    /// edge starts with no media stamp, token or standby flag of the last one.
+    fn clear_departed_slots(&self, now: u64) {
+        use TunnelDirection::{Egress, Ingress};
+        let departed = |s: &UdpSession| s.departed(Ingress, now) || s.departed(Egress, now);
+        // Collected first, and the iterator dropped: `get_mut` below takes
+        // the shard's write lock, which a live iterator's read guard would
+        // hold up for ever.
+        let ids: Vec<Uuid> =
+            self.sessions.iter().filter(|e| departed(e.value())).map(|e| *e.key()).collect();
+        for id in ids {
+            // Asked again under the entry's lock: a slot that registered since
+            // is kept.
+            let Some(mut session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            for direction in [Ingress, Egress] {
+                if session.departed(direction, now) {
+                    session.clear_slot(direction);
+                    tracing::debug!(
+                        "native-UDP tunnel {id}: {direction:?} slot cleared, nothing from it for {}s",
+                        SESSION_IDLE_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Remove whole sessions idle longer than [`SESSION_IDLE_TIMEOUT`] on the
+    /// wall clock. Returns the count reaped.
+    fn reap_idle_sessions(&self) -> usize {
         let now = now_ms();
         let cutoff = SESSION_IDLE_TIMEOUT.as_millis() as u64;
         let is_stale = |session: &UdpSession| {
@@ -594,11 +848,17 @@ impl UdpSessionRouter {
         self.sessions.len()
     }
 
+    /// Sessions whose two slots are both heard and whose two edges are not both
+    /// standing by: those media may be flowing through. A tunnel whose edges
+    /// went to its other relay, or that stands by here while it runs there, is
+    /// not counted.
     pub fn active_count(&self) -> usize {
-        self.sessions.iter().filter(|e| e.value().both_latched()).count()
+        let now = mono_ms();
+        self.sessions.iter().filter(|e| e.value().status_str(now) == "active").count()
     }
 
     pub fn list(&self) -> Vec<UdpSessionInfo> {
+        let now = mono_ms();
         self.sessions
             .iter()
             .map(|e| {
@@ -606,7 +866,7 @@ impl UdpSessionRouter {
                 UdpSessionInfo {
                     tunnel_id: s.tunnel_id,
                     transport: "udp",
-                    status: s.status_str().to_string(),
+                    status: s.status_str(now).to_string(),
                     ingress_addr: s.ingress.load().map(|a| a.to_string()),
                     egress_addr: s.egress.load().map(|a| a.to_string()),
                     bytes_ingress: s.stats.bytes_ingress.load(Ordering::Relaxed),
@@ -776,11 +1036,17 @@ async fn handle_control(
     ctrl: UdpRelayControl,
 ) {
     match ctrl {
+        // `seq` and `standby` are typed (`u32`, `bool`) and serde has already
+        // refused any other value, so there is nothing further to validate:
+        // `seq` is only echoed back to the address it came from, and `standby`
+        // only says how this session is counted.
         UdpRelayControl::Register {
             tunnel_id,
             direction,
             bind_token,
             protocol_version,
+            seq,
+            standby,
         } => {
             if protocol_version != 0 && protocol_version != TUNNEL_PROTOCOL_VERSION {
                 tracing::debug!(
@@ -829,8 +1095,15 @@ async fn handle_control(
             }
 
             let registered = ctx.router.registered_token(&tunnel_id, direction);
-            let latched =
-                ctx.udp_sessions.latch(tunnel_id, direction, src, sock_idx, shown, registered);
+            let latched = ctx.udp_sessions.latch(
+                tunnel_id,
+                direction,
+                src,
+                sock_idx,
+                standby.unwrap_or(false),
+                shown,
+                registered,
+            );
             if let LatchResult::TookOver { held_by, .. } = latched {
                 tracing::warn!(
                     "native-UDP tunnel {tunnel_id}: {src} showed the {direction:?} slot's token, \
@@ -851,16 +1124,28 @@ async fn handle_control(
                 );
             }
             match latched {
-                LatchResult::Ok(ready) | LatchResult::TookOver { ready, .. } => {
-                    // Ack so the edge confirms the relay is alive (failover) and
-                    // learns when both sides are present.
-                    if let Ok(bytes) =
-                        encode_udp_control(&UdpRelayControl::Ack { tunnel_id, ready })
-                    {
+                LatchResult::Ok(readiness) | LatchResult::TookOver { readiness, .. } => {
+                    // Ack so the edge confirms the relay is alive (failover),
+                    // learns when both sides are present, and — an edge after
+                    // v0.117.0 — whether its peer is heard here, to meet it on
+                    // whichever relay both reach.
+                    let ack = UdpRelayControl::Ack {
+                        tunnel_id,
+                        ready: readiness.latched,
+                        peer_live: Some(readiness.peer_live),
+                        live_ms: Some(readiness.live_ms),
+                        relay_id: Some(ctx.udp_sessions.relay_id().to_owned()),
+                        seq,
+                    };
+                    if let Ok(bytes) = encode_udp_control(&ack) {
                         let _ = sock.send_to(&bytes, src).await;
                     }
-                    if ready {
-                        tracing::debug!("native-UDP tunnel {tunnel_id} active (both sides latched)");
+                    if readiness.latched {
+                        tracing::debug!(
+                            "native-UDP tunnel {tunnel_id}: both slots latched, peer {} ({} ms live)",
+                            if readiness.peer_live { "heard" } else { "not heard in the last 16 s" },
+                            readiness.live_ms
+                        );
                     }
                 }
                 LatchResult::RejectedSlotHeld => {
@@ -949,11 +1234,11 @@ mod tests {
 
         // Only one side latched → not ready, no forwarding target. Egress
         // dialed relay socket 0, ingress dialed socket 1 (multi-port relay).
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, src, 0, None, None), LatchResult::Ok(false)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, src, 0, false, None, None), LatchResult::Ok(Readiness { latched: false, .. })));
         assert!(r.forward_target(t, src, 100).is_none());
 
         // Both latched → ready.
-        assert!(matches!(r.latch(t, TunnelDirection::Ingress, dst, 1, None, None), LatchResult::Ok(true)));
+        assert!(matches!(r.latch(t, TunnelDirection::Ingress, dst, 1, false, None, None), LatchResult::Ok(Readiness { latched: true, .. })));
 
         // Source-side datagram forwards to the destination side via the socket
         // the destination dialed (1), and vice versa via socket 0.
@@ -972,8 +1257,8 @@ mod tests {
         let t = Uuid::new_v4();
         let src = v4(5000); // source/egress side, dialed relay socket 2
         let dst = v4(6000); // destination/ingress side, dialed relay socket 0
-        r.latch(t, TunnelDirection::Egress, src, 2, None, None);
-        r.latch(t, TunnelDirection::Ingress, dst, 0, None, None);
+        r.latch(t, TunnelDirection::Egress, src, 2, false, None, None);
+        r.latch(t, TunnelDirection::Ingress, dst, 0, false, None, None);
         // src→dst egresses from the socket dst dialed (0)…
         assert_eq!(r.forward_target(t, src, 1), Some((dst, 0)));
         // …and dst→src egresses from the socket src dialed (2).
@@ -991,11 +1276,11 @@ mod tests {
         let r = UdpSessionRouter::new(64);
         let t = Uuid::new_v4();
         let dst = v4(6000);
-        r.latch(t, TunnelDirection::Ingress, dst, 0, None, None);
-        r.latch(t, TunnelDirection::Egress, v4(5000), 0, None, None);
+        r.latch(t, TunnelDirection::Ingress, dst, 0, false, None, None);
+        r.latch(t, TunnelDirection::Egress, v4(5000), 0, false, None, None);
         assert_eq!(r.forward_target(t, v4(5000), 1), Some((dst, 0)));
         // Egress edge's NAT rebinds to a new port; re-register relatches it.
-        r.latch(t, TunnelDirection::Egress, v4(5001), 0, None, None);
+        r.latch(t, TunnelDirection::Egress, v4(5001), 0, false, None, None);
         assert!(r.forward_target(t, v4(5000), 1).is_none());
         assert_eq!(r.forward_target(t, v4(5001), 1), Some((dst, 0)));
     }
@@ -1006,15 +1291,15 @@ mod tests {
         let ip = Ipv4Addr::new(10, 0, 0, 9);
         // Three distinct tunnels from the same IP: third is rejected.
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0, None, None),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0, false, None, None),
             LatchResult::Ok(_)
         ));
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0, None, None),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0, false, None, None),
             LatchResult::Ok(_)
         ));
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 3), 0, None, None),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 3), 0, false, None, None),
             LatchResult::RejectedDosCap
         ));
     }
@@ -1024,7 +1309,7 @@ mod tests {
         let r = UdpSessionRouter::new(1);
         let t = Uuid::new_v4();
         let ip = Ipv4Addr::new(10, 0, 0, 1);
-        r.latch(t, TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0, None, None);
+        r.latch(t, TunnelDirection::Egress, SocketAddr::new(ip.into(), 1), 0, false, None, None);
         // Force it stale.
         r.sessions
             .get(&t)
@@ -1035,7 +1320,7 @@ mod tests {
         assert_eq!(r.count(), 0);
         // IP quota was freed → a new session from the same IP succeeds.
         assert!(matches!(
-            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0, None, None),
+            r.latch(Uuid::new_v4(), TunnelDirection::Egress, SocketAddr::new(ip.into(), 2), 0, false, None, None),
             LatchResult::Ok(_)
         ));
     }
@@ -1077,11 +1362,11 @@ mod slot_holddown_tests {
         let real = addr("198.51.100.10", 5000);
         let attacker = addr("203.0.113.7", 5000);
 
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, real, 0, None, None), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, real, 0, false, None, None), LatchResult::Ok(_)));
         mark_media(&r, t, TunnelDirection::Egress);
 
         assert!(matches!(
-            r.latch(t, TunnelDirection::Egress, attacker, 0, None, None),
+            r.latch(t, TunnelDirection::Egress, attacker, 0, false, None, None),
             LatchResult::RejectedSlotHeld
         ));
         assert_eq!(
@@ -1100,10 +1385,10 @@ mod slot_holddown_tests {
         let before = addr("198.51.100.10", 5000);
         let after = addr("198.51.100.10", 41234);
 
-        r.latch(t, TunnelDirection::Egress, before, 0, None, None);
+        r.latch(t, TunnelDirection::Egress, before, 0, false, None, None);
         mark_media(&r, t, TunnelDirection::Egress);
 
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, after, 0, None, None), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, after, 0, false, None, None), LatchResult::Ok(_)));
         assert_eq!(slot_addr(&r, t, TunnelDirection::Egress), Some(after));
     }
 
@@ -1117,9 +1402,9 @@ mod slot_holddown_tests {
         let first = addr("198.51.100.10", 5000);
         let second = addr("203.0.113.7", 5000);
 
-        r.latch(t, TunnelDirection::Egress, first, 0, None, None);
+        r.latch(t, TunnelDirection::Egress, first, 0, false, None, None);
         // No media ever forwarded on this slot.
-        assert!(matches!(r.latch(t, TunnelDirection::Egress, second, 0, None, None), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Egress, second, 0, false, None, None), LatchResult::Ok(_)));
         assert_eq!(slot_addr(&r, t, TunnelDirection::Egress), Some(second));
     }
 
@@ -1154,11 +1439,11 @@ mod slot_holddown_tests {
     fn holddown_is_per_slot_not_per_session() {
         let r = UdpSessionRouter::new(64);
         let t = Uuid::new_v4();
-        r.latch(t, TunnelDirection::Egress, addr("198.51.100.10", 5000), 0, None, None);
+        r.latch(t, TunnelDirection::Egress, addr("198.51.100.10", 5000), 0, false, None, None);
         mark_media(&r, t, TunnelDirection::Egress);
 
         assert!(matches!(
-            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.9", 6000), 0, None, None),
+            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.9", 6000), 0, false, None, None),
             LatchResult::Ok(_)
         ));
     }
@@ -1221,7 +1506,7 @@ mod slot_holddown_tests {
             let t = Uuid::new_v4();
             let src: SocketAddr = bad.parse().unwrap();
             assert!(
-                matches!(r.latch(t, TunnelDirection::Egress, src, 0, None, None), LatchResult::RejectedInvalidSource),
+                matches!(r.latch(t, TunnelDirection::Egress, src, 0, false, None, None), LatchResult::RejectedInvalidSource),
                 "{bad} must be refused by latch, not merely by the predicate"
             );
             assert_eq!(
@@ -1245,10 +1530,10 @@ mod slot_holddown_tests {
         // The relay's own advertised dial address, as an attacker would spoof it.
         let relay_self = addr("111.118.193.172", 7400);
 
-        assert!(matches!(r.latch(t, TunnelDirection::Ingress, relay_self, 0, None, None), LatchResult::Ok(_)));
+        assert!(matches!(r.latch(t, TunnelDirection::Ingress, relay_self, 0, false, None, None), LatchResult::Ok(_)));
         assert!(
             matches!(
-                r.latch(t, TunnelDirection::Egress, relay_self, 0, None, None),
+                r.latch(t, TunnelDirection::Egress, relay_self, 0, false, None, None),
                 LatchResult::RejectedInvalidSource
             ),
             "the opposite slot must refuse an address the other slot already holds"
@@ -1269,7 +1554,7 @@ mod slot_holddown_tests {
         // Drive the router into the degenerate state directly, bypassing
         // `latch`'s refusal — this asserts the drop holds regardless of HOW
         // both slots came to hold one address.
-        r.latch(t, TunnelDirection::Ingress, addr("198.51.100.10", 5000), 0, None, None);
+        r.latch(t, TunnelDirection::Ingress, addr("198.51.100.10", 5000), 0, false, None, None);
         let s = r.sessions.get(&t).expect("session exists");
         s.ingress.store(relay_self);
         s.egress.store(relay_self);
@@ -1301,8 +1586,8 @@ mod slot_holddown_tests {
         let contributor = addr("198.51.100.10", 5000);
 
         assert!(matches!(
-            r.latch(t, TunnelDirection::Ingress, contributor, 0, None, None),
-            LatchResult::Ok(false) // peer not latched: session is "waiting"
+            r.latch(t, TunnelDirection::Ingress, contributor, 0, false, None, None),
+            LatchResult::Ok(Readiness { latched: false, .. }) // peer not latched: session is "waiting"
         ));
         // Media arrives with no egress peer yet — nothing to forward to…
         assert_eq!(r.forward_target(t, contributor, 1316), None);
@@ -1318,7 +1603,7 @@ mod slot_holddown_tests {
 
         // And the hold-down actually refuses the spoofed move.
         assert!(matches!(
-            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.7", 5000), 0, None, None),
+            r.latch(t, TunnelDirection::Ingress, addr("203.0.113.7", 5000), 0, false, None, None),
             LatchResult::RejectedSlotHeld
         ));
         assert_eq!(slot_addr(&r, t, TunnelDirection::Ingress), Some(contributor));
@@ -1328,9 +1613,8 @@ mod slot_holddown_tests {
     /// or the hold-down either blocks live keepalives or outlives the session.
     #[test]
     fn grace_window_is_bounded_by_the_register_cadence_and_idle_timeout() {
-        const REGISTER_CADENCE_MS: u64 = 5_000;
         let grace = SLOT_TAKEOVER_GRACE_MS;
-        assert!(grace > REGISTER_CADENCE_MS, "must exceed the ~5 s register cadence");
+        assert!(grace > EDGE_REGISTER_INTERVAL_MS, "must exceed the ~5 s register cadence");
         assert!(
             grace < SESSION_IDLE_TIMEOUT.as_millis() as u64,
             "must expire before the session is reaped"
@@ -1358,7 +1642,7 @@ mod shown_token_tests {
     /// nothing registered, and is sending.
     fn held(t: Uuid, direction: TunnelDirection, src: SocketAddr, shown: Option<TokenDigest>) -> UdpSessionRouter {
         let r = UdpSessionRouter::new(64);
-        assert!(matches!(r.latch(t, direction, src, 0, shown, None), LatchResult::Ok(false)));
+        assert!(matches!(r.latch(t, direction, src, 0, false, shown, None), LatchResult::Ok(Readiness { latched: false, .. })));
         assert!(r.forward_target(t, src, 1316).is_none());
         r
     }
@@ -1383,28 +1667,28 @@ mod shown_token_tests {
                 let t = Uuid::new_v4();
                 let (stranger, real, peer) = (addr(1, 5000), addr(2, 6000), addr(3, 7000));
                 let r = held(t, direction, stranger, shown);
-                assert!(matches!(r.latch(t, other, peer, 1, None, None), LatchResult::Ok(true)));
+                assert!(matches!(r.latch(t, other, peer, 1, false, None, None), LatchResult::Ok(Readiness { latched: true, .. })));
                 assert_eq!(r.forward_target(t, peer, 1), Some((stranger, 0)));
 
                 // Not while no token is registered, nor to one that shows none.
                 for (shown, registered) in
                     [(token("right"), None), (None, token("right")), (token("wrong"), token("right"))]
                 {
-                    let latched = r.latch(t, direction, real, 2, shown, registered);
+                    let latched = r.latch(t, direction, real, 2, false, shown, registered);
                     assert!(matches!(latched, LatchResult::RejectedSlotHeld));
                     assert_eq!(r.forward_target(t, peer, 1), Some((stranger, 0)));
                 }
-                let latched = r.latch(t, direction, real, 2, token("right"), token("right"));
+                let latched = r.latch(t, direction, real, 2, false, token("right"), token("right"));
                 assert!(matches!(
                     latched,
-                    LatchResult::TookOver { ready: true, held_by } if held_by == stranger
+                    LatchResult::TookOver { readiness: Readiness { latched: true, .. }, held_by } if held_by == stranger
                 ));
                 assert_eq!(slot(&r, t, direction), (Some(real), 0, 2));
                 assert_eq!(r.forward_target(t, stranger, 1316), None);
                 assert_eq!(r.forward_target(t, peer, 1), Some((real, 2)));
                 assert_eq!(r.forward_target(t, real, 1), Some((peer, 1)));
                 let third = addr(4, 8000);
-                let latched = r.latch(t, direction, third, 3, token("right"), token("right"));
+                let latched = r.latch(t, direction, third, 3, false, token("right"), token("right"));
                 assert!(matches!(latched, LatchResult::RejectedSlotHeld));
             }
         }
@@ -1416,8 +1700,8 @@ mod shown_token_tests {
     fn a_slot_taken_over_is_ready_when_the_other_side_is_there() {
         let t = Uuid::new_v4();
         let r = held(t, Ingress, addr(1, 5000), None);
-        let latched = r.latch(t, Ingress, addr(2, 6000), 0, token("right"), token("right"));
-        assert!(matches!(latched, LatchResult::TookOver { ready: false, .. }));
+        let latched = r.latch(t, Ingress, addr(2, 6000), 0, false, token("right"), token("right"));
+        assert!(matches!(latched, LatchResult::TookOver { readiness: Readiness { latched: false, .. }, .. }));
     }
 
     /// A holder that has shown the token keeps its slot while it sends, whoever
@@ -1428,23 +1712,23 @@ mod shown_token_tests {
         for registered_at_first in [None, token("right")] {
             let t = Uuid::new_v4();
             let r = UdpSessionRouter::new(64);
-            r.latch(t, Egress, real, 0, token("right"), registered_at_first);
+            r.latch(t, Egress, real, 0, false, token("right"), registered_at_first);
             r.forward_target(t, real, 1);
             for _ in 0..3 {
-                let latched = r.latch(t, Egress, replayed, 0, token("right"), token("right"));
+                let latched = r.latch(t, Egress, replayed, 0, false, token("right"), token("right"));
                 assert!(matches!(latched, LatchResult::RejectedSlotHeld));
                 assert_eq!(slot(&r, t, Egress).0, Some(real));
                 assert!(matches!(
-                    r.latch(t, Egress, real, 0, token("right"), token("right")),
-                    LatchResult::Ok(false)
+                    r.latch(t, Egress, real, 0, false, token("right"), token("right")),
+                    LatchResult::Ok(Readiness { latched: false, .. })
                 ));
             }
         }
         // Shown by a later register of its own, with none at first.
         let t = Uuid::new_v4();
         let r = held(t, Egress, real, None);
-        r.latch(t, Egress, real, 0, token("right"), None);
-        let latched = r.latch(t, Egress, replayed, 0, token("right"), token("right"));
+        r.latch(t, Egress, real, 0, false, token("right"), None);
+        let latched = r.latch(t, Egress, replayed, 0, false, token("right"), token("right"));
         assert!(matches!(latched, LatchResult::RejectedSlotHeld));
     }
 
@@ -1456,20 +1740,20 @@ mod shown_token_tests {
         let (stranger, real) = (addr(1, 5000), addr(2, 6000));
         let r = held(t, Egress, stranger, None);
         assert!(matches!(
-            r.latch(t, Ingress, addr(1, 5001), 0, token("right"), None),
-            LatchResult::Ok(true)
+            r.latch(t, Ingress, addr(1, 5001), 0, false, token("right"), None),
+            LatchResult::Ok(Readiness { latched: true, .. })
         ));
-        let refused = r.latch(t, Egress, addr(3, 7000), 0, token("right"), None);
+        let refused = r.latch(t, Egress, addr(3, 7000), 0, false, token("right"), None);
         assert!(matches!(refused, LatchResult::RejectedSlotHeld));
-        let latched = r.latch(t, Egress, real, 0, token("right"), token("right"));
+        let latched = r.latch(t, Egress, real, 0, false, token("right"), token("right"));
         assert!(matches!(latched, LatchResult::TookOver { .. }));
 
         // Nor one shown by whoever had the slot before.
         let t = Uuid::new_v4();
-        r.latch(t, Egress, real, 0, token("right"), None);
-        r.latch(t, Egress, stranger, 0, None, None);
+        r.latch(t, Egress, real, 0, false, token("right"), None);
+        r.latch(t, Egress, stranger, 0, false, None, None);
         r.forward_target(t, stranger, 1);
-        let latched = r.latch(t, Egress, real, 0, token("right"), token("right"));
+        let latched = r.latch(t, Egress, real, 0, false, token("right"), token("right"));
         assert!(matches!(latched, LatchResult::TookOver { .. }));
     }
 
@@ -1480,34 +1764,48 @@ mod shown_token_tests {
         let t = Uuid::new_v4();
         let (old, new) = (addr(1, 5000), addr(2, 6000));
         let r = held(t, Egress, old, token("before"));
-        let refused = r.latch(t, Egress, new, 0, token("before"), token("before"));
+        let refused = r.latch(t, Egress, new, 0, false, token("before"), token("before"));
         assert!(matches!(refused, LatchResult::RejectedSlotHeld));
         r.forward_target(t, old, 1);
         assert_eq!(slot(&r, t, Egress).0, Some(old));
-        let latched = r.latch(t, Egress, new, 0, token("after"), token("after"));
+        let latched = r.latch(t, Egress, new, 0, false, token("after"), token("after"));
         assert!(matches!(latched, LatchResult::TookOver { .. }));
     }
 
     /// A datagram of the native plane, sent from its own address.
-    async fn socket(host: u8) -> UdpSocket {
+    pub(super) async fn socket(host: u8) -> UdpSocket {
         UdpSocket::bind(SocketAddr::from(([127, 0, 0, host], 0))).await.unwrap()
     }
 
     async fn register(sock: &UdpSocket, relay: SocketAddr, t: Uuid, direction: TunnelDirection, token: Option<&str>) -> Option<bool> {
-        let msg = encode_udp_control(&UdpRelayControl::Register {
+        let register = UdpRelayControl::Register {
             tunnel_id: t,
             direction,
             bind_token: token.map(str::to_owned),
             protocol_version: TUNNEL_PROTOCOL_VERSION,
-        });
-        sock.send_to(&msg.unwrap(), relay).await.unwrap();
+            seq: None,
+            standby: None,
+        };
+        match ack(sock, relay, &register).await? {
+            UdpRelayControl::Ack { ready, .. } => Some(ready),
+            other => panic!("{other:?} is not an ack"),
+        }
+    }
+
+    /// Send `register` from `sock` and wait for the control datagram that
+    /// answers it, if one comes within 300 ms: an `Ack` for its tunnel.
+    pub(super) async fn ack(sock: &UdpSocket, relay: SocketAddr, register: &UdpRelayControl) -> Option<UdpRelayControl> {
+        let UdpRelayControl::Register { tunnel_id: t, .. } = register else {
+            panic!("{register:?} is not a register");
+        };
+        sock.send_to(&encode_udp_control(register).unwrap(), relay).await.unwrap();
         let mut buf = [0; 2048];
         loop {
             let read = tokio::time::timeout(Duration::from_millis(300), sock.recv(&mut buf));
             let n = read.await.ok()?.unwrap();
-            if let Some(UdpRelayControl::Ack { ready, tunnel_id }) = try_decode_udp_control(&buf[..n]) {
-                assert_eq!(tunnel_id, t);
-                return Some(ready);
+            if let Some(ack) = try_decode_udp_control(&buf[..n]) {
+                assert!(matches!(ack, UdpRelayControl::Ack { tunnel_id, .. } if tunnel_id == *t), "{ack:?}");
+                return Some(ack);
             }
         }
     }
@@ -1592,6 +1890,306 @@ mod shown_token_tests {
 }
 
 #[cfg(test)]
+mod liveness_tests {
+    //! Which slots are heard, which edges stand by, and slots whose edge has
+    //! gone: what lets a pair of edges after v0.117.0 meet on whichever relay
+    //! both reach, and fail back together.
+    use super::shown_token_tests::{ack, socket};
+    use super::*;
+    use crate::session::test_relay::start_relay_capped;
+    use TunnelDirection::{Egress, Ingress};
+
+    /// A monotonic millisecond for `latch_at`, far from the process's own
+    /// clock, so no stamp written here is mistaken for one written by the
+    /// data path, which runs on that clock.
+    const T: u64 = 10_000_000;
+
+    /// The source edge, which registers `Egress`.
+    fn source() -> SocketAddr {
+        "198.51.100.10:5000".parse().unwrap()
+    }
+
+    /// The destination edge, which registers `Ingress`.
+    fn destination() -> SocketAddr {
+        "203.0.113.7:6000".parse().unwrap()
+    }
+
+    fn token(text: &str) -> Option<TokenDigest> {
+        Some(TokenDigest::of(text))
+    }
+
+    fn readiness(latched: bool, peer_live: bool, live_ms: u64) -> Readiness {
+        Readiness { latched, peer_live, live_ms }
+    }
+
+    /// A `Register` from the edge that has `direction`, at `now`.
+    fn register(r: &UdpSessionRouter, t: Uuid, direction: TunnelDirection, standby: bool, now: u64) -> Readiness {
+        let src = if direction == Ingress { destination() } else { source() };
+        let LatchResult::Ok(readiness) = r.latch_at(t, direction, src, 0, standby, None, None, now) else {
+            panic!("the {direction:?} register at {now} was refused");
+        };
+        readiness
+    }
+
+    fn status(r: &UdpSessionRouter, t: Uuid, now: u64) -> &'static str {
+        r.sessions.get(&t).unwrap().status_str(now)
+    }
+
+    /// Parity with the edge's `RELAY_PEER_LIVE_MS`, which times its moves by it.
+    #[test]
+    fn the_peer_live_window_is_16_s() {
+        assert_eq!(PEER_LIVE_MS, 16_000);
+    }
+
+    #[test]
+    fn a_slot_is_heard_for_16_s_after_its_last_register_or_media() {
+        assert!(slot_heard(T - 15_999, 0, T), "15 999 ms ago is heard");
+        assert!(!slot_heard(T - 16_000, 0, T), "16 000 ms ago is not");
+        assert!(!slot_heard(0, 0, T), "0 is never");
+        assert!(slot_heard(0, T - 15_999, T), "media alone counts");
+        assert!(slot_heard(T - 60_000, T - 1, T), "the later stamp counts");
+        assert!(slot_heard(T + 5_000, 0, T), "a stamp in the future is just heard");
+
+        assert!(!slot_departed(T - 30_000, 0, T), "30 s is not yet gone");
+        assert!(slot_departed(T - 30_001, 0, T), "past 30 s is");
+        assert!(!slot_departed(T - 60_000, T - 30_000, T), "media keeps a slot");
+    }
+
+    /// `ready` keeps its meaning — both slots latched — while `peer_live` says
+    /// whether the other one is still heard, by its `Register`s or its media.
+    #[test]
+    fn an_ack_reports_the_peer_live_only_while_it_is_heard() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        assert_eq!(register(&r, t, Egress, false, T), readiness(false, false, 0));
+        assert_eq!(register(&r, t, Ingress, false, T), readiness(true, true, 0));
+        assert_eq!(register(&r, t, Ingress, false, T + 10_000), readiness(true, true, 10_000));
+        // The egress side's last `Register` is 17 s old: latched, not heard.
+        assert_eq!(register(&r, t, Ingress, false, T + 17_000), readiness(true, false, 0));
+        // Media from its address is hearing it.
+        r.sessions.get(&t).unwrap().egress_media_ms.store(T + 16_500, Ordering::Relaxed);
+        assert_eq!(register(&r, t, Ingress, false, T + 18_000), readiness(true, true, 0));
+        assert_eq!(register(&r, t, Egress, false, T + 18_500), readiness(true, true, 500));
+    }
+
+    #[test]
+    fn live_ms_grows_and_restarts_after_a_gap_of_either_side() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        register(&r, t, Egress, false, T);
+        assert_eq!(register(&r, t, Ingress, false, T).live_ms, 0);
+        assert_eq!(register(&r, t, Egress, false, T + 5_000).live_ms, 5_000);
+        assert_eq!(register(&r, t, Ingress, false, T + 10_000).live_ms, 10_000);
+
+        // The ingress side goes quiet, and the egress side's next `Register`
+        // finds it unheard…
+        assert_eq!(register(&r, t, Egress, false, T + 26_000), readiness(true, false, 0));
+        // …so the stretch starts again from its return.
+        assert_eq!(register(&r, t, Ingress, false, T + 27_000), readiness(true, true, 0));
+        assert_eq!(register(&r, t, Egress, false, T + 31_000).live_ms, 4_000);
+        assert_eq!(register(&r, t, Ingress, false, T + 36_000).live_ms, 9_000);
+
+        // The egress side goes quiet for longer than 16 s while the other's
+        // `Register`s still find it heard: its own return restarts the stretch.
+        assert_eq!(register(&r, t, Ingress, false, T + 46_000).live_ms, 19_000);
+        assert_eq!(register(&r, t, Egress, false, T + 47_001), readiness(true, true, 0));
+        assert_eq!(register(&r, t, Ingress, false, T + 48_001).live_ms, 1_000);
+    }
+
+    /// A slot taken from a stranger by the edge that shows its token is a new
+    /// edge on that side, whose stretch has only begun.
+    #[test]
+    fn a_slot_taken_over_starts_the_stretch_again() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let stranger: SocketAddr = "192.0.2.9:7000".parse().unwrap();
+        assert!(matches!(r.latch_at(t, Ingress, stranger, 0, false, None, None, T), LatchResult::Ok(_)));
+        r.sessions.get(&t).unwrap().ingress_media_ms.store(T + 4_000, Ordering::Relaxed);
+        assert_eq!(register(&r, t, Egress, false, T + 1_000), readiness(true, true, 0));
+        assert_eq!(register(&r, t, Egress, false, T + 5_000).live_ms, 4_000);
+        let taken = r.latch_at(t, Ingress, destination(), 0, false, token("right"), token("right"), T + 6_000);
+        assert!(matches!(
+            taken,
+            LatchResult::TookOver { readiness: Readiness { latched: true, peer_live: true, live_ms: 0 }, held_by }
+                if held_by == stranger
+        ));
+        assert_eq!(register(&r, t, Egress, false, T + 7_000).live_ms, 1_000);
+    }
+
+    /// The status goes by which slots are heard: a pair whose `Register`s
+    /// stopped reads `empty` while both slots are still latched.
+    #[test]
+    fn the_status_counts_heard_slots_not_latched_ones() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        register(&r, t, Egress, false, T);
+        assert_eq!(status(&r, t, T), "waiting_ingress");
+        register(&r, t, Ingress, false, T + 10_000);
+        assert_eq!(status(&r, t, T + 10_000), "active");
+        assert_eq!(status(&r, t, T + 16_000), "waiting_egress");
+        assert_eq!(status(&r, t, T + 26_000), "empty");
+        assert!(r.sessions.get(&t).unwrap().both_latched());
+    }
+
+    /// Both edges registering here only to be found, their media going
+    /// through the tunnel's other relay: listed `standby`, not counted active.
+    /// One edge sending here is enough to count.
+    #[test]
+    fn a_standby_pair_reads_standby_and_is_not_counted_active() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let listed = |r: &UdpSessionRouter| (r.list()[0].status.clone(), r.active_count(), r.count());
+        r.latch(t, Egress, source(), 0, true, None, None);
+        assert_eq!(listed(&r), ("waiting_ingress".into(), 0, 1));
+        r.latch(t, Ingress, destination(), 0, true, None, None);
+        assert_eq!(listed(&r), ("standby".into(), 0, 1));
+        r.latch(t, Ingress, destination(), 0, false, None, None);
+        assert_eq!(listed(&r), ("active".into(), 1, 1));
+        r.latch(t, Egress, source(), 0, false, None, None);
+        assert_eq!(listed(&r), ("active".into(), 1, 1));
+        r.latch(t, Ingress, destination(), 0, true, None, None);
+        r.latch(t, Egress, source(), 0, true, None, None);
+        assert_eq!(listed(&r), ("standby".into(), 0, 1));
+    }
+
+    /// Over the plane's own receive loop: every `Ack` names this relay process
+    /// and echoes the `Register`'s `seq`, and the `standby` flag reaches the
+    /// session. An edge up to v0.117.0 sends neither and is answered as before,
+    /// with the new fields beside `ready`.
+    #[tokio::test]
+    async fn the_ack_names_the_relay_and_echoes_seq() {
+        let (_, _, ctx, _events) = start_relay_capped(false, 64, 100);
+        let config = RelayConfig {
+            udp_relay_addrs: Some(vec!["127.0.0.1:0".into()]),
+            ..RelayConfig::default()
+        };
+        let sockets = bind_udp_relay(&config).unwrap();
+        let relay = sockets[0].local_addr().unwrap();
+        tokio::spawn(serve_udp_relay(sockets, ctx.clone()));
+
+        let relay_id = ctx.udp_sessions.relay_id().to_owned();
+        assert_eq!(relay_id.len(), 32);
+        assert!(relay_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{relay_id}");
+        assert_ne!(UdpSessionRouter::new(64).relay_id(), relay_id, "one per process");
+
+        let t = Uuid::new_v4();
+        let register = |direction, seq, standby| UdpRelayControl::Register {
+            tunnel_id: t,
+            direction,
+            bind_token: None,
+            protocol_version: TUNNEL_PROTOCOL_VERSION,
+            seq,
+            standby,
+        };
+        let (source, destination) = (socket(1).await, socket(1).await);
+        assert_eq!(
+            ack(&source, relay, &register(Egress, Some(u32::MAX), Some(false))).await,
+            Some(UdpRelayControl::Ack {
+                tunnel_id: t,
+                ready: false,
+                peer_live: Some(false),
+                live_ms: Some(0),
+                relay_id: Some(relay_id.clone()),
+                seq: Some(u32::MAX),
+            })
+        );
+        assert_eq!(
+            ack(&destination, relay, &register(Ingress, None, None)).await,
+            Some(UdpRelayControl::Ack {
+                tunnel_id: t,
+                ready: true,
+                peer_live: Some(true),
+                live_ms: Some(0),
+                relay_id: Some(relay_id.clone()),
+                seq: None,
+            })
+        );
+        assert_eq!(ctx.udp_sessions.list()[0].status, "active");
+
+        for (sock, direction, seq) in [(&source, Egress, 7), (&destination, Ingress, 8)] {
+            let answer = ack(sock, relay, &register(direction, Some(seq), Some(true))).await;
+            assert!(matches!(
+                answer,
+                Some(UdpRelayControl::Ack { ready: true, peer_live: Some(true), seq: Some(s), relay_id: Some(ref id), .. })
+                    if s == seq && *id == relay_id
+            ));
+        }
+        assert_eq!(ctx.udp_sessions.list()[0].status, "standby");
+        assert_eq!(ctx.udp_sessions.active_count(), 0);
+    }
+
+    /// The reaper clears a slot whose edge has gone — nothing from it for
+    /// 30 s — in a session its peer keeps alive, and the peer's next `Ack`
+    /// says the tunnel is no longer ready. Up to v0.20.0 only whole sessions
+    /// were reaped, so an edge that moved to the other relay stayed latched
+    /// here for as long as its peer registered.
+    #[test]
+    fn a_stale_slot_is_cleared_and_the_session_kept() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let LatchResult::Ok(_) = r.latch_at(t, Ingress, destination(), 2, true, token("right"), None, T) else {
+            panic!("refused");
+        };
+        register(&r, t, Egress, false, T + 25_000);
+
+        r.reap_idle_at(T + 30_000);
+        assert_eq!(r.sessions.get(&t).unwrap().ingress.load(), Some(destination()), "30 s is not yet gone");
+
+        assert_eq!(r.reap_idle_at(T + 30_001), 0, "the session stays");
+        assert_eq!(r.count(), 1);
+        {
+            let s = r.sessions.get(&t).unwrap();
+            assert_eq!(s.ingress.load(), None);
+            assert_eq!(
+                (
+                    s.ingress_seen_ms.load(Ordering::Relaxed),
+                    s.ingress_media_ms.load(Ordering::Relaxed),
+                    s.ingress_sock.load(Ordering::Relaxed),
+                    s.ingress_standby.load(Ordering::Relaxed),
+                    s.ingress_shown.is_none(),
+                    s.live_since_ms.load(Ordering::Relaxed),
+                ),
+                (0, 0, usize::MAX, false, true, 0)
+            );
+            assert_eq!(s.egress.load(), Some(source()), "the peer's slot is kept");
+        }
+        assert_eq!(register(&r, t, Egress, false, T + 31_000), readiness(false, false, 0));
+        assert_eq!(r.forward_target(t, source(), 100), None, "nothing to forward to");
+
+        // Media keeps a slot whose `Register`s have stopped.
+        r.sessions.get(&t).unwrap().egress_media_ms.store(T + 56_000, Ordering::Relaxed);
+        r.reap_idle_at(T + 62_000);
+        assert_eq!(r.sessions.get(&t).unwrap().egress.load(), Some(source()));
+        r.reap_idle_at(T + 86_001);
+        assert_eq!(status(&r, t, T + 86_001), "empty");
+        assert_eq!(r.count(), 1, "whole sessions still go by the wall clock");
+    }
+
+    /// A cleared slot is empty again: the next `Register` has it, whoever
+    /// sends it, as at first contact, though a live edge had it with the token.
+    #[test]
+    fn a_cleared_slot_is_latched_by_any_register() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        let stranger: SocketAddr = "192.0.2.9:7000".parse().unwrap();
+        let held = r.latch_at(t, Ingress, destination(), 1, false, token("right"), None, T);
+        assert!(matches!(held, LatchResult::Ok(_)));
+        r.sessions.get(&t).unwrap().ingress_media_ms.store(T, Ordering::Relaxed);
+        let refused = r.latch_at(t, Ingress, stranger, 0, false, None, None, T + 1_000);
+        assert!(matches!(refused, LatchResult::RejectedSlotHeld), "held while it carries media");
+
+        register(&r, t, Egress, false, T + 20_000);
+        r.reap_idle_at(T + 30_001);
+        assert_eq!(r.sessions.get(&t).unwrap().ingress.load(), None);
+
+        let latched = r.latch_at(t, Ingress, stranger, 3, false, None, None, T + 30_500);
+        assert!(matches!(latched, LatchResult::Ok(Readiness { latched: true, peer_live: true, live_ms: 0 })));
+        let s = r.sessions.get(&t).unwrap();
+        assert_eq!((s.ingress.load(), s.ingress_sock.load(Ordering::Relaxed)), (Some(stranger), 3));
+    }
+}
+
+#[cfg(test)]
 mod totals_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
@@ -1606,8 +2204,8 @@ mod totals_tests {
 
     /// Register both sides from hosts of their own, the source first.
     fn register(r: &UdpSessionRouter, t: Uuid, host: u8) {
-        r.latch(t, TunnelDirection::Egress, source(host), 0, None, None);
-        r.latch(t, TunnelDirection::Ingress, destination(host), 0, None, None);
+        r.latch(t, TunnelDirection::Egress, source(host), 0, false, None, None);
+        r.latch(t, TunnelDirection::Ingress, destination(host), 0, false, None, None);
     }
 
     /// Make a session idle for longer than the reaper lets it be.
@@ -1736,7 +2334,7 @@ mod removal_race_tests {
 
     fn latch(r: &UdpSessionRouter, t: Uuid, port: u16) -> bool {
         let src = SocketAddr::new(HOST, port);
-        matches!(r.latch(t, TunnelDirection::Egress, src, 0, None, None), LatchResult::Ok(_))
+        matches!(r.latch(t, TunnelDirection::Egress, src, 0, false, None, None), LatchResult::Ok(_))
     }
 
     fn make_stale(r: &UdpSessionRouter, t: Uuid) {

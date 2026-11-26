@@ -4146,8 +4146,8 @@ mod tunnel_counter_tests {
         let (source, destination): (SocketAddr, SocketAddr) =
             ("198.51.100.10:5000".parse().unwrap(), "203.0.113.7:6000".parse().unwrap());
         let register = |id| {
-            ctx.udp_sessions.latch(id, TunnelDirection::Egress, source, 0, None, None);
-            ctx.udp_sessions.latch(id, TunnelDirection::Ingress, destination, 0, None, None);
+            ctx.udp_sessions.latch(id, TunnelDirection::Egress, source, 0, false, None, None);
+            ctx.udp_sessions.latch(id, TunnelDirection::Ingress, destination, 0, false, None, None);
         };
         register(id);
         ctx.udp_sessions.forward_target(id, source, 700).unwrap();

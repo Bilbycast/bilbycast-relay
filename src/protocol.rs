@@ -314,7 +314,16 @@ pub fn decode_udp_datagram(data: &[u8]) -> Option<(Uuid, &[u8])> {
 // This must match `bilbycast-edge/src/tunnel/protocol.rs`.
 
 /// Control messages for the plain-UDP relay data plane.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Every field after the first four of each variant is optional on the wire
+/// (`serde(default)`, and left out when `None`), so each side reads the other's
+/// older shape: an edge up to v0.117.0 sends neither `seq` nor `standby`, and a
+/// relay up to v0.20.0 answers with `tunnel_id` and `ready` alone. Neither
+/// crate denies unknown keys. An `Ack` carrying `peer_live` is how an edge
+/// tells a relay that reports liveness from one that does not, so
+/// [`TUNNEL_PROTOCOL_VERSION`] stays 2: no type is new and no field changes
+/// its meaning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum UdpRelayControl {
     /// edge → relay: register/keepalive this endpoint's `(tunnel_id, direction)` and
@@ -330,12 +339,44 @@ pub enum UdpRelayControl {
         bind_token: Option<String>,
         #[serde(default)]
         protocol_version: u32,
+        /// A per-socket counter, starting at a random value and going up by one
+        /// per `Register`. The relay echoes it in the `Ack`'s `seq`, so the edge
+        /// can match an `Ack` to the `Register` it answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u32>,
+        /// `true` when the sending socket is not the edge's active one: the edge
+        /// stands by on this relay while its media goes through the tunnel's
+        /// other relay. A pair standing by on both sides is not counted active.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standby: Option<bool>,
     },
 
     /// relay → edge: acknowledge a [`UdpRelayControl::Register`] and report whether both
     /// sides of the tunnel are now registered (media may flow).
     #[serde(rename = "ack")]
-    Ack { tunnel_id: Uuid, ready: bool },
+    Ack {
+        tunnel_id: Uuid,
+        /// Both slots of the tunnel hold an address. Unchanged in meaning: a
+        /// slot that has gone quiet still counts until the relay clears it.
+        ready: bool,
+        /// The opposite slot was heard in the last 16 s (monotonic): a
+        /// `Register` from it was accepted, or media was forwarded from its
+        /// latched address. Present only from a relay after v0.20.0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_live: Option<bool>,
+        /// How long both slots have been heard without a break, as observed
+        /// at `Register`s. `0` whenever `peer_live` is `false`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_ms: Option<u64>,
+        /// 32 lowercase hex characters, one value per relay process, so an
+        /// edge can tell two addresses of one relay from two relays, and a
+        /// restarted relay from the one before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_id: Option<String>,
+        /// The `seq` of the `Register` this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u32>,
+    },
 }
 
 /// Encode a [`UdpRelayControl`] message as a control datagram: nil-UUID prefix + JSON.
@@ -356,4 +397,131 @@ pub fn try_decode_udp_control(data: &[u8]) -> Option<UdpRelayControl> {
         return None;
     }
     serde_json::from_slice::<UdpRelayControl>(payload).ok()
+}
+
+#[cfg(test)]
+mod udp_control_tests {
+    //! The native plane's control datagrams, old and new shapes. The edge
+    //! (`bilbycast-edge/src/tunnel/protocol.rs`) has the same tests.
+    use super::*;
+
+    const TUNNEL: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
+    fn tunnel() -> Uuid {
+        TUNNEL.parse().unwrap()
+    }
+
+    fn decode(json: &str) -> UdpRelayControl {
+        let mut datagram = Uuid::nil().as_bytes().to_vec();
+        datagram.extend_from_slice(json.as_bytes());
+        try_decode_udp_control(&datagram).unwrap_or_else(|| panic!("{json} must decode"))
+    }
+
+    fn round_trip(msg: &UdpRelayControl) -> UdpRelayControl {
+        try_decode_udp_control(&encode_udp_control(msg).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn every_new_native_control_field_round_trips() {
+        let register = UdpRelayControl::Register {
+            tunnel_id: tunnel(),
+            direction: TunnelDirection::Ingress,
+            bind_token: Some("ab".repeat(32)),
+            protocol_version: TUNNEL_PROTOCOL_VERSION,
+            seq: Some(u32::MAX),
+            standby: Some(true),
+        };
+        assert_eq!(round_trip(&register), register);
+        let ack = UdpRelayControl::Ack {
+            tunnel_id: tunnel(),
+            ready: true,
+            peer_live: Some(false),
+            live_ms: Some(604_800_000),
+            relay_id: Some("0123456789abcdef0123456789abcdef".into()),
+            seq: Some(7),
+        };
+        assert_eq!(round_trip(&ack), ack);
+    }
+
+    #[test]
+    fn the_old_native_control_shapes_decode_with_every_new_field_none() {
+        assert_eq!(
+            decode(&format!(r#"{{"type":"ack","tunnel_id":"{TUNNEL}","ready":true}}"#)),
+            UdpRelayControl::Ack {
+                tunnel_id: tunnel(),
+                ready: true,
+                peer_live: None,
+                live_ms: None,
+                relay_id: None,
+                seq: None,
+            }
+        );
+        assert_eq!(
+            decode(&format!(
+                r#"{{"type":"register","tunnel_id":"{TUNNEL}","direction":"egress","bind_token":"cd","protocol_version":2}}"#
+            )),
+            UdpRelayControl::Register {
+                tunnel_id: tunnel(),
+                direction: TunnelDirection::Egress,
+                bind_token: Some("cd".into()),
+                protocol_version: 2,
+                seq: None,
+                standby: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_new_native_control_shape_with_an_unknown_key_still_decodes() {
+        let ack = decode(&format!(
+            r#"{{"type":"ack","tunnel_id":"{TUNNEL}","ready":false,"peer_live":true,"live_ms":42,"relay_id":"ff","seq":3,"later":{{"x":1}}}}"#
+        ));
+        assert_eq!(
+            ack,
+            UdpRelayControl::Ack {
+                tunnel_id: tunnel(),
+                ready: false,
+                peer_live: Some(true),
+                live_ms: Some(42),
+                relay_id: Some("ff".into()),
+                seq: Some(3),
+            }
+        );
+        let register = decode(&format!(
+            r#"{{"type":"register","tunnel_id":"{TUNNEL}","direction":"ingress","seq":9,"standby":false,"later":null}}"#
+        ));
+        assert!(matches!(
+            register,
+            UdpRelayControl::Register { seq: Some(9), standby: Some(false), bind_token: None, protocol_version: 0, .. }
+        ));
+    }
+
+    /// A field left `None` is not on the wire, so an `Ack` without the new
+    /// fields is byte for byte what a relay up to v0.20.0 sends.
+    #[test]
+    fn a_field_left_none_is_not_on_the_wire() {
+        let ack = UdpRelayControl::Ack {
+            tunnel_id: tunnel(),
+            ready: true,
+            peer_live: None,
+            live_ms: None,
+            relay_id: None,
+            seq: None,
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        assert_eq!(json, format!(r#"{{"type":"ack","tunnel_id":"{TUNNEL}","ready":true}}"#));
+        let register = UdpRelayControl::Register {
+            tunnel_id: tunnel(),
+            direction: TunnelDirection::Ingress,
+            bind_token: None,
+            protocol_version: 2,
+            seq: None,
+            standby: None,
+        };
+        let json = serde_json::to_string(&register).unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"type":"register","tunnel_id":"{TUNNEL}","direction":"ingress","protocol_version":2}}"#)
+        );
+    }
 }
