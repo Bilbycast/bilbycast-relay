@@ -178,12 +178,12 @@ distribution and nothing else. If the subsystem cannot start — an origin root
 the service user cannot write, an HTTP or ingest address already taken — or
 stops later, the relay logs `viewer-distribution subsystem stopped: <reason>`,
 raises a Critical `relay_distribution_stopped` event naming the reason, stops
-advertising `viewer-distribution` and `origin-policy`, refuses every
-`configure_distribution` push from then on (so the manager keeps a drop or a
-clip expiry it sends as owed, rather than settling one that went nowhere), and
-reports `"distribution": "stopped"` on its public `/health` and
-`distribution_error` on its manager health. QUIC and native-UDP tunnels carry
-on. Before relay#15 the same failure exited the whole
+advertising `viewer-distribution`, `origin-policy`, `token-keyring` and
+`live-streams`, refuses every `configure_distribution` push from then on (so
+the manager keeps a drop or a clip expiry it sends as owed, rather than
+settling one that went nowhere), and reports `"distribution": "stopped"` on
+its public `/health` and `distribution_error` on its manager health. QUIC and
+native-UDP tunnels carry on. Before relay#15 the same failure exited the whole
 process, and on 2026-09-22 a root-owned `/var/lib/bilbycast/relay/origin` put
 a production relay that used no distribution at all into a restart loop.
 
@@ -1934,12 +1934,12 @@ up. Two things do still need care:
   logs `viewer-distribution subsystem stopped: distribution origin storage dir
   <root>: origin storage dir … is not empty and was not created by the relay`,
   raises a Critical `relay_distribution_stopped` event, stops advertising
-  `viewer-distribution` and `origin-policy`, reports `"distribution":
-  "stopped"` on `/health`, and keeps forwarding tunnels. Distribution is not
-  retried in-process: restore the marker or point `origin_storage_dir` at a
-  directory of its own, then restart the relay. (Before relay#15 the refusal
-  ended the whole process, which under `Restart=always` came back every 3 s
-  and refused again.)
+  `viewer-distribution`, `origin-policy`, `token-keyring` and `live-streams`,
+  reports `"distribution": "stopped"` on `/health`, and keeps forwarding
+  tunnels. Distribution is not retried in-process: restore the marker or point
+  `origin_storage_dir` at a directory of its own, then restart the relay.
+  (Before relay#15 the refusal ended the whole process, which under
+  `Restart=always` came back every 3 s and refused again.)
 
 **Sizing a whole-event window.** The window costs relay disk, not device
 memory — a viewer holds only `backBufferLength`, whatever the window. Measured
