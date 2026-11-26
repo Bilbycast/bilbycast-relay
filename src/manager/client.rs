@@ -1631,12 +1631,17 @@ fn build_health_message(
 
     // Capability bits the manager UI gates on. "udp-relay" => native SRT/RIST
     // (no-QUIC) tunnels, withdrawn if the plane stopped (relay#15).
+    // "udp-peer-liveness" => that plane's `Ack`s carry `peer_live`, `live_ms`,
+    // `relay_id` and `seq`, and a departed slot is cleared, so a pair of edges
+    // after v0.117.0 meets on whichever relay both reach and fails back
+    // together; it goes with "udp-relay", since it says how that plane answers.
     // "viewer-distribution" => WHEP SFU + LL-HLS origin, present only while the
     // subsystem publishes telemetry — which a stopped one never does again.
     let mut capabilities: Vec<&str> = Vec::new();
     let udp_relay_stopped = relay_stats.udp_relay_stopped();
     if relay_config.udp_relay_enabled && udp_relay_stopped.is_none() {
         capabilities.push("udp-relay");
+        capabilities.push("udp-peer-liveness");
     }
     let dist_snapshot = relay_stats.distribution_snapshot();
     if dist_snapshot.is_some() {
@@ -3870,7 +3875,7 @@ mod stopped_subsystem_health_tests {
         let p = health(&stats, &config);
         assert_eq!(
             capabilities(&p),
-            ["udp-relay", "viewer-distribution", "origin-policy"]
+            ["udp-relay", "udp-peer-liveness", "viewer-distribution", "origin-policy"]
         );
         assert!(p.get("distribution_error").is_none());
         assert!(p.get("udp_relay_error").is_none());
@@ -3904,10 +3909,15 @@ mod stopped_subsystem_health_tests {
         stats.mark_distribution_stopped("Permission denied (os error 13)".into());
         let config = RelayConfig { udp_relay_enabled: true, ..Default::default() };
         let p = health(&stats, &config);
-        assert_eq!(capabilities(&p), ["udp-relay"]);
+        // The native plane's two bits stay, and go together: the liveness bit
+        // says how the plane answers, so it is never there without the plane.
+        assert_eq!(capabilities(&p), ["udp-relay", "udp-peer-liveness"]);
         assert_eq!(p["distribution_error"], "Permission denied (os error 13)");
         assert!(p.get("distribution").is_none());
         assert_eq!(p["status"], "ok", "the forwarder is still up");
+
+        let disabled = RelayConfig { udp_relay_enabled: false, ..Default::default() };
+        assert!(capabilities(&health(&stats, &disabled)).is_empty());
     }
 
     #[test]
