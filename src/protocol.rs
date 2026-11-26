@@ -365,7 +365,8 @@ pub enum UdpRelayControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer_live: Option<bool>,
         /// How long both slots have been heard without a break, as observed
-        /// at `Register`s. `0` whenever `peer_live` is `false`.
+        /// at `Register`s, in ms, at most 604 800 000 (seven days: an edge
+        /// drops an `Ack` with more). `0` whenever `peer_live` is `false`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         live_ms: Option<u64>,
         /// 32 lowercase hex characters, one value per relay process, so an

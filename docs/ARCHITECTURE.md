@@ -545,8 +545,9 @@ The relay now says more, and leaves the edges' decisions to them:
 - **How long.** The session keeps `live_since_ms`, set when a `Register` finds both
   slots heard and either there was no stretch or this slot had a break (it was not
   heard, or was just taken over), and cleared when a `Register` finds the other
-  slot unheard. `live_ms` on the `Ack` is the time since; edges fail back to the
-  primary only once their pair has been live there for 60 s.
+  slot unheard. `live_ms` on the `Ack` is the time since, at most seven days
+  (`MAX_LIVE_MS`: an edge drops an `Ack` reporting more as malformed); edges fail
+  back to the primary only once their pair has been live there for 60 s.
 - **Which relay.** `relay_id` is 32 lowercase hex characters, new each time the
   relay process starts. Two configured addresses that answer with one id are one
   relay, and an id that changes is a restart. `seq` echoes the `Register`'s own

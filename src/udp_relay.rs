@@ -258,6 +258,12 @@ pub(crate) const PEER_LIVE_MS: u64 = 16_000;
 /// How often an edge re-registers: the edge's `KEEPALIVE_INTERVAL`.
 const EDGE_REGISTER_INTERVAL_MS: u64 = 5_000;
 
+/// The most `live_ms` an `Ack` reports: seven days. An edge after v0.117.0
+/// drops an `Ack` whose `live_ms` is larger as malformed, so a tunnel live for
+/// longer than a week reports this rather than lose its `Ack`s; the edge only
+/// asks whether its pair has been live for 60 s.
+const MAX_LIVE_MS: u64 = 604_800_000;
+
 const _: () = assert!(PEER_LIVE_MS >= 3 * EDGE_REGISTER_INTERVAL_MS);
 const _: () = assert!(PEER_LIVE_MS < SESSION_IDLE_TIMEOUT.as_millis() as u64);
 
@@ -455,7 +461,8 @@ pub struct Readiness {
     /// The opposite slot was heard in the last [`PEER_LIVE_MS`]: `peer_live`.
     pub peer_live: bool,
     /// How long both slots have been heard without a break, as `Register`s
-    /// observed it; `0` when `peer_live` is false: `live_ms`.
+    /// observed it, at most seven days; `0` when `peer_live` is false:
+    /// `live_ms`.
     pub live_ms: u64,
 }
 
@@ -666,7 +673,7 @@ impl UdpSessionRouter {
         let readiness = Readiness {
             latched: session.both_latched(),
             peer_live,
-            live_ms: if peer_live { now.saturating_sub(live_since) } else { 0 },
+            live_ms: if peer_live { now.saturating_sub(live_since).min(MAX_LIVE_MS) } else { 0 },
         };
         match held_by {
             Some(held_by) => LatchResult::TookOver { readiness, held_by },
@@ -1994,6 +2001,25 @@ mod liveness_tests {
         assert_eq!(register(&r, t, Ingress, false, T + 46_000).live_ms, 19_000);
         assert_eq!(register(&r, t, Egress, false, T + 47_001), readiness(true, true, 0));
         assert_eq!(register(&r, t, Ingress, false, T + 48_001).live_ms, 1_000);
+    }
+
+    /// An edge drops an `Ack` whose `live_ms` is over seven days, so a tunnel
+    /// live for longer reports seven days rather than lose its `Ack`s.
+    #[test]
+    fn live_ms_stops_at_seven_days() {
+        let r = UdpSessionRouter::new(64);
+        let t = Uuid::new_v4();
+        register(&r, t, Egress, false, T);
+        register(&r, t, Ingress, false, T);
+        let week = 604_800_000;
+        let mut now = T;
+        while now < T + week + 20_000 {
+            now += 10_000;
+            for direction in [Ingress, Egress] {
+                assert_eq!(register(&r, t, direction, false, now).live_ms, (now - T).min(week));
+            }
+        }
+        assert_eq!(MAX_LIVE_MS, week);
     }
 
     /// A slot taken from a stranger by the edge that shows its token is a new
